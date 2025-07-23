@@ -1,6 +1,6 @@
 # Comprehensive Overview
 
-
+```
 +------------------------+
 |   Source Code Management  |
 |--------------------------|
@@ -15,6 +15,7 @@
 +-----+    +-----+
 |CVCS |    |DVCS |
 +-----+    +-----+
+```
 
 ## Introduction to Source Code Management (SCM)
 Source Code Management (SCM), also known as Version Control System (VCS), is a fundamental tool in modern software development. It helps developers track and manage changes to software code over time, enabling multiple developers to work together efficiently on complex projects.
@@ -135,6 +136,7 @@ Source Code Management (SCM), also known as Version Control System (VCS), is a f
 
 ### Git's Architecture
 
+```
 +----------------+
 |  Working Copy  |
 +----------------+
@@ -150,6 +152,7 @@ Source Code Management (SCM), also known as Version Control System (VCS), is a f
 +----------------+
     |    |    |
   Branch Branch Branch
+```
 
 #### 2. Mercurial
 - **Key Features**
