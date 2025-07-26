@@ -22,7 +22,7 @@ mkdir -p "$PUBLISH_DIR/pdf"
 mkdir -p "$PUBLISH_DIR/epub"
 mkdir -p "$PUBLISH_DIR/assets"
 
-# Create a simple book cover generator function
+# Enhanced book cover generator function with smart text handling
 generate_book_cover() {
     local book_name="$1"
     local cover_file="$PUBLISH_DIR/assets/${book_name}.svg"
@@ -31,65 +31,87 @@ generate_book_cover() {
     local colors=("#50fa7b" "#ff79c6" "#bd93f9" "#ffb86c" "#8be9fd" "#f1fa8c")
     local random_color=${colors[$((RANDOM % ${#colors[@]}))]}
 
-    # Split the book name into words for better wrapping
-    local words=($book_name)
-    local line1=""
-    local line2=""
-    local line3=""
+    # Clean and format book name for better display
+    local display_name=$(echo "$book_name" | sed 's/-/ /g' | sed 's/_/ /g')
 
-    # Simple text wrapping logic
-    if [ ${#words[@]} -eq 1 ]; then
-        # Single word - check if it's too long
-        if [ ${#book_name} -gt 12 ]; then
-            line1="${book_name:0:12}"
-            line2="${book_name:12}"
-        else
-            line1="$book_name"
-        fi
-    elif [ ${#words[@]} -eq 2 ]; then
-        # Two words - put each on separate line if combined length > 15
-        if [ $((${#words[0]} + ${#words[1]})) -gt 15 ]; then
-            line1="${words[0]}"
-            line2="${words[1]}"
-        else
-            line1="$book_name"
-        fi
+    # Smart font sizing based on title length
+    local title_length=${#display_name}
+    local font_size=20
+    local line_height=1.2
+    local title_height=100
+    local title_y=10
+
+    # Adjust font size and layout based on title length
+    if [ $title_length -gt 50 ]; then
+        # Very long titles
+        font_size=14
+        line_height=1.1
+        title_height=120
+        title_y=5
+    elif [ $title_length -gt 35 ]; then
+        # Long titles
+        font_size=16
+        line_height=1.15
+        title_height=110
+        title_y=7
+    elif [ $title_length -gt 25 ]; then
+        # Medium titles
+        font_size=18
+        line_height=1.2
+        title_height=105
+        title_y=8
+    elif [ $title_length -gt 15 ]; then
+        # Normal titles
+        font_size=20
+        line_height=1.2
+        title_height=100
+        title_y=10
     else
-        # Multiple words - distribute across lines
-        line1="${words[0]}"
-        if [ ${#words[@]} -gt 1 ]; then
-            line2="${words[1]}"
-        fi
-        if [ ${#words[@]} -gt 2 ]; then
-            line3="${words[2]}"
-        fi
+        # Short titles - can use larger font
+        font_size=22
+        line_height=1.3
+        title_height=100
+        title_y=10
     fi
 
-    # Create an SVG book cover with better design and text positioning
+    # Adjust book icon position based on title area height
+    local icon_y=$((180 + (title_height - 100) / 2))
+
+    # Create an enhanced SVG book cover with smart text handling
     cat > "$cover_file" << EOF
-<svg width="200" height="280" xmlns="http://www.w3.org/2000/svg">
-  <!-- Main background -->
-  <rect width="200" height="280" fill="#282a36" rx="8" ry="8"/>
-
-  <!-- Inner background -->
-  <rect width="190" height="270" x="5" y="5" fill="#44475a" rx="5" ry="5"/>
-
-  <!-- Title area with gradient effect -->
+<svg width="240" height="320" xmlns="http://www.w3.org/2000/svg">
   <defs>
+    <!-- Title gradient -->
     <linearGradient id="titleGrad" x1="0%" y1="0%" x2="0%" y2="100%">
       <stop offset="0%" style="stop-color:${random_color};stop-opacity:1" />
-      <stop offset="100%" style="stop-color:${random_color};stop-opacity:0.8" />
+      <stop offset="100%" style="stop-color:${random_color};stop-opacity:0.7" />
     </linearGradient>
+
+    <!-- Shadow filter -->
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="2" dy="4" stdDeviation="3" flood-color="#000000" flood-opacity="0.3"/>
+    </filter>
+
+    <!-- Text shadow filter -->
+    <filter id="textShadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="1" dy="2" stdDeviation="1" flood-color="#000000" flood-opacity="0.5"/>
+    </filter>
   </defs>
 
-  <!-- Large colored title area -->
-  <rect width="190" height="80" x="5" y="5" fill="url(#titleGrad)" rx="5" ry="5"/>
+  <!-- Main background with shadow -->
+  <rect width="240" height="320" fill="#282a36" rx="12" ry="12" filter="url(#shadow)"/>
 
-  <!-- Title text with better positioning -->
-  <foreignObject x="10" y="10" width="180" height="70">
+  <!-- Inner background -->
+  <rect width="220" height="300" x="10" y="10" fill="#44475a" rx="8" ry="8"/>
+
+  <!-- Title area with gradient (dynamic height) -->
+  <rect width="220" height="${title_height}" x="10" y="${title_y}" fill="url(#titleGrad)" rx="8" ry="8"/>
+
+  <!-- Title text with smart sizing -->
+  <foreignObject x="15" y="$((title_y + 5))" width="210" height="$((title_height - 10))">
     <div xmlns="http://www.w3.org/1999/xhtml" style="
-      font-family: 'Fira Code', monospace;
-      font-size: 18px;
+      font-family: 'Fira Code', 'Monaco', 'Consolas', monospace;
+      font-size: ${font_size}px;
       color: #282a36;
       text-align: center;
       font-weight: 700;
@@ -98,32 +120,149 @@ generate_book_cover() {
       justify-content: center;
       height: 100%;
       word-wrap: break-word;
-      line-height: 1.3;
+      line-height: ${line_height};
       padding: 8px;
-      text-shadow: 0 1px 2px rgba(0,0,0,0.3);
+      text-shadow: 0 1px 3px rgba(0,0,0,0.4);
+      hyphens: auto;
+      overflow-wrap: break-word;
+      word-break: break-word;
     ">
-      ${book_name}
+      ${display_name}
     </div>
   </foreignObject>
 
-  <!-- Decorative line -->
-  <line x1="15" y1="95" x2="185" y2="95" stroke="#6272a4" stroke-width="2" opacity="0.6"/>
+  <!-- Decorative elements (positioned after title area) -->
+  <line x1="25" y1="$((title_y + title_height + 10))" x2="215" y2="$((title_y + title_height + 10))" stroke="#6272a4" stroke-width="2" opacity="0.8"/>
+  <line x1="25" y1="$((title_y + title_height + 15))" x2="215" y2="$((title_y + title_height + 15))" stroke="${random_color}" stroke-width="1" opacity="0.6"/>
 
-  <!-- Modern book icon -->
-  <g transform="translate(100, 140)">
-    <!-- Book spine -->
-    <rect x="-25" y="-20" width="50" height="60" fill="#6272a4" rx="3" ry="3"/>
-    <!-- Book pages -->
-    <rect x="-22" y="-17" width="44" height="54" fill="#f8f8f2" rx="2" ry="2"/>
-    <!-- Page lines -->
-    <line x1="-15" y1="-5" x2="15" y2="-5" stroke="#6272a4" stroke-width="1.5" opacity="0.7"/>
-    <line x1="-15" y1="5" x2="15" y2="5" stroke="#6272a4" stroke-width="1.5" opacity="0.7"/>
-    <line x1="-15" y1="15" x2="10" y2="15" stroke="#6272a4" stroke-width="1.5" opacity="0.7"/>
-    <line x1="-15" y1="25" x2="15" y2="25" stroke="#6272a4" stroke-width="1.5" opacity="0.7"/>
+  <!-- Skeuomorphic bookshelf icon (positioned dynamically) -->
+  <g transform="translate(120, ${icon_y})">
+    <defs>
+      <!-- Book gradients for 3D effect -->
+      <linearGradient id="book1Grad" x1="0%" y1="0%" x2="100%" y2="0%">
+        <stop offset="0%" style="stop-color:#8b4513;stop-opacity:1" />
+        <stop offset="50%" style="stop-color:#a0522d;stop-opacity:1" />
+        <stop offset="100%" style="stop-color:#654321;stop-opacity:1" />
+      </linearGradient>
+
+      <linearGradient id="book2Grad" x1="0%" y1="0%" x2="100%" y2="0%">
+        <stop offset="0%" style="stop-color:#2e8b57;stop-opacity:1" />
+        <stop offset="50%" style="stop-color:#3cb371;stop-opacity:1" />
+        <stop offset="100%" style="stop-color:#228b22;stop-opacity:1" />
+      </linearGradient>
+
+      <linearGradient id="book3Grad" x1="0%" y1="0%" x2="100%" y2="0%">
+        <stop offset="0%" style="stop-color:#4682b4;stop-opacity:1" />
+        <stop offset="50%" style="stop-color:#5f9ea0;stop-opacity:1" />
+        <stop offset="100%" style="stop-color:#2f4f4f;stop-opacity:1" />
+      </linearGradient>
+
+      <linearGradient id="shelfGrad" x1="0%" y1="0%" x2="0%" y2="100%">
+        <stop offset="0%" style="stop-color:#8b7355;stop-opacity:1" />
+        <stop offset="50%" style="stop-color:#a0522d;stop-opacity:1" />
+        <stop offset="100%" style="stop-color:#654321;stop-opacity:1" />
+      </linearGradient>
+    </defs>
+
+    <!-- Bookshelf shadow -->
+    <ellipse cx="0" cy="45" rx="45" ry="8" fill="#000000" opacity="0.2"/>
+
+    <!-- Wooden bookshelf base -->
+    <rect x="-40" y="35" width="80" height="12" fill="url(#shelfGrad)" rx="2" ry="2"/>
+    <rect x="-40" y="47" width="80" height="3" fill="#654321" rx="1" ry="1"/>
+
+    <!-- Wood grain texture lines -->
+    <line x1="-35" y1="38" x2="35" y2="38" stroke="#654321" stroke-width="0.5" opacity="0.6"/>
+    <line x1="-35" y1="42" x2="35" y2="42" stroke="#654321" stroke-width="0.5" opacity="0.4"/>
+    <line x1="-35" y1="45" x2="35" y2="45" stroke="#654321" stroke-width="0.5" opacity="0.6"/>
+
+    <!-- Book 1 (leftmost) - thick technical book -->
+    <g transform="translate(-22, 0)">
+      <!-- Book shadow -->
+      <rect x="-1" y="-18" width="14" height="53" fill="#000000" rx="1" ry="1" opacity="0.3"/>
+      <!-- Book spine -->
+      <rect x="-2" y="-20" width="12" height="55" fill="url(#book1Grad)" rx="1" ry="1"/>
+      <!-- Book top edge -->
+      <rect x="-2" y="-20" width="12" height="2" fill="#a0522d" rx="1" ry="1"/>
+      <!-- Spine details -->
+      <rect x="-1" y="-15" width="10" height="1" fill="#654321" opacity="0.8"/>
+      <rect x="-1" y="-10" width="10" height="1" fill="#654321" opacity="0.8"/>
+      <rect x="-1" y="25" width="10" height="1" fill="#654321" opacity="0.8"/>
+      <!-- Book title area -->
+      <rect x="0" y="-5" width="8" height="15" fill="#8b4513" opacity="0.7" rx="0.5" ry="0.5"/>
+    </g>
+
+    <!-- Book 2 (center) - medium book -->
+    <g transform="translate(-5, 0)">
+      <!-- Book shadow -->
+      <rect x="-1" y="-15" width="12" height="50" fill="#000000" rx="1" ry="1" opacity="0.3"/>
+      <!-- Book spine -->
+      <rect x="-2" y="-17" width="10" height="52" fill="url(#book2Grad)" rx="1" ry="1"/>
+      <!-- Book top edge -->
+      <rect x="-2" y="-17" width="10" height="2" fill="#3cb371" rx="1" ry="1"/>
+      <!-- Spine details -->
+      <rect x="-1" y="-12" width="8" height="1" fill="#228b22" opacity="0.8"/>
+      <rect x="-1" y="-7" width="8" height="1" fill="#228b22" opacity="0.8"/>
+      <rect x="-1" y="25" width="8" height="1" fill="#228b22" opacity="0.8"/>
+      <!-- Book title area -->
+      <rect x="0" y="-2" width="6" height="12" fill="#2e8b57" opacity="0.7" rx="0.5" ry="0.5"/>
+    </g>
+
+    <!-- Book 3 (right) - thin book -->
+    <g transform="translate(12, 0)">
+      <!-- Book shadow -->
+      <rect x="-1" y="-12" width="10" height="47" fill="#000000" rx="1" ry="1" opacity="0.3"/>
+      <!-- Book spine -->
+      <rect x="-2" y="-14" width="8" height="49" fill="url(#book3Grad)" rx="1" ry="1"/>
+      <!-- Book top edge -->
+      <rect x="-2" y="-14" width="8" height="2" fill="#5f9ea0" rx="1" ry="1"/>
+      <!-- Spine details -->
+      <rect x="-1" y="-9" width="6" height="1" fill="#2f4f4f" opacity="0.8"/>
+      <rect x="-1" y="-4" width="6" height="1" fill="#2f4f4f" opacity="0.8"/>
+      <rect x="-1" y="25" width="6" height="1" fill="#2f4f4f" opacity="0.8"/>
+      <!-- Book title area -->
+      <rect x="0" y="0" width="4" height="10" fill="#4682b4" opacity="0.7" rx="0.5" ry="0.5"/>
+    </g>
+
+    <!-- Book 4 (far right) - very thin book -->
+    <g transform="translate(25, 0)">
+      <!-- Book shadow -->
+      <rect x="-1" y="-10" width="8" height="45" fill="#000000" rx="1" ry="1" opacity="0.3"/>
+      <!-- Book spine -->
+      <rect x="-2" y="-12" width="6" height="47" fill="${random_color}" rx="1" ry="1"/>
+      <!-- Book top edge -->
+      <rect x="-2" y="-12" width="6" height="2" fill="${random_color}" rx="1" ry="1" opacity="0.8"/>
+      <!-- Spine details -->
+      <rect x="-1" y="-7" width="4" height="1" fill="#000000" opacity="0.3"/>
+      <rect x="-1" y="25" width="4" height="1" fill="#000000" opacity="0.3"/>
+      <!-- Book title area -->
+      <rect x="0" y="2" width="2" height="8" fill="${random_color}" opacity="0.5" rx="0.5" ry="0.5"/>
+    </g>
+
+    <!-- Bookend (left) -->
+    <g transform="translate(-35, 0)">
+      <rect x="-3" y="-20" width="6" height="55" fill="#2f2f2f" rx="1" ry="1"/>
+      <rect x="-2" y="-19" width="4" height="53" fill="#404040" rx="0.5" ry="0.5"/>
+      <circle cx="0" cy="10" r="2" fill="#606060"/>
+    </g>
+
+    <!-- Bookend (right) -->
+    <g transform="translate(35, 0)">
+      <rect x="-3" y="-20" width="6" height="55" fill="#2f2f2f" rx="1" ry="1"/>
+      <rect x="-2" y="-19" width="4" height="53" fill="#404040" rx="0.5" ry="0.5"/>
+      <circle cx="0" cy="10" r="2" fill="#606060"/>
+    </g>
+
+    <!-- Shelf front edge highlight -->
+    <rect x="-40" y="35" width="80" height="1" fill="#d2b48c" opacity="0.6" rx="1" ry="1"/>
   </g>
 
-  <!-- Bottom accent -->
-  <rect width="190" height="3" x="5" y="272" fill="${random_color}" rx="1" ry="1" opacity="0.8"/>
+  <!-- Bottom decorative elements -->
+  <rect width="220" height="4" x="10" y="306" fill="${random_color}" rx="2" ry="2" opacity="0.8"/>
+
+  <!-- Corner decorations -->
+  <circle cx="25" cy="285" r="3" fill="${random_color}" opacity="0.6"/>
+  <circle cx="215" cy="285" r="3" fill="${random_color}" opacity="0.6"/>
 </svg>
 EOF
 
@@ -173,44 +312,73 @@ cat > "$PUBLISH_DIR/index.html" << 'EOF'
             margin: 0 auto;
         }
 
-        /* Header styles removed */
+        .header {
+            text-align: center;
+            margin-bottom: 3rem;
+            padding: 2rem 0;
+            border-bottom: 2px solid var(--selection);
+        }
+
+        .header h1 {
+            color: var(--cyan);
+            font-size: 2.5rem;
+            margin-bottom: 0.5rem;
+            text-shadow: 0 2px 4px rgba(0, 0, 0, 0.3);
+        }
+
+        .header p {
+            color: var(--comment);
+            font-size: 1.1rem;
+        }
 
         .books-container {
             display: grid;
-            grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
-            gap: 2rem;
+            grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+            gap: 2.5rem;
+            padding: 2rem 0;
         }
 
         .book-card {
             background-color: var(--selection);
-            border-radius: 8px;
+            border-radius: 12px;
             overflow: hidden;
-            transition: transform 0.3s ease, box-shadow 0.3s ease;
-            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.3);
+            transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.3), 0 1px 3px rgba(0, 0, 0, 0.2);
+            border: 1px solid rgba(98, 114, 164, 0.3);
         }
 
         .book-card:hover {
-            transform: translateY(-5px);
-            box-shadow: 0 10px 20px rgba(0, 0, 0, 0.4);
+            transform: translateY(-8px) scale(1.02);
+            box-shadow: 0 20px 25px rgba(0, 0, 0, 0.4), 0 10px 10px rgba(0, 0, 0, 0.2);
+            border-color: rgba(98, 114, 164, 0.6);
+        }
+
+        .book-cover-container {
+            position: relative;
+            width: 100%;
+            height: 320px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            background: linear-gradient(135deg, #44475a 0%, #282a36 100%);
+            padding: 20px;
         }
 
         .book-cover {
-            width: 100%;
-            height: 280px;
-            object-fit: cover;
+            max-width: 240px;
+            max-height: 320px;
+            width: auto;
+            height: auto;
+            object-fit: contain;
             display: block;
+            filter: drop-shadow(0 8px 16px rgba(0, 0, 0, 0.3));
         }
 
         .book-info {
             padding: 1.5rem;
         }
 
-        .book-title {
-            color: var(--cyan);
-            font-size: 1.2rem;
-            margin-bottom: 1rem;
-            font-weight: bold;
-        }
+
 
         .book-formats {
             display: flex;
@@ -283,13 +451,169 @@ cat > "$PUBLISH_DIR/index.html" << 'EOF'
         /* Stats styles removed */
 
         @media (max-width: 768px) {
+            body {
+                padding: 1rem;
+            }
+
             .books-container {
-                grid-template-columns: repeat(auto-fill, minmax(250px, 1fr));
+                grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+                gap: 1.5rem;
+            }
+
+            .header h1 {
+                font-size: 2rem;
+            }
+
+            .book-cover-container {
+                height: 280px;
+                padding: 15px;
+            }
+
+            .book-cover {
+                max-width: 200px;
+                max-height: 280px;
+            }
+        }
+
+        @media (max-width: 480px) {
+            .books-container {
+                grid-template-columns: 1fr;
+            }
+
+            .book-formats {
+                flex-direction: column;
+                gap: 0.5rem;
+            }
+
+            .format-link {
+                text-align: center;
             }
         }
     </style>
 </head>
 <body>
+    <div class="header">
+        <h1 style="display: flex; align-items: center; justify-content: center; gap: 24px; line-height: 1;">
+            <svg width="240" height="160" viewBox="0 0 60 48" style="flex-shrink: 0; display: block;">
+                <defs>
+                    <!-- Book gradients for 3D effect -->
+                    <linearGradient id="headerBook1" x1="0%" y1="0%" x2="100%" y2="0%">
+                        <stop offset="0%" style="stop-color:#8b4513;stop-opacity:1" />
+                        <stop offset="50%" style="stop-color:#a0522d;stop-opacity:1" />
+                        <stop offset="100%" style="stop-color:#654321;stop-opacity:1" />
+                    </linearGradient>
+
+                    <linearGradient id="headerBook2" x1="0%" y1="0%" x2="100%" y2="0%">
+                        <stop offset="0%" style="stop-color:#2e8b57;stop-opacity:1" />
+                        <stop offset="50%" style="stop-color:#3cb371;stop-opacity:1" />
+                        <stop offset="100%" style="stop-color:#228b22;stop-opacity:1" />
+                    </linearGradient>
+
+                    <linearGradient id="headerBook3" x1="0%" y1="0%" x2="100%" y2="0%">
+                        <stop offset="0%" style="stop-color:#4682b4;stop-opacity:1" />
+                        <stop offset="50%" style="stop-color:#5f9ea0;stop-opacity:1" />
+                        <stop offset="100%" style="stop-color:#2f4f4f;stop-opacity:1" />
+                    </linearGradient>
+
+                    <linearGradient id="headerBook4" x1="0%" y1="0%" x2="100%" y2="0%">
+                        <stop offset="0%" style="stop-color:#8be9fd;stop-opacity:1" />
+                        <stop offset="50%" style="stop-color:#50fa7b;stop-opacity:1" />
+                        <stop offset="100%" style="stop-color:#bd93f9;stop-opacity:1" />
+                    </linearGradient>
+
+                    <linearGradient id="headerShelf" x1="0%" y1="0%" x2="0%" y2="100%">
+                        <stop offset="0%" style="stop-color:#8b7355;stop-opacity:1" />
+                        <stop offset="50%" style="stop-color:#a0522d;stop-opacity:1" />
+                        <stop offset="100%" style="stop-color:#654321;stop-opacity:1" />
+                    </linearGradient>
+                </defs>
+
+                <!-- Bookshelf shadow -->
+                <ellipse cx="30" cy="44" rx="26" ry="3" fill="#000000" opacity="0.2"/>
+
+                <!-- Wooden bookshelf base -->
+                <rect x="4" y="38" width="52" height="6" fill="url(#headerShelf)" rx="1.5" ry="1.5"/>
+                <rect x="4" y="44" width="52" height="1.5" fill="#654321" rx="0.75" ry="0.75"/>
+
+                <!-- Wood grain texture -->
+                <line x1="6" y1="40" x2="54" y2="40" stroke="#654321" stroke-width="0.4" opacity="0.6"/>
+                <line x1="6" y1="42" x2="54" y2="42" stroke="#654321" stroke-width="0.4" opacity="0.4"/>
+
+                <!-- Book 1 (leftmost) - "Linux" -->
+                <g transform="translate(8, 22)">
+                    <rect x="0" y="0" width="6" height="16" fill="url(#headerBook1)" rx="0.75" ry="0.75"/>
+                    <rect x="0" y="0" width="6" height="0.75" fill="#a0522d"/>
+                    <rect x="0.75" y="3" width="4.5" height="0.4" fill="#654321" opacity="0.8"/>
+                    <rect x="0.75" y="13" width="4.5" height="0.4" fill="#654321" opacity="0.8"/>
+                    <!-- Book title "Linux" -->
+                    <text x="3" y="8.5" text-anchor="middle" fill="#f8f8f2" font-family="Fira Code, monospace" font-size="3" font-weight="bold" transform="rotate(-90, 3, 8.5)">Linux</text>
+                </g>
+
+                <!-- Book 2 - "Git" -->
+                <g transform="translate(15, 20)">
+                    <rect x="0" y="0" width="6" height="18" fill="url(#headerBook2)" rx="0.75" ry="0.75"/>
+                    <rect x="0" y="0" width="6" height="0.75" fill="#3cb371"/>
+                    <rect x="0.75" y="3" width="4.5" height="0.4" fill="#228b22" opacity="0.8"/>
+                    <rect x="0.75" y="14" width="4.5" height="0.4" fill="#228b22" opacity="0.8"/>
+                    <!-- Book title "Git" -->
+                    <text x="3" y="9.5" text-anchor="middle" fill="#f8f8f2" font-family="Fira Code, monospace" font-size="3.5" font-weight="bold" transform="rotate(-90, 3, 9.5)">Git</text>
+                </g>
+
+                <!-- Book 3 - "Bash" -->
+                <g transform="translate(22, 21)">
+                    <rect x="0" y="0" width="6" height="17" fill="url(#headerBook3)" rx="0.75" ry="0.75"/>
+                    <rect x="0" y="0" width="6" height="0.75" fill="#5f9ea0"/>
+                    <rect x="0.75" y="3" width="4.5" height="0.4" fill="#2f4f4f" opacity="0.8"/>
+                    <rect x="0.75" y="13" width="4.5" height="0.4" fill="#2f4f4f" opacity="0.8"/>
+                    <!-- Book title "Bash" -->
+                    <text x="3" y="9" text-anchor="middle" fill="#f8f8f2" font-family="Fira Code, monospace" font-size="3" font-weight="bold" transform="rotate(-90, 3, 9)">Bash</text>
+                </g>
+
+                <!-- Book 4 - "Docker" -->
+                <g transform="translate(29, 18)">
+                    <rect x="0" y="0" width="6" height="20" fill="url(#headerBook4)" rx="0.75" ry="0.75"/>
+                    <rect x="0" y="0" width="6" height="0.75" fill="#8be9fd"/>
+                    <rect x="0.75" y="3" width="4.5" height="0.4" fill="#bd93f9" opacity="0.8"/>
+                    <rect x="0.75" y="16" width="4.5" height="0.4" fill="#bd93f9" opacity="0.8"/>
+                    <!-- Book title "Docker" -->
+                    <text x="3" y="10.5" text-anchor="middle" fill="#282a36" font-family="Fira Code, monospace" font-size="2.8" font-weight="bold" transform="rotate(-90, 3, 10.5)">Docker</text>
+                </g>
+
+                <!-- Book 5 - "Python" -->
+                <g transform="translate(36, 24)">
+                    <rect x="0" y="0" width="6" height="14" fill="url(#headerBook1)" rx="0.75" ry="0.75"/>
+                    <rect x="0" y="0" width="6" height="0.75" fill="#a0522d"/>
+                    <rect x="0.75" y="2.5" width="4.5" height="0.4" fill="#654321" opacity="0.8"/>
+                    <rect x="0.75" y="10" width="4.5" height="0.4" fill="#654321" opacity="0.8"/>
+                    <!-- Book title "Python" -->
+                    <text x="3" y="7.5" text-anchor="middle" fill="#f8f8f2" font-family="Fira Code, monospace" font-size="2.5" font-weight="bold" transform="rotate(-90, 3, 7.5)">Python</text>
+                </g>
+
+                <!-- Book 6 (rightmost) - "DevOps" -->
+                <g transform="translate(43, 23)">
+                    <rect x="0" y="0" width="6" height="15" fill="url(#headerBook2)" rx="0.75" ry="0.75"/>
+                    <rect x="0" y="0" width="6" height="0.75" fill="#3cb371"/>
+                    <rect x="0.75" y="2.5" width="4.5" height="0.4" fill="#228b22" opacity="0.8"/>
+                    <rect x="0.75" y="11" width="4.5" height="0.4" fill="#228b22" opacity="0.8"/>
+                    <!-- Book title "DevOps" -->
+                    <text x="3" y="8" text-anchor="middle" fill="#f8f8f2" font-family="Fira Code, monospace" font-size="2.3" font-weight="bold" transform="rotate(-90, 3, 8)">DevOps</text>
+                </g>
+
+                <!-- Bookends -->
+                <rect x="4" y="18" width="3" height="20" fill="#2f2f2f" rx="0.75" ry="0.75"/>
+                <rect x="4.3" y="18.75" width="2.4" height="18.5" fill="#404040" rx="0.5" ry="0.5"/>
+
+                <rect x="53" y="18" width="3" height="20" fill="#2f2f2f" rx="0.75" ry="0.75"/>
+                <rect x="53.3" y="18.75" width="2.4" height="18.5" fill="#404040" rx="0.5" ry="0.5"/>
+
+                <!-- Shelf highlight -->
+                <rect x="4" y="38" width="52" height="0.75" fill="#d2b48c" opacity="0.6" rx="0.75" ry="0.75"/>
+            </svg>
+            <span style="flex-shrink: 0;">Books Collection</span>
+        </h1>
+        <p>Comprehensive technical documentation and guides</p>
+    </div>
+
     <div class="books-container">
 EOF
 
@@ -363,9 +687,10 @@ for book_dir in */; do
             # Add entry to index.html
             cat >> "$PUBLISH_DIR/index.html" << EOF
         <div class="book-card">
-            <img src="./assets/${book_name}.svg" alt="${book_name} cover" class="book-cover">
+            <div class="book-cover-container">
+                <img src="./assets/${book_name}.svg" alt="${book_name} cover" class="book-cover">
+            </div>
             <div class="book-info">
-                <h2 class="book-title">${book_name}</h2>
                 <div class="book-formats">
 EOF
 
