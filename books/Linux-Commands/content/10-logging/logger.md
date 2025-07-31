@@ -1,7 +1,7 @@
 # logger
 
 ## Overview
-The `logger` command makes entries in the system log. It provides a shell command interface to the syslog system log module.
+The `logger` command makes entries in the system log. It provides a shell command interface to the syslog system log module, allowing you to create log entries from the command line or scripts.
 
 ## Syntax
 ```bash
@@ -11,106 +11,81 @@ logger [options] [message]
 ## Common Options
 | Option | Description |
 |--------|-------------|
+| `-f file` | Log contents of file |
 | `-i` | Log process ID |
-| `-f file` | Log file contents |
-| `-p priority` | Specify priority |
-| `-t tag` | Mark with tag |
-| `-n server` | Write to remote server |
-| `-P port` | Use port number |
-| `-s` | Output to stderr |
-| `-u socket` | Write to socket |
-| `--id=[id]` | Log with id |
-| `--rfc3164` | Use RFC 3164 format |
-| `--rfc5424` | Use RFC 5424 format |
-
-## Priority Levels
-| Level | Description |
-|-------|-------------|
-| emerg | System unusable |
-| alert | Immediate action needed |
-| crit | Critical conditions |
-| err | Error conditions |
-| warning | Warning conditions |
-| notice | Normal but significant |
-| info | Informational |
-| debug | Debug messages |
+| `-p priority` | Specify message priority |
+| `-t tag` | Mark every line with specified tag |
+| `-n server` | Write to remote syslog server |
+| `-s` | Output to standard error as well |
+| `-u socket` | Write to specified socket |
+| `--id=[id]` | Enter log entry with specified ID |
 
 ## Key Use Cases
-1. System logging
-2. Script logging
-3. Debugging
-4. Monitoring
-5. Auditing
+1. Script logging
+2. System monitoring
+3. Application debugging
+4. Security auditing
+5. Event tracking
 
 ## Examples with Explanations
-### Example 1: Basic Usage
+### Example 1: Basic Logging
 ```bash
-logger "System backup completed"
+logger "System backup completed successfully"
 ```
-Log simple message
+Logs a simple message to syslog
 
-### Example 2: With Priority
+### Example 2: Tagged Message
 ```bash
-logger -p local0.info "Service started"
+logger -t BACKUP -p local0.info "Backup process started"
 ```
-Log with facility and priority
+Logs a tagged message with priority
 
-### Example 3: With Tag
+### Example 3: Log File Contents
 ```bash
-logger -t backup -p user.notice "Backup process complete"
+logger -f /var/log/myapp.log
 ```
-Log with tag and priority
+Sends file contents to syslog
+
+## Understanding Output
+Priority Levels:
+- emerg (0): System is unusable
+- alert (1): Action must be taken immediately
+- crit (2): Critical conditions
+- err (3): Error conditions
+- warning (4): Warning conditions
+- notice (5): Normal but significant
+- info (6): Informational
+- debug (7): Debug-level messages
 
 ## Common Usage Patterns
 1. Script logging:
    ```bash
-   logger -t myscript "Process started"
+   logger -t myscript -p local0.info "Script started"
    ```
-2. File content:
+2. Error logging:
    ```bash
-   logger -f /var/log/errors
+   logger -i -t myapp -p local0.err "Error: Database connection failed"
    ```
 3. Remote logging:
    ```bash
-   logger -n logserver.example.com -P 514 "Remote log"
+   logger -n logserver.example.com -P 514 "Remote log entry"
    ```
 
-## Security Considerations
-1. Log permissions
-2. Remote logging
-3. Message content
-4. Facility usage
-5. Priority levels
+## Performance Analysis
+- Minimal system impact
+- Asynchronous operation
+- Consider log rotation
+- Monitor disk usage
+- Check syslog configuration
 
 ## Related Commands
-- `syslog` - System logger
-- `rsyslog` - Enhanced syslog
-- `journalctl` - Query logs
-- `tail` - View log files
-- `grep` - Search logs
+- `syslogd` - System log daemon
+- `klogd` - Kernel log daemon
+- `dmesg` - Print kernel messages
+- `tail` - Monitor log files
+- `journalctl` - Query systemd journal
 
 ## Additional Resources
-- [Logger Manual](https://man7.org/linux/man-pages/man1/logger.1.html)
-- [Syslog Guide](https://www.rsyslog.com/doc/master/index.html)
-- [Logging Best Practices](https://www.cyberciti.biz/tips/howto-linux-unix-log-management.html)
-
-## Best Practices
-1. Use appropriate priorities
-2. Include context
-3. Structured messages
-4. Regular monitoring
-5. Log rotation
-
-## Message Format
-1. Timestamp
-2. Hostname
-3. Process name
-4. Process ID
-5. Message text
-
-## Troubleshooting
-1. Log delivery
-2. Priority levels
-3. Remote logging
-4. Permission issues
-5. Storage space
+- [Linux logger manual](https://man7.org/linux/man-pages/man1/logger.1.html)
+- [Syslog Protocol RFC](https://tools.ietf.org/html/rfc5424)
+- [System Logging Guide](https://www.rsyslog.com/doc/master/)
