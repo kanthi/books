@@ -80,6 +80,6 @@ To start a new book project:
 4.  **Render**:
     -   You can render just this book to test:
         ```bash
-        # From the project root
-        ./books/indipub.sh My-New-Book
+        cd books
+        ./indipub.sh My-New-Book
         ```
