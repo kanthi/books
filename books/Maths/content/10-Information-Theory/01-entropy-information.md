@@ -560,3 +560,20 @@ Understanding these concepts enables you to:
 - Optimize communication protocols
 - Build better machine learning models
 - Evaluate security systems
+## Source Coding Sketch (Huffman Intuition)
+
+Given symbol frequencies, assign shorter codes to frequent symbols and longer codes to rare symbols.
+
+Example frequencies:
+- A: 0.4, B: 0.3, C: 0.2, D: 0.1
+
+One valid prefix code:
+- A -> 0
+- B -> 10
+- C -> 110
+- D -> 111
+
+Average length:
+`L = 0.4*1 + 0.3*2 + 0.2*3 + 0.1*3 = 1.9 bits/symbol`
+
+This is close to entropy lower bound for efficient lossless coding.

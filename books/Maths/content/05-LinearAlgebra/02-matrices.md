@@ -1007,3 +1007,25 @@ Matrix concepts prepare you for:
 ```
 
 Matrices represent the computational heart of linear algebra, providing both theoretical foundations and practical tools for solving real-world problems. The skills developed in this chapter - matrix operations, system solving, and geometric interpretation - form essential building blocks for advanced topics in linear algebra and its applications across science, engineering, and data analysis. Understanding matrices opens the door to powerful computational methods and elegant mathematical insights that drive modern technology and scientific discovery.
+## Matrix as Linear Transformation
+
+A matrix is not just a table of numbers; it is a transformation from one vector space to another.
+
+```mermaid
+flowchart LR
+  V[Input vector x] --> A[Apply matrix A]
+  A --> Y[Output vector y = Ax]
+```
+
+Example transformation:
+`A = [[2,0],[0,1]]` scales x-axis by 2 and leaves y-axis unchanged.
+
+## Determinant as Area/Volume Scaling
+
+For 2x2 matrix `A`, `|det(A)|` is area scale factor.
+
+- `det(A)=0`: collapses area to line/point (non-invertible)
+- `det(A)<0`: includes orientation flip
+
+Quick example:
+`A = [[3,0],[0,2]]` -> unit square area `1` becomes rectangle area `6`.

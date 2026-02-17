@@ -629,3 +629,25 @@ Key takeaways:
 - **Cache effects** can significantly impact real-world performance
 
 Understanding these concepts enables you to write more efficient code and make informed decisions about algorithm selection and system design.
+## Recurrence Tree Intuition
+
+For recurrences like `T(n)=2T(n/2)+n`, a recurrence tree helps visualize per-level work.
+
+```mermaid
+flowchart TD
+  A[T(n): n work] --> B[T(n/2): n/2]
+  A --> C[T(n/2): n/2]
+  B --> D[T(n/4): n/4]
+  B --> E[T(n/4): n/4]
+  C --> F[T(n/4): n/4]
+  C --> G[T(n/4): n/4]
+```
+
+Each level contributes about `n` total work; there are `log n` levels, giving `Theta(n log n)`.
+
+## Proof Checklist for Asymptotic Claims
+
+1. State constants `c, n0` explicitly.
+2. Show inequality holds for all `n >= n0`.
+3. Separate upper and lower bounds when proving `Theta`.
+4. Avoid empirical-only argument as proof.

@@ -33,3 +33,28 @@ We'll use Python with libraries like:
 - SciPy for scientific computing
 - Matplotlib for visualization
 - SymPy for symbolic mathematics
+## Concept Dependency Map
+
+```mermaid
+flowchart LR
+  A[Functions] --> B[Limits]
+  B --> C[Continuity]
+  C --> D[Derivatives]
+  D --> E[Optimization]
+  D --> F[Gradient Methods]
+  B --> G[Integrals]
+  G --> H[Accumulation and Probability]
+```
+
+## CS-Oriented Study Sequence
+
+1. Learn limits and derivative mechanics.
+2. Practice optimization on 1D and 2D functions.
+3. Move to gradients/Jacobians for ML.
+4. Use integrals for probability density reasoning.
+
+## Quick Diagnostic Exercises
+
+1. Explain why `f(x)=|x|` is non-differentiable at `x=0`.
+2. Compute derivative of `x^3 e^x`.
+3. Give one CS optimization problem modeled with derivatives.

@@ -883,3 +883,37 @@ Probability represents the mathematical language of uncertainty, providing the t
 Understanding probability is essential not only for advanced statistical methods but also for critical thinking in our uncertain world. Whether you're evaluating medical test results, assessing financial risks, or interpreting research findings, probability provides the framework for reasoning logically about uncertain outcomes and making decisions that account for the inherent variability in data and predictions.
 
 The probability distributions and techniques you've learned form the building blocks for statistical inference, where we use sample data to draw conclusions about populations. As you progress to inferential statistics, these probability concepts will provide the theoretical justification for confidence intervals, hypothesis tests, and other methods that allow us to quantify our uncertainty and make reliable generalizations from limited data.
+## Bayes with Probability Tree (Medical Test)
+
+```mermaid
+flowchart TD
+  A[Population] -->|1%| B[Disease]
+  A -->|99%| C[No Disease]
+  B -->|95%| D[Test +]
+  B -->|5%| E[Test -]
+  C -->|10%| F[Test +]
+  C -->|90%| G[Test -]
+```
+
+From the tree:
+- `P(+)=0.01*0.95 + 0.99*0.10 = 0.1085`
+- `P(Disease|+) = (0.01*0.95)/0.1085 ≈ 0.0876`
+
+Even good tests can have low positive predictive value when prevalence is low.
+
+## Monte Carlo Estimation Sketch
+
+Use random simulation to approximate probabilities when analytic formulas are difficult.
+
+```python
+import random
+
+def estimate_prob_two_heads(trials=100000):
+    success = 0
+    for _ in range(trials):
+        a = random.choice([0, 1])
+        b = random.choice([0, 1])
+        if a == 1 and b == 1:
+            success += 1
+    return success / trials
+```
