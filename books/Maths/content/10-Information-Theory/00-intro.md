@@ -17,11 +17,10 @@ Information theory quantifies information content, uncertainty, and the efficien
 ## Chapter Contents
 
 1. [Entropy and Information Content](01-entropy-information.md)
-2. [Mutual Information and Correlation](02-mutual-information.md)
-3. [Data Compression Theory](03-data-compression.md)
-4. [Error Correction Codes](04-error-correction.md)
-5. [Information in Machine Learning](05-information-ml.md)
-6. [Channel Capacity and Communication](06-channel-capacity.md)
+2. [Mutual Information and Channel Capacity](02-mutual-information-and-capacity.md)
+3. Data Compression Theory (planned)
+4. Error Correction Codes (planned)
+5. Information in Machine Learning (planned)
 
 ## Mathematical Prerequisites
 

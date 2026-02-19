@@ -31,13 +31,13 @@ Data science combines statistics, mathematics, and computer science to extract i
 ## Chapter Contents
 
 1. [Statistical Foundations](01-statistical-foundations.md)
-2. [Probability Distributions](02-probability-distributions.md)
-3. [Hypothesis Testing](03-hypothesis-testing.md)
-4. [Regression Analysis](04-regression-analysis.md)
-5. [Dimensionality Reduction](05-dimensionality-reduction.md)
-6. [Time Series Analysis](06-time-series-analysis.md)
-7. [Experimental Design](07-experimental-design.md)
-8. [Bayesian Methods](08-bayesian-methods.md)
+2. Probability Distributions (covered in `07-Statistics` and `17-Probability-Advanced`)
+3. Hypothesis Testing (covered in `07-Statistics/04-statistical-inference.md`)
+4. Regression Analysis (covered in `07-Statistics/05-regression-and-experiments.md`)
+5. Dimensionality Reduction (covered in `18-Linear-Algebra-Advanced/03-svd-and-pca.md`)
+6. Time Series Analysis (planned)
+7. Experimental Design (covered in `07-Statistics/05-regression-and-experiments.md`)
+8. Bayesian Methods (covered in `17-Probability-Advanced/04-bayesian-inference.md`)
 
 ## Prerequisites
 

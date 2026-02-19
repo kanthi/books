@@ -31,11 +31,11 @@ Machine learning is fundamentally built on mathematical concepts. This chapter c
 ## Chapter Contents
 
 1. [Linear Algebra for ML](01-linear-algebra-ml.md)
-2. [Calculus and Optimization](02-calculus-optimization.md)
-3. [Probability Theory in ML](03-probability-ml.md)
-4. [Statistical Learning Theory](04-statistical-learning.md)
-5. [Information Theory](05-information-theory.md)
-6. [Numerical Methods](06-numerical-methods.md)
+2. Calculus and Optimization (covered in `08-Calculus` and `11-Optimization`)
+3. Probability Theory in ML (covered in `07-Statistics` and `17-Probability-Advanced`)
+4. Statistical Learning Theory (planned)
+5. Information Theory (covered in `10-Information-Theory`)
+6. Numerical Methods (covered in `15-Numerical-Methods`)
 
 ## Prerequisites
 

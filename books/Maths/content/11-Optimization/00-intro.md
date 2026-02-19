@@ -31,13 +31,13 @@ Where:
 
 ## Chapter Contents
 
-1. [Unconstrained Optimization](01-unconstrained-optimization.md)
+1. [Convexity Foundations](01-convexity.md)
 2. [Constrained Optimization](02-constrained-optimization.md)
-3. [Linear Programming](03-linear-programming.md)
-4. [Convex Optimization](04-convex-optimization.md)
-5. [Gradient-Based Methods](05-gradient-methods.md)
-6. [Metaheuristic Algorithms](06-metaheuristics.md)
-7. [Multi-Objective Optimization](07-multi-objective.md)
+3. [Regularization and Generalization](03-regularization-and-generalization.md)
+4. [Gradient-Based Methods](05-gradient-methods.md)
+5. Linear Programming (planned)
+6. Metaheuristic Algorithms (planned)
+7. Multi-Objective Optimization (planned)
 
 ## Applications in Computer Science
 

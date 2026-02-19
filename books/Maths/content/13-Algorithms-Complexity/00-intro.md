@@ -18,12 +18,10 @@ Computational complexity theory provides the mathematical framework for analyzin
 ## Chapter Contents
 
 1. [Asymptotic Analysis](01-asymptotic-analysis.md)
-2. [Recurrence Relations](02-recurrence-relations.md)
-3. [Complexity Classes](03-complexity-classes.md)
-4. [NP-Completeness](04-np-completeness.md)
-5. [Approximation Algorithms](05-approximation-algorithms.md)
-6. [Randomized Algorithms](06-randomized-algorithms.md)
-7. [Parallel and Distributed Complexity](07-parallel-complexity.md)
+2. [Complexity Classes and Reductions](02-complexity-classes-and-reductions.md)
+3. [Randomized and Approximation Complexity](03-randomized-and-approximation.md)
+4. NP-Completeness (covered in section `19-Complexity-Theory`)
+5. Parallel and Distributed Complexity (planned)
 
 ## Mathematical Prerequisites
 
