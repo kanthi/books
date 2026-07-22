@@ -1,5 +1,8 @@
 # Repository Agent Notes
 
+> Full monorepo workflow (render portal, CI, scripts, layout) is documented in the root **`AGENTS.md`**.
+> This file covers book-local Quarto generation rules only.
+
 ## Quarto Generation Rules (All Book Folders)
 
 - Treat each book's `_quarto.yml` as generated output.
