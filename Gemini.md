@@ -12,3 +12,4 @@ This file is kept as a short pointer so older tooling that looks for `Gemini.md`
 - Single book: `books/indipub.sh <BookName>`.
 - Content lives under `books/<BookName>/content/` with numeric prefixes for order.
 - `published_books/` and `_book/` are gitignored build artifacts.
+- New books: copy **`Template-New-1/`** (not `Template.backup/`).

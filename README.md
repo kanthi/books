@@ -6,7 +6,8 @@ The project is designed to host and publish multiple technical books (or documen
 
 ### Key Directories
 - **`/books`**: The core directory containing all book projects. Each subdirectory (e.g., `Git-Github`, `Linux-Commands`) represents a separate book.
-- **`/Template`**: A reference structure for creating new books.
+- **`/Template-New-1`**: Preferred scaffold for creating new books.
+- **`/Template.backup`**: Legacy scaffold (kept for reference only).
 - **`/.github`**: Contains GitHub Actions workflows for automated deployment.
 
 ### Book Structure (e.g., inside `/books/Linux-Commands`)
@@ -57,29 +58,28 @@ The file `.github/workflows/main.yml` defines the CI/CD pipeline:
 
 ## 4. How to Create a New Book
 
-To start a new book project:
+Use **`Template-New-1`** (preferred). The older scaffold is preserved as **`Template.backup`**.
 
-1.  **Copy the Template**:
-    Copy the `Template` directory into the `books/` directory and rename it to your desired book name (e.g., `My-New-Book`).
+1.  **Copy the template** into `books/` and name the folder for the book:
     ```bash
-    cp -r Template books/My-New-Book
+    cp -r Template-New-1 books/My-New-Book
+    ```
+    The folder name becomes the Quarto book title when you regenerate `_quarto.yml`.
+
+2.  **Edit content**:
+    -   Prefill lives under `content/` (e.g. `00-intro/`, `01-foundations/`).
+    -   Add `.md` / `.qmd` chapters; use numeric prefixes for order.
+    -   Optional notes go in `content/_planning/` (ignored by the index script).
+
+3.  **Update configuration** (do not hand-edit `_quarto.yml`):
+    ```bash
+    cd books/My-New-Book
+    bash scripts/update-index.sh
     ```
 
-2.  **Add Content**:
-    -   Create a `content` folder inside your new book directory if it doesn't exist.
-    -   Add your Markdown (`.md`) or Quarto (`.qmd`) files into `content/`.
-    -   Organize chapters by creating subdirectories within `content/`.
-
-3.  **Update Configuration**:
-    -   Run the update script to generate your `_quarto.yml` configuration based on your folder structure:
-        ```bash
-        cd books/My-New-Book/scripts
-        ./update-index.sh
-        ```
-
 4.  **Render**:
-    -   You can render just this book to test:
-        ```bash
-        cd books
-        ./indipub.sh My-New-Book
-        ```
+    ```bash
+    cd books
+    ./indipub.sh My-New-Book          # single book
+    # ./renderpub-codex-v2.sh         # full library portal (what CI runs)
+    ```

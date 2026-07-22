@@ -22,7 +22,8 @@ A **multi-book Quarto monorepo**. Each book is a self-contained Quarto project u
 | `books/<BookName>/index.qmd` | Book landing page (always first chapter) |
 | `books/<BookName>/_book/` | Local Quarto output (**gitignored**) |
 | `books/published_books/` | Aggregated site artifact (**gitignored**; CI deploy source) |
-| `Template/` | Scaffold for a new book |
+| `Template-New-1/` | **Preferred** scaffold for a new book |
+| `Template.backup/` | Legacy book scaffold (kept for reference only) |
 | `.github/workflows/main.yml` | Build + deploy on push to `main` |
 
 ### Current books (as of last inventory)
@@ -112,9 +113,12 @@ File: `.github/workflows/main.yml`
 
 ## Creating a new book
 
+Prefer **`Template-New-1/`** (sample `content/`, accurate monorepo README, no per-book CI).
+Legacy scaffold is kept as **`Template.backup/`** — do not use it for new books.
+
 ```bash
-cp -r Template books/My-New-Book
-# Add content under books/My-New-Book/content/<NN-part>/...
+cp -r Template-New-1 books/My-New-Book
+# Edit index.qmd; add/replace content under content/<NN-part>/...
 cd books/My-New-Book && bash scripts/update-index.sh
 cd ../ && ./indipub.sh My-New-Book   # optional local test
 ```
