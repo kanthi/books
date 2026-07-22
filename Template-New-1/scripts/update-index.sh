@@ -24,13 +24,29 @@ extract_qmd_title() {
   local title=""
 
   if [ -f "$file" ]; then
-    title="$(sed -n '/^---$/,/^---$/p' "$file" | grep "^title:" | head -n 1 | sed 's/^title:[[:space:]]*"\{0,1\}\([^"]*\)"\{0,1\}[[:space:]]*$/\1/')"
+    # YAML frontmatter title: (first --- block only)
+    title="$(awk '
+      BEGIN { in_fm=0 }
+      /^---[[:space:]]*$/ {
+        if (in_fm == 0) { in_fm=1; next }
+        else { exit }
+      }
+      in_fm && /^title:[[:space:]]*/ {
+        sub(/^title:[[:space:]]*/, "")
+        gsub(/^["'\'']|["'\'']$/, "")
+        print
+        exit
+      }
+    ' "$file")"
     if [ -n "$title" ]; then
       printf '%s\n' "$title"
       return
     fi
 
-    title="$(head -n 20 "$file" | grep "^#[[:space:]]\+" | head -n 1 | sed 's/^#[[:space:]]*\(.*\)$/\1/' | sed 's/[[:space:]]*\{[^}]*\}[[:space:]]*$//')"
+    # First markdown H1; strip optional Pandoc attrs like {.unnumbered}
+    title="$(head -n 20 "$file" | grep -E '^#[[:space:]]+' | head -n 1 | sed -E 's/^#[[:space:]]+//')"
+    title="${title%% \{*}"
+    title="$(printf '%s' "$title" | sed -E 's/[[:space:]]+$//')"
     if [ -n "$title" ]; then
       printf '%s\n' "$title"
       return
@@ -158,6 +174,12 @@ while IFS= read -r category_info; do
 done < <(printf "%s\n" "${categories[@]}" | sort -n)
 
 cat >> "$TMP_FILE" <<'EOL'
+
+# Document-level (not valid under book:). HTML title block: date → Published; date-modified → Updated.
+date-modified: last-modified
+
+language:
+  title-block-modified: "Updated"
 
 format:
   html:

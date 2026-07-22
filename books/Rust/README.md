@@ -1,25 +1,44 @@
-# Rust Book
+# Rust
 
-A Quarto-based Rust programming book scaffolded from the shared template.
+Quarto book in the multi-book monorepo. Prefer the repository root **`AGENTS.md`** for the full publish workflow.
 
-## Quick Start
+## Layout
 
-1. Add or edit files under `content/`.
-2. Regenerate the chapter map:
-   ```bash
-   ./scripts/update-index.sh
-   ```
-3. Render the book:
-   ```bash
-   quarto render
-   ```
+```text
+Rust/
+├── index.qmd                 # Book landing page
+├── content/                  # Chapters by part (numeric prefixes)
+├── scripts/update-index.sh   # Regenerates _quarto.yml
+├── styles/                   # HTML + EPUB themes
+└── _quarto.yml               # GENERATED — do not hand-edit
+```
 
-## Curriculum Goal
+Parts under `content/` (ignored dirs start with `_`):  
+00-intro,01-rust-basics,02-rust-intermediate,03-rust-advanced,04-rust-systems-programming,05-network-programming,06-security-programming,07-distributed-systems,08-embedded-iot,09-observability-performance-career,
 
-The syllabus is organized into:
+## Local commands
 
-1. Rust Basics
-2. Rust Intermediate
-3. Rust Advanced
-4. Rust Systems Programming
-5. Capstone and Next Steps
+From this directory:
+
+```bash
+bash scripts/update-index.sh   # after add/remove/rename under content/
+quarto preview                 # live preview
+```
+
+From `books/`:
+
+```bash
+./indipub.sh Rust      # update-index + quarto render (this book only)
+# ./renderpub-codex-v2.sh      # full library portal (what CI runs)
+```
+
+## Content rules
+
+1. Do **not** hand-edit `_quarto.yml`; re-run `scripts/update-index.sh`.
+2. Parts = first-level dirs under `content/` (`01-name`, …). Order is the numeric prefix.
+3. Chapter order inside a part = lexicographic filename order.
+4. Dirs starting with `_` are ignored by the index script.
+5. Sidebar titles come from YAML `title:`, else the first `#` heading.
+6. HTML title block shows **Published** (`book.date`) and **Updated** (`date-modified`).
+
+New books should start from root **`Template-New-1/`**, not `Template.backup/`.

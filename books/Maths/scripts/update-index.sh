@@ -1,77 +1,97 @@
-#!/bin/bash
+#!/usr/bin/env bash
+# Generate _quarto.yml from content/ directory layout.
+# Do not hand-edit _quarto.yml; re-run this script after structural changes.
+set -euo pipefail
 
-# Get the directory where the script is located
-SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BOOK_DIR="$(dirname "$SCRIPT_DIR")"
 CONTENT_DIR="$BOOK_DIR/content"
 QUARTO_YML="$BOOK_DIR/_quarto.yml"
+BOOK_NAME="$(basename "$BOOK_DIR")"
 
-# Get the book name from the directory
-BOOK_NAME=$(basename "$BOOK_DIR")
+# Repo homepage used in the book navbar (monorepo).
+REPO_URL="${BOOK_REPO_URL:-https://github.com/kanthi/books}"
+BOOK_AUTHOR="${BOOK_AUTHOR:-K19G}"
 
-# Function to extract title from qmd file
+if [ ! -d "$CONTENT_DIR" ]; then
+  echo "error: content/ not found at $CONTENT_DIR" >&2
+  echo "Create content/<NN-part>/ chapters, then re-run this script." >&2
+  exit 1
+fi
+
 extract_qmd_title() {
-    local file="$1"
-    if [ -f "$file" ]; then
-        # First try YAML frontmatter
-        title=$(sed -n '/^---$/,/^---$/p' "$file" | grep "^title:" | sed 's/^title:[[:space:]]*"\{0,1\}\([^"]*\)"\{0,1\}[[:space:]]*$/\1/')
-        if [ -n "$title" ]; then
-            echo "$title"
-            return
-        fi
+  local file="$1"
+  local title=""
 
-        # Then try first markdown header
-        title=$(head -n 10 "$file" | grep "^#[[:space:]]\+" | head -n 1 | sed 's/^#[[:space:]]*\(.*\)$/\1/')
-        if [ -n "$title" ]; then
-            echo "$title"
-            return
-        fi
+  if [ -f "$file" ]; then
+    # YAML frontmatter title: (first --- block only)
+    title="$(awk '
+      BEGIN { in_fm=0 }
+      /^---[[:space:]]*$/ {
+        if (in_fm == 0) { in_fm=1; next }
+        else { exit }
+      }
+      in_fm && /^title:[[:space:]]*/ {
+        sub(/^title:[[:space:]]*/, "")
+        gsub(/^["'\'']|["'\'']$/, "")
+        print
+        exit
+      }
+    ' "$file")"
+    if [ -n "$title" ]; then
+      printf '%s\n' "$title"
+      return
     fi
 
-    # Fallback to directory name
-    dirname=$(basename "$(dirname "$file")")
-    echo "$dirname" | sed -E 's/^[0-9]+-?//' | sed 's/-/ /g' | awk '{for(i=1;i<=NF;i++)sub(/./,toupper(substr($i,1,1)),$i)}1'
+    # First markdown H1; strip optional Pandoc attrs like {.unnumbered}
+    title="$(head -n 20 "$file" | grep -E '^#[[:space:]]+' | head -n 1 | sed -E 's/^#[[:space:]]+//')"
+    title="${title%% \{*}"
+    title="$(printf '%s' "$title" | sed -E 's/[[:space:]]+$//')"
+    if [ -n "$title" ]; then
+      printf '%s\n' "$title"
+      return
+    fi
+  fi
+
+  local dirname
+  dirname="$(basename "$(dirname "$file")")"
+  printf '%s\n' "$dirname" | sed -E 's/^[0-9]+-?//' | sed 's/-/ /g' | awk '{for(i=1;i<=NF;i++)sub(/./,toupper(substr($i,1,1)),$i)}1'
 }
 
-# Function to get metadata from directory name
 get_metadata() {
-    local dir="$1"
-    local dirname=$(basename "$dir")
-    local order=""
-    local title=""
+  local dir="$1"
+  local dirname
+  dirname="$(basename "$dir")"
+  local order title
 
-    # Extract order if present (format: XX-)
-    if [[ $dirname =~ ^[0-9]+ ]]; then
-        order="${BASH_REMATCH[0]}"
-        title=$(echo "$dirname" | sed -E 's/^[0-9]+-?//' | sed 's/-/ /g' | awk '{for(i=1;i<=NF;i++)sub(/./,toupper(substr($i,1,1)),$i)}1')
-    else
-        order="99"
-        title=$(echo "$dirname" | sed 's/-/ /g' | awk '{for(i=1;i<=NF;i++)sub(/./,toupper(substr($i,1,1)),$i)}1')
-    fi
+  if [[ $dirname =~ ^[0-9]+ ]]; then
+    order="${BASH_REMATCH[0]}"
+    title="$(echo "$dirname" | sed -E 's/^[0-9]+-?//' | sed 's/-/ /g' | awk '{for(i=1;i<=NF;i++)sub(/./,toupper(substr($i,1,1)),$i)}1')"
+  else
+    order="99"
+    title="$(echo "$dirname" | sed 's/-/ /g' | awk '{for(i=1;i<=NF;i++)sub(/./,toupper(substr($i,1,1)),$i)}1')"
+  fi
 
-    echo "${order}|${title}"
+  printf '%s|%s\n' "$order" "$title"
 }
 
-# Create a temporary file
-TMP_FILE=$(mktemp)
+TMP_FILE="$(mktemp)"
+trap 'rm -f "$TMP_FILE"' EXIT
 
-# Write the header
-cat > "$TMP_FILE" << EOL
+cat > "$TMP_FILE" <<EOL
 project:
   type: book
   output-dir: _book
 
 book:
   title: "$BOOK_NAME"
-  author: "K19G"
+  author: "$BOOK_AUTHOR"
   date: last-modified
   navbar:
     pinned: true
     right:
       - icon: github
-        href: https://github.com/yourusername
-      - icon: twitter
-        href: https://twitter.com/yourusername
+        href: $REPO_URL
 
   sidebar:
     style: docked
@@ -80,77 +100,86 @@ book:
     - index.qmd
 EOL
 
-# Function to process directories
 process_directory() {
-    local dir="$1"
-    local metadata=$(get_metadata "$dir")
-    local order=$(echo "$metadata" | cut -d'|' -f1)
-    local title=$(echo "$metadata" | cut -d'|' -f2)
+  local dir="$1"
+  local metadata order title
+  metadata="$(get_metadata "$dir")"
+  order="$(echo "$metadata" | cut -d'|' -f1)"
+  title="$(echo "$metadata" | cut -d'|' -f2)"
 
-    # Add the category with part
-    echo "    - part: \"$title\"" >> "$TMP_FILE"
-    echo "      contents:" >> "$TMP_FILE"
+  {
+    echo "    - part: \"$title\""
+    echo "      contents:"
+  } >> "$TMP_FILE"
 
-    # Process all files in the directory
-    for ext in "qmd" "md"; do
-        # First process index files
-        if [ -f "$dir/index.$ext" ]; then
-            local file_title=$(extract_qmd_title "$dir/index.$ext")
-            echo "        - text: \"$file_title\"" >> "$TMP_FILE"
-            echo "          file: content/$(basename "$dir")/index.$ext" >> "$TMP_FILE"
-        fi
+  local ext doc doc_name file_title subdir subdir_name relative_path
 
-        # Then process non-index files
-        for doc in "$dir"/*.$ext; do
-            if [ -f "$doc" ] && [ "$(basename "$doc")" != "index.$ext" ]; then
-                local doc_name=$(basename "$doc")
-                local file_title=$(extract_qmd_title "$doc")
-                echo "        - text: \"$file_title\"" >> "$TMP_FILE"
-                echo "          file: content/$(basename "$dir")/${doc_name}" >> "$TMP_FILE"
-            fi
-        done
-    done
+  for ext in qmd md; do
+    if [ -f "$dir/index.$ext" ]; then
+      file_title="$(extract_qmd_title "$dir/index.$ext")"
+      {
+        echo "        - text: \"$file_title\""
+        echo "          file: content/$(basename "$dir")/index.$ext"
+      } >> "$TMP_FILE"
+    fi
 
-    # Process subdirectories
-    for subdir in "$dir"/*; do
-        if [ -d "$subdir" ] && [[ ! $(basename "$subdir") == _* ]]; then
-            local subdir_name=$(basename "$subdir")
-            echo "        - section: \"$subdir_name\"" >> "$TMP_FILE"
-            echo "          contents:" >> "$TMP_FILE"
+    # Lexicographic order via sorted null-safe listing
+    while IFS= read -r -d '' doc; do
+      doc_name="$(basename "$doc")"
+      [ "$doc_name" = "index.$ext" ] && continue
+      file_title="$(extract_qmd_title "$doc")"
+      {
+        echo "        - text: \"$file_title\""
+        echo "          file: content/$(basename "$dir")/${doc_name}"
+      } >> "$TMP_FILE"
+    done < <(find "$dir" -maxdepth 1 -type f -name "*.$ext" -print0 2>/dev/null | sort -z)
+  done
 
-            for ext in "qmd" "md"; do
-                for doc in "$subdir"/*.$ext; do
-                    if [ -f "$doc" ]; then
-                        local doc_name=$(basename "$doc")
-                        local file_title=$(extract_qmd_title "$doc")
-                        local relative_path="content/$(basename "$dir")/$(basename "$subdir")"
-                        echo "            - text: \"$file_title\"" >> "$TMP_FILE"
-                        echo "              file: ${relative_path}/${doc_name}" >> "$TMP_FILE"
-                    fi
-                done
-            done
-        fi
-    done
+  for subdir in "$dir"/*; do
+    if [ -d "$subdir" ] && [[ ! $(basename "$subdir") == _* ]]; then
+      subdir_name="$(basename "$subdir")"
+      {
+        echo "        - section: \"$subdir_name\""
+        echo "          contents:"
+      } >> "$TMP_FILE"
+
+      for ext in qmd md; do
+        while IFS= read -r -d '' doc; do
+          doc_name="$(basename "$doc")"
+          file_title="$(extract_qmd_title "$doc")"
+          relative_path="content/$(basename "$dir")/$(basename "$subdir")"
+          {
+            echo "            - text: \"$file_title\""
+            echo "              file: ${relative_path}/${doc_name}"
+          } >> "$TMP_FILE"
+        done < <(find "$subdir" -maxdepth 1 -type f -name "*.$ext" -print0 2>/dev/null | sort -z)
+      done
+    fi
+  done
 }
 
-# Get all main categories and sort them by order
 categories=()
 while IFS= read -r category; do
-    if [ -d "$category" ] && [[ ! $(basename "$category") == _* ]]; then
-        metadata=$(get_metadata "$category")
-        order=$(echo "$metadata" | cut -d'|' -f1)
-        categories+=("$order|$category")
-    fi
-done < <(find "$CONTENT_DIR" -maxdepth 1 -mindepth 1 -type d)
+  if [ -d "$category" ] && [[ ! $(basename "$category") == _* ]]; then
+    metadata="$(get_metadata "$category")"
+    order="$(echo "$metadata" | cut -d'|' -f1)"
+    categories+=("$order|$category")
+  fi
+done < <(find "$CONTENT_DIR" -maxdepth 1 -mindepth 1 -type d | sort)
 
-# Sort categories by order and process them
 while IFS= read -r category_info; do
-    category_path=$(echo "$category_info" | cut -d'|' -f2)
-    process_directory "$category_path"
+  [ -z "$category_info" ] && continue
+  category_path="$(echo "$category_info" | cut -d'|' -f2)"
+  process_directory "$category_path"
 done < <(printf "%s\n" "${categories[@]}" | sort -n)
 
-# Add the format section
-cat >> "$TMP_FILE" << EOL
+cat >> "$TMP_FILE" <<'EOL'
+
+# Document-level (not valid under book:). HTML title block: date → Published; date-modified → Updated.
+date-modified: last-modified
+
+language:
+  title-block-modified: "Updated"
 
 format:
   html:
@@ -176,9 +205,12 @@ format:
   epub:
     toc: true
     number-sections: false
+    css: styles/epub.css
 EOL
 
-# Replace the original file with the new content
 mv "$TMP_FILE" "$QUARTO_YML"
+trap - EXIT
 
-echo "Updated _quarto.yml with current directory structure"
+echo "Updated _quarto.yml for book: $BOOK_NAME"
+echo "  content: $CONTENT_DIR"
+echo "  output:  $QUARTO_YML"

@@ -37,6 +37,7 @@ A **multi-book Quarto monorepo**. Each book is a self-contained Quarto project u
 3. **CI path of record** is `books/renderpub-codex-v2.sh` (not the older `renderpub.sh`).
 4. `published_books/` and `_book/` are build artifacts — do not commit them.
 5. Older scripts (`renderpub.sh`, `renderpub-codex.sh`, `renderpub-indi-codex.sh`, `renderpub_backup*.sh`) may still be in the tree; treat them as legacy unless the user says otherwise.
+6. Live books under `books/` share the **Template-New-1 shell**: `scripts/update-index.sh` (GitHub link, `date-modified` + “Updated” label, `epub.css`), monorepo README, no per-book `.github/`, no `render_all_books.sh`.
 
 ## Content conventions
 
