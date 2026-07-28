@@ -1,82 +1,163 @@
 # Mathematics for Data Science
 
-Data science combines statistics, mathematics, and computer science to extract insights from data. This chapter covers the essential mathematical foundations needed for modern data science, including statistical inference, hypothesis testing, and mathematical modeling.
+Data science turns measurements into decisions under uncertainty. The mathematics is not a single theorem but a **stack**: descriptive summaries, probability models, estimation, hypothesis testing, prediction, and experimental design—implemented at scale with linear algebra and optimization. This part emphasizes statistical foundations with CS systems awareness (pipelines, A/B tests, metrics).
 
-## Core Mathematical Areas
+## The data science loop (mathematical view)
 
-### 1. Statistics and Probability
-- Descriptive statistics and data summarization
-- Probability distributions and their properties
-- Statistical inference and hypothesis testing
-- Bayesian statistics and decision theory
+1. **Collect** samples from a process (ideally i.i.d. or with known dependence)
+2. **Describe** with robust summaries and visualizations
+3. **Model** $P(Y\mid X)$ or $P(X)$ or causal $P(Y\mid\mathrm{do}(X))$
+4. **Estimate** parameters / predict with uncertainty
+5. **Decide** (ship feature? alert? allocate?)
+6. **Validate** on held-out data or sequential experiments
 
-### 2. Linear Algebra for Data Science
-- Matrix operations for data manipulation
-- Dimensionality reduction techniques
-- Principal Component Analysis (PCA)
-- Singular Value Decomposition (SVD)
+Skipping uncertainty quantification produces confident wrong products.
 
-### 3. Calculus and Optimization
-- Optimization for model fitting
-- Gradient-based methods
-- Constrained and unconstrained optimization
-- Maximum likelihood estimation
+## Core mathematical areas
 
-### 4. Information Theory
-- Entropy and information content
-- Mutual information for feature selection
-- Information-theoretic model selection
-- Compression and encoding
+### Statistics and probability
 
-## Chapter Contents
+- Descriptive statistics and exploratory data analysis (EDA)
+- Estimation: bias, variance, MSE, consistency
+- Confidence intervals and hypothesis tests
+- Bayesian updating
+- Bootstrap and resampling
 
-1. [Statistical Foundations](01-statistical-foundations.md)
-2. Probability Distributions (covered in `07-Statistics` and `17-Probability-Advanced`)
-3. Hypothesis Testing (covered in `07-Statistics/04-statistical-inference.md`)
-4. Regression Analysis (covered in `07-Statistics/05-regression-and-experiments.md`)
-5. Dimensionality Reduction (covered in `18-Linear-Algebra-Advanced/03-svd-and-pca.md`)
-6. Time Series Analysis (planned)
-7. Experimental Design (covered in `07-Statistics/05-regression-and-experiments.md`)
-8. Bayesian Methods (covered in `17-Probability-Advanced/04-bayesian-inference.md`)
+### Linear algebra for tabular / embedding data
 
-## Prerequisites
+- Data matrix $X\in\mathbb{R}^{n\times d}$
+- PCA / SVD for dimensionality reduction
+- Least squares and regularized regression
 
-- Basic calculus and linear algebra
-- Programming experience (Python/R recommended)
-- Understanding of basic statistics
-- Familiarity with data manipulation
+### Optimization and calibration
 
-## Tools and Libraries
+- Fitting models by minimizing empirical risk
+- Proper scoring rules (log loss, Brier)
+- Threshold selection under class imbalance
 
-### Python Ecosystem
-- **NumPy**: Numerical computing
-- **Pandas**: Data manipulation and analysis
-- **SciPy**: Scientific computing
-- **Scikit-learn**: Machine learning
-- **Statsmodels**: Statistical modeling
-- **Matplotlib/Seaborn**: Data visualization
+### Causality and design (often neglected)
 
-### R Ecosystem
-- **Base R**: Statistical computing
-- **dplyr**: Data manipulation
-- **ggplot2**: Data visualization
-- **caret**: Machine learning
-- **tidyverse**: Data science workflow
+- Randomized experiments (A/B tests)
+- Confounding in observational data
+- Potential outcomes sketch
 
-## Key Concepts Overview
+### Worked example 1 — metric vs estimator
 
-### Descriptive vs Inferential Statistics
-- **Descriptive**: Summarize and describe data
-- **Inferential**: Make conclusions about populations from samples
+“Average revenue per user” is a functional of a distribution. The sample mean estimates it; variance and dependence (users repeat) affect standard errors. Math separates **parameter** from **estimator**.
 
-### Parametric vs Non-parametric Methods
-- **Parametric**: Assume specific probability distributions
-- **Non-parametric**: Make fewer distributional assumptions
+### Worked example 2 — classification pipeline
 
-### Frequentist vs Bayesian Approaches
-- **Frequentist**: Probability as long-run frequency
-- **Bayesian**: Probability as degree of belief
+Labels $y\in\{0,1\}$, features $x$. Model $\hat p(x)\approx P(y=1\mid x)$. Threshold $\hat p\ge t$ yields decisions. Choosing $t$ is decision theory, not only “accuracy maximization.”
 
-### Supervised vs Unsupervised Learning
-- **Supervised**: Learn from labeled examples
-- **Unsupervised**: Find patterns in unlabeled data
+## Descriptive → inferential bridge
+
+Descriptive stats summarize **the sample you have**. Inferential stats make claims about **the process that generated it**, requiring assumptions (random sampling, model class, independence).
+
+### Worked example 3
+
+Mean latency on yesterday’s logs describes yesterday. Inferring next week’s P99 needs a model of traffic mix and nonstationarity—often the hard part.
+
+## Roadmap
+
+1. **Statistical foundations** — summaries, estimation, testing, error types, power (detailed chapter)
+2. Cross-links: Probability advanced (`17`), Linear algebra advanced (`18`), Optimization (`11`), Information theory (`10`)
+
+## Notation
+
+- Sample $(x_i)_{i=1}^n$ or pairs $(x_i,y_i)$
+- Estimator $\hat\theta_n$; true $\theta$
+- Empirical distribution $\hat P_n=\frac1n\sum\delta_{x_i}$
+- Loss $\ell$; risk $R$; empirical risk $\hat R_n$
+
+### Worked example 4 — empirical risk
+
+$\hat R_n(f)=\frac1n\sum_i \ell(y_i,f(x_i))$ is a Monte Carlo estimate of $R(f)=\mathbb{E}[\ell(y,f(x))]$ when data are i.i.d.
+
+## Systems constraints
+
+| Constraint | Math impact |
+|------------|-------------|
+| Streaming data | Online estimators, sketching |
+| Multiple testing | Family-wise error, FDR |
+| Logging bias | Selection bias; counterfactual issues |
+| Delayed outcomes | Censoring; off-policy evaluation |
+| Privacy | Noise injection; bias-variance trade |
+
+### Worked example 5 — peeking in A/B tests
+
+Repeatedly testing until $p<0.05$ inflates Type I error. Sequential testing / always-valid p-values fix the math of early stopping.
+
+## Estimands, estimators, and error
+
+An **estimand** is the target quantity (population mean conversion, ATE, $P(Y=1\mid x)$). An **estimator** is a function of the sample (sample mean, difference-in-means, logistic MLE). Quality metrics:
+
+$$
+\mathrm{Bias}(\hat\theta)=\mathbb{E}[\hat\theta]-\theta,\qquad
+\mathrm{Var}(\hat\theta)=\mathbb{E}[(\hat\theta-\mathbb{E}\hat\theta)^2],\qquad
+\mathrm{MSE}=\mathrm{Bias}^2+\mathrm{Var}.
+$$
+
+### Worked example 6 — biased but useful
+
+Ridge coefficients are biased toward zero yet can lower MSE under collinearity. “Unbiased” is not always the right product goal.
+
+### Worked example 7 — standard error
+
+For i.i.d. sample mean, $\mathrm{se}=\sigma/\sqrt{n}$. Doubling precision (halving se) needs roughly $4\times$ data—budgeting law of data science.
+
+## Supervised learning as statistics
+
+Prediction models estimate functionals of $P(Y\mid X)$. Classification thresholds implement decision theory; calibration asks whether $\hat p(x)\approx P(Y=1\mid X=x)$. Cross-validation estimates risk of the **selection procedure**, not only a fixed model.
+
+### Worked example 8 — class imbalance
+
+Accuracy can be $99\%$ by always predicting “negative” when base rate is $1\%$. Prefer precision/recall, PR-AUC, or expected cost under a loss matrix.
+
+## Causal vs predictive summary table
+
+| Question | Tool |
+|----------|------|
+| What will happen if we observe $X=x$? | Predictive model |
+| What if we **set** $T=1$? | Causal estimand + design/ID |
+| Which features associate with $Y$? | Regression / MI (not automatically causal) |
+| Did the launch move the metric? | Experiment or quasi-experiment |
+
+### Worked example 9 — logging policy
+
+Bandit logs of $\pi(a\mid x)$ enable off-policy evaluation of a new policy $\pi'$ via importance weights—if support conditions hold. Pure supervised fit on logged rewards without correction is biased.
+
+## Pitfalls
+
+1. **p-hacking and metric shopping**  
+2. **Train-test leakage** in feature pipelines  
+3. **Simpson’s paradox** aggregation  
+4. **Confusing prediction with causation**  
+5. **Ignoring dependence** (time series, users, graphs)  
+6. **Huge $n$ ≠ no bias** (systematic measurement error)  
+
+## Checkpoint
+
+- Separate description, inference, prediction, causation  
+- Write risk vs empirical risk  
+- Name bias/variance of an estimator  
+- Explain why A/B tests beat naive before/after  
+- List three pipeline leakages  
+
+## Exercises
+
+1. Define bias and variance of $\hat\theta$; give an example with nonzero bias.
+2. Why can accuracy be a bad metric at 1% positive class?
+3. Write an A/B test design: unit of randomization, primary metric, guardrails.
+4. Explain bootstrap SE for the median at a high level.
+5. Give a Simpson’s paradox contingency table (numbers).
+6. When is MAP estimation “like regularization”?
+7. PCA: what objective does the first PC optimize?
+8. Multiple metrics: how does multiple testing arise in dashboards?
+9. Streaming mean: write Welford update (or online mean formula).
+10. Causal: why does “users who clicked had higher revenue” not prove clicks cause revenue?
+11. Calibration: define ECE at a high level.
+12. Checkpoint project: pick a KPI at work/school; identify estimand, estimator, assumption most likely false.
+
+## Summary
+
+Data science math is statistical decision-making with matrices and optimizers attached. Master estimands, estimators, uncertainty, and design—then scale with computation. The next chapter builds statistical foundations in depth.
