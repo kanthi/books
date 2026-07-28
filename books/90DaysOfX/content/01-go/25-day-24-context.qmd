@@ -1,0 +1,380 @@
+---
+title: "Day 24 — Context cancel & deadlines"
+---
+
+# Day 24 — Context cancel & deadlines
+
+**Stage III · ~3h (theory-heavy)**  
+**Goal:** Use `context.Context` for cancellation and deadlines across goroutine trees; cancel a worker pool cleanly; treat context values as rare metadata—not a bag of dependencies.
+
+::: {.callout-note}
+`context` is how Go **signals “stop work”** across API boundaries. If a function may block or spawn work, its first parameter is almost always `ctx context.Context`.
+:::
+
+## Why this day exists
+
+Without cancellation:
+
+- HTTP handlers outlive client disconnects  
+- Worker pools finish useless jobs after failure  
+- Timeouts are ad-hoc `time.After` soup  
+- Tests hang forever  
+
+With careless context values:
+
+- Hidden globals  
+- Untyped bag-of-deps  
+- Broken testability  
+
+Today you learn the **narrow, correct** use.
+
+---
+
+## Theory 1 — What a Context carries
+
+A `context.Context` is an interface:
+
+```go
+type Context interface {
+	Deadline() (deadline time.Time, ok bool)
+	Done() <-chan struct{}
+	Err() error
+	Value(key any) any
+}
+```
+
+| Method | Meaning |
+|--------|---------|
+| `Done()` | Closed when cancelled or deadline exceeded |
+| `Err()` | Why: `Canceled` or `DeadlineExceeded` (after Done) |
+| `Deadline()` | Absolute time if any |
+| `Value` | Sparse request-scoped data |
+
+Contexts are **immutable trees**: child derived from parent; cancel parent ⇒ cancel children.
+
+---
+
+## Theory 2 — Constructors you actually use
+
+```go
+ctx := context.Background()           // root: never cancelled
+ctx := context.TODO()                 // placeholder when unsure
+
+ctx, cancel := context.WithCancel(parent)
+defer cancel()                        // always, to free resources
+
+ctx, cancel := context.WithTimeout(parent, 2*time.Second)
+defer cancel()
+
+ctx, cancel := context.WithDeadline(parent, time.Now().Add(2*time.Second))
+defer cancel()
+
+ctx := context.WithValue(parent, key, val) // rare
+```
+
+### Always cancel
+
+Even after success, call `cancel` (via `defer`) for timeout/cancel contexts so timers are released.
+
+```go
+ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+defer cancel()
+```
+
+---
+
+## Theory 3 — Cooperative cancellation
+
+Cancellation is **not** preemptive kill of arbitrary code. Workers must **check**:
+
+```go
+select {
+case <-ctx.Done():
+	return ctx.Err()
+case job := <-jobs:
+	return handle(ctx, job)
+}
+```
+
+Or at loop heads:
+
+```go
+for _, item := range items {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := work(ctx, item); err != nil {
+		return err
+	}
+}
+```
+
+Blocking stdlib calls that accept `ctx` (`http.NewRequestWithContext`, `db.QueryContext`, …) abort when cancelled.
+
+### Ignore context = ignore product requirements
+
+A function signature without `ctx` that does I/O is incomplete for services.
+
+---
+
+## Theory 4 — Error values and wrapping
+
+```go
+errors.Is(err, context.Canceled)
+errors.Is(err, context.DeadlineExceeded)
+```
+
+Prefer returning `ctx.Err()` on cancel paths so callers can distinguish timeout vs logic errors.
+
+Go 1.20+ also has `context.WithCancelCause` / `context.Cause` for richer reasons—useful in libraries; know it exists.
+
+```go
+ctx, cancel := context.WithCancelCause(parent)
+cancel(fmt.Errorf("upstream failed: %w", err))
+// context.Cause(ctx) → your error
+```
+
+---
+
+## Theory 5 — Context values (use sparingly)
+
+```go
+type key int
+const traceKey key = 0
+
+ctx = context.WithValue(ctx, traceKey, traceID)
+id, _ := ctx.Value(traceKey).(string)
+```
+
+| Good | Bad |
+|------|-----|
+| Request ID / trace ID | Passing `*sql.DB` |
+| Auth principal (debated; often OK) | Optional function parameters |
+| Locale | Config structs |
+
+**Rule:** if a function needs it to compile-time correct logic, make it a real parameter—not a context value.
+
+Use private key types to avoid collisions.
+
+---
+
+## Theory 6 — Wiring cancel into a worker pool
+
+Pattern:
+
+1. Parent creates `ctx, cancel`  
+2. Workers select on `ctx.Done()` and jobs  
+3. On first fatal error or timeout, `cancel()`  
+4. Drain or abandon jobs channel carefully  
+
+```go
+func runPool(ctx context.Context, jobs <-chan Job, workers int) error {
+	errCh := make(chan error, 1)
+	var wg sync.WaitGroup
+
+	worker := func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case job, ok := <-jobs:
+				if !ok {
+					return
+				}
+				if err := process(ctx, job); err != nil {
+					select {
+					case errCh <- err:
+					default:
+					}
+					return
+				}
+			}
+		}
+	}
+
+	wg.Add(workers)
+	for i := 0; i < workers; i++ {
+		go worker()
+	}
+
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		return nil
+	case err := <-errCh:
+		return err
+	case <-ctx.Done():
+		<-done // wait workers exit
+		return ctx.Err()
+	}
+}
+```
+
+Day 27’s `errgroup` expresses this more cleanly—learn the manual shape first.
+
+---
+
+## Worked example — timeout a slow operation
+
+```go
+package main
+
+import (
+	"context"
+	"fmt"
+	"time"
+)
+
+func slow(ctx context.Context) error {
+	select {
+	case <-time.After(500 * time.Millisecond):
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func main() {
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+
+	err := slow(ctx)
+	fmt.Println(err) // context deadline exceeded
+	fmt.Println(errorsIsDeadline(err))
+}
+
+func errorsIsDeadline(err error) bool {
+	return err == context.DeadlineExceeded ||
+		(err != nil && err.Error() == context.DeadlineExceeded.Error())
+}
+```
+
+Prefer `errors.Is(err, context.DeadlineExceeded)` in real code (import `errors`).
+
+---
+
+## Worked example — HTTP-shaped request (stdlib)
+
+```go
+package main
+
+import (
+	"context"
+	"fmt"
+	"io"
+	"net/http"
+	"time"
+)
+
+func fetch(ctx context.Context, url string) (int, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return 0, err
+	}
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return 0, err
+	}
+	defer res.Body.Close()
+	n, _ := io.Copy(io.Discard, res.Body)
+	return int(n), nil
+}
+
+func main() {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	n, err := fetch(ctx, "https://example.com")
+	fmt.Println(n, err)
+}
+```
+
+---
+
+## Lab 1 — Cancel with a button (channel)
+
+Workspace: `~/lab/90daysofx/01-go/day24`
+
+```bash
+mkdir -p ~/lab/90daysofx/01-go/day24 && cd ~/lab/90daysofx/01-go/day24
+go mod init example.com/day24
+```
+
+1. Start a loop worker that ticks every 100ms.  
+2. After 500ms, call `cancel()`.  
+3. Worker exits with `context.Canceled`.  
+4. `go run -race .`
+
+---
+
+## Lab 2 — Cancel Day 23’s pool
+
+Port your worker pool:
+
+- `process` takes `ctx` and checks it  
+- Parent uses `WithTimeout` (e.g. 200ms) with jobs that each sleep 50–100ms  
+- Show that not all jobs complete  
+- Ensure no goroutine leak: after return, `runtime.NumGoroutine()` returns near baseline (sample after short sleep)
+
+```bash
+go run -race .
+go test -race ./...
+```
+
+---
+
+## Lab 3 — Deadline vs Timeout
+
+Write two functions producing the same deadline end time—one with `WithTimeout`, one with `WithDeadline`. Assert both cancel around the same wall time (tolerance 50ms).
+
+---
+
+## Lab 4 — Context value discipline
+
+1. Store a request ID in context; log it in a child function.  
+2. Refactor a **bad** example that stuffed a `*Logger` or config into context into an explicit parameter.  
+3. Journal why the refactor is clearer for tests.
+
+---
+
+## Common gotchas
+
+| Gotcha | Fix |
+|--------|-----|
+| Forgetting `defer cancel()` | Always defer after WithCancel/Timeout |
+| Passing `context.Background()` deep forever | Thread request ctx from edges inward |
+| Storing deps in Value | Explicit params |
+| Not checking `ctx.Done` in loops | Poll `ctx.Err()` / select |
+| Starting work with already-cancelled ctx | Check at entry |
+| Cancelling but not joining workers | WaitGroup after cancel |
+
+---
+
+## Checkpoint
+
+- [ ] Can list Background, WithCancel, WithTimeout, WithValue  
+- [ ] Always defers cancel in lab code  
+- [ ] Pool respects cancel and exits race-clean  
+- [ ] Uses `errors.Is` for deadline/cancel  
+- [ ] Explains why cancellation is cooperative  
+- [ ] Avoids abusing context values  
+
+### Commit
+
+```bash
+git add .
+git commit -m "day24: context cancel/timeout wired through worker pool"
+```
+
+Write three personal gotchas before continuing.
+
+---
+
+## Tomorrow
+
+**Day 25 — Race detector & leaks:** break programs on purpose, read race reports, and build a habit of `-race` in tests.

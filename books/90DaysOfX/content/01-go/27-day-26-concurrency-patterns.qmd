@@ -1,0 +1,368 @@
+---
+title: "Day 26 — Concurrency patterns"
+---
+
+# Day 26 — Concurrency patterns
+
+**Stage III · ~3h (theory-heavy)**  
+**Goal:** Internalize a catalog of reusable concurrency patterns—fan-out/fan-in, or-done, tee, bounded parallelism, and error-aware pipelines—and implement fan-out with correct error propagation.
+
+::: {.callout-note}
+Patterns are **vocabulary**. Name them in code reviews: “this is fan-out with an or-done parent,” not “a bunch of goroutines.”
+:::
+
+## Why this day exists
+
+Days 19–25 gave primitives. Without patterns you re-invent:
+
+- How to stop a pipeline mid-stream  
+- How to duplicate a stream  
+- How to limit in-flight work while collecting errors  
+
+Today is a **map of the territory** before `errgroup` (Day 27) packages the most common structure.
+
+---
+
+## Theory 1 — Fan-out / fan-in
+
+**Fan-out:** multiple workers pull from one jobs channel (or each gets a subset).  
+**Fan-in:** merge multiple result channels into one (Day 21).
+
+```text
+          ┌→ worker1 ─┐
+jobs  →───┼→ worker2 ─┼→ results → consumer
+          └→ worker3 ─┘
+```
+
+Use when work is independent and CPU/I/O parallelizable.
+
+---
+
+## Theory 2 — Or-done (cancel-aware receive)
+
+Problem: `for v := range in` ignores cancellation until the producer closes.
+
+```go
+func orDone[T any](done <-chan struct{}, in <-chan T) <-chan T {
+	out := make(chan T)
+	go func() {
+		defer close(out)
+		for {
+			select {
+			case <-done:
+				return
+			case v, ok := <-in:
+				if !ok {
+					return
+				}
+				select {
+				case out <- v:
+				case <-done:
+					return
+				}
+			}
+		}
+	}()
+	return out
+}
+```
+
+Modern code often uses `ctx.Done()` instead of a raw `done` channel—the shape is identical.
+
+---
+
+## Theory 3 — Tee (split a stream)
+
+```go
+func tee[T any](done <-chan struct{}, in <-chan T) (<-chan T, <-chan T) {
+	out1 := make(chan T)
+	out2 := make(chan T)
+	go func() {
+		defer close(out1)
+		defer close(out2)
+		for v := range orDone(done, in) {
+			// careful: both sends must not block forever
+			o1, o2 := out1, out2
+			for i := 0; i < 2; i++ {
+				select {
+				case <-done:
+					return
+				case o1 <- v:
+					o1 = nil // disable case
+				case o2 <- v:
+					o2 = nil
+				}
+			}
+		}
+	}()
+	return out1, out2
+}
+```
+
+Use for “log and process” dual consumers. Prefer careful nil-case disabling so one slow tee side doesn’t deadlock forever without cancel.
+
+---
+
+## Theory 4 — Bridge (chan of chans)
+
+Flatten `<-chan <-chan T` into `<-chan T`:
+
+```go
+func bridge[T any](done <-chan struct{}, chanCh <-chan <-chan T) <-chan T {
+	out := make(chan T)
+	go func() {
+		defer close(out)
+		for {
+			var stream <-chan T
+			select {
+			case <-done:
+				return
+			case maybe, ok := <-chanCh:
+				if !ok {
+					return
+				}
+				stream = maybe
+			}
+			for v := range orDone(done, stream) {
+				select {
+				case out <- v:
+				case <-done:
+					return
+				}
+			}
+		}
+	}()
+	return out
+}
+```
+
+Appears when each job produces a channel of chunks.
+
+---
+
+## Theory 5 — Bounded parallelism pattern
+
+```go
+func mapLimit[T any, R any](ctx context.Context, items []T, limit int, fn func(context.Context, T) (R, error)) ([]R, error) {
+	// semaphore + results collection; first error cancels ctx
+}
+```
+
+Skeleton:
+
+1. Derive cancellable ctx  
+2. Semaphore capacity `limit`  
+3. Store results by index (avoid append races)  
+4. First error → cancel  
+5. Wait all in-flight  
+6. Return first error or results  
+
+This is the heart of Day 27’s `errgroup` + `SetLimit`.
+
+---
+
+## Theory 6 — Error propagation styles
+
+| Style | Behavior |
+|-------|----------|
+| **Best effort** | Collect all errors (`errors.Join`) |
+| **Fail fast** | Cancel siblings on first error |
+| **All-or-nothing** | Fail fast + no partial commit |
+
+Channels often carry:
+
+```go
+type result[T any] struct {
+	v   T
+	err error
+	idx int
+}
+```
+
+Never lose the index if order matters.
+
+---
+
+## Theory 7 — Pipeline with cancel (composed)
+
+```text
+ctx → gen → transform → sink
+         ↘ cancel on error
+```
+
+Each stage takes `ctx` and exits on `Done`, closing outbound channels so downstream ranges finish.
+
+---
+
+## Worked example — fan-out with error awareness
+
+```go
+package main
+
+import (
+	"context"
+	"fmt"
+	"sync"
+)
+
+func fanOut(ctx context.Context, jobs <-chan int, workers int, fn func(context.Context, int) (int, error)) <-chan result {
+	out := make(chan result)
+	var wg sync.WaitGroup
+	wg.Add(workers)
+	for i := 0; i < workers; i++ {
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case j, ok := <-jobs:
+					if !ok {
+						return
+					}
+					v, err := fn(ctx, j)
+					select {
+					case out <- result{v: v, err: err}:
+					case <-ctx.Done():
+						return
+					}
+				}
+			}
+		}()
+	}
+	go func() {
+		wg.Wait()
+		close(out)
+	}()
+	return out
+}
+
+type result struct {
+	v   int
+	err error
+}
+
+func main() {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	jobs := make(chan int)
+	go func() {
+		defer close(jobs)
+		for i := 1; i <= 20; i++ {
+			select {
+			case jobs <- i:
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+
+	out := fanOut(ctx, jobs, 4, func(ctx context.Context, n int) (int, error) {
+		if n == 13 {
+			return 0, fmt.Errorf("unlucky")
+		}
+		return n * n, nil
+	})
+
+	for r := range out {
+		if r.err != nil {
+			fmt.Println("err", r.err)
+			cancel() // fail fast signal; workers exit
+			// continue draining out until closed
+			continue
+		}
+		fmt.Println(r.v)
+	}
+}
+```
+
+Improve tomorrow with errgroup so cancel + wait is less manual.
+
+---
+
+## Lab 1 — Catalog implementations
+
+Workspace: `~/lab/90daysofx/01-go/day26`
+
+Implement in package `patterns`:
+
+1. `OrDone`  
+2. `FanIn`  
+3. `Tee` (two outputs)  
+4. `MapLimit` (bounded)  
+
+```bash
+go test -race ./...
+```
+
+Table-driven tests with small channels and timeouts (`t.Fatal` if >2s).
+
+---
+
+## Lab 2 — Fan-out square with fail-fast
+
+Process numbers 1..100; function fails on multiples of 17. On first error, cancel remaining work. Assert:
+
+- Error returned to caller  
+- Not all squares necessarily computed  
+- No leaked goroutines after short settle (coarse)  
+- Race-clean  
+
+---
+
+## Lab 3 — Best-effort mode
+
+Same as Lab 2 but collect all errors with `errors.Join` and do not cancel. Compare counts of successes.
+
+Journal when each mode is appropriate (payments vs metrics).
+
+---
+
+## Lab 4 — Name the pattern
+
+Take your Day 23/24 fetcher and add comments:
+
+```go
+// Pattern: worker pool (fixed fan-out)
+// Pattern: or-done via ctx.Done
+```
+
+Refactor one piece toward the catalog helpers.
+
+---
+
+## Common gotchas
+
+| Gotcha | Fix |
+|--------|-----|
+| Fan-in without waiting senders | WaitGroup then close |
+| Tee deadlock on slow consumer | ctx cancel + nil cases |
+| Losing error index order | Result with index |
+| Infinite goroutines in mapLimit | Semaphore / fixed workers |
+| Closing shared jobs from workers | Only producer closes |
+
+---
+
+## Checkpoint
+
+- [ ] Implemented OrDone, FanIn, Tee, MapLimit  
+- [ ] Explained fail-fast vs best-effort  
+- [ ] Fan-out lab race-clean with cancel  
+- [ ] Can sketch bridge pattern verbally  
+- [ ] Annotated an older lab with pattern names  
+
+### Commit
+
+```bash
+git add .
+git commit -m "day26: concurrency patterns catalog + fan-out errors"
+```
+
+Write three personal gotchas before continuing.
+
+---
+
+## Tomorrow
+
+**Day 27 — `errgroup`:** structured concurrency with `golang.org/x/sync/errgroup`—first-error cancel and `SetLimit`.
