@@ -1,0 +1,111 @@
+# Syllabus C — Project-driven (milestones pull theory)
+
+**Voice:** Build something every week; theory is pulled in only when blocked.  
+**Exploration only.** Baseline: **26.05**.
+
+## Thesis
+
+Motivation dies in abstract language chapters. This path uses **milestone systems**; each milestone lists **minimum theory** required and **tools introduced**.
+
+## Milestone track
+
+### M0 — Lab ready
+
+**Build:** QEMU VM (or preferred), snapshot, ≥40–50 GB disk plan for store.  
+**Theory:** none beyond Linux SSH.  
+**Tools:** QEMU/libvirt or UTM; notes only.
+
+### M1 — Nix on any Linux (optional pre-NixOS)
+
+**Build:** multi-user Nix; run `hello` via `nix run` / shell.  
+**Theory:** store path, profile.  
+**Tools:** Nix installer (official or Determinate).
+
+### M2 — First NixOS 26.05 box
+
+**Build:** install, SSH user, static-ish net, firewall SSH only.  
+**Theory:** configuration.nix vs hardware-configuration; generations.  
+**Tools:** ISO, `nixos-rebuild`.  
+**26.05 note:** systemd stage-1 default—record any install surprises.
+
+### M3 — Two declarative services
+
+**Build:** e.g. nginx + something small (or Caddy) + auto start.  
+**Theory:** modules, options search, firewall ports.  
+**Tools:** search.nixos.org options.
+
+### M4 — DevShell for a real repo
+
+**Build:** `nix develop` with language tools you use daily.  
+**Theory:** mkShell, pinning.  
+**Tools:** direnv + nix-direnv (recommended).
+
+### M5 — Flake unifies host + shell
+
+**Build:** one flake: `nixosConfigurations` + `devShells` + lockfile.  
+**Theory:** inputs/outputs/`follows`.  
+**Tools:** flakes CLI; optional flake-parts later.
+
+### M6 — Home Manager daily driver slice
+
+**Build:** git + shell + editor via HM (system-integrated or standalone).  
+**Theory:** HM vs system boundary.  
+**Tools:** home-manager.
+
+### M7 — Disko reinstall story
+
+**Build:** wipe/reinstall lab disk from declarative layout (VM).  
+**Theory:** filesystems, LUKS optional.  
+**Tools:** disko.
+
+### M8 — Secrets-backed service
+
+**Build:** service needing API key/password without store plaintext.  
+**Theory:** store purity.  
+**Tools:** sops-nix or agenix (pick one first).
+
+### M9 — Package something
+
+**Build:** package internal script or missing tool; consume from flake.  
+**Theory:** stdenv phases, FOD.  
+**Tools:** nix build, nix log.
+
+### M10 — Second host
+
+**Build:** second VM/host from same flake.  
+**Theory:** multi-host modules.  
+**Tools:** `nixos-rebuild --target-host` first; later deploy-rs/colmena.
+
+### M11 — Cache + CI
+
+**Build:** push build to a cache (public Cachix free tier or Attic/self-host); CI runs `nix flake check` / build.  
+**Theory:** substituters, trust.  
+**Tools:** Cachix/Attic; GitHub Actions / Forgejo / etc.
+
+### M12 — Homelab stack slice
+
+**Build:** 2–3 real services (e.g. reverse proxy + app + metrics).  
+**Theory:** composition, backups thinking.  
+**Tools:** whatever services you actually run (Traefik/nginx, Grafana stack, Immich, etc.—document choices).
+
+### M13 — Production-minded hardening
+
+**Build:** SSH hardened, auto-upgrade policy conscious, backups tested once.  
+**Theory:** activation failure modes.  
+**Tools:** optional: Prometheus/Grafana, Loki, healthchecks.
+
+### M14 — Capstone: “rebuild from bare metal/VM in one sitting”
+
+**Build:** empty disk → locked flake → secrets → services → verified.  
+**Theory:** full spine review.  
+**Tools:** full personal stack.
+
+## Theory insert order (only when blocked)
+
+Language deep-dives are **side quests** attached to M4–M9, not a 4-chapter block before any OS.
+
+## Community signal this matches
+
+- “Just install and iterate” vs endless theory (common r/NixOS beginner threads).  
+- Flakes + HM appear early because modern guides do (with explicit non-mandatory note).  
+- Homelab projects as learning engine (self-hosting culture).

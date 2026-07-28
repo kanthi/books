@@ -1,0 +1,189 @@
+# Syllabus H — Exhaustive topic & tool coverage map
+
+**Purpose:** Ensure the book can eventually cover **everything important**—not a reading order.  
+**Use:** checklist against chosen spine (A–G).  
+**Baseline:** 26.05-era ecosystem (update this table over time).
+
+Legend: **P** personal · **R** production · **D** depth later
+
+---
+
+## H1 — Concepts
+
+| Topic | P | R | Notes |
+|-------|---|---|------|
+| Purity / reproducibility | ✓ | ✓ | |
+| Store model | ✓ | ✓ | |
+| Derivations / FOD | ✓ | ✓ | |
+| Evaluation vs realization | ✓ | ✓ | |
+| Profiles & generations | ✓ | ✓ | |
+| GC & roots | ✓ | ✓ | |
+| Sandbox builds | ✓ | ✓ | |
+| Binary substitution & trust | ✓ | ✓ | |
+| Content-addressed derivations | D | D | |
+| Cross compilation | D | ✓ | |
+| Remote builders | D | ✓ | |
+
+## H2 — Language
+
+| Topic | P | R |
+|-------|---|---|
+| Types, strings, paths | ✓ | ✓ |
+| Functions, patterns | ✓ | ✓ |
+| Laziness / thunks | ✓ | ✓ |
+| `builtins` | ✓ | ✓ |
+| `nixpkgs.lib` | ✓ | ✓ |
+| Fixed points / overlays math | D | ✓ |
+| Debugging eval | ✓ | ✓ |
+| Performance of eval | D | ✓ |
+
+## H3 — Nix CLI & config
+
+| Topic | P | R |
+|-------|---|---|
+| Modern CLI | ✓ | ✓ |
+| Legacy CLI literacy | ✓ | ✓ |
+| `nix.conf` / NixOS nix settings | ✓ | ✓ |
+| Flakes experimental features | ✓ | ✓ |
+| Profiles / nix profile | ✓ | ✓ |
+| Channels | ✓ | ✓ |
+| Registries | D | D |
+| Shebang `nix shell` scripts | ✓ | ✓ |
+
+## H4 — NixOS system
+
+| Topic | P | R |
+|-------|---|---|
+| Installation | ✓ | ✓ |
+| hardware-configuration | ✓ | ✓ |
+| Module system | ✓ | ✓ |
+| Options & types | ✓ | ✓ |
+| Activation / switch-to-configuration | ✓ | ✓ |
+| Bootloaders | ✓ | ✓ |
+| **systemd stage-1 / initrd (26.05)** | ✓ | ✓ |
+| systemd services/timers | ✓ | ✓ |
+| Networking / firewall / VPN | ✓ | ✓ |
+| Users / PAM / sudo | ✓ | ✓ |
+| Filesystems / mounts | ✓ | ✓ |
+| Containers (nixos-containers, podman) | ✓ | ✓ |
+| Desktop environments | ✓ | D |
+| GPU / NVIDIA | ✓ | D |
+| Printing / Bluetooth / etc. | ✓ | D |
+| Upgrades / stateVersion | ✓ | ✓ |
+| Testing (`nixosTests`) | D | ✓ |
+
+## H5 — Flakes & structure
+
+| Topic | P | R |
+|-------|---|---|
+| flake inputs/outputs | ✓ | ✓ |
+| lockfiles / follows | ✓ | ✓ |
+| flake-parts / flake-utils | ✓ | ✓ |
+| Templates | ✓ | ✓ |
+| Private inputs | ✓ | ✓ |
+| Checks / formatters | ✓ | ✓ |
+| Non-flake pins (npins/niv) | ✓ | ✓ |
+
+## H6 — Home / multi-OS
+
+| Topic | P | R |
+|-------|---|---|
+| Home Manager | ✓ | ✓ |
+| nix-darwin | ✓ | ~ |
+| Shared modules | ✓ | ✓ |
+| Dotfile strategies | ✓ | ✓ |
+
+## H7 — Packaging
+
+| Topic | P | R |
+|-------|---|---|
+| stdenv phases | ✓ | ✓ |
+| Language ecosystems (major) | ✓ | ✓ |
+| Overlays / package sets | ✓ | ✓ |
+| callPackage | ✓ | ✓ |
+| Upstream contribution | D | ✓ |
+| Wrapper/patchelf | ✓ | ✓ |
+
+## H8 — Storage & identity of machines
+
+| Topic | P | R |
+|-------|---|---|
+| Disko | ✓ | ✓ |
+| LUKS / TPM unlock | ✓ | ✓ |
+| ZFS/Btrfs advanced | D | ✓ |
+| Impermanence | ✓ | ✓ |
+| Secure Boot / lanzaboote | ✓ | ✓ |
+
+## H9 — Secrets
+
+| Topic | P | R |
+|-------|---|---|
+| sops-nix | ✓ | ✓ |
+| agenix/ragenix | ✓ | ✓ |
+| Vault/OIDC patterns | D | ✓ |
+| Secret rotation | ✓ | ✓ |
+
+## H10 — Deploy & fleet
+
+| Topic | P | R |
+|-------|---|---|
+| target-host rebuild | ✓ | ✓ |
+| deploy-rs | ✓ | ✓ |
+| colmena | ✓ | ✓ |
+| Other orchestrators | D | D |
+| Inventory / environments | ✓ | ✓ |
+
+## H11 — CI / cache
+
+| Topic | P | R |
+|-------|---|---|
+| GA/GitLab/Forgejo + Nix | ✓ | ✓ |
+| Cachix | ✓ | ✓ |
+| Attic / self-host cache | ✓ | ✓ |
+| Hydra | D | ✓ |
+| Remote build farm | D | ✓ |
+
+## H12 — Images & orchestration
+
+| Topic | P | R |
+|-------|---|---|
+| dockerTools / nix2container | ✓ | ✓ |
+| nixos-generators | ✓ | ✓ |
+| microvm.nix | ✓ | ✓ |
+| k8s + Nix | D | ✓ |
+
+## H13 — Observability & backup
+
+| Topic | P | R |
+|-------|---|---|
+| journald / logging stacks | ✓ | ✓ |
+| Metrics/alerting | ✓ | ✓ |
+| Backup/restore drills | ✓ | ✓ |
+
+## H14 — Security & compliance
+
+| Topic | P | R |
+|-------|---|---|
+| Hardening baselines | ✓ | ✓ |
+| Update policy | ✓ | ✓ |
+| SBOM / vuln scanning | D | ✓ |
+| Supply chain trust | ✓ | ✓ |
+
+## H15 — Internals & ecosystem
+
+| Topic | P | R |
+|-------|---|---|
+| Classic / Determinate / Lix | ✓ | ✓ |
+| Tvix research | D | D |
+| Release engineering literacy | ✓ | ✓ |
+| 26.05→26.11 migration topics | ✓ | ✓ |
+
+---
+
+## Gap process
+
+When choosing final spine:
+
+1. Mark each H-row against chapters in spine.  
+2. Unmapped **✓✓ production** rows must become chapters or appendix entries.  
+3. Revisit this file each NixOS release.
