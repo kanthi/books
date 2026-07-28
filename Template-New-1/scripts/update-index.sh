@@ -167,11 +167,13 @@ while IFS= read -r category; do
   fi
 done < <(find "$CONTENT_DIR" -maxdepth 1 -mindepth 1 -type d | sort)
 
-while IFS= read -r category_info; do
-  [ -z "$category_info" ] && continue
-  category_path="$(echo "$category_info" | cut -d'|' -f2)"
-  process_directory "$category_path"
-done < <(printf "%s\n" "${categories[@]}" | sort -n)
+if [ "${#categories[@]}" -gt 0 ]; then
+  while IFS= read -r category_info; do
+    [ -z "$category_info" ] && continue
+    category_path="$(echo "$category_info" | cut -d'|' -f2)"
+    process_directory "$category_path"
+  done < <(printf "%s\n" "${categories[@]}" | sort -n)
+fi
 
 cat >> "$TMP_FILE" <<'EOL'
 

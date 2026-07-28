@@ -23,6 +23,28 @@ For books using `scripts/update-index.sh` in this repo:
 7. Directories starting with `_` are ignored by part discovery.
 8. Root-level files directly under `content/` are not included as chapters.
 
+## 90DaysOfX (multi-volume series)
+
+- Portal book: `books/90DaysOfX/`
+- **Volumes** = independent parts: `content/01-go/`, `content/02-nixos/`, `content/03-maths/`, future `content/04-…/`
+- Readers take one volume at a time by default; no morning/evening dual-track in published prose
+- Each volume: `00-sub-book-overview.qmd` + `01-syllabus.qmd` first; chapters later
+- Series-wide docs: `content/00-program/`
+- Standalone `Go` / `NixOS` / `Maths` stay as deep libraries; do not auto-merge chapter bodies
+
+### Naming (same as root AGENTS.md — do not confuse with standalone books)
+
+| Say / assume | Path |
+|--------------|------|
+| **standalone Go / Go book / Go@lib** | `books/Go/` |
+| **standalone NixOS / NixOS book / NixOS@lib** | `books/NixOS/` |
+| **standalone Maths / Maths book / Maths@lib** | `books/Maths/` |
+| **Go volume / 90X Go / Volume 1 / Go@90** | `books/90DaysOfX/content/01-go/` |
+| **NixOS volume / 90X NixOS / Volume 2 / NixOS@90** | `books/90DaysOfX/content/02-nixos/` |
+| **Maths volume / 90X Maths / Volume 3 / Maths@90** | `books/90DaysOfX/content/03-maths/` |
+
+**book** = standalone library · **volume / 90X / @90** = series day path. Ask if the user only says “Go” / “NixOS” / “Maths” without a qualifier.
+
 ## myHomelab Specific
 
 - Canonical manuscript content is split into prefixed files under:

@@ -28,7 +28,40 @@ A **multi-book Quarto monorepo**. Each book is a self-contained Quarto project u
 
 ### Current books (as of last inventory)
 
-`C`, `ContainerLabs`, `Git-Github`, `Go`, `Linux-Commands`, `Linux-Editors`, `Linux-ShellScripting-Bash`, `Maths`, `myHomelab`, `Rust`
+`90DaysOfX`, `C`, `ContainerLabs`, `Git-Github`, `Go`, `Linux-Commands`, `Linux-Editors`, `Linux-ShellScripting-Bash`, `Maths`, `myHomelab`, `Networking`, `NixOS`, `Rust`
+
+- **`90DaysOfX`**: multi-volume series container. Volumes are **independent** parts under `content/` (`01-go`, `02-nixos`, `03-maths`, …)—no required joint schedule. Standalone `Go` / `NixOS` / `Maths` books remain deeper libraries.
+
+## Book vs volume naming (user language → path)
+
+**Same topic names appear twice:** as a **standalone library book** and as a **volume inside `90DaysOfX`**. Agents **must** resolve the user’s wording to the correct path and **must ask** if ambiguous (e.g. bare “fix Go” / “NixOS chapter”).
+
+### Rule of thumb
+
+| User says… | Means… | Path |
+|------------|--------|------|
+| **`Go book`**, **`standalone Go`**, **`Go@lib`** | Standalone library | `books/Go/` |
+| **`NixOS book`**, **`standalone NixOS`**, **`NixOS@lib`** | Standalone library | `books/NixOS/` |
+| **`Maths book`**, **`standalone Maths`**, **`Maths@lib`** | Standalone library | `books/Maths/` |
+| **`90DaysOfX`**, **`series`** | Series container only | `books/90DaysOfX/` |
+| **`Go volume`**, **`90X Go`**, **`Volume 1`**, **`Go@90`** | Day-paced Go spine | `books/90DaysOfX/content/01-go/` |
+| **`NixOS volume`**, **`90X NixOS`**, **`Volume 2`**, **`NixOS@90`** | Day-paced NixOS spine | `books/90DaysOfX/content/02-nixos/` |
+| **`Maths volume`**, **`90X Maths`**, **`Volume 3`**, **`Maths@90`** | Day-paced Maths spine | `books/90DaysOfX/content/03-maths/` |
+
+### Defaults when the user is ambiguous
+
+1. Prefer **asking** which target (`@lib` vs `@90`) over guessing.
+2. If they say **“Day N”**, **gate**, **Lab 0**, or **90-day path** → treat as a **volume** under `90DaysOfX`.
+3. If they say **library**, **projects part**, **long-form**, or name advanced parts only in the standalone tree (e.g. Go `13-network-systems`, NixOS `99-projects`) → **standalone book**.
+4. **Do not** silently edit both trees unless the user asks to sync or mirror.
+5. **Do not** add cross-links between standalone `Go` / `NixOS` / `Maths` and `90DaysOfX` unless the user explicitly requests them (standalone books currently have **no** series links by policy).
+
+### Roles (content shape)
+
+| Kind | Role |
+|------|------|
+| **Standalone book** | Deep library / reference / large project set; **topic-organized** parts (not a day calendar). For **NixOS book** especially: normal chapters under `01-concepts/` … `08-capstone/` + `99-projects/` — **not** `day-01`…`day-90` filenames. |
+| **Volume (`@90`)** | ~90-day-shaped curriculum: overview, syllabus, **day chapters**, gates, capstone under `90DaysOfX/content/0N-*/` |
 
 ## Critical rules
 
@@ -95,6 +128,18 @@ cd books
 
 Runs update-index + `quarto render` only (does **not** rebuild the portal).
 
+### Single- or multi-book local preview (Safari)
+
+```bash
+cd books
+./indiprev.sh <BookName>              # static serve of _book/ (fast)
+./indiprev.sh Go NixOS Maths          # several books; ports 4242+
+./indiprev.sh Go --live               # quarto preview live reload
+./indipub.sh Go && ./indiprev.sh Go   # rebuild then open Safari
+```
+
+Default is **static** (`python3 -m http.server` on `_book/`), waits for HTTP ready, opens Safari at `http://localhost:<port>/`. Use `--live` for Quarto live reload. See root `README.md` for flags.
+
 ### Per-book index refresh only
 
 ```bash
@@ -149,7 +194,9 @@ On the next full CI run (or local `renderpub-codex-v2.sh`), the new book appears
 ## Defaults for future sessions
 
 - Prefer **`renderpub-codex-v2.sh`** for full library builds.
-- Prefer **`indipub.sh <Book>`** for single-book iteration.
+- Prefer **`indipub.sh <Book>`** for single-book one-shot render.
+- Prefer **`indiprev.sh <Book>`** for local Safari preview (static `_book/`; use `--live` for Quarto reload).
+- Resolve **book vs volume** using **Book vs volume naming** above; ask if “Go” / “NixOS” / “Maths” is ambiguous.
 - Do not re-explain this pipeline unless the user asks; assume it is known.
 - Do not invent hand-maintained chapter lists in `_quarto.yml`.
 - When unsure whether `_quarto.yml` is stale after content moves, regenerate it.
