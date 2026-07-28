@@ -1,0 +1,21 @@
+# Syllabus 1 — Expert practitioner (spiral)
+
+**Vendor-agnostic.** Open lab images only. Destination: expert NetOps competence.
+
+## Thesis
+Experts debug **planes**, **encapsulation**, and **state**—not brand menus. Spiral depth beats feature bingo.
+
+## Arcs
+0. Models (planes, encaps, underlay/overlay) + verification culture  
+1. Lab craft (Containerlab + Linux networking)  
+2. Packets & tables (MAC, ARP/ND, RIB vs forwarding)  
+3. Bridging domains until boring  
+4. Interior routing truth (adjacency, flood/SPF, multi-area)  
+5. Edge routing & policy (sessions, path choice, dual-homing)  
+6. Resilience & services (FHRP-class, NAT, relays)  
+7. Filters, QoS vocabulary, hardening  
+8. Overlays & fabrics  
+9. NetOps (automation, CI labs, observe, runbooks)  
+
+## Definition of done
+Broken multi-protocol lab → restore with evidence → prevent recurrence → all in free Containerlab images.

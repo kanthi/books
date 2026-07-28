@@ -1,0 +1,23 @@
+# Syllabus 2 — Project-driven milestones
+
+Open images · Containerlab · theory only when blocked.
+
+| M | Build | Theory pulled |
+|---|--------|----------------|
+| M0 | Host ready; first deploy/destroy | Linux net, images |
+| M1 | Triangle routers, static + pcap | IP, static |
+| M2 | Multi-switch VLANs/trunks | Bridging, tags |
+| M3 | Loop-prevention failover | Spanning tree family |
+| M4 | IGP single area | Link-state basics |
+| M5 | Multi-area IGP | Hierarchy, filtering |
+| M6 | Dual-homed edge routing | Inter-domain, policy intro |
+| M7 | First-hop HA + relay | Resilience, services |
+| M8 | Filters + edge translation | ACL thinking, NAT |
+| M9 | Site tunnel | Overlay basics |
+| M10 | Mini leaf-spine | Fabric underlay |
+| M11 | Overlay fabric taste | VXLAN/EVPN-class ideas |
+| M12 | Automate config against lab | NetOps scripting |
+| M13 | CI smoke deploy | Lab-as-code |
+| M14 | Capstone multi-site | Integration |
+
+Each M: `.clab.yml` · address plan · expected state · break · recovery · diagram.
