@@ -2,41 +2,461 @@
 title: "Systems Programming"
 ---
 
-# Systems Programming: Low Level Go
+# Systems Programming: Low-Level Go
 
-Go was written to replace C++ at Google. It has deep system capabilities.
+## Overview
 
-## 1. Syscalls (`golang.org/x/sys/unix`)
-Go doesn't use `libc` for syscalls (on Linux). It makes raw syscalls.
-The `syscall` package is frozen. Use `golang.org/x/sys/unix`.
+Go was designed to replace much of the C++/Java systems software at Google: servers, CLIs, and infrastructure agents. It still offers deliberate low-level power—raw syscalls via `golang.org/x/sys`, unsafe zero-copy tricks, cgo bridges, and userspace control planes for eBPF—while keeping a memory-safe default path.
+
+This chapter covers syscalls, Delve, eBPF userspace, `unsafe`, and production guardrails.
+
+## When to Drop Below the Stdlib
+
+| Need | Prefer | Reach for low-level when |
+|------|--------|---------------------------|
+| Files | `os`, `io` | Special flags, `flock`, sendfile |
+| Processes | `os/exec` | Fine-grained credentials, ptrace |
+| Network | `net` | Raw sockets, SO_REUSEPORT tuning |
+| Memory | GC + slices | `mlock`, huge pages, mmap shared regions |
+| Tracing | slog/pprof | eBPF kernel probes |
+
+Most services never need `unsafe` or eBPF. Learn the tools so you recognize when they earn their complexity.
+
+## Syscalls with `golang.org/x/sys`
+
+The `syscall` package is frozen. New code should use **`golang.org/x/sys/unix`** (and `windows`).
 
 ```go
-// Example: Lock memory to prevent swapping (mlock)
-unix.Mlock(data)
-```
+package main
 
-## 2. Debuggers (Delve)
-**Delve** (`dlv`) is the Go debugger.
-*   **Remote Debugging:** Run your app on a Linux server, connect your IDE (VS Code) from your Mac.
-*   **Core Dumps:** If your app crashes in prod, configure it to write a core dump. Open the core dump with Delve to see the *exact* state of memory when it died.
+import (
+    "log"
+    "golang.org/x/sys/unix"
+)
 
-```bash
-dlv core ./myapp core.1234
-```
+func main() {
+    // Example: prevent a secret buffer from being swapped to disk (best-effort).
+    secret := make([]byte, 4096)
+    copy(secret, []byte("super-secret-token"))
 
-## 3. eBPF (Cilium/Ebpf)
-eBPF is the kernel superpower of 2026. You can write programs that run *inside the Linux Kernel* to filter packets or trace functions safely.
+    if err := unix.Mlock(secret); err != nil {
+        log.Printf("mlock: %v (may need privileges)", err)
+    }
+    defer func() {
+        // Zero then unlock
+        for i := range secret {
+            secret[i] = 0
+        }
+        _ = unix.Munlock(secret)
+    }()
 
-Go is the primary language for writing eBPF *userspace* controllers (Cilium, Falco).
-Library: `github.com/cilium/ebpf`.
-
-## 4. `unsafe` Pointer Magic
-Sometimes you need to read a C struct or cast bytes to floats instantly.
-```go
-import "unsafe"
-
-func BytesToFloat(b []byte) float64 {
-    return *(*float64)(unsafe.Pointer(&b[0]))
+    // use secret...
+    _ = secret
 }
 ```
-**Warning:** This is dangerous. It bypasses types. But it's necessary for zero-copy parsing of network packets or binary formats.
+
+### File locking
+
+```go
+func lockFile(fd int) error {
+    return unix.Flock(fd, unix.LOCK_EX|unix.LOCK_NB)
+}
+```
+
+### Raising file descriptor limits (process)
+
+Often better done by systemd/`ulimit`, but diagnostics help:
+
+```go
+var rLimit unix.Rlimit
+if err := unix.Getrlimit(unix.RLIMIT_NOFILE, &rLimit); err != nil {
+    log.Fatal(err)
+}
+log.Printf("nofile cur=%d max=%d", rLimit.Cur, rLimit.Max)
+```
+
+**Portability:** `unix` builds are OS-specific. Use build tags or high-level wrappers for multi-OS products.
+
+## Debugging with Delve
+
+**Delve** (`dlv`) understands goroutines, channels, and Go's runtime—unlike gdb alone.
+
+```bash
+go install github.com/go-delve/delve/cmd/dlv@latest
+
+# local
+dlv debug ./cmd/server -- --config config.yaml
+
+# attach
+dlv attach $(pgrep -n myapp)
+
+# tests
+dlv test ./internal/store -- -test.run TestRace
+```
+
+### Core dumps
+
+On a crash with core dumps enabled:
+
+```bash
+ulimit -c unlimited
+# ... crash ...
+dlv core ./myapp core.12345
+```
+
+Inside Delve: `bt`, `goroutines`, `frame`, `print varname`.
+
+### Remote debugging sketch
+
+```bash
+# on server
+dlv exec ./myapp --headless --listen=:2345 --api-version=2 --accept-multiclient
+
+# local IDE / dlv connect :2345
+```
+
+**Never** leave headless Delve exposed on a public interface in production.
+
+## eBPF Userspace in Go
+
+eBPF programs run in the kernel (restricted VM). Go is the dominant language for **loaders and control planes** (Cilium, many observability agents) via `github.com/cilium/ebpf`.
+
+```text
+[ kernel eBPF program ]  <--- map read/write --->  [ Go agent ]
+   packet filter / probe                              metrics, policy, UI
+```
+
+Conceptual load flow:
+
+```go
+// Illustrative — real programs use bpf2go generated specs.
+spec, err := ebpf.LoadCollectionSpec("bpf/prog.o")
+if err != nil {
+    log.Fatal(err)
+}
+coll, err := ebpf.NewCollection(spec)
+if err != nil {
+    log.Fatal(err)
+}
+defer coll.Close()
+
+// Read a map of counters
+var key uint32 = 0
+var value uint64
+if err := coll.Maps["pkt_count"].Lookup(&key, &value); err == nil {
+    log.Printf("packets=%d", value)
+}
+```
+
+Requirements: Linux, appropriate kernel version, often `CAP_BPF` / `CAP_SYS_ADMIN` or unprivileged eBPF policy depending on distro. This is **not** portable to FreeBSD/macOS the same way.
+
+## `unsafe` for Zero-Copy Views
+
+`unsafe` bypasses type and memory safety. Use only with invariants you can prove.
+
+```go
+package endianx
+
+import (
+    "encoding/binary"
+    "unsafe"
+)
+
+// BytesToFloat64LE interprets the first 8 bytes as a little-endian float64.
+// Prefer encoding/binary in application code; this shows the unsafe cast pattern.
+func BytesToFloat64LE(b []byte) float64 {
+    if len(b) < 8 {
+        panic("short buffer")
+    }
+    // Safer portable approach:
+    u := binary.LittleEndian.Uint64(b[:8])
+    return *(*float64)(unsafe.Pointer(&u))
+}
+```
+
+Rules of thumb:
+
+1. Document alignment and lifetime; the backing array must live as long as the view.
+2. Prefer `encoding/binary`, `bytealg`, or generated code before `unsafe`.
+3. Gate with build tags / architecture checks when needed.
+4. Race detector and tests still matter—`unsafe` does not excuse data races.
+
+### Slice header caution
+
+```go
+// Dangerous if misused: sharing underlying array across ownership boundaries.
+func noCopyString(b []byte) string {
+    return unsafe.String(unsafe.SliceData(b), len(b))
+}
+// Only valid while b is not mutated; do not return if caller may recycle b.
+```
+
+Go 1.20+ `unsafe.String` / `unsafe.Slice` make intent clearer than raw pointer casts—still sharp tools.
+
+## mmap for Large Read-Only Data
+
+```go
+f, err := os.Open("large.bin")
+if err != nil {
+    return err
+}
+defer f.Close()
+
+st, err := f.Stat()
+if err != nil {
+    return err
+}
+data, err := unix.Mmap(int(f.Fd()), 0, int(st.Size()),
+    unix.PROT_READ, unix.MAP_SHARED)
+if err != nil {
+    return err
+}
+defer unix.Munmap(data)
+
+// read-only use of data
+_ = data[0]
+```
+
+Good for large static corpora; bad for small files where `os.ReadFile` is simpler.
+
+## cgo Boundary (Reminder)
+
+cgo lets you call C, but:
+
+- Slows builds and complicates cross-compilation
+- Shares the C world of undefined behavior
+- Has a cost crossing the boundary under high call rates
+
+Prefer pure Go or subprocess isolation unless a library is irreplaceable. See the dedicated cgo chapter for details.
+
+## Production Checklist
+
+- [ ] Prefer stdlib / high-level packages before `x/sys` and `unsafe`
+- [ ] OS-specific code isolated behind interfaces + build tags
+- [ ] Delve/core dump workflow documented for on-call
+- [ ] eBPF agents least-privilege; never world-open debug ports
+- [ ] Secrets: mlock where required + zeroization; still prefer hardware/HSM when critical
+- [ ] Integration tests on the real target kernel/OS for syscall features
+- [ ] `go test -race` on all packages that share memory
+
+## Common Pitfalls
+
+1. **Using frozen `syscall` for new code** — miss fixes and constants; use `x/sys`.
+2. **Ignoring errors from `Mlock` / `Flock`** — silent degraded security or locking.
+3. **eBPF on the wrong kernel** — load fails mysteriously; pin kernel versions in ops docs.
+4. **`unsafe` aliasing bugs** — GC moves aren't the issue (pinned carefully) so much as **lifetime and mutation**.
+5. **Privileged containers by default** — systems agents often over-request `privileged: true`.
+6. **Core dumps with secrets** — cores can contain tokens; encrypt at rest and restrict access.
+
+## Exercises
+
+1. **Flock CLI** — Write a tiny program that takes a lock file path, `LOCK_EX`, prints “locked”, sleeps 10s; run two instances and show the second fails with `LOCK_NB`.
+2. **Rlimit log** — Print `RLIMIT_NOFILE` at startup; document how systemd `LimitNOFILE` changes it.
+3. **Delve session** — Break on a handler, inspect a request struct, continue.
+4. **unsafe round-trip** — Convert `float64` → bytes → `float64` with `encoding/binary` and with `unsafe`; fuzz compare.
+5. **mmap read** — mmap a file of uint64 LE values and sum them; compare speed to `os.ReadFile` for a 100MB file.
+6. **Build tags** — Provide `mlock_linux.go` and a no-op stub for other OSes; `GOOS=darwin go build` must succeed.
+
+## More examples
+
+### Length-prefix binary frame (encode/decode)
+
+```bash
+mkdir -p /tmp/go-sys-frame && cd /tmp/go-sys-frame
+go mod init example.com/sys-frame
+```
+
+Save as `main.go`:
+
+```go
+package main
+
+import (
+	"bytes"
+	"encoding/binary"
+	"fmt"
+	"io"
+)
+
+func writeFrame(w io.Writer, payload []byte) error {
+	var hdr [4]byte
+	binary.BigEndian.PutUint32(hdr[:], uint32(len(payload)))
+	if _, err := w.Write(hdr[:]); err != nil {
+		return err
+	}
+	_, err := w.Write(payload)
+	return err
+}
+
+func readFrame(r io.Reader) ([]byte, error) {
+	var hdr [4]byte
+	if _, err := io.ReadFull(r, hdr[:]); err != nil {
+		return nil, err
+	}
+	n := binary.BigEndian.Uint32(hdr[:])
+	if n > 1<<20 {
+		return nil, fmt.Errorf("frame too large: %d", n)
+	}
+	buf := make([]byte, n)
+	if _, err := io.ReadFull(r, buf); err != nil {
+		return nil, err
+	}
+	return buf, nil
+}
+
+func main() {
+	var buf bytes.Buffer
+	_ = writeFrame(&buf, []byte("ping"))
+	_ = writeFrame(&buf, []byte("pong-payload"))
+	a, _ := readFrame(&buf)
+	b, _ := readFrame(&buf)
+	fmt.Println(string(a), string(b), "left", buf.Len())
+}
+```
+
+```bash
+go run .
+```
+
+**Expected output:**
+
+```
+ping pong-payload left 0
+```
+
+### Little-endian uint64 round-trip
+
+```bash
+mkdir -p /tmp/go-sys-le && cd /tmp/go-sys-le
+go mod init example.com/sys-le
+```
+
+Save as `main.go`:
+
+```go
+package main
+
+import (
+	"encoding/binary"
+	"fmt"
+)
+
+func main() {
+	var raw [8]byte
+	binary.LittleEndian.PutUint64(raw[:], 0x0102030405060708)
+	fmt.Printf("bytes: % x\n", raw)
+	v := binary.LittleEndian.Uint64(raw[:])
+	fmt.Printf("value: 0x%x\n", v)
+}
+```
+
+```bash
+go run .
+```
+
+**Expected output:**
+
+```
+bytes: 08 07 06 05 04 03 02 01
+value: 0x102030405060708
+```
+
+## Runnable example
+
+Systems programming often means process identity, file locks, and child processes. This program prints OS/runtime identity, uses an exclusive lock file, and runs a short child with `CommandContext`.
+
+```bash
+mkdir -p /tmp/go-systems && cd /tmp/go-systems
+go mod init example.com/systems
+```
+
+Save as `main.go`:
+
+```go
+package main
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
+	"time"
+)
+
+func main() {
+	fmt.Printf("goos=%s pid=%d goroutines=%d\n", runtime.GOOS, os.Getpid(), runtime.NumGoroutine())
+
+	dir := filepath.Join(os.TempDir(), "go-systems-demo")
+	_ = os.MkdirAll(dir, 0o750)
+	lockPath := filepath.Join(dir, "app.lock")
+
+	// Exclusive lock via O_EXCL lockfile (simple, portable pattern for single-instance tools).
+	lf, err := os.OpenFile(lockPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	if err != nil {
+		fmt.Println("lock busy or error:", err)
+	} else {
+		fmt.Fprintln(lf, os.Getpid())
+		fmt.Println("acquired lock:", lockPath)
+		defer func() {
+			lf.Close()
+			_ = os.Remove(lockPath)
+			fmt.Println("released lock")
+		}()
+	}
+
+	// Second acquire should fail while first holds O_EXCL file.
+	_, err = os.OpenFile(lockPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	fmt.Println("second lock failed:", err != nil)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "echo", "child-hello")
+	out, err := cmd.CombinedOutput()
+	fmt.Printf("child: %q err=%v\n", string(out), err)
+
+	// Cancelled child
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel2()
+	slow := exec.CommandContext(ctx2, "sleep", "2")
+	err = slow.Run()
+	fmt.Println("sleep cancelled:", err != nil)
+
+	fmt.Println("systems demo ok")
+}
+```
+
+```bash
+go run .
+```
+
+**Expected output** (illustrative):
+
+```
+goos=darwin pid=12345 goroutines=1
+acquired lock: /tmp/go-systems-demo/app.lock
+second lock failed: true
+child: "child-hello\n" err=<nil>
+sleep cancelled: true
+released lock
+systems demo ok
+```
+
+**What to notice**
+
+- `CommandContext` kills children when the deadline hits—critical for supervisors and CI wrappers.
+- Exclusive lock files (`O_EXCL`) are a portable single-instance pattern; Linux production often prefers `flock` via `golang.org/x/sys/unix` (not stdlib).
+- Always clean lock files in `defer` on graceful exit; crash may leave stale locks (document recovery).
+
+**Try next**
+
+- On Linux, experiment with `unix.Flock` from `golang.org/x/sys` (outside pure stdlib).
+- Print open file soft limit via platform APIs or document `ulimit -n` next to your service unit.
+
+## Related Topics
+
+- [Unsafe](../09-performance-tooling/55-unsafe.qmd)
+- [cgo](../09-performance-tooling/56-cgo.qmd)
+- [Go on NixOS & FreeBSD](../10-infrastructure/72-nixos-freebsd.qmd)
+- [Application Hardening](../11-security/81-hardening.qmd)

@@ -1,12 +1,19 @@
 ---
-title: "141 Processes, Signals, and Supervisors"
+title: "Processes, Signals, and Supervisors"
 ---
 
-# 141 Processes, Signals, and Supervisors
+# Processes, Signals, and Supervisors
 
-Process supervision is about controlling state transitions under uncertainty.
+Process supervision is about controlling **state transitions under uncertainty**. Crashes, deploys, OOMs, and hung IO all force transitions; production software defines what happens next.
 
-## Lifecycle Model
+## Why / Overview
+
+A Go binary is a process. Orchestrators (systemd, Kubernetes, Nomad, Docker) are supervisors. Your code must cooperate with them:
+
+- Start quickly enough to pass readiness
+- Serve while healthy
+- On stop signal: drain work, close listeners, exit
+- On failure: exit with a meaningful code so the supervisor can decide restart policy
 
 ```text
 starting -> running -> stopping -> exited
@@ -14,27 +21,486 @@ starting -> running -> stopping -> exited
                 +-> crash-+
 ```
 
-A production supervisor defines what happens in each transition, including restart policy and shutdown deadlines.
+## Signals You Must Handle
 
-## Signal Semantics
+| Signal | Typical meaning | Your response |
+|--------|-----------------|---------------|
+| `SIGTERM` | Graceful stop (K8s, systemd) | Drain + exit 0 if clean |
+| `SIGINT` | Ctrl-C | Same as SIGTERM for services |
+| `SIGHUP` | Reload config (classic Unix) | Optional: reload, or ignore |
+| `SIGKILL` | Hard kill (uncatchable) | Cannot handle; keep critical writes atomic |
+| `SIGPIPE` | Write to closed pipe | Often ignored; CLI tools should handle `EPIPE` |
 
-- `SIGTERM`: request graceful shutdown.
-- `SIGINT`: interactive stop (often treated similarly).
-- `SIGKILL`: immediate termination (no cleanup).
+```go
+ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+defer stop()
+```
 
-Programs should handle `SIGTERM`/`SIGINT` by draining in-flight work, closing listeners, and exiting with clear status.
+`NotifyContext` cancels when a signal arrives. Use that `ctx` everywhere: HTTP servers, worker loops, `exec.CommandContext`.
 
-## Restart Policy
+## Graceful Shutdown Pattern
 
-Blind restart loops can worsen incidents. Prefer bounded backoff with jitter and an upper retry ceiling.
+```go
+package main
 
-## Observability Requirements
+import (
+	"context"
+	"errors"
+	"log/slog"
+	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
+)
 
-A supervisor should emit structured events for:
+func main() {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
 
-- process start/exit code
-- restart reason
-- shutdown duration
-- signal received
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /work", func(w http.ResponseWriter, r *http.Request) {
+		// Honor cancellation so Shutdown can finish.
+		select {
+		case <-r.Context().Done():
+			return
+		case <-time.After(2 * time.Second):
+			w.Write([]byte("done"))
+		}
+	})
 
-These events are essential during incident reconstruction.
+	srv := &http.Server{Addr: ":8080", Handler: mux, ReadHeaderTimeout: 5 * time.Second}
+
+	errCh := make(chan error, 1)
+	go func() {
+		slog.Info("listening", "addr", srv.Addr)
+		errCh <- srv.ListenAndServe()
+	}()
+
+	select {
+	case <-ctx.Done():
+		slog.Info("signal received, shutting down")
+	case err := <-errCh:
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
+			slog.Error("server failed", "err", err)
+			os.Exit(1)
+		}
+	}
+
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	if err := srv.Shutdown(shutdownCtx); err != nil {
+		slog.Error("graceful shutdown failed", "err", err)
+		_ = srv.Close()
+		os.Exit(1)
+	}
+	slog.Info("bye")
+}
+```
+
+### Two-phase stop
+
+1. **Soft deadline** (e.g. 15s): stop accepting, drain in-flight.
+2. **Hard deadline**: cancel contexts, close forcibly, exit non-zero if work abandoned.
+
+Kubernetes: `terminationGracePeriodSeconds` must be **greater** than your soft deadline, or you get SIGKILL mid-drain.
+
+## Exit Codes as API
+
+| Code | Convention |
+|------|------------|
+| 0 | Success |
+| 1 | General failure |
+| 2 | Misuse / bad flags (CLI) |
+| 130 | Interrupted by SIGINT (128+2) often |
+| 137 | SIGKILL / OOM kill (128+9) often |
+| 143 | SIGTERM (128+15) often |
+
+Supervisors and CI branch on these. Do not `os.Exit(0)` after a failed deploy migration.
+
+```go
+func main() {
+	if err := run(); err != nil {
+		slog.Error("exit", "err", err)
+		os.Exit(1)
+	}
+}
+```
+
+Keep `os.Exit` in `main` only so deferred cleanup runs.
+
+## Child Processes
+
+### Always use context
+
+```go
+cmd := exec.CommandContext(ctx, "ffmpeg", args...)
+cmd.Stdout = &buf
+cmd.Stderr = &errBuf
+if err := cmd.Run(); err != nil {
+	return fmt.Errorf("ffmpeg: %w: %s", err, errBuf.String())
+}
+```
+
+When `ctx` cancels, Go sends `SIGKILL` to the child by default (after `CommandContext` cancel). For graceful child stop, start with `cmd.Start()`, signal `SIGTERM`, wait, then kill.
+
+```go
+func runGraceful(ctx context.Context, name string, args ...string) error {
+	cmd := exec.Command(name, args...)
+	if err := cmd.Start(); err != nil {
+		return err
+	}
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+
+	select {
+	case err := <-done:
+		return err
+	case <-ctx.Done():
+		_ = cmd.Process.Signal(syscall.SIGTERM)
+		select {
+		case err := <-done:
+			return err
+		case <-time.After(5 * time.Second):
+			_ = cmd.Process.Kill()
+			return <-done
+		}
+	}
+}
+```
+
+### Avoid shell
+
+```go
+// BAD: injection + opaque failures
+// exec.Command("sh", "-c", "do-thing "+user)
+
+// GOOD
+exec.CommandContext(ctx, "/usr/bin/do-thing", userArg)
+```
+
+### Process groups
+
+When your child spawns grandchildren, killing only the direct child can leave orphans. On Unix, set a process group and signal the group (advanced; platform-specific). Document behavior for plugin systems.
+
+## Supervisor Policies
+
+Whether you write a supervisor or rely on K8s:
+
+| Policy | Behavior | Risk |
+|--------|----------|------|
+| Always restart | Crash loop | Maskes config bugs; thrashes |
+| On-failure | Restart non-zero only | Good default |
+| Backoff + jitter | Delay restarts | Prevents restart storms |
+| Max attempts | Give up / page | Surfaces poison configs |
+| Rate limit | N restarts / window | Protects cluster |
+
+```text
+crash -> wait min(cap, base*2^n) + jitter -> restart
+         if n > max: alert and stop
+```
+
+**Never** restart blindly without backoff when the crash cause is bad config — you will burn CPU and spam logs.
+
+## Readiness vs Liveness (process view)
+
+- **Liveness failure** → supervisor restarts process (hung deadlock).
+- **Readiness failure** → leave process up but remove from LB (warming, dependency down).
+
+Implementing readiness that always equals "process started" defeats the purpose. See distributed infra health-check chapter for HTTP shapes.
+
+## Observability for Process Lifecycle
+
+Emit structured events:
+
+```go
+slog.Info("process_start", "version", version, "pid", os.Getpid())
+slog.Info("signal", "sig", "SIGTERM")
+slog.Info("shutdown_begin")
+slog.Info("shutdown_end", "dur_ms", dur.Milliseconds(), "exit_hint", 0)
+```
+
+Metrics: `process_start_time`, `shutdown_duration_seconds`, `child_exit_total{code,cmd}`, restart counts if you supervise.
+
+## PID 1 and Containers
+
+In containers, your app may be PID 1. PID 1 has special signal and zombie-reaping responsibilities. Prefer a tiny init (`tini`, dumb-init) or ensure you wait on children. Go apps that spawn children without reaping can accumulate zombies.
+
+## Production Checklist
+
+- [ ] `signal.NotifyContext` for SIGTERM/SIGINT
+- [ ] Soft shutdown deadline < orchestrator grace period
+- [ ] Handlers/workers honor context cancel
+- [ ] Children launched with `CommandContext` or explicit term/kill
+- [ ] No `os.Exit` in libraries
+- [ ] Meaningful exit codes
+- [ ] Restart backoff at supervisor layer
+- [ ] Logs for signal, shutdown duration, child failures
+- [ ] Liveness ≠ readiness semantics documented
+
+## Common Pitfalls
+
+1. **Ignoring SIGTERM** — K8s waits, then SIGKILL mid-request.
+2. **Shutdown longer than grace period** — always killed.
+3. **Goroutines without context** — drain never finishes.
+4. **`log.Fatal` in hot paths** — skips defers.
+5. **Restart loop on bad config** — fix with crash backoff + config validation at start.
+6. **Orphan children** after parent exit.
+7. **Treating OOM kills as app bugs only** — sometimes limits are wrong; still exit 137 is a signal.
+
+## Exercises
+
+1. Write a server that sleeps 10s per request; send SIGTERM; show that without context the process hangs until kill.
+2. Fix it with context-aware handlers and `Shutdown`; measure drain time.
+3. Spawn `sleep 60` with `CommandContext`; cancel after 1s; confirm child dies.
+4. Implement graceful child termination (SIGTERM then SIGKILL).
+5. Simulate crash loop with a binary that exits 1; write a supervisor with exponential backoff + max 5 attempts.
+6. Document your cluster's `terminationGracePeriodSeconds` vs app shutdown timeout.
+7. Create a child that spawns another child; observe zombies without `Wait`; fix.
+8. Map exit codes in CI for a CLI tool (0/1/2).
+9. Add slog events for start/signal/shutdown; reconstruct a deploy timeline from logs alone.
+10. Compare systemd `Restart=on-failure` vs Kubernetes restartPolicy for the same binary.
+
+## More examples
+
+### HTTP graceful shutdown on signal context
+
+```bash
+mkdir -p /tmp/go-graceful-http && cd /tmp/go-graceful-http
+go mod init example.com/graceful-http
+```
+
+Save as `main.go`:
+
+```go
+package main
+
+import (
+	"context"
+	"fmt"
+	"net"
+	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
+)
+
+func main() {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /ok", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintln(w, "ok")
+	})
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		panic(err)
+	}
+	srv := &http.Server{Handler: mux}
+
+	errCh := make(chan error, 1)
+	go func() { errCh <- srv.Serve(ln) }()
+
+	// Simulate orchestrator SIGTERM without needing an external kill.
+	go func() {
+		time.Sleep(30 * time.Millisecond)
+		stop()
+	}()
+
+	resp, err := http.Get("http://" + ln.Addr().String() + "/ok")
+	if err != nil {
+		panic(err)
+	}
+	resp.Body.Close()
+	fmt.Println("served:", resp.StatusCode)
+
+	<-ctx.Done()
+	shCtx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	if err := srv.Shutdown(shCtx); err != nil {
+		panic(err)
+	}
+	fmt.Println("shutdown:", <-errCh)
+}
+```
+
+```bash
+go run .
+```
+
+**Expected output:**
+
+```
+served: 200
+shutdown: http: Server closed
+```
+
+### Exit codes for CLI contract
+
+```bash
+mkdir -p /tmp/go-exit-codes && cd /tmp/go-exit-codes
+go mod init example.com/exit-codes
+```
+
+Save as `main.go`:
+
+```go
+package main
+
+import (
+	"errors"
+	"fmt"
+	"os"
+)
+
+func run(args []string) error {
+	if len(args) < 1 {
+		return errUsage
+	}
+	if args[0] == "fail" {
+		return errors.New("runtime boom")
+	}
+	fmt.Println("ok:", args[0])
+	return nil
+}
+
+var errUsage = errors.New("usage: tool <name>")
+
+func main() {
+	// Demo mapping without os.Exit so the process stays testable.
+	for _, args := range [][]string{{}, {"fail"}, {"ship"}} {
+		err := run(args)
+		code := 0
+		switch {
+		case errors.Is(err, errUsage):
+			code = 2
+		case err != nil:
+			code = 1
+		}
+		fmt.Printf("args=%v code=%d err=%v\n", args, code, err)
+	}
+}
+```
+
+```bash
+go run .
+```
+
+**Expected output:**
+
+```
+args=[] code=2 err=usage: tool <name>
+args=[fail] code=1 err=runtime boom
+ok: ship
+args=[ship] code=0 err=<nil>
+```
+
+## Runnable example
+
+Graceful signal handling with `signal.NotifyContext`, a child process under `CommandContext`, and a tiny supervisor backoff loop—all in one stdlib program.
+
+```bash
+mkdir -p /tmp/go-signals && cd /tmp/go-signals
+go mod init example.com/signals
+```
+
+Save as `main.go`:
+
+```go
+package main
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"os/exec"
+	"os/signal"
+	"syscall"
+	"time"
+)
+
+func supervisor(run func() error, maxAttempts int) error {
+	var delay = 50 * time.Millisecond
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		err := run()
+		if err == nil {
+			return nil
+		}
+		fmt.Printf("attempt %d failed: %v\n", attempt, err)
+		if attempt == maxAttempts {
+			return fmt.Errorf("gave up after %d attempts: %w", maxAttempts, err)
+		}
+		time.Sleep(delay)
+		delay *= 2
+	}
+	return nil
+}
+
+func main() {
+	// 1) Signal-aware context (demo: cancel after short timer to avoid interactive wait).
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	go func() {
+		time.Sleep(30 * time.Millisecond)
+		// Simulate supervisor/orchestrator stop without needing a real signal in CI.
+		stop()
+	}()
+
+	<-ctx.Done()
+	fmt.Println("shutdown signal path:", ctx.Err())
+
+	// 2) Child with deadline
+	cctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	cmd := exec.CommandContext(cctx, "sleep", "2")
+	err := cmd.Run()
+	fmt.Println("child cancelled:", err != nil)
+
+	// 3) Supervisor backoff: fail twice then succeed
+	var n int
+	err = supervisor(func() error {
+		n++
+		if n < 3 {
+			return fmt.Errorf("boom %d", n)
+		}
+		fmt.Println("worker healthy")
+		return nil
+	}, 5)
+	fmt.Println("supervisor err:", err)
+}
+```
+
+```bash
+go run .
+```
+
+**Expected output:**
+
+```
+shutdown signal path: context canceled
+child cancelled: true
+attempt 1 failed: boom 1
+attempt 2 failed: boom 2
+worker healthy
+supervisor err: <nil>
+```
+
+**What to notice**
+
+- Kubernetes/`docker stop` send SIGTERM first; apps must drain within the grace period or get SIGKILL.
+- `CommandContext` is how you avoid orphan helpers after cancel.
+- Supervisors need capped exponential backoff or they thundering-herd a bad config forever.
+
+**Try next**
+
+- Build a mini HTTP server and call `Shutdown` when the signal context cancels.
+- Map exit codes: `0` success, `1` runtime error, `2` usage error for a CLI.
+
+## Further Reading
+
+- `os/signal` package docs
+- Kubernetes termination lifecycle
+- Next: **Filesystem Automation and Safe IO**

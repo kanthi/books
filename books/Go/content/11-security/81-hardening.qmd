@@ -1,0 +1,718 @@
+---
+title: "Application Hardening"
+---
+
+# Application Hardening
+
+Security tools find known problems. **Hardening** is the engineering practice of making services difficult to exploit and safe to operate when something goes wrong. This chapter is the production checklist for Go services: least privilege, attack-surface reduction, input distrust, secure defaults, and fail-closed behavior.
+
+## Why Hardening Matters
+
+A service can pass `govulncheck` and still be fragile:
+
+- Debug endpoints exposed on the public interface
+- Overly broad filesystem or network capabilities
+- Missing request size limits (memory exhaustion)
+- Secrets loaded from env forever with no rotation path
+- Process running as root "because Docker made it easy"
+
+Hardening is not a single library. It is a set of defaults you enforce until they become muscle memory.
+
+```text
+attack surface
+  |-- network listeners
+  |-- auth boundaries
+  |-- parse/decode paths
+  |-- filesystem access
+  |-- subprocesses / cgo
+  |-- admin/debug tooling
+  +-- dependency graph
+```
+
+## Core Principles
+
+1. **Least privilege** — the process gets only what it needs (UID, capabilities, mounts, outbound destinations).
+2. **Fail closed** — ambiguous auth, bad config, or missing secrets stop the service rather than open a hole.
+3. **Distrust boundaries** — every byte from the network, queue, or filesystem is hostile until validated.
+4. **Defense in depth** — TLS + authn + authz + rate limits + audit logs; no single control is enough.
+5. **Operational security** — logs, metrics, and admin APIs are part of the threat model.
+
+## Hardening the Process
+
+### Drop privileges early
+
+Never keep root after bind if you can avoid it. Prefer binding via a privileged parent, then drop; or use non-privileged ports behind a reverse proxy.
+
+```go
+package main
+
+import (
+	"log"
+	"net/http"
+	"os"
+	"os/user"
+	"strconv"
+	"syscall"
+	"time"
+)
+
+func dropToUser(username string) error {
+	u, err := user.Lookup(username)
+	if err != nil {
+		return err
+	}
+	uid, _ := strconv.Atoi(u.Uid)
+	gid, _ := strconv.Atoi(u.Gid)
+	// Order matters: groups, then gid, then uid.
+	if err := syscall.Setgid(gid); err != nil {
+		return err
+	}
+	if err := syscall.Setuid(uid); err != nil {
+		return err
+	}
+	return nil
+}
+
+func main() {
+	// Prefer: start as non-root in the container/image.
+	// If you must bind privileged ports, drop after Listen.
+	if os.Geteuid() == 0 {
+		log.Println("warning: running as root; drop privileges in production")
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+
+	srv := &http.Server{
+		Addr:              ":8080",
+		Handler:           mux,
+		ReadHeaderTimeout: 5 * time.Second,
+	}
+	log.Fatal(srv.ListenAndServe())
+}
+```
+
+In practice use a container `USER` directive and a distroless/static image rather than runtime `setuid`. The Go code above is for understanding the principle.
+
+### Container baseline
+
+```dockerfile
+# multi-stage: build as root, run as non-root
+FROM golang:1.22-bookworm AS build
+WORKDIR /src
+COPY . .
+RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/app ./cmd/app
+
+FROM gcr.io/distroless/static-debian12:nonroot
+COPY --from=build /out/app /app
+USER nonroot:nonroot
+EXPOSE 8080
+ENTRYPOINT ["/app"]
+```
+
+Production notes:
+
+- `CGO_ENABLED=0` shrinks the binary and removes libc attack surface (when pure Go is viable).
+- `-trimpath` removes local paths from binaries (less recon info).
+- Read-only root filesystem + tmpfs for scratch dirs in orchestrators.
+- No shell in the image reduces interactive abuse after break-in.
+
+## Hardening the HTTP Surface
+
+### Timeouts and body limits
+
+Unbounded bodies and missing timeouts are DoS vectors.
+
+```go
+package httpserver
+
+import (
+	"context"
+	"encoding/json"
+	"io"
+	"net"
+	"net/http"
+	"time"
+)
+
+const maxBody = 1 << 20 // 1 MiB
+
+func NewServer(addr string, h http.Handler) *http.Server {
+	return &http.Server{
+		Addr:              addr,
+		Handler:           limitBody(h, maxBody),
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       60 * time.Second,
+		MaxHeaderBytes:    1 << 16, // 64 KiB
+		BaseContext: func(net.Listener) context.Context {
+			return context.Background()
+		},
+	}
+}
+
+func limitBody(next http.Handler, n int64) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		r.Body = http.MaxBytesReader(w, r.Body, n)
+		next.ServeHTTP(w, r)
+	})
+}
+
+// Safe JSON decode: size-limited + DisallowUnknownFields for strict APIs.
+func DecodeJSON(w http.ResponseWriter, r *http.Request, dst any) error {
+	defer r.Body.Close()
+	dec := json.NewDecoder(io.LimitReader(r.Body, maxBody))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(dst); err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return err
+	}
+	return nil
+}
+```
+
+Import `encoding/json` alongside the other packages in a real module.
+
+### Separate admin and data planes
+
+Never mount pprof or admin UIs on the public listener.
+
+```go
+package main
+
+import (
+	"log"
+	"net/http"
+	_ "net/http/pprof"
+)
+
+func main() {
+	// Public traffic only.
+	public := http.NewServeMux()
+	public.HandleFunc("GET /api/v1/items", listItems)
+	go func() {
+		log.Fatal(http.ListenAndServe(":8080", public))
+	}()
+
+	// Admin/debug on localhost or a private network interface only.
+	admin := http.NewServeMux()
+	admin.Handle("/debug/pprof/", http.DefaultServeMux)
+	admin.HandleFunc("GET /readyz", readiness)
+	log.Fatal(http.ListenAndServe("127.0.0.1:6060", admin))
+}
+```
+
+### Security headers and TLS defaults
+
+```go
+func securityHeaders(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.Header().Set("X-Frame-Options", "DENY")
+		w.Header().Set("Referrer-Policy", "no-referrer")
+		w.Header().Set("Content-Security-Policy", "default-src 'none'; frame-ancestors 'none'")
+		// HSTS only when TLS terminates here or is guaranteed upstream.
+		// w.Header().Set("Strict-Transport-Security", "max-age=63072000; includeSubDomains")
+		next.ServeHTTP(w, r)
+	})
+}
+```
+
+Prefer TLS 1.2+ with modern cipher suites; see the dedicated TLS chapter in part 17 for mTLS and cert rotation.
+
+## Input Validation and Injection Defense
+
+### SQL: parameters only
+
+```go
+// BAD: string concatenation → injection
+// q := "SELECT * FROM users WHERE name = '" + name + "'"
+
+// GOOD: placeholders
+row := db.QueryRowContext(ctx, `SELECT id, email FROM users WHERE name = $1`, name)
+```
+
+### Paths: root-jail every user-supplied path
+
+```go
+package safepath
+
+import (
+	"fmt"
+	"path/filepath"
+	"strings"
+)
+
+func UnderRoot(root, userPath string) (string, error) {
+	cleanRoot := filepath.Clean(root)
+	joined := filepath.Join(cleanRoot, userPath)
+	// Resolve ".." and symlinks carefully; Clean alone is not enough against all symlink escapes.
+	abs, err := filepath.Abs(joined)
+	if err != nil {
+		return "", err
+	}
+	rel, err := filepath.Rel(cleanRoot, abs)
+	if err != nil || strings.HasPrefix(rel, "..") {
+		return "", fmt.Errorf("path escapes root")
+	}
+	return abs, nil
+}
+```
+
+### Commands: never shell out with untrusted strings
+
+```go
+// BAD
+// exec.Command("sh", "-c", "convert "+userFile)
+
+// GOOD: fixed binary + argv array
+cmd := exec.CommandContext(ctx, "convert", userFile, outFile)
+```
+
+### Randomness and tokens
+
+Use `crypto/rand` for session IDs, CSRF tokens, and API keys — never `math/rand`.
+
+```go
+func randomToken(n int) (string, error) {
+	b := make([]byte, n)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(b), nil
+}
+```
+
+## Secrets and Configuration
+
+| Do | Don't |
+|----|--------|
+| Load from env / secret manager at runtime | Commit secrets to git |
+| Fail fast on missing required secrets | Silently use empty defaults |
+| Support dual-read during rotation | Hard-code a single static key forever |
+| Redact secrets in logs | Log full Authorization headers |
+
+```go
+func mustEnv(key string) string {
+	v := os.Getenv(key)
+	if v == "" {
+		slog.Error("missing required secret", "key", key)
+		os.Exit(1)
+	}
+	return v
+}
+```
+
+## Dependency and Supply-Chain Hardening
+
+1. Pin modules with `go.sum`; review unexpected upgrades in PRs.
+2. Run `govulncheck ./...` in CI on every change.
+3. Prefer small, well-maintained libraries over kitchen-sink frameworks for security-sensitive paths.
+4. Use `capslock` (or similar) when adopting new deps that should not need network/FS capabilities.
+5. Build with reproducible flags; publish checksums for release artifacts.
+
+```bash
+go install golang.org/x/vuln/cmd/govulncheck@latest
+govulncheck ./...
+gosec ./...
+```
+
+## Runtime Abuse Controls
+
+### Rate limiting (simple token bucket sketch)
+
+```go
+type limiter struct {
+	mu     sync.Mutex
+	tokens float64
+	max    float64
+	refill float64 // tokens per second
+	last   time.Time
+}
+
+func (l *limiter) Allow() bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	now := time.Now()
+	elapsed := now.Sub(l.last).Seconds()
+	l.last = now
+	l.tokens += elapsed * l.refill
+	if l.tokens > l.max {
+		l.tokens = l.max
+	}
+	if l.tokens < 1 {
+		return false
+	}
+	l.tokens--
+	return true
+}
+```
+
+Place rate limits per IP / per principal *after* authentication for authenticated APIs so one user cannot exhaust another's budget.
+
+### Panic recovery at the edge
+
+Recover panics in HTTP handlers so one bad request does not kill the process — but log stack traces and return 500, never continue with half-written responses.
+
+```go
+func recoverMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer func() {
+			if rec := recover(); rec != nil {
+				slog.Error("panic", "err", rec, "path", r.URL.Path)
+				http.Error(w, "internal error", http.StatusInternalServerError)
+			}
+		}()
+		next.ServeHTTP(w, r)
+	})
+}
+```
+
+## Production Hardening Checklist
+
+- [ ] Non-root process / distroless image
+- [ ] Read-only root FS where possible
+- [ ] Public listener has full timeout suite + body limits
+- [ ] Admin/pprof not on public interface
+- [ ] TLS 1.2+ (or terminated by a hardened proxy with the same bar)
+- [ ] Authn before authz; default deny
+- [ ] Parameterized queries; no shell interpolation
+- [ ] Path jail for file operations
+- [ ] Secrets from env/manager; fail-closed on missing
+- [ ] Structured logs with redaction
+- [ ] `govulncheck` + static security checks in CI
+- [ ] Graceful shutdown on SIGTERM with deadline
+- [ ] Resource limits (CPU/memory) set in orchestrator
+- [ ] Network policy: egress allowlist when feasible
+
+## Common Pitfalls
+
+1. **Trusting reverse proxies blindly** — if you use `X-Forwarded-For` for rate limits or auth, validate that only trusted proxies can set it.
+2. **Debug builds in prod** — race detector and extra logging are fine; open pprof on `0.0.0.0` is not.
+3. **“Internal” network = secure** — flat VPC trust is outdated; use mTLS or service identity between services.
+4. **Logging secrets** — JWT, cookies, and API keys leak through request dumps.
+5. **Unbounded fan-out** — one authenticated request spawning N unbounded downstream calls is a DoS amplifier.
+6. **Ignoring context** — operations that ignore cancellation hold resources under attack load.
+7. **World-writable files** — `0666`/`0777` permissions in services that write state.
+
+## Exercises
+
+1. Take a minimal `net/http` server and add body limits, header/read/write timeouts, and a max header size. Load-test with a slow client and confirm it disconnects.
+2. Split public and admin muxes; prove with `curl` that pprof is unreachable on `:8080`.
+3. Write a `UnderRoot` function and unit-test path traversal attempts (`../../etc/passwd`, absolute paths, symlink escapes if you resolve them).
+4. Introduce a deliberate SQL string concat and show `gosec` (or a review checklist) catching it; fix with placeholders.
+5. Implement fail-closed startup: missing `DATABASE_URL` must exit non-zero before listening.
+6. Add panic recovery middleware and a handler that panics; verify the process stays up and a 500 is returned.
+7. Build a multi-stage Dockerfile that runs as non-root and contains no shell; inspect the image.
+8. Implement a per-IP rate limiter middleware and verify 429 responses under burst.
+9. Audit your logs: log a fake Authorization header once, then add redaction so it never appears again.
+10. Run `govulncheck ./...` on a sample module and document how you would gate merges on new findings.
+
+## Further Reading
+
+- Go security policy and release notes for crypto changes
+- OWASP ASVS (application security verification)
+- Part 17 of this book: TLS/mTLS, authn/authz, secrets rotation
+- Previous chapter: security tooling (`govulncheck`, `gosec`, capability analysis)
+
+## More examples
+
+### Body limit + security headers middleware
+
+```bash
+mkdir -p /tmp/go-harden-mw && cd /tmp/go-harden-mw
+go mod init example.com/harden-mw
+```
+
+Save as `main.go`:
+
+```go
+package main
+
+import (
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+)
+
+func secureHeaders(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.Header().Set("X-Frame-Options", "DENY")
+		w.Header().Set("Referrer-Policy", "no-referrer")
+		next.ServeHTTP(w, r)
+	})
+}
+
+func maxBytes(n int64, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		r.Body = http.MaxBytesReader(w, r.Body, n)
+		next.ServeHTTP(w, r)
+	})
+}
+
+func main() {
+	h := secureHeaders(maxBytes(8, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, err := io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, "payload too large", http.StatusRequestEntityTooLarge)
+			return
+		}
+		fmt.Fprintf(w, "got %d bytes\n", len(b))
+	})))
+
+	// OK body
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader("hello"))
+	h.ServeHTTP(rr, req)
+	fmt.Println("small:", rr.Code, strings.TrimSpace(rr.Body.String()), rr.Header().Get("X-Content-Type-Options"))
+
+	// Oversized
+	rr = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodPost, "/", strings.NewReader("0123456789"))
+	h.ServeHTTP(rr, req)
+	fmt.Println("large:", rr.Code)
+}
+```
+
+```bash
+go run .
+```
+
+**Expected output:**
+
+```
+small: 200 got 5 bytes nosniff
+large: 413
+```
+
+### Fail-closed required config
+
+```bash
+mkdir -p /tmp/go-fail-closed && cd /tmp/go-fail-closed
+go mod init example.com/fail-closed
+```
+
+Save as `main.go`:
+
+```go
+package main
+
+import (
+	"fmt"
+	"os"
+)
+
+func requireEnv(keys ...string) error {
+	for _, k := range keys {
+		if os.Getenv(k) == "" {
+			return fmt.Errorf("missing required env %s", k)
+		}
+	}
+	return nil
+}
+
+func main() {
+	os.Unsetenv("DATABASE_URL")
+	os.Setenv("APP_SECRET", "x")
+	err := requireEnv("DATABASE_URL", "APP_SECRET")
+	fmt.Println("before:", err)
+
+	os.Setenv("DATABASE_URL", "postgres://local/app")
+	err = requireEnv("DATABASE_URL", "APP_SECRET")
+	fmt.Println("after:", err)
+}
+```
+
+```bash
+go run .
+```
+
+**Expected output:**
+
+```
+before: missing required env DATABASE_URL
+after: <nil>
+```
+
+## Runnable example
+
+Hardening is timeouts, body limits, path jails, and fail-closed config. This server rejects oversized bodies, blocks path escape, and requires a secret env var before listening.
+
+```bash
+mkdir -p /tmp/go-hardening && cd /tmp/go-hardening
+go mod init example.com/hardening
+```
+
+Save as `main.go`:
+
+```go
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+	"io"
+	"log"
+	"net"
+	"net/http"
+	"os"
+	"path/filepath"
+	"strings"
+	"time"
+)
+
+const maxBody = 1 << 10 // 1 KiB for the demo
+
+func underRoot(root, userPath string) (string, error) {
+	cleanRoot := filepath.Clean(root)
+	joined := filepath.Join(cleanRoot, userPath)
+	abs, err := filepath.Abs(joined)
+	if err != nil {
+		return "", err
+	}
+	rootAbs, err := filepath.Abs(cleanRoot)
+	if err != nil {
+		return "", err
+	}
+	rel, err := filepath.Rel(rootAbs, abs)
+	if err != nil || strings.HasPrefix(rel, "..") {
+		return "", fmt.Errorf("path escapes root")
+	}
+	return abs, nil
+}
+
+func limitBody(next http.Handler, n int64) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		r.Body = http.MaxBytesReader(w, r.Body, n)
+		next.ServeHTTP(w, r)
+	})
+}
+
+func securityHeaders(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.Header().Set("X-Frame-Options", "DENY")
+		next.ServeHTTP(w, r)
+	})
+}
+
+func main() {
+	// Fail closed in production: if os.Getenv("API_TOKEN") == "" { log.Fatal("missing API_TOKEN") }
+	token := os.Getenv("API_TOKEN")
+	if token == "" {
+		token = "dev-only-token"
+		fmt.Println("warning: API_TOKEN unset; using dev-only-token")
+	}
+	fmt.Println("token_configured:", token != "")
+
+	root := filepath.Join(os.TempDir(), "hardening-demo-root")
+	_ = os.MkdirAll(root, 0o750)
+	_ = os.WriteFile(filepath.Join(root, "note.txt"), []byte("safe\n"), 0o640)
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
+	})
+	mux.HandleFunc("POST /echo", func(w http.ResponseWriter, r *http.Request) {
+		b, err := io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, "payload too large or unreadable", http.StatusRequestEntityTooLarge)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"n": len(b)})
+	})
+	mux.HandleFunc("GET /file", func(w http.ResponseWriter, r *http.Request) {
+		name := r.URL.Query().Get("name")
+		path, err := underRoot(root, name)
+		if err != nil {
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return
+		}
+		b, err := os.ReadFile(path)
+		if err != nil {
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
+		_, _ = w.Write(b)
+	})
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		log.Fatal(err)
+	}
+	h := securityHeaders(limitBody(mux, maxBody))
+	srv := &http.Server{
+		Handler:           h,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       10 * time.Second,
+		WriteTimeout:      10 * time.Second,
+		MaxHeaderBytes:    1 << 14,
+	}
+	go func() { _ = srv.Serve(ln) }()
+	base := "http://" + ln.Addr().String()
+
+	// Self-tests.
+	resp, _ := http.Get(base + "/healthz")
+	fmt.Println("healthz:", resp.StatusCode)
+	resp.Body.Close()
+
+	resp, _ = http.Get(base + "/file?name=note.txt")
+	fmt.Println("file ok:", resp.StatusCode)
+	resp.Body.Close()
+
+	resp, _ = http.Get(base + "/file?name=../../etc/passwd")
+	fmt.Println("path escape:", resp.StatusCode)
+	resp.Body.Close()
+
+	big := strings.Repeat("x", int(maxBody)+10)
+	resp, err = http.Post(base+"/echo", "text/plain", strings.NewReader(big))
+	if err != nil {
+		fmt.Println("oversize post err:", err)
+	} else {
+		fmt.Println("oversize body:", resp.StatusCode)
+		resp.Body.Close()
+	}
+
+	_ = srv.Close()
+	fmt.Println("hardening demo done")
+	// Production: replace the soft default above with token := mustEnv("API_TOKEN").
+}
+```
+
+```bash
+go run .
+API_TOKEN=secret go run .
+```
+
+**Expected output** (illustrative):
+
+```
+warning: API_TOKEN unset; using dev-only-token
+token_configured: true
+healthz: 200
+file ok: 200
+path escape: 403
+oversize body: 413
+hardening demo done
+```
+
+**What to notice**
+
+- `http.MaxBytesReader` + server timeouts are first-line DoS controls.
+- Path jails need `filepath.Rel` / prefix checks—not only `Clean`.
+- Production should `log.Fatal` on missing secrets *before* `Listen` (no soft defaults).
+
+**Try next**
+
+- Mount pprof on `127.0.0.1:6060` only; prove it is unreachable on the public mux.
+- Replace the demo token default with hard fail-closed exit when `API_TOKEN` is unset.
+
+Next: once tooling and hardening defaults are in place, design patterns (SOLID-ish module boundaries) keep secure code maintainable — see `82-solid-design.qmd`.

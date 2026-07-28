@@ -1,34 +1,462 @@
 ---
-title: "161 Structured Logging and Correlation"
+title: "Structured Logging and Correlation"
 ---
 
-# 161 Structured Logging and Correlation
+# Structured Logging and Correlation
 
-Structured logs are event records, not formatted print statements.
+Structured logs are **event records**, not formatted print statements. In Go 1.21+, `log/slog` is the standard library foundation for production logging.
 
-## Correlation Model
+## Why / Overview
+
+`fmt.Println` and free-form `log.Printf` fail at scale:
+
+- Cannot reliably filter by field
+- Cannot join with traces
+- Easy to leak secrets
+- Inconsistent shapes across services
 
 ```text
-request_id/trace_id
-   -> log fields
-   -> metric labels (careful cardinality)
-   -> trace attributes
+request_id / trace_id
+   -> log fields on every line for that request
+   -> (optional) metric exemplars
+   -> trace span attributes
 ```
 
-A single correlation key allows fast cross-signal debugging.
+## slog Fundamentals
 
-## Schema Discipline
+```go
+package main
 
-Keep a stable field set across services:
+import (
+	"log/slog"
+	"os"
+)
 
-- `service`
-- `env`
-- `request_id`
-- `trace_id`
-- `error_class`
+func main() {
+	h := slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
+		Level: slog.LevelInfo,
+	})
+	log := slog.New(h)
+	slog.SetDefault(log)
 
-Inconsistent schemas make incident search expensive and error-prone.
+	slog.Info("server start", "addr", ":8080", "version", version)
+}
+```
 
-## Security Consideration
+Levels: `Debug`, `Info`, `Warn`, `Error`. Prefer `Error` for handled failures that need attention; do not log+return the same error at every layer (pick a boundary).
 
-Logs are data exfiltration risk. Always design for redaction and sensitive-field filtering.
+### Loggers with attributes
+
+```go
+reqLog := slog.With(
+	"service", "checkout",
+	"env", os.Getenv("ENV"),
+)
+reqLog.Info("payment authorized", "amount_cents", 4200)
+```
+
+## Correlation IDs
+
+Generate or accept a request id at the edge; store in context; inject into logger.
+
+```go
+type ctxKey struct{}
+
+func WithRequestID(ctx context.Context, id string) context.Context {
+	return context.WithValue(ctx, ctxKey{}, id)
+}
+
+func RequestID(ctx context.Context) string {
+	if v, ok := ctx.Value(ctxKey{}).(string); ok {
+		return v
+	}
+	return ""
+}
+
+func requestIDMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		id := r.Header.Get("X-Request-Id")
+		if id == "" {
+			id = newID() // crypto/rand hex
+		}
+		ctx := WithRequestID(r.Context(), id)
+		w.Header().Set("X-Request-Id", id)
+		// Logger bound to request
+		log := slog.Default().With("request_id", id)
+		ctx = withLogger(ctx, log)
+		next.ServeHTTP(w, r.WithContext(ctx))
+	})
+}
+```
+
+Propagate `X-Request-Id` / `traceparent` on outbound calls.
+
+### Context-aware logging helpers
+
+```go
+func Info(ctx context.Context, msg string, args ...any) {
+	Logger(ctx).Info(msg, args...)
+}
+```
+
+Avoid putting the entire `*slog.Logger` in context if your style guide forbids context values — alternatives: explicit logger parameters. Many teams accept request-scoped logger in context for HTTP services.
+
+## Stable Schema
+
+Cross-service conventions beat clever one-offs:
+
+| Field | Meaning |
+|-------|---------|
+| `service` | Service name |
+| `env` | prod/stage |
+| `version` | build/version |
+| `request_id` | Edge correlation |
+| `trace_id` | Distributed trace |
+| `span_id` | Current span |
+| `method` / `path` / `route` | HTTP shape (`route` = template) |
+| `status` | HTTP status or RPC code |
+| `err` | Error string / type |
+| `dur_ms` | Duration |
+
+Use **route templates** (`/users/{id}`) not raw URLs in aggregatable fields.
+
+## What to Log
+
+| Do log | Avoid |
+|--------|--------|
+| Request start/end (or access log) | Full bodies by default |
+| Business state transitions | Secrets, tokens, passwords |
+| Dependency failures with class | Unbounded free text dumps |
+| Config version at start | PII without legal basis |
+
+Access log example:
+
+```go
+slog.Info("http_request",
+	"method", r.Method,
+	"route", routePattern,
+	"status", status,
+	"dur_ms", time.Since(start).Milliseconds(),
+	"bytes", n,
+)
+```
+
+## Redaction and Security
+
+Logs are a data store. Assume breach.
+
+```go
+func redactAuth(h http.Header) http.Header {
+	c := h.Clone()
+	if c.Get("Authorization") != "" {
+		c.Set("Authorization", "REDACTED")
+	}
+	if c.Get("Cookie") != "" {
+		c.Set("Cookie", "REDACTED")
+	}
+	return c
+}
+```
+
+For structured fields, prefer hashing user ids when only correlation is needed: `user_sha256=…`.
+
+## Sampling and Volume
+
+High-QPS services may sample successful debug/info events while always keeping errors:
+
+```go
+// Conceptual: custom Handler that drops Info with probability p
+// unless level >= Warn
+```
+
+Or sample at the shipper (Fluent Bit, Vector) — still emit errors at 100%.
+
+## Goroutines and Lost Context
+
+```go
+// BAD: detaches without ids
+go func() {
+	doWork(context.Background())
+}()
+
+// GOOD: carry request context (or derived with timeout)
+go func(ctx context.Context) {
+	defer func() { /* recover log with request_id */ }()
+	doWork(ctx)
+}(ctx)
+```
+
+If work outlives the request, extract ids into the child logger before detaching, and use a new root context with timeout.
+
+## slog Handlers and Production
+
+- **JSON** to stdout for containers (collectors parse)
+- **Text** for local dev
+- Fan-out handlers exist in community packages if you must dual-write
+
+```go
+// Level from env
+level := slog.LevelInfo
+if os.Getenv("LOG_LEVEL") == "debug" {
+	level = slog.LevelDebug
+}
+```
+
+## Testing Logs
+
+```go
+var buf bytes.Buffer
+log := slog.New(slog.NewJSONHandler(&buf, nil))
+// inject log into code under test
+// assert strings.Contains(buf.String(), `"msg":"paid"`)
+```
+
+Or use a test handler that records `[]slog.Record`.
+
+## Production Checklist
+
+- [ ] JSON structured logs in prod
+- [ ] Stable field vocabulary documented
+- [ ] request_id / trace_id on every request log line
+- [ ] Middleware sets and returns request id
+- [ ] Outbound calls propagate correlation headers
+- [ ] Secrets redacted; body logging opt-in only
+- [ ] Error logged once at boundary with stack or error chain
+- [ ] Levels configurable without recompile
+- [ ] Volume/sampling plan for hot paths
+
+## Common Pitfalls
+
+1. **String interpolation only** — `"user "+id` loses structure.
+2. **Different field names** per service (`req_id` vs `requestId`).
+3. **Logging entire `http.Request`** — headers leak cookies.
+4. **`log.Fatal` in libraries** — kills process.
+5. **Missing id after async hop**.
+6. **Debug left at Info** — cost and noise.
+7. **Duplicate error logs** every layer → alert fatigue.
+
+## Exercises
+
+1. Replace a `log.Printf` access log with `slog` JSON fields; query with `jq`.
+2. Implement request id middleware; prove id appears in handler logs and response header.
+3. Propagate id on an outbound `http.Client` call; log on both sides; join lines by id.
+4. Add redaction for Authorization; unit-test.
+5. Spawn a goroutine without context; show missing id; fix.
+6. Define a 10-field schema doc for your team; refactor one service to match.
+7. Emit `dur_ms` histogram-equivalent in logs only; discuss when metrics are better.
+8. Implement level-from-env; toggle debug in a running container via restart with env.
+9. Benchmark logging 10k info lines JSON vs text; note CPU.
+10. Create an incident drill: given only logs, reconstruct a failed checkout path.
+
+## More examples
+
+### slog groups and default attrs
+
+```bash
+mkdir -p /tmp/go-slog-group && cd /tmp/go-slog-group
+go mod init example.com/slog-group
+```
+
+Save as `main.go`:
+
+```go
+package main
+
+import (
+	"bytes"
+	"fmt"
+	"log/slog"
+	"strings"
+)
+
+func main() {
+	var buf bytes.Buffer
+	base := slog.New(slog.NewJSONHandler(&buf, nil))
+	log := base.With("service", "checkout", "env", "dev")
+	log.Info("paid",
+		slog.Group("user", "id", 42, "plan", "pro"),
+		"amount_cents", 999,
+	)
+	line := strings.TrimSpace(buf.String())
+	fmt.Println(line)
+	fmt.Println("has service:", strings.Contains(line, `"service":"checkout"`))
+	fmt.Println("has user group:", strings.Contains(line, `"user"`))
+}
+```
+
+```bash
+go run .
+```
+
+**Expected output** (time field varies):
+
+```
+{"time":"...","level":"INFO","msg":"paid","service":"checkout","env":"dev","user":{"id":42,"plan":"pro"},"amount_cents":999}
+has service: true
+has user group: true
+```
+
+### Child logger from context request id
+
+```bash
+mkdir -p /tmp/go-slog-child && cd /tmp/go-slog-child
+go mod init example.com/slog-child
+```
+
+Save as `main.go`:
+
+```go
+package main
+
+import (
+	"bytes"
+	"context"
+	"fmt"
+	"log/slog"
+	"strings"
+)
+
+type ctxKey string
+
+const ridKey ctxKey = "rid"
+
+func loggerWithRID(ctx context.Context, base *slog.Logger) *slog.Logger {
+	if v, ok := ctx.Value(ridKey).(string); ok && v != "" {
+		return base.With("request_id", v)
+	}
+	return base
+}
+
+func main() {
+	var buf bytes.Buffer
+	base := slog.New(slog.NewJSONHandler(&buf, nil))
+	ctx := context.WithValue(context.Background(), ridKey, "req-9")
+	log := loggerWithRID(ctx, base)
+	log.Info("step", "name", "charge")
+	fmt.Println(strings.Contains(buf.String(), "req-9"))
+}
+```
+
+```bash
+go run .
+```
+
+**Expected output:**
+
+```
+true
+```
+
+## Runnable example
+
+JSON `slog`, request-id middleware with `httptest`, outbound header propagation, and Authorization redaction.
+
+```bash
+mkdir -p /tmp/go-slog-corr && cd /tmp/go-slog-corr
+go mod init example.com/slog-corr
+```
+
+Save as `main.go`:
+
+```go
+package main
+
+import (
+	"bytes"
+	"context"
+	"fmt"
+	"log/slog"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+)
+
+type ctxKey string
+
+const ridKey ctxKey = "request_id"
+
+func withRID(ctx context.Context, id string) context.Context {
+	return context.WithValue(ctx, ridKey, id)
+}
+
+func rid(ctx context.Context) string {
+	if v, ok := ctx.Value(ridKey).(string); ok {
+		return v
+	}
+	return ""
+}
+
+func redactAuth(h http.Header) string {
+	v := h.Get("Authorization")
+	if v == "" {
+		return ""
+	}
+	return "REDACTED"
+}
+
+func main() {
+	var buf bytes.Buffer
+	log := slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo}))
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /api", func(w http.ResponseWriter, r *http.Request) {
+		log.Info("handler",
+			"request_id", rid(r.Context()),
+			"path", r.URL.Path,
+			"authorization", redactAuth(r.Header),
+		)
+		// simulate outbound call headers
+		out := httptest.NewRequest(http.MethodGet, "http://dep/x", nil)
+		out.Header.Set("X-Request-ID", rid(r.Context()))
+		fmt.Println("outbound X-Request-ID:", out.Header.Get("X-Request-ID"))
+		w.Header().Set("X-Request-ID", rid(r.Context()))
+		fmt.Fprintln(w, "ok")
+	})
+
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		id := r.Header.Get("X-Request-ID")
+		if id == "" {
+			id = "generated-1"
+		}
+		ctx := withRID(r.Context(), id)
+		mux.ServeHTTP(w, r.WithContext(ctx))
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/api", nil)
+	req.Header.Set("X-Request-ID", "abc-123")
+	req.Header.Set("Authorization", "Bearer super-secret")
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	fmt.Println("status:", rr.Code, "resp id:", rr.Header().Get("X-Request-ID"))
+	fmt.Println(strings.TrimSpace(buf.String()))
+}
+```
+
+```bash
+go run .
+```
+
+**Expected output:**
+
+```
+outbound X-Request-ID: abc-123
+status: 200 resp id: abc-123
+{"time":"...","level":"INFO","msg":"handler","request_id":"abc-123","path":"/api","authorization":"REDACTED"}
+```
+
+**What to notice**
+
+- Correlation requires the same id in middleware, handler logs, response, and outbound clients.
+- Never log raw bearer tokens; redact at the edge of the logger.
+- Prefer structured attrs over string interpolation.
+
+**Try next**
+
+- Level from `LOG_LEVEL` env; hide Debug when `info`.
+- Spawn work with `context` so child goroutines keep the request id.
+
+## Further Reading
+
+- Go `log/slog` package documentation
+- OpenTelemetry baggage vs attributes (next chapters)
+- Next: **Metrics and Prometheus Design**

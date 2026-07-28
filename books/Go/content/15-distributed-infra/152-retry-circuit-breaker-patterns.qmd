@@ -1,33 +1,563 @@
 ---
-title: "152 Retry and Circuit Breaker Patterns"
+title: "Retry and Circuit Breaker Patterns"
 ---
 
-# 152 Retry and Circuit Breaker Patterns
+# Retry and Circuit Breaker Patterns
 
-Retries and circuit breakers are control systems. Misconfigured control loops create amplification and cascades.
+Retries and circuit breakers are **control systems**. Misconfigured control loops create amplification and cascades. Well-tuned ones improve availability during partial outages.
 
-## Decision Flow
+## Why / Overview
 
-```text
-call fails -> classify error -> retryable?
-             |                  |
-             no                 yes -> backoff -> retry limit -> fail fast
-```
+Dependencies fail in bursts. Naive reactions:
 
-## Retry Boundaries
-
-Only retry operations that are safe (idempotent or explicitly deduplicated). Keep attempt count small and bound total elapsed time.
-
-## Circuit States
+- Retry immediately forever → melt the dependency
+- Never retry → convert blips into user errors
+- Cache open circuits without half-open probes → permanent brownout
 
 ```text
-closed -> open -> half-open -> closed
+call fails -> classify -> retryable?
+               |             |
+              no            yes -> backoff + jitter -> budget left? -> retry
+                                                      |
+                                                     no -> fail
 ```
 
-- Closed: normal traffic.
-- Open: reject quickly to reduce pressure.
-- Half-open: probe limited requests to test recovery.
+Circuit breaker adds a fast-path reject when failure rate is high:
 
-## Practical Outcome
+```text
+closed --(too many failures)--> open --(cooldown)--> half-open --(success)--> closed
+                                   ^                     |
+                                   +-----(fail)----------+
+```
 
-Well-tuned policies improve availability during partial outages; poorly tuned policies turn partial outages into system-wide incidents.
+## Error Classification
+
+```go
+type Class int
+
+const (
+	ClassSuccess Class = iota
+	ClassRetryable
+	ClassFatal
+	ClassCaller // 4xx-ish; do not retry
+)
+
+func classify(err error, status int) Class {
+	if err == nil && status >= 200 && status < 400 {
+		return ClassSuccess
+	}
+	if errors.Is(err, context.Canceled) {
+		return ClassFatal
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return ClassRetryable
+	}
+	if status == 429 || status == 408 || status >= 500 {
+		return ClassRetryable
+	}
+	if status >= 400 && status < 500 {
+		return ClassCaller
+	}
+	if err != nil {
+		return ClassRetryable // network blip heuristic
+	}
+	return ClassFatal
+}
+```
+
+Idempotency is orthogonal: a retryable transport failure on a non-idempotent POST is still dangerous.
+
+## Retry with Exponential Backoff and Jitter
+
+```go
+func retry[T any](ctx context.Context, maxAttempts int, base time.Duration, fn func(context.Context) (T, error)) (T, error) {
+	var zero T
+	var last error
+	backoff := base
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		v, err := fn(ctx)
+		if err == nil {
+			return v, nil
+		}
+		last = err
+		if classify(err, 0) != ClassRetryable || attempt == maxAttempts {
+			return zero, last
+		}
+		// Full jitter: sleep random [0, backoff]
+		delay := time.Duration(rand.Int63n(int64(backoff)))
+		select {
+		case <-ctx.Done():
+			return zero, ctx.Err()
+		case <-time.After(delay):
+		}
+		backoff *= 2
+		if backoff > 5*time.Second {
+			backoff = 5 * time.Second
+		}
+	}
+	return zero, last
+}
+```
+
+### Policy parameters
+
+| Param | Guidance |
+|-------|----------|
+| maxAttempts | 2–3 for user-facing; more only for background |
+| base delay | 20–100ms typical |
+| max delay | Cap to protect tail latency |
+| total budget | Parent context deadline is the true cap |
+| methods | GET/HEAD/PUT safe; POST needs idempotency key |
+
+### Decorrelated jitter (alternative)
+
+Often better under correlated failure than pure exponential; see AWS architecture blog on backoff. Implement when you have many clients.
+
+## Idempotency Keys
+
+```go
+req.Header.Set("Idempotency-Key", key) // client-generated UUID
+// server stores key -> result for retention window
+```
+
+Without server support, client retries of POST are a product decision, not just a transport decision.
+
+## Circuit Breaker Implementation (Educational)
+
+```go
+type state int
+
+const (
+	stateClosed state = iota
+	stateOpen
+	stateHalfOpen
+)
+
+type Breaker struct {
+	mu           sync.Mutex
+	st           state
+	failures     int
+	successes    int
+	openUntil    time.Time
+	failThreshold int
+	successThreshold int
+	cooldown     time.Duration
+}
+
+func (b *Breaker) Allow() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	now := time.Now()
+	switch b.st {
+	case stateOpen:
+		if now.After(b.openUntil) {
+			b.st = stateHalfOpen
+			b.successes = 0
+			return true // probe
+		}
+		return false
+	default:
+		return true
+	}
+}
+
+func (b *Breaker) Report(err error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if err == nil {
+		b.failures = 0
+		if b.st == stateHalfOpen {
+			b.successes++
+			if b.successes >= b.successThreshold {
+				b.st = stateClosed
+			}
+		}
+		return
+	}
+	b.failures++
+	if b.st == stateHalfOpen || b.failures >= b.failThreshold {
+		b.st = stateOpen
+		b.openUntil = time.Now().Add(b.cooldown)
+		b.failures = 0
+	}
+}
+```
+
+Usage:
+
+```go
+if !breaker.Allow() {
+	return ErrFailFast
+}
+v, err := call(ctx)
+breaker.Report(err)
+```
+
+Production libraries (`sony/gobreaker`, resilience middleware) add sliding windows and metrics — use them when possible; understand the state machine first.
+
+## Combining Retry and Breaker
+
+Order matters:
+
+```text
+if !breaker.Allow() -> fail fast (no retry storm)
+else attempt with retry **inside** half-open carefully (often single probe)
+```
+
+Do **not** let every request retry while open; the breaker already decided.
+
+## Budgets and Hedging
+
+**Hedging** (send a second request if the first is slow) can reduce tail latency but doubles load — only for idempotent, cheap reads, with strict limits.
+
+Prefer fixing the slow dependency and using proper deadlines.
+
+## Multi-Layer Retry Coordination
+
+| Layer | Should retry? |
+|-------|----------------|
+| Browser | Limited |
+| Edge proxy | GET only, 1× |
+| Service mesh | Align with app |
+| App HTTP client | Primary policy owner |
+| DB driver | Often internal; know it |
+
+Document **one primary** retry layer for each hop to avoid multiplicative attempts.
+
+## Observability
+
+Metrics:
+
+- `client_calls_total{dep,result}`
+- `client_retries_total{dep}`
+- `client_retry_exhaust_total{dep}`
+- `breaker_state{dep}` (0/1/2)
+- `breaker_open_total{dep}`
+- latency histograms **including** and **excluding** retries if possible
+
+Logs: attempt number, delay, final classification, correlation id.
+
+## Production Checklist
+
+- [ ] Classify errors; do not retry fatal/caller errors
+- [ ] Cap attempts and honor parent context
+- [ ] Jittered backoff with max delay
+- [ ] Idempotency story for mutating retries
+- [ ] Breaker on high-traffic dependencies
+- [ ] Half-open probe limits
+- [ ] Metrics for retries and breaker state
+- [ ] Coordinated policy with mesh/proxy
+- [ ] Load tests with injected 50% failure
+
+## Common Pitfalls
+
+1. **Retry on everything** including 400 and cancel.
+2. **No jitter** — synchronized herds.
+3. **Infinite retries** in background workers without poison handling.
+4. **Breaker thresholds too sensitive** — flapping.
+5. **Breaker without half-open** — never recovers automatically.
+6. **Hiding all errors as retryable network errors**.
+7. **Retry after context deadline already passed**.
+
+## Exercises
+
+1. Implement `retry` with full jitter; unit-test attempt count and context cancel mid-backoff.
+2. Simulate 50% failure; compare success rate with 1 vs 3 attempts; measure dependency QPS.
+3. Add a breaker; drive failure rate above threshold; prove fail-fast latency is low.
+4. Show flapping: threshold 1 failure — fix with windowed counts.
+5. Implement idempotent POST with an in-memory key store; retry safely.
+6. Trace a bug where proxy and client both retry twice (4 attempts); write a policy doc fixing it.
+7. Export breaker state as a Prometheus gauge; alert when open > 2 minutes.
+8. Compare exponential vs decorrelated jitter under synchronized clients (simple simulation).
+9. Ensure `context.Canceled` never increments retry metrics as dependency failure.
+10. Chaos: kill dependency for 30s; plot error rate with/without breaker.
+
+## More examples
+
+### Classify errors before retrying
+
+```bash
+mkdir -p /tmp/go-retry-class && cd /tmp/go-retry-class
+go mod init example.com/retry-class
+```
+
+Save as `main.go`:
+
+```go
+package main
+
+import (
+	"context"
+	"errors"
+	"fmt"
+)
+
+type class int
+
+const (
+	ok class = iota
+	retryable
+	fatal
+	caller
+)
+
+func classify(err error, status int) class {
+	if err == nil && status >= 200 && status < 400 {
+		return ok
+	}
+	if errors.Is(err, context.Canceled) {
+		return fatal
+	}
+	if status == 429 || status >= 500 {
+		return retryable
+	}
+	if status >= 400 {
+		return caller
+	}
+	if err != nil {
+		return retryable
+	}
+	return fatal
+}
+
+func main() {
+	cases := []struct {
+		err    error
+		status int
+	}{
+		{nil, 200},
+		{nil, 503},
+		{nil, 400},
+		{context.Canceled, 0},
+		{fmt.Errorf("net"), 0},
+	}
+	for _, c := range cases {
+		fmt.Printf("status=%d err=%v -> %v\n", c.status, c.err, classify(c.err, c.status))
+	}
+}
+```
+
+```bash
+go run .
+```
+
+**Expected output:**
+
+```
+status=200 err=<nil> -> 0
+status=503 err=<nil> -> 1
+status=400 err=<nil> -> 3
+status=0 err=context canceled -> 2
+status=0 err=net -> 1
+```
+
+### Budget-aware retry (honor parent deadline)
+
+```bash
+mkdir -p /tmp/go-retry-budget && cd /tmp/go-retry-budget
+go mod init example.com/retry-budget
+```
+
+Save as `main.go`:
+
+```go
+package main
+
+import (
+	"context"
+	"fmt"
+	"time"
+)
+
+func retry(ctx context.Context, attempts int, fn func() error) (int, error) {
+	var err error
+	for i := 1; i <= attempts; i++ {
+		if err = ctx.Err(); err != nil {
+			return i - 1, err
+		}
+		err = fn()
+		if err == nil {
+			return i, nil
+		}
+		select {
+		case <-ctx.Done():
+			return i, ctx.Err()
+		case <-time.After(15 * time.Millisecond):
+		}
+	}
+	return attempts, err
+}
+
+func main() {
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Millisecond)
+	defer cancel()
+	n, err := retry(ctx, 10, func() error { return fmt.Errorf("down") })
+	fmt.Println("stopped attempts:", n, "err:", err != nil)
+}
+```
+
+```bash
+go run .
+```
+
+**Expected output:**
+
+```
+stopped attempts: 2 err: true
+```
+
+(Exact attempt count may be 1–3 depending on scheduling; it must be **less than 10**.)
+
+## Runnable example
+
+Retries with full jitter plus a circuit breaker (closed → open → half-open) against a flaky in-process dependency.
+
+```bash
+mkdir -p /tmp/go-breaker && cd /tmp/go-breaker
+go mod init example.com/breaker
+```
+
+Save as `main.go`:
+
+```go
+package main
+
+import (
+	"context"
+	"fmt"
+	"math/rand"
+	"sync"
+	"time"
+)
+
+func retry(ctx context.Context, attempts int, fn func() error) error {
+	var err error
+	for i := 0; i < attempts; i++ {
+		if err = ctx.Err(); err != nil {
+			return err
+		}
+		err = fn()
+		if err == nil {
+			return nil
+		}
+		if i+1 == attempts {
+			break
+		}
+		// full jitter backoff
+		d := time.Duration(rand.Intn(int(20*time.Millisecond)<<i)) + time.Millisecond
+		t := time.NewTimer(d)
+		select {
+		case <-ctx.Done():
+			t.Stop()
+			return ctx.Err()
+		case <-t.C:
+		}
+	}
+	return err
+}
+
+type CircuitBreaker struct {
+	mu          sync.Mutex
+	failures    int
+	threshold   int
+	openUntil   time.Time
+	halfOpen    bool
+	coolDown    time.Duration
+}
+
+func NewCB(threshold int, coolDown time.Duration) *CircuitBreaker {
+	return &CircuitBreaker{threshold: threshold, coolDown: coolDown}
+}
+
+func (c *CircuitBreaker) Do(fn func() error) error {
+	c.mu.Lock()
+	now := time.Now()
+	if now.Before(c.openUntil) {
+		c.mu.Unlock()
+		return fmt.Errorf("breaker open")
+	}
+	if !c.openUntil.IsZero() && now.After(c.openUntil) {
+		c.halfOpen = true
+	}
+	c.mu.Unlock()
+
+	err := fn()
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if err != nil {
+		c.failures++
+		if c.halfOpen || c.failures >= c.threshold {
+			c.openUntil = time.Now().Add(c.coolDown)
+			c.halfOpen = false
+			c.failures = 0
+		}
+		return err
+	}
+	c.failures = 0
+	c.halfOpen = false
+	c.openUntil = time.Time{}
+	return nil
+}
+
+func main() {
+	var n int
+	flaky := func() error {
+		n++
+		if n < 3 {
+			return fmt.Errorf("transient")
+		}
+		return nil
+	}
+	err := retry(context.Background(), 5, flaky)
+	fmt.Println("retry ok:", err, "calls:", n)
+
+	cb := NewCB(3, 50*time.Millisecond)
+	fail := func() error { return fmt.Errorf("down") }
+	for i := 0; i < 5; i++ {
+		err := cb.Do(fail)
+		fmt.Printf("cb %d: %v\n", i+1, err)
+	}
+	time.Sleep(60 * time.Millisecond)
+	// half-open success resets
+	err = cb.Do(func() error { return nil })
+	fmt.Println("after cooldown success:", err)
+	err = cb.Do(fail)
+	fmt.Println("still closed after success, one fail:", err)
+}
+```
+
+```bash
+go run .
+```
+
+**Expected output** (illustrative):
+
+```
+retry ok: <nil> calls: 3
+cb 1: down
+cb 2: down
+cb 3: down
+cb 4: breaker open
+cb 5: breaker open
+after cooldown success: <nil>
+still closed after success, one fail: down
+```
+
+**What to notice**
+
+- Breakers fail fast when open—latency collapses vs waiting on a dead dependency.
+- Half-open allows a single probe after cooldown so the system can recover automatically.
+- Retries without jitter synchronize clients and create herds.
+
+**Try next**
+
+- Do not retry `context.Canceled` or HTTP 400.
+- Export breaker state as a gauge (`0/1`) in the metrics chapter style.
+
+## Further Reading
+
+- Release It! (circuit breaker popularization)
+- AWS architecture blog: exponential backoff and jitter
+- Previous: discovery/health as inputs to call eligibility
+- Next: **Queue Workers and Backpressure**

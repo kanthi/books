@@ -67,3 +67,269 @@ row := db.QueryRow(ctx, "SELECT ...")
 // Bad (cancelling request won't stop query)
 row := db.QueryRow(context.Background(), "SELECT ...")
 ```
+
+## Worked example
+
+Look-aside cache with TTL expiry (stdlib Redis/DB stand-in).
+
+Save as `main.go`. Then:
+
+```bash
+go mod init example
+go run .
+```
+
+```go
+package main
+
+import (
+	"context"
+	"fmt"
+	"sync"
+	"time"
+)
+
+type cache struct {
+	mu    sync.Mutex
+	items map[string]entry
+}
+
+type entry struct {
+	val string
+	exp time.Time
+}
+
+func (c *cache) Get(k string) (string, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	e, ok := c.items[k]
+	if !ok || time.Now().After(e.exp) {
+		delete(c.items, k)
+		return "", false
+	}
+	return e.val, true
+}
+
+func (c *cache) Set(k, v string, ttl time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.items[k] = entry{val: v, exp: time.Now().Add(ttl)}
+}
+
+func main() {
+	c := &cache{items: map[string]entry{}}
+	c.Set("u1", "alice", 20*time.Millisecond)
+	if v, ok := c.Get("u1"); ok {
+		fmt.Println("hit:", v)
+	}
+	time.Sleep(25 * time.Millisecond)
+	_, ok := c.Get("u1")
+	fmt.Println("after ttl hit:", ok)
+
+	// context cancel around a "query"
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	select {
+	case <-ctx.Done():
+		fmt.Println("query aborted:", ctx.Err())
+	default:
+	}
+}
+```
+
+**Expected output:**
+
+```text
+hit: alice
+after ttl hit: false
+query aborted: context canceled
+```
+
+## More examples
+
+Simple atomic rate limiter (Redis INCR window analogue).
+
+```go
+package main
+
+import (
+	"fmt"
+	"sync"
+	"sync/atomic"
+	"time"
+)
+
+type limiter struct {
+	mu     sync.Mutex
+	count  int
+	reset  time.Time
+	limit  int
+	window time.Duration
+}
+
+func (l *limiter) Allow() bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	now := time.Now()
+	if now.After(l.reset) {
+		l.count = 0
+		l.reset = now.Add(l.window)
+	}
+	if l.count >= l.limit {
+		return false
+	}
+	l.count++
+	return true
+}
+
+func main() {
+	l := &limiter{limit: 3, window: time.Second, reset: time.Now().Add(time.Second)}
+	var allowed atomic.Int64
+	var wg sync.WaitGroup
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if l.Allow() {
+				allowed.Add(1)
+			}
+		}()
+	}
+	wg.Wait()
+	fmt.Println("allowed:", allowed.Load()) // 3
+}
+```
+
+**Expected output:**
+
+```text
+allowed: 3
+```
+
+## Runnable example
+
+> **Note:** Production uses **pgx** + **Redis**. This stdlib stand-in models a look-aside cache and context-aware “query” against in-memory stores so the pattern is runnable offline.
+
+Save as `main.go`. Then:
+
+```bash
+go mod init example
+go run .
+```
+
+```go
+package main
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"sync"
+	"time"
+)
+
+// FakeDB simulates Postgres latency + storage.
+type FakeDB struct {
+	mu   sync.Mutex
+	rows map[string]string
+	hits int
+}
+
+func (db *FakeDB) QueryRow(ctx context.Context, key string) (string, error) {
+	select {
+	case <-ctx.Done():
+		return "", ctx.Err()
+	case <-time.After(20 * time.Millisecond): // pretend network/DB
+	}
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	db.hits++
+	v, ok := db.rows[key]
+	if !ok {
+		return "", errors.New("not found")
+	}
+	return v, nil
+}
+
+// FakeRedis is a tiny TTL cache.
+type FakeRedis struct {
+	mu    sync.Mutex
+	items map[string]cacheItem
+}
+
+type cacheItem struct {
+	val string
+	exp time.Time
+}
+
+func NewRedis() *FakeRedis {
+	return &FakeRedis{items: map[string]cacheItem{}}
+}
+
+func (r *FakeRedis) Get(_ context.Context, key string) (string, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	it, ok := r.items[key]
+	if !ok || time.Now().After(it.exp) {
+		delete(r.items, key)
+		return "", false
+	}
+	return it.val, true
+}
+
+func (r *FakeRedis) Set(_ context.Context, key, val string, ttl time.Duration) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.items[key] = cacheItem{val: val, exp: time.Now().Add(ttl)}
+}
+
+func getUser(ctx context.Context, db *FakeDB, cache *FakeRedis, id string) (string, string, error) {
+	if v, ok := cache.Get(ctx, id); ok {
+		return v, "cache", nil
+	}
+	v, err := db.QueryRow(ctx, id)
+	if err != nil {
+		return "", "", err
+	}
+	cache.Set(ctx, id, v, time.Minute)
+	return v, "db", nil
+}
+
+func main() {
+	db := &FakeDB{rows: map[string]string{"u1": "alice"}}
+	cache := NewRedis()
+	ctx := context.Background()
+
+	v1, src1, err := getUser(ctx, db, cache, "u1")
+	if err != nil {
+		panic(err)
+	}
+	v2, src2, err := getUser(ctx, db, cache, "u1")
+	if err != nil {
+		panic(err)
+	}
+
+	// Cancelled context aborts the “query”
+	cctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, _, cerr := db.QueryRow(cctx, "u1")
+
+	fmt.Println("first:", v1, "via", src1)
+	fmt.Println("second:", v2, "via", src2)
+	fmt.Println("db hits:", db.hits)
+	fmt.Println("cancelled err:", cerr)
+}
+```
+
+**Expected output:**
+
+```text
+first: alice via db
+second: alice via cache
+db hits: 1
+cancelled err: context canceled
+```
+
+**What to notice:** Look-aside cache protects the DB on hot keys (`db.hits` stays 1). Passing a cancelled `context` stops work early—the same discipline you need with `pgx` / `go-redis`.
+
+**Try next:** Expire the cache entry with a 1ms TTL and sleep before the second read. Add a simple rate limiter using an in-memory counter + window (Redis `INCR`/`EXPIRE` analogue).

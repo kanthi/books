@@ -1,29 +1,511 @@
 ---
-title: "153 Queue Workers and Backpressure"
+title: "Queue Workers and Backpressure"
 ---
 
-# 153 Queue Workers and Backpressure
+# Queue Workers and Backpressure
 
-Queue systems decouple producer and consumer rates, but only if capacity and failure behavior are explicit.
+Queue systems decouple producer and consumer rates — **only if** capacity and failure behavior are explicit. Otherwise queues become infinite latency sinks or memory bombs.
 
-## Throughput Model
+## Why / Overview
+
+Synchronous request paths force producers to wait. Queues enable:
+
+- Spike absorption
+- Asynchronous workflows
+- Retries isolated from user latency
+- Fan-out to multiple worker types
 
 ```text
-producer -> queue(buffer) -> workers -> dependency
-               |
-               +-> backpressure when full
+producer -> queue (buffer) -> workers -> dependency
+                |
+                +-> backpressure when full / depth high
 ```
 
-## Key Design Levers
+In Go you will use:
 
-- Queue size (latency vs memory).
-- Worker count (parallelism vs contention).
-- Retry strategy (durability vs duplicate work risk).
+- **In-process**: channels + worker pools
+- **Durable**: SQS, Pub/Sub, NATS JetStream, Kafka, RabbitMQ, Redis streams
 
-## Failure Handling
+The control theory is the same; durability and delivery semantics differ.
 
-Not all failed jobs should be retried equally. Distinguish transient failures from poison messages and route accordingly.
+## Delivery Semantics
 
-## Operational Goal
+| Semantic | Meaning | App duty |
+|----------|---------|----------|
+| At most once | May drop | Accept loss |
+| At least once | May duplicate | Idempotent handlers |
+| Exactly once | Rare/expensive | Often "effectively once" via idempotency |
 
-Backpressure should degrade gracefully under overload rather than silently dropping data or exhausting memory.
+Assume **at-least-once** unless you have a strong proof otherwise. Design handlers to be safe under duplicate delivery.
+
+```go
+// Idempotent handler sketch
+func handle(ctx context.Context, job Job) error {
+	ok, err := store.MarkIfNew(ctx, job.ID)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return nil // duplicate
+	}
+	return doWork(ctx, job)
+}
+```
+
+## In-Process Worker Pool
+
+```go
+type Pool struct {
+	jobs chan Job
+	wg   sync.WaitGroup
+}
+
+func NewPool(ctx context.Context, workers int, h func(context.Context, Job) error) *Pool {
+	p := &Pool{jobs: make(chan Job, 1024)}
+	for i := 0; i < workers; i++ {
+		p.wg.Add(1)
+		go func() {
+			defer p.wg.Done()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case job, ok := <-p.jobs:
+					if !ok {
+						return
+					}
+					if err := h(ctx, job); err != nil {
+						slog.Error("job failed", "id", job.ID, "err", err)
+					}
+				}
+			}
+		}()
+	}
+	return p
+}
+
+func (p *Pool) Submit(ctx context.Context, job Job) error {
+	select {
+	case p.jobs <- job:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+		return ErrQueueFull // backpressure to caller
+	}
+}
+
+func (p *Pool) Close() {
+	close(p.jobs)
+	p.wg.Wait()
+}
+```
+
+### Blocking vs dropping vs rejecting
+
+| `Submit` policy | Behavior |
+|-----------------|----------|
+| Block on full channel | Applies backpressure; can stall HTTP |
+| Non-blocking + 503 | Protects memory; client retries |
+| Drop oldest/newest | Lossy; only for metrics/logs |
+
+Choose consciously. Silent drops for payment events are unacceptable.
+
+## Sizing Levers
+
+```text
+throughput ≈ workers × (1 / mean_job_latency)
+```
+
+But dependency capacity is the real ceiling. Oversubscribing workers increases contention and error rates.
+
+| Lever | Too small | Too large |
+|-------|-----------|-----------|
+| Queue depth | Reject under mild spikes | Huge latency / RAM |
+| Workers | Low throughput | Dep overload, lock contention |
+| Visibility timeout (external) | Duplicate processing | Stuck messages if worker dies |
+| Max receive count | Early DLQ | Infinite poison retry |
+
+## External Queue Worker Loop (Shape)
+
+```go
+func worker(ctx context.Context, q Queue, h func(context.Context, Msg) error) error {
+	for {
+		msgs, err := q.Receive(ctx, 10, 20*time.Second) // batch, wait
+		if err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			slog.Error("receive", "err", err)
+			time.Sleep(time.Second)
+			continue
+		}
+		for _, m := range msgs {
+			msgCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+			err := h(msgCtx, m)
+			cancel()
+			if err != nil {
+				// leave for retry / nack depending on system
+				slog.Error("handle", "id", m.ID, "err", err)
+				continue
+			}
+			if err := q.Ack(ctx, m); err != nil {
+				slog.Error("ack", "err", err)
+			}
+		}
+	}
+}
+```
+
+### Ack timing
+
+- **Ack after success** — at-least-once if crash before ack
+- **Ack before work** — at-most-once loss on crash
+- **Extend visibility** for long jobs
+
+## Poison Messages and DLQ
+
+Not all failures are transient.
+
+```text
+transient:  timeout, 503, deadlock -> retry with backoff
+poison:     invalid payload, permanent 400 -> DLQ after N attempts
+```
+
+```go
+func handle(ctx context.Context, m Msg) error {
+	var job Job
+	if err := json.Unmarshal(m.Body, &job); err != nil {
+		return errPoison // route to DLQ, do not infinite retry
+	}
+	return process(ctx, job)
+}
+```
+
+Alert on DLQ depth; empty it with a runbook, not silence.
+
+## Backpressure Across Tiers
+
+```text
+HTTP handler -> Submit(job)
+   if ErrQueueFull -> 503 Retry-After
+consumer lag high -> scale workers / shed non-critical producers
+dependency circuit open -> slow receive rate or park workers
+```
+
+True end-to-end backpressure requires producers to **observe** consumer health (queue depth metrics, not only local channel fullness).
+
+## Graceful Shutdown
+
+```go
+cancel()           // stop receiving new jobs
+close(jobs)        // or stop Submit
+wait with timeout  // finish in-flight
+// for external queues: stop Receive; in-flight still acked or returned by visibility expiry
+```
+
+Never exit immediately while holding unacked messages if you can avoid it — you will cause stampedes of redelivery.
+
+## Observability
+
+Metrics:
+
+- `queue_depth` / channel length if available
+- `jobs_enqueued_total{result=ok|full}`
+- `jobs_processed_total{result}`
+- `job_duration_seconds`
+- `jobs_in_flight`
+- `dlq_depth`
+- `receive_errors_total`
+
+Lag: time between enqueue timestamp and process start (requires timestamp in payload).
+
+## Production Checklist
+
+- [ ] Document delivery semantics and idempotency
+- [ ] Bounded queue / explicit full behavior
+- [ ] Worker count tied to dependency capacity
+- [ ] Timeouts on job handlers
+- [ ] Poison path + DLQ + alerts
+- [ ] Ack/visibility policy documented
+- [ ] Graceful drain on shutdown
+- [ ] Metrics for depth, lag, failures, DLQ
+- [ ] Load test: spike producers, kill workers, duplicate delivery
+
+## Common Pitfalls
+
+1. **Unbounded `make(chan T)`** or growing slices as queues — OOM.
+2. **More workers = faster** without measuring the dependency.
+3. **Non-idempotent handlers** with at-least-once queues.
+4. **Infinite retries** of bad payloads.
+5. **Blocking HTTP on full in-process queue** without timeout — cascading latency.
+6. **Ack before durable side effect completes**.
+7. **No lag metric** — discover the backlog from customer tickets.
+
+## Exercises
+
+1. Implement a bounded worker pool; prove `Submit` returns `ErrQueueFull` under overload.
+2. Change policy to block with context timeout; compare HTTP p99 under spike.
+3. Inject duplicate deliveries; show double side effects; add idempotency store.
+4. Generate invalid JSON jobs; after 3 failures move to DLQ slice; alert when DLQ > 0.
+5. Measure throughput vs worker count for a 50ms simulated dependency; find the plateau.
+6. Shutdown mid-job; confirm message redelivery with external queue or simulated visibility.
+7. Add enqueue timestamp; export lag histogram.
+8. Combine with a circuit breaker: when open, stop pulling messages for that dependency.
+9. Use `errgroup` with limit for per-batch parallel handle; ensure ctx cancel stops the batch.
+10. Write a capacity plan: peak produce rate, target lag, mean job time → workers and depth.
+
+## More examples
+
+### Bounded queue + worker pool
+
+```bash
+mkdir -p /tmp/go-queue-bp && cd /tmp/go-queue-bp
+go mod init example.com/queue-bp
+```
+
+Save as `main.go`:
+
+```go
+package main
+
+import (
+	"fmt"
+	"sync"
+	"time"
+)
+
+func main() {
+	jobs := make(chan int, 4) // backpressure depth
+	var wg sync.WaitGroup
+	var done int
+	var mu sync.Mutex
+
+	for w := 0; w < 2; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := range jobs {
+				time.Sleep(5 * time.Millisecond)
+				mu.Lock()
+				done++
+				_ = j
+				mu.Unlock()
+			}
+		}()
+	}
+
+	for i := 1; i <= 10; i++ {
+		jobs <- i // blocks when buffer full → producer slows
+	}
+	close(jobs)
+	wg.Wait()
+	fmt.Println("processed:", done)
+}
+```
+
+```bash
+go run .
+```
+
+**Expected output:**
+
+```
+processed: 10
+```
+
+### Drop vs block when full (load shed)
+
+```bash
+mkdir -p /tmp/go-queue-shed && cd /tmp/go-queue-shed
+go mod init example.com/queue-shed
+```
+
+Save as `main.go`:
+
+```go
+package main
+
+import "fmt"
+
+func tryEnqueue(ch chan int, v int) bool {
+	select {
+	case ch <- v:
+		return true
+	default:
+		return false
+	}
+}
+
+func main() {
+	ch := make(chan int, 2)
+	accepted, dropped := 0, 0
+	for i := 0; i < 5; i++ {
+		if tryEnqueue(ch, i) {
+			accepted++
+		} else {
+			dropped++
+		}
+	}
+	fmt.Println("accepted:", accepted, "dropped:", dropped, "len:", len(ch))
+}
+```
+
+```bash
+go run .
+```
+
+**Expected output:**
+
+```
+accepted: 2 dropped: 3 len: 2
+```
+
+## Runnable example
+
+Bounded in-memory queue, worker pool, `ErrQueueFull` backpressure, and a tiny dead-letter list for poison messages.
+
+```bash
+mkdir -p /tmp/go-queue && cd /tmp/go-queue
+go mod init example.com/queue
+```
+
+Save as `main.go`:
+
+```go
+package main
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"sync"
+	"time"
+)
+
+var ErrQueueFull = errors.New("queue full")
+
+type Job struct {
+	ID      string
+	Payload string
+	Attempt int
+}
+
+type Pool struct {
+	jobs   chan Job
+	dlq    []Job
+	mu     sync.Mutex
+	wg     sync.WaitGroup
+	handle func(context.Context, Job) error
+}
+
+func NewPool(depth, workers int, handle func(context.Context, Job) error) *Pool {
+	p := &Pool{jobs: make(chan Job, depth), handle: handle}
+	for i := 0; i < workers; i++ {
+		p.wg.Add(1)
+		go func() {
+			defer p.wg.Done()
+			for j := range p.jobs {
+				ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+				err := p.handle(ctx, j)
+				cancel()
+				if err != nil {
+					j.Attempt++
+					if j.Attempt >= 3 {
+						p.mu.Lock()
+						p.dlq = append(p.dlq, j)
+						p.mu.Unlock()
+						continue
+					}
+					// re-queue best-effort
+					select {
+					case p.jobs <- j:
+					default:
+						p.mu.Lock()
+						p.dlq = append(p.dlq, j)
+						p.mu.Unlock()
+					}
+				}
+			}
+		}()
+	}
+	return p
+}
+
+func (p *Pool) Submit(j Job) error {
+	select {
+	case p.jobs <- j:
+		return nil
+	default:
+		return ErrQueueFull
+	}
+}
+
+func (p *Pool) Close() {
+	close(p.jobs)
+	p.wg.Wait()
+}
+
+func main() {
+	var okCount int
+	var mu sync.Mutex
+	p := NewPool(2, 2, func(ctx context.Context, j Job) error {
+		if j.Payload == "poison" {
+			return fmt.Errorf("bad payload")
+		}
+		mu.Lock()
+		okCount++
+		mu.Unlock()
+		return nil
+	})
+
+	fmt.Println("submit a:", p.Submit(Job{ID: "1", Payload: "ok"}))
+	fmt.Println("submit b:", p.Submit(Job{ID: "2", Payload: "ok"}))
+	fmt.Println("submit c:", p.Submit(Job{ID: "3", Payload: "ok"})) // may fill
+	// drain a bit
+	time.Sleep(50 * time.Millisecond)
+	_ = p.Submit(Job{ID: "4", Payload: "poison"})
+	time.Sleep(50 * time.Millisecond)
+	for i := 0; i < 5; i++ {
+		if err := p.Submit(Job{ID: fmt.Sprintf("x%d", i), Payload: "ok"}); err != nil {
+			fmt.Println("backpressure:", err)
+			break
+		}
+	}
+	p.Close()
+	p.mu.Lock()
+	fmt.Println("ok_count:", okCount, "dlq:", len(p.dlq))
+	p.mu.Unlock()
+}
+```
+
+```bash
+go run .
+```
+
+**Expected output** (timing-sensitive; illustrative):
+
+```
+submit a: <nil>
+submit b: <nil>
+submit c: queue full
+backpressure: queue full
+ok_count: ... dlq: >=1
+```
+
+**What to notice**
+
+- Bounded channels are the simplest backpressure tool; unbounded queues OOM under spike.
+- Poison messages need attempt caps and a DLQ—infinite retry burns workers forever.
+- Closing the job channel and `Wait` is orderly worker shutdown.
+
+**Try next**
+
+- Block with `select` + context timeout instead of immediate `ErrQueueFull`.
+- Export queue depth gauge and lag from enqueue timestamp.
+
+## Further Reading
+
+- Queueing theory basics (Littles's law: L = λW) for lag intuition
+- Previous: retries/breakers on the dependency side of workers
+- Next part: **Observability and SRE** — measuring all of the above

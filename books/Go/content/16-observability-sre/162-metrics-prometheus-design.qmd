@@ -1,31 +1,539 @@
 ---
-title: "162 Metrics and Prometheus Design"
+title: "Metrics and Prometheus Design"
 ---
 
-# 162 Metrics and Prometheus Design
+# Metrics and Prometheus Design
 
-Metrics should answer operational questions quickly: Is traffic normal? Are errors rising? Is latency degrading?
+Metrics answer operational questions quickly: Is traffic normal? Are errors rising? Is latency degrading? They are cheap aggregates — if you design labels carefully.
 
-## RED Baseline
+## Why / Overview
+
+Logs are high-cardinality events. Metrics are **pre-aggregated time series**. Prometheus scrapes pull-based endpoints; you expose `/metrics` with a small, intentional surface.
 
 ```text
-Rate: requests/sec
-Errors: failed requests/sec
-Duration: latency distribution (histogram)
+process -> counters/histograms/gauges
+              |
+         /metrics scrape
+              |
+         Prometheus -> alerts / Grafana
 ```
 
-## Label Strategy
+## RED and USE
 
-Labels are powerful and dangerous. High-cardinality labels can destabilize metric systems.
+**RED** (request-driven services):
 
-Prefer bounded dimensions such as:
+| Signal | Meaning |
+|--------|---------|
+| Rate | Requests per second |
+| Errors | Failed requests per second |
+| Duration | Latency distribution |
 
-- method
-- route template
-- status class
+**USE** (resources):
 
-Avoid unbounded dimensions such as user IDs or raw URLs.
+| Signal | Meaning |
+|--------|---------|
+| Utilization | % busy |
+| Saturation | Queue depth / wait |
+| Errors | Resource error counts |
 
-## SRE Connection
+Export both: RED for SLIs, USE for capacity.
 
-Useful metrics are tied to alerts and runbooks. Instrumentation without response policy adds noise, not reliability.
+## Metric Types
+
+| Type | Use |
+|------|-----|
+| Counter | Monotonic events (`_total` suffix) |
+| Gauge | Levels that go up/down (goroutines, depth) |
+| Histogram | Latency/size distributions |
+| Summary | Client-side quantiles (less preferred for prom federation) |
+
+Prefer **histograms** for latency with server-side aggregation.
+
+## Instrumentation Example
+
+```go
+package metrics
+
+import (
+	"net/http"
+	"strconv"
+	"time"
+
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+)
+
+var (
+	httpRequests = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "http_requests_total",
+		Help: "HTTP requests",
+	}, []string{"method", "route", "code"})
+
+	httpDuration = promauto.NewHistogramVec(prometheus.HistogramOpts{
+		Name:    "http_request_duration_seconds",
+		Help:    "HTTP latency",
+		Buckets: []float64{.005, .01, .025, .05, .1, .25, .5, 1, 2.5, 5, 10},
+	}, []string{"method", "route"})
+
+	inFlight = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "http_requests_in_flight",
+		Help: "In-flight HTTP requests",
+	})
+)
+
+func Middleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		inFlight.Inc()
+		defer inFlight.Dec()
+		ww := &statusWriter{ResponseWriter: w, code: 200}
+		next.ServeHTTP(ww, r)
+		route := routeOf(r) // template, not raw path
+		httpRequests.WithLabelValues(r.Method, route, strconv.Itoa(ww.code)).Inc()
+		httpDuration.WithLabelValues(r.Method, route).Observe(time.Since(start).Seconds())
+	})
+}
+
+func Handler() http.Handler { return promhttp.Handler() }
+```
+
+Mount metrics on admin listener when possible:
+
+```go
+go http.ListenAndServe("127.0.0.1:9090", metrics.Handler())
+```
+
+## Label Strategy (Cardinality)
+
+Each unique label combination is a time series.
+
+**Safe (bounded):**
+
+- `method`, `route` template, `code`/`code_class`, `dependency` name, `breaker_state`
+
+**Unsafe (unbounded):**
+
+- `user_id`, `email`, raw `path`, `url`, `request_id`, pod IP as high-churn without care
+
+```go
+// BAD
+counter.WithLabelValues(r.URL.Path).Inc()
+
+// GOOD
+counter.WithLabelValues(routeTemplate).Inc()
+```
+
+Rule of thumb: if a label can take unlimited values from user input, it does not belong on a metric.
+
+## Histogram Buckets
+
+Default buckets may not fit your SLOs. If SLO is 300ms, ensure buckets around 0.1, 0.25, 0.3, 0.5, …
+
+```go
+Buckets: prometheus.ExponentialBuckets(0.005, 2, 12)
+// or explicit slice aligned to SLOs
+```
+
+You cannot fix wrong buckets retroactively without a new metric name.
+
+## Naming Conventions
+
+```text
+namespace_subsystem_name_unit
+http_request_duration_seconds
+db_query_duration_seconds
+queue_depth
+client_requests_total
+```
+
+- Counters end with `_total`
+- Units in seconds/bytes base units
+- Avoid mixing milliseconds and seconds across metrics
+
+## Outbound Client Metrics
+
+```go
+var depDuration = promauto.NewHistogramVec(prometheus.HistogramOpts{
+	Name:    "dependency_request_duration_seconds",
+	Help:    "Outbound calls",
+	Buckets: prometheus.DefBuckets,
+}, []string{"dep", "method", "result"})
+
+func observeDep(dep, method, result string, d time.Duration) {
+	depDuration.WithLabelValues(dep, method, result).Observe(d.Seconds())
+}
+```
+
+`result`: `ok`, `timeout`, `error`, `cancel` — not free-form error strings.
+
+## Exemplars and Trace Links
+
+Modern Prometheus + OTel can attach trace ids to histogram observations (exemplars). When available, latency spikes become one click into a trace. Configure rather than reinvent.
+
+## Alerting from Metrics
+
+Alert on **symptoms**:
+
+```text
+// conceptual PromQL
+rate(http_requests_total{code=~"5.."}[5m])
+  / rate(http_requests_total[5m]) > 0.01
+```
+
+And latency:
+
+```text
+histogram_quantile(0.99, sum by (le) (rate(http_request_duration_seconds_bucket[5m]))) > 0.3
+```
+
+Multi-window multi-burn-rate alerts (SRE workbook) reduce noise for SLO burn.
+
+Every alert needs:
+
+1. What is broken (SLI)
+2. User impact
+3. Runbook link
+4. Severity / routing
+
+## Runtime Metrics
+
+Export Go runtime via collectors:
+
+```go
+// prometheus client includes process and go collectors when using default registry
+// go_goroutines, go_memstats_*, process_cpu_seconds_total
+```
+
+Useful for saturation; not a substitute for RED SLIs.
+
+## Production Checklist
+
+- [ ] RED metrics per public route template
+- [ ] Dependency latency/error metrics
+- [ ] Bounded label sets reviewed in PR
+- [ ] Histogram buckets match SLOs
+- [ ] `/metrics` not public without auth/network policy
+- [ ] Alerts tied to SLOs + runbooks
+- [ ] Dashboards use rate/increase correctly on counters
+- [ ] Queue depth / in-flight gauges for backpressure
+- [ ] Document metric stability (renames break alerts)
+
+## Common Pitfalls
+
+1. **Raw path labels** → metric explosion → Prometheus OOM.
+2. **Using summaries** then trying to aggregate quantiles across instances incorrectly.
+3. **Alerting on CPU only** while error rate is the user pain.
+4. **Counter without `_total`** / non-monotonic "counters".
+5. **Measuring only mean latency** — tails hide outages.
+6. **Scrape timeout** longer than interval; missed scrapes.
+7. **High-cardinality `error_message` labels**.
+
+## Exercises
+
+1. Instrument a toy server with counter + histogram; scrape with a local Prometheus.
+2. Add path label vs route template; show series count difference with unique ids in paths.
+3. Choose buckets for a 200ms SLO; verify quantile accuracy with known sleeps.
+4. Write PromQL for 5xx rate and p99 latency; graph both.
+5. Add dependency metrics around an HTTP client.
+6. Create an alert rule file; fire it with forced errors; follow a stub runbook.
+7. Export queue depth gauge from a worker; alert when depth > N for 10m.
+8. Compare `rate` vs `increase` on a slow counter; explain gaps.
+9. Secure `/metrics` behind network policy or basic auth.
+10. Define error budget math for 99.9% availability over 30 days.
+
+## More examples
+
+### Prometheus text exposition (stdlib)
+
+```bash
+mkdir -p /tmp/go-prom-text && cd /tmp/go-prom-text
+go mod init example.com/prom-text
+```
+
+Save as `main.go`:
+
+```go
+package main
+
+import (
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"sync/atomic"
+)
+
+type Counter struct{ n atomic.Int64 }
+
+func (c *Counter) Inc() { c.n.Add(1) }
+func (c *Counter) Get() int64 { return c.n.Load() }
+
+func main() {
+	var reqs Counter
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /", func(w http.ResponseWriter, r *http.Request) {
+		reqs.Inc()
+		fmt.Fprintln(w, "ok")
+	})
+	mux.HandleFunc("GET /metrics", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain; version=0.0.4")
+		fmt.Fprintf(w, "# HELP http_requests_total Total HTTP requests\n")
+		fmt.Fprintf(w, "# TYPE http_requests_total counter\n")
+		fmt.Fprintf(w, "http_requests_total %d\n", reqs.Get())
+	})
+
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+	for i := 0; i < 3; i++ {
+		r, _ := http.Get(ts.URL + "/")
+		r.Body.Close()
+	}
+	r, _ := http.Get(ts.URL + "/metrics")
+	defer r.Body.Close()
+	var b [256]byte
+	n, _ := r.Body.Read(b[:])
+	body := string(b[:n])
+	fmt.Println(strings.TrimSpace(body))
+	fmt.Println("has type:", strings.Contains(body, "TYPE http_requests_total"))
+}
+```
+
+```bash
+go run .
+```
+
+**Expected output:**
+
+```
+# HELP http_requests_total Total HTTP requests
+# TYPE http_requests_total counter
+http_requests_total 3
+has type: true
+```
+
+### Labeled counter map (cardinality caution)
+
+```bash
+mkdir -p /tmp/go-prom-labels && cd /tmp/go-prom-labels
+go mod init example.com/prom-labels
+```
+
+Save as `main.go`:
+
+```go
+package main
+
+import (
+	"fmt"
+	"sync"
+)
+
+type LabeledCounter struct {
+	mu sync.Mutex
+	m  map[string]int
+}
+
+func (c *LabeledCounter) Inc(code string) {
+	c.mu.Lock()
+	if c.m == nil {
+		c.m = map[string]int{}
+	}
+	c.m[code]++
+	c.mu.Unlock()
+}
+
+func (c *LabeledCounter) Render(name string) string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	var b string
+	for k, v := range c.m {
+		b += fmt.Sprintf("%s{code=%q} %d\n", name, k, v)
+	}
+	return b
+}
+
+func main() {
+	var c LabeledCounter
+	c.Inc("200")
+	c.Inc("200")
+	c.Inc("500")
+	out := c.Render("http_responses_total")
+	fmt.Print(out)
+	fmt.Println("lines:", len(out) > 0)
+}
+```
+
+```bash
+go run .
+```
+
+**Expected output** (label order may vary):
+
+```
+http_responses_total{code="200"} 2
+http_responses_total{code="500"} 1
+lines: true
+```
+
+## Runnable example
+
+Manual Prometheus text exposition: counter, gauge, and a crude histogram bucket set—stdlib only, no client_golang.
+
+```bash
+mkdir -p /tmp/go-metrics && cd /tmp/go-metrics
+go mod init example.com/metrics
+```
+
+Save as `main.go`:
+
+```go
+package main
+
+import (
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"sort"
+	"strings"
+	"sync"
+	"time"
+)
+
+type registry struct {
+	mu      sync.Mutex
+	reqs    map[string]float64 // status -> count
+	inFlight float64
+	// latency buckets in seconds
+	bounds []float64
+	counts []float64
+	sum    float64
+	count  float64
+}
+
+func newReg() *registry {
+	b := []float64{0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1}
+	return &registry{
+		reqs:   map[string]float64{},
+		bounds: b,
+		counts: make([]float64, len(b)+1), // +Inf
+	}
+}
+
+func (r *registry) observe(status string, d time.Duration) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.reqs[status]++
+	sec := d.Seconds()
+	r.sum += sec
+	r.count++
+	placed := false
+	for i, b := range r.bounds {
+		if sec <= b {
+			r.counts[i]++
+			placed = true
+			break
+		}
+	}
+	if !placed {
+		r.counts[len(r.bounds)]++
+	}
+}
+
+func (r *registry) expose() string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var b strings.Builder
+	fmt.Fprintf(&b, "# HELP http_requests_total Demo requests\n")
+	fmt.Fprintf(&b, "# TYPE http_requests_total counter\n")
+	var statuses []string
+	for s := range r.reqs {
+		statuses = append(statuses, s)
+	}
+	sort.Strings(statuses)
+	for _, s := range statuses {
+		fmt.Fprintf(&b, "http_requests_total{status=%q} %g\n", s, r.reqs[s])
+	}
+	fmt.Fprintf(&b, "# HELP http_in_flight Demo gauge\n")
+	fmt.Fprintf(&b, "# TYPE http_in_flight gauge\n")
+	fmt.Fprintf(&b, "http_in_flight %g\n", r.inFlight)
+
+	fmt.Fprintf(&b, "# HELP http_request_duration_seconds Demo histogram\n")
+	fmt.Fprintf(&b, "# TYPE http_request_duration_seconds histogram\n")
+	var cum float64
+	for i, bound := range r.bounds {
+		cum += r.counts[i]
+		fmt.Fprintf(&b, "http_request_duration_seconds_bucket{le=%q} %g\n", fmt.Sprintf("%g", bound), cum)
+	}
+	cum += r.counts[len(r.bounds)]
+	fmt.Fprintf(&b, "http_request_duration_seconds_bucket{le=\"+Inf\"} %g\n", cum)
+	fmt.Fprintf(&b, "http_request_duration_seconds_sum %g\n", r.sum)
+	fmt.Fprintf(&b, "http_request_duration_seconds_count %g\n", r.count)
+	return b.String()
+}
+
+func main() {
+	reg := newReg()
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /work", func(w http.ResponseWriter, r *http.Request) {
+		reg.mu.Lock()
+		reg.inFlight++
+		reg.mu.Unlock()
+		start := time.Now()
+		time.Sleep(12 * time.Millisecond)
+		reg.mu.Lock()
+		reg.inFlight--
+		reg.mu.Unlock()
+		reg.observe("200", time.Since(start))
+		w.WriteHeader(200)
+	})
+	mux.HandleFunc("GET /metrics", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/plain; version=0.0.4")
+		fmt.Fprint(w, reg.expose())
+	})
+
+	for i := 0; i < 3; i++ {
+		rr := httptest.NewRecorder()
+		mux.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/work", nil))
+	}
+	// one error path
+	reg.observe("500", 30*time.Millisecond)
+
+	rr := httptest.NewRecorder()
+	mux.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	fmt.Print(rr.Body.String())
+}
+```
+
+```bash
+go run .
+```
+
+**Expected output** (excerpt):
+
+```
+# HELP http_requests_total Demo requests
+# TYPE http_requests_total counter
+http_requests_total{status="200"} 3
+http_requests_total{status="500"} 1
+...
+http_request_duration_seconds_count 4
+```
+
+**What to notice**
+
+- Use route templates as labels, never raw ids (`/user/123`)—cardinality explosion kills Prometheus.
+- Histograms need `_bucket` / `_sum` / `_count`; counters use `_total`.
+- Gauges go up and down (`in_flight`); counters only increase.
+
+**Try next**
+
+- Scrape with a local Prometheus or `curl` a real listener.
+- Write PromQL: `rate(http_requests_total{status="500"}[5m])`.
+
+## Further Reading
+
+- Prometheus metric and labeling best practices
+- Google SRE workbook: alerting on SLOs
+- Previous: structured logs for event detail
+- Next: **Tracing and Context Propagation**

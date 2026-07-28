@@ -1,28 +1,485 @@
 ---
-title: "163 Tracing and Context Propagation"
+title: "Tracing and Context Propagation"
 ---
 
-# 163 Tracing and Context Propagation
+# Tracing and Context Propagation
 
-Tracing makes distributed latency visible by preserving causal context across boundaries.
+Tracing makes distributed latency visible by preserving **causal context** across process boundaries. A single missing propagation hop blinds the whole request path.
 
-## Propagation Path
+## Why / Overview
+
+Metrics say p99 is bad. Logs say a request failed. Traces answer: **where did the time go** across gateway → service → DB → dependency?
 
 ```text
-gateway -> service A -> service B -> datastore
-   context + trace headers propagated at each hop
+gateway ----> service A ----> service B ----> datastore
+   |              |               |
+ span           span            span
+   trace-id = same across all
 ```
 
-## Common Failure Mode
+OpenTelemetry (OTel) is the default modern approach in Go ecosystems; the ideas apply even if you use a vendor SDK.
 
-A single missing propagation point breaks end-to-end trace visibility. This often happens in background goroutines or manual HTTP client construction.
+## Core Concepts
 
-## Design Guidance
+| Term | Meaning |
+|------|---------|
+| Trace | End-to-end request / workflow |
+| Span | Unit of work with start/end, attributes, status |
+| Context | Carries trace/span identity in-process |
+| Propagator | Inject/extract context over HTTP/gRPC headers |
+| Sampler | Which traces to keep |
 
-- Accept `context.Context` at API boundaries.
-- Pass context through outbound calls without replacement.
-- Record operation-level spans around DB and external dependencies.
+```text
+W3C Trace Context headers:
+  traceparent: 00-<trace-id>-<span-id>-<flags>
+  tracestate: optional vendor data
+```
 
-## Outcome
+## Context Propagation Rules
 
-Correct tracing turns unknown latency into attributable latency.
+1. Accept `context.Context` at API boundaries.
+2. Pass the same ctx (or child) into outbound calls — **never** `context.Background()` mid-request unless intentionally detaching.
+3. When detaching, copy trace ids into a new context if the async work should remain in the trace (or start a linked span).
+4. Instrument DB, HTTP, and queue publish/consume.
+
+```go
+// BAD
+go process(context.Background())
+
+// GOOD: child span / derived context
+go process(context.WithoutCancel(ctx)) // Go 1.21+ if you must outlive request cancel
+// or: start a new root with explicit link for async jobs
+```
+
+`WithoutCancel` preserves values but not cancellation — use carefully for fire-and-forget that should still be attributed.
+
+## Minimal HTTP Propagation (Conceptual)
+
+Even without full OTel, the discipline is:
+
+```go
+func propagate(req *http.Request, incoming http.Header) {
+	if v := incoming.Get("Traceparent"); v != "" {
+		req.Header.Set("Traceparent", v)
+	}
+	if v := incoming.Get("X-Request-Id"); v != "" {
+		req.Header.Set("X-Request-Id", v)
+	}
+}
+```
+
+With OTel, use official propagators and `otelhttp` transport wrappers instead of hand-rolling.
+
+## Span Design
+
+Create spans around **meaningful operations**, not every function:
+
+- Inbound HTTP/gRPC request (framework middleware)
+- Outbound HTTP/RPC
+- DB query / transaction
+- Significant queue publish
+- Expensive compute blocks
+
+```go
+// Pseudocode shape with OTel API
+ctx, span := tracer.Start(ctx, "db.QueryUser")
+defer span.End()
+span.SetAttributes(attribute.String("db.system", "postgres"))
+row := db.QueryRowContext(ctx, q, id)
+if err != nil {
+	span.RecordError(err)
+	span.SetStatus(codes.Error, err.Error())
+}
+```
+
+Attributes: low-cardinality. Do not put raw SQL with unbound ids if that becomes a PII/cardinality problem — use operation names.
+
+## Sampling
+
+| Strategy | When |
+|----------|------|
+| Always on | Low traffic / critical paths |
+| Probability (e.g. 1–10%) | High QPS happy path |
+| Parent-based | Honor upstream decision |
+| Tail sampling | Keep errors/slow traces (collector) |
+
+Always sample (or force) **errors and high latency** when the platform allows.
+
+## Common Failure Modes
+
+1. **New client without transport wrapper** — headers not injected.
+2. **Goroutine with Background** — orphan spans or missing children.
+3. **Queue consumer not extracting** — new unrelated traces per message.
+4. **Clock skew** — span order looks weird (use careful interpretation).
+5. **Too many tiny spans** — overhead and UI noise.
+6. **Sensitive data in attributes** — tokens, PII.
+
+### Queue propagation
+
+Put trace context in message metadata/headers; extract on consume; start a **consumer span** as child or link.
+
+```text
+producer span -> inject into message
+consumer receives -> extract -> process span
+```
+
+## Correlation with Logs and Metrics
+
+- Put `trace_id` and `span_id` into slog fields from the current span context.
+- Metrics exemplars can point to traces.
+- Same `service.name` and resource attributes across signals.
+
+```go
+// After extracting span from ctx:
+slog.InfoContext(ctx, "paid", "order_id", id)
+// With a handler that appends trace ids from ctx (OTel slog bridge or custom)
+```
+
+## In-Process Performance Note
+
+Span creation is cheap when sampled out, not free when always on with heavy attributes. Measure overhead on ultra-hot paths; batch exporters carefully.
+
+## SDK Lifecycle (Shape)
+
+Regardless of vendor, production services should:
+
+```go
+func main() {
+	ctx := context.Background()
+	shutdown, err := initTracer(ctx) // set global TracerProvider + propagator
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer func() {
+		// Flush remaining spans on exit; bound the wait.
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = shutdown(ctx)
+	}()
+
+	// run server...
+}
+```
+
+Initialize **once**. Multiple providers create confusing partial traces.
+
+### HTTP middleware and transport (conceptual)
+
+```go
+// Server: wrap handler so each request becomes a span.
+// handler = otelhttp.NewHandler(mux, "api")
+
+// Client: wrap transport so outbound calls inject context.
+// client.Transport = otelhttp.NewTransport(http.DefaultTransport)
+```
+
+Prefer library wrappers over copying header maps by hand — they handle version updates of the propagation format.
+
+## Baggage vs Attributes
+
+| Mechanism | Purpose | Danger |
+|-----------|---------|--------|
+| Span attributes | Describe this operation | Cardinality if unbounded |
+| Baggage | Propagate key-values to downstream | Becomes a global gossip channel |
+
+Use baggage sparingly (e.g. tenant tier for sampling). Never put PII or secrets in baggage — every hop may log it.
+
+## Reading a Trace During an Incident
+
+1. Open the trace from the failing `request_id` / exemplar.
+2. Sort or scan for the longest span or first error status.
+3. Check whether time is **in your service** (CPU/DB) or **waiting on a child**.
+4. Confirm the slow child has correct timeout budgets (part 13).
+5. If the trace stops mid-path, find the missing propagation hop and fix instrumentation first.
+
+A broken trace is itself a reliability bug.
+
+## Production Checklist
+
+- [ ] OTel (or vendor) SDK initialized once at start
+- [ ] W3C TraceContext propagator configured
+- [ ] HTTP server middleware creates root/child spans
+- [ ] HTTP client transport injects context
+- [ ] DB/redis clients instrumented or wrapped
+- [ ] Async/queue paths extract/inject
+- [ ] Sampling policy documented
+- [ ] Errors mark span status
+- [ ] Logs include trace_id
+- [ ] Admin-only or secured debug endpoints
+
+## Common Pitfalls
+
+1. Multiple tracer provider initializations.
+2. Forgetting `Shutdown` on exporter at process exit (lost tail spans).
+3. Using request body content as span names (cardinality + PII).
+4. Mixing baggage (cross-cutting key-values) with unbounded values.
+5. Assuming trace UI replaces metrics for alerting — it does not.
+
+## Exercises
+
+1. Manually pass `X-Request-Id` across two HTTP services; log it on both.
+2. Add W3C `traceparent` generation/parsing in a toy form; verify header round-trip.
+3. Break propagation in one client; observe "broken" trace; fix.
+4. Start a span around a DB call; add attributes; export to a local collector (Jaeger/OTel).
+5. Detach a goroutine with Background; compare trace; fix with derived context.
+6. Publish a message with trace headers; consume and continue the trace.
+7. Configure 1% sampling; force error sampling if available.
+8. Bridge slog to include trace ids; grep logs for a trace id from the UI.
+9. Measure CPU with tracing on/off under load for a hot endpoint.
+10. Write a runbook: "p99 high" → open trace → identify slow span → next action.
+
+## End-to-End Lab Outline
+
+1. Two tiny services: `A` calls `B` over HTTP.
+2. Add request ids + manual `traceparent` first; prove logs join.
+3. Swap in OTel SDK + Jaeger/OTLP collector locally.
+4. Break the client transport wrapper; note the cliff in the UI.
+5. Add a DB span in `B`; force a slow query; confirm the waterfall.
+6. Drop sample rate to 1%; force an error path to stay visible.
+
+Document the exact env vars and ports your team uses so the lab is repeatable.
+
+## More examples
+
+### Trace/span ids on context and outbound headers
+
+```bash
+mkdir -p /tmp/go-trace-ctx && cd /tmp/go-trace-ctx
+go mod init example.com/trace-ctx
+```
+
+Save as `main.go`:
+
+```go
+package main
+
+import (
+	"context"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+)
+
+type ctxKey string
+
+const (
+	traceKey ctxKey = "trace_id"
+	spanKey  ctxKey = "span_id"
+)
+
+func withTrace(ctx context.Context, traceID, spanID string) context.Context {
+	ctx = context.WithValue(ctx, traceKey, traceID)
+	return context.WithValue(ctx, spanKey, spanID)
+}
+
+func inject(req *http.Request) {
+	if v, ok := req.Context().Value(traceKey).(string); ok {
+		req.Header.Set("X-Trace-Id", v)
+	}
+	if v, ok := req.Context().Value(spanKey).(string); ok {
+		req.Header.Set("X-Span-Id", v)
+	}
+}
+
+func main() {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, "trace=%s span=%s", r.Header.Get("X-Trace-Id"), r.Header.Get("X-Span-Id"))
+	}))
+	defer upstream.Close()
+
+	ctx := withTrace(context.Background(), "t-1", "s-9")
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, upstream.URL, nil)
+	inject(req)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		panic(err)
+	}
+	defer resp.Body.Close()
+	var buf [64]byte
+	n, _ := resp.Body.Read(buf[:])
+	fmt.Println(string(buf[:n]))
+}
+```
+
+```bash
+go run .
+```
+
+**Expected output:**
+
+```
+trace=t-1 span=s-9
+```
+
+### Nested span timing (in-process)
+
+```bash
+mkdir -p /tmp/go-span-time && cd /tmp/go-span-time
+go mod init example.com/span-time
+```
+
+Save as `main.go`:
+
+```go
+package main
+
+import (
+	"fmt"
+	"time"
+)
+
+type Span struct {
+	Name string
+	Dur  time.Duration
+}
+
+func timed(name string, fn func()) Span {
+	start := time.Now()
+	fn()
+	return Span{Name: name, Dur: time.Since(start)}
+}
+
+func main() {
+	var spans []Span
+	spans = append(spans, timed("handler", func() {
+		spans = append(spans, timed("db", func() { time.Sleep(5 * time.Millisecond) }))
+		spans = append(spans, timed("cache", func() { time.Sleep(1 * time.Millisecond) }))
+	}))
+	for _, s := range spans {
+		fmt.Printf("%s >=1ms: %v\n", s.Name, s.Dur >= time.Millisecond)
+	}
+}
+```
+
+```bash
+go run .
+```
+
+**Expected output:**
+
+```
+db >=1ms: true
+cache >=1ms: true
+handler >=1ms: true
+```
+
+## Runnable example
+
+W3C-style `traceparent` generate/parse and HTTP propagation between two `httptest` services—stdlib only (no OTel SDK).
+
+```bash
+mkdir -p /tmp/go-traceprop && cd /tmp/go-traceprop
+go mod init example.com/traceprop
+```
+
+Save as `main.go`:
+
+```go
+package main
+
+import (
+	"crypto/rand"
+	"encoding/hex"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+)
+
+func newTraceparent() string {
+	var tid [16]byte
+	var sid [8]byte
+	_, _ = rand.Read(tid[:])
+	_, _ = rand.Read(sid[:])
+	return fmt.Sprintf("00-%s-%s-01", hex.EncodeToString(tid[:]), hex.EncodeToString(sid[:]))
+}
+
+func parseTraceparent(s string) (traceID, spanID string, ok bool) {
+	parts := strings.Split(s, "-")
+	if len(parts) != 4 || parts[0] != "00" || len(parts[1]) != 32 || len(parts[2]) != 16 {
+		return "", "", false
+	}
+	return parts[1], parts[2], true
+}
+
+func main() {
+	// Service B
+	b := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		tp := r.Header.Get("traceparent")
+		tid, sid, ok := parseTraceparent(tp)
+		fmt.Printf("B saw trace_ok=%v trace_id=%s parent_span=%s\n", ok, tid, sid)
+		fmt.Fprintln(w, "b-ok")
+	}))
+	defer b.Close()
+
+	// Service A calls B, propagating traceparent
+	a := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		tp := r.Header.Get("traceparent")
+		if tp == "" {
+			tp = newTraceparent()
+		}
+		tid, _, _ := parseTraceparent(tp)
+		// child span id for outbound
+		var child [8]byte
+		_, _ = rand.Read(child[:])
+		outTP := fmt.Sprintf("00-%s-%s-01", tid, hex.EncodeToString(child[:]))
+		fmt.Printf("A outbound traceparent=%s\n", outTP)
+
+		req, _ := http.NewRequest(http.MethodGet, b.URL+"/work", nil)
+		req.Header.Set("traceparent", outTP)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+		resp.Body.Close()
+		w.Header().Set("traceparent", tp)
+		fmt.Fprintln(w, "a-ok")
+	}))
+	defer a.Close()
+
+	req, _ := http.NewRequest(http.MethodGet, a.URL+"/", nil)
+	req.Header.Set("traceparent", newTraceparent())
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		panic(err)
+	}
+	resp.Body.Close()
+	fmt.Println("client status:", resp.StatusCode)
+
+	// Broken propagation demo
+	_, _, ok := parseTraceparent("not-a-trace")
+	fmt.Println("invalid rejected:", !ok)
+}
+```
+
+```bash
+go run .
+```
+
+**Expected output** (ids random):
+
+```
+A outbound traceparent=00-...
+B saw trace_ok=true trace_id=... parent_span=...
+client status: 200
+invalid rejected: true
+```
+
+**What to notice**
+
+- Trace id stays stable across the request tree; span id changes per hop.
+- Forgetting to copy `traceparent` on the client is the classic “broken trace” bug.
+- Real systems add OTel SDK exporters; the propagation contract stays the same.
+
+**Try next**
+
+- Put `trace_id` into slog fields for log↔trace joins.
+- Continue a trace across a simulated queue message header map.
+
+## Further Reading
+
+- OpenTelemetry Go documentation
+- W3C Trace Context specification
+- Previous: Prometheus metrics for detection; traces for diagnosis
+- Next part: **Security Hardening** — protecting the systems you can now observe

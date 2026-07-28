@@ -1,40 +1,578 @@
 ---
-title: "132 HTTP Client and Server Resilience"
+title: "HTTP Client and Server Resilience"
 ---
 
-# 132 HTTP Client and Server Resilience
+# HTTP Client and Server Resilience
 
-Resilience in HTTP systems is budget management: every inbound request has limited time, and each downstream call spends part of that budget.
+Resilience in HTTP systems is **budget management**: every inbound request has limited time, and each downstream call spends part of that budget. When budgets are implicit, partial outages become full outages.
 
-## Budget-First Thinking
+## Why / Overview
+
+`net/http` is excellent — and dangerously easy to misuse. The zero-value `Client` has **no timeout**. The zero-value `Server` has **no read/write timeouts**. Those defaults are fine for toy programs and catastrophic under load.
+
+This chapter makes timeouts, cancellation, retries, and transport tuning explicit.
 
 ```text
-total request budget: 1200ms
-|-- auth --|-- cache --|-- db --|-- upstream API --|-- encode response --|
+client SLA (e.g. 2s)
+    |
+    v
+edge / server budget (1.8s) -- ReadHeader/Read/Write/Idle
+    |
+    +--> auth (50ms)
+    +--> cache (100ms)
+    +--> db (400ms)
+    +--> upstream HTTP (remaining via context)
+    +--> encode
 ```
-
-If one component consumes too much budget, upstream callers see latency spikes and timeouts.
 
 ## Server-Side Guardrails
 
-- `ReadHeaderTimeout` to protect against slowloris-style abuse.
-- `ReadTimeout` and `WriteTimeout` to bound request/response processing.
-- `IdleTimeout` to control keep-alive resource usage.
+### Configure the server, not just the handler
+
+```go
+srv := &http.Server{
+	Addr:              ":8080",
+	Handler:           logging(mux),
+	ReadHeaderTimeout: 5 * time.Second,  // slowloris protection
+	ReadTimeout:       15 * time.Second, // headers + body
+	WriteTimeout:      30 * time.Second, // careful with streaming
+	IdleTimeout:       60 * time.Second, // keep-alives
+	MaxHeaderBytes:    1 << 16,
+}
+```
+
+| Field | Protects against |
+|-------|------------------|
+| `ReadHeaderTimeout` | Slow header drip (slowloris) |
+| `ReadTimeout` | Slow bodies |
+| `WriteTimeout` | Stuck clients on response |
+| `IdleTimeout` | Idle keep-alive resource waste |
+| `MaxHeaderBytes` | Oversized header memory use |
+
+**Streaming caveat:** `WriteTimeout` is absolute from request start on many setups; long-lived streams (SSE, chunked) may need a different server or hijacking strategy.
+
+### Handler-level budgets
+
+```go
+func handleOrder(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), 1200*time.Millisecond)
+	defer cancel()
+
+	user, err := auth.User(ctx, r)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	order, err := orders.Create(ctx, user, r.Body)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, order)
+}
+```
+
+Always derive from `r.Context()` so client disconnects cancel work.
+
+### Limit concurrency of expensive handlers
+
+```go
+var sem = make(chan struct{}, 100)
+
+func limited(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case sem <- struct{}{}:
+			defer func() { <-sem }()
+			next.ServeHTTP(w, r)
+		default:
+			http.Error(w, "overloaded", http.StatusServiceUnavailable)
+		}
+	})
+}
+```
+
+Return **503** with `Retry-After` when shedding load so well-behaved clients back off.
+
+### Body limits
+
+```go
+r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+```
+
+Combine with JSON decoders that use `DisallowUnknownFields` for strict APIs.
 
 ## Client-Side Guardrails
 
-- Default `http.Client` timeout for hard cap.
-- Per-call `context.WithTimeout` for operation-specific budgets.
-- Retry only idempotent operations and only within remaining budget.
+### Never use the naked default client in production
+
+```go
+var outbound = &http.Client{
+	Timeout: 10 * time.Second, // hard cap including body read
+	Transport: &http.Transport{
+		Proxy: http.ProxyFromEnvironment,
+		DialContext: (&net.Dialer{
+			Timeout:   3 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          100,
+		MaxIdleConnsPerHost:   10,
+		MaxConnsPerHost:       32,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   5 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+		ResponseHeaderTimeout: 5 * time.Second,
+	},
+}
+```
+
+Notes:
+
+- `Client.Timeout` covers the whole request (dial → headers → body).
+- Prefer **per-call context** for operation-specific budgets finer than the client timeout.
+- Tune `MaxConnsPerHost` to avoid stampedes on a single dependency.
+
+### Context-aware requests
+
+```go
+func fetchUser(ctx context.Context, id string) (*User, error) {
+	ctx, cancel := context.WithTimeout(ctx, 300*time.Millisecond)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, baseURL+"/users/"+id, nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := outbound.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 500 {
+		return nil, fmt.Errorf("upstream status %d", resp.StatusCode)
+	}
+	var u User
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&u); err != nil {
+		return nil, err
+	}
+	return &u, nil
+}
+```
+
+Always `Close` bodies — leaking bodies leaks connections from the pool.
 
 ## Failure Classification
 
-Treat failures differently:
+| Signal | Likely meaning | Retry? |
+|--------|----------------|--------|
+| `context.DeadlineExceeded` | Budget exhausted / slow dep | Maybe once, if idempotent & budget remains |
+| `context.Canceled` | Caller gave up | No |
+| Connection refused / reset | Dep down or restarting | Yes with backoff |
+| HTTP 408 / 429 | Timeout / rate limit | Yes respecting `Retry-After` |
+| HTTP 500 / 502 / 503 / 504 | Upstream error | Conditional |
+| HTTP 400 / 401 / 403 / 404 | Caller / auth / missing | No |
+| HTTP 409 / 422 | Business conflict | Usually no |
 
-- Timeout/cancel: likely capacity or dependency latency issue.
-- 5xx: downstream error, candidate for controlled retry.
-- 4xx: usually caller/input issue, no retry.
+```go
+func retryable(status int, err error) bool {
+	if err != nil {
+		if errors.Is(err, context.Canceled) {
+			return false
+		}
+		return true // network errors: often transient
+	}
+	switch status {
+	case 408, 429, 500, 502, 503, 504:
+		return true
+	default:
+		return false
+	}
+}
+```
 
-## Operational Insight
+## Retries Without Amplification
 
-Services become stable when timeout and retry policy is explicit, consistent, and visible in logs/metrics. Hidden defaults are the most common source of cascading failure.
+Rules of thumb:
+
+1. Retry only **idempotent** methods by default (`GET`, `HEAD`, `PUT`, `DELETE` with idempotency keys).
+2. Cap attempts (e.g. 2–3 total).
+3. Exponential backoff **with jitter**.
+4. Bound **total elapsed time**, not just attempt count.
+5. Propagate remaining parent context budget.
+6. Prefer idempotency keys for `POST` when the business allows.
+
+```go
+func doWithRetry(ctx context.Context, c *http.Client, req *http.Request) (*http.Response, error) {
+	var last error
+	backoff := 50 * time.Millisecond
+	for attempt := 0; attempt < 3; attempt++ {
+		if attempt > 0 {
+			// Clone body if needed; for GET, req can be reused carefully.
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(backoff + jitter(backoff)):
+			}
+			backoff *= 2
+		}
+		r := req.Clone(ctx)
+		resp, err := c.Do(r)
+		if err == nil && !retryable(resp.StatusCode, nil) {
+			return resp, nil
+		}
+		if err == nil {
+			resp.Body.Close()
+			last = fmt.Errorf("status %d", resp.StatusCode)
+		} else {
+			last = err
+			if !retryable(0, err) {
+				return nil, err
+			}
+		}
+	}
+	return nil, last
+}
+```
+
+Misconfigured retries at **browser + edge + service + client library** layers multiply load — coordinate policy.
+
+## Transport Pooling and HTTP/2
+
+- Reuse a single `*http.Client` / `Transport` (connection pool lives there).
+- Creating a new `Transport` per request disables reuse and burns sockets.
+- HTTP/2 multiplexes streams on one conn; head-of-line blocking moves to the application layer — still use deadlines per request.
+- For many hosts, raise `MaxIdleConns`; for one hot host, raise `MaxIdleConnsPerHost`.
+
+## Graceful Shutdown
+
+```go
+ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+defer stop()
+
+go func() {
+	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		slog.Error("listen", "err", err)
+		os.Exit(1)
+	}
+}()
+
+<-ctx.Done()
+shutdownCtx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+defer cancel()
+if err := srv.Shutdown(shutdownCtx); err != nil {
+	slog.Error("shutdown", "err", err)
+	_ = srv.Close()
+}
+```
+
+`Shutdown` stops accepting, waits for handlers; handlers must honor `r.Context()` to finish promptly.
+
+## Observability Hooks
+
+Emit at least:
+
+- Request rate, error rate, latency histogram (RED)
+- Client-side: outbound latency and error class by dependency
+- Timeout counts separately from application 5xx
+- In-flight requests / active connections
+
+```go
+func instrument(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		ww := &statusWriter{ResponseWriter: w, code: 200}
+		next.ServeHTTP(ww, r)
+		slog.Info("request",
+			"method", r.Method,
+			"path", r.URL.Path,
+			"status", ww.code,
+			"dur_ms", time.Since(start).Milliseconds(),
+		)
+	})
+}
+```
+
+## Production Checklist
+
+- [ ] Every `http.Server` has header/read/write/idle timeouts
+- [ ] Every production `http.Client` has `Timeout` + tuned `Transport`
+- [ ] Handlers derive work from `r.Context()` with sub-timeouts
+- [ ] Response bodies always closed; request bodies limited
+- [ ] Retries are idempotent, jittered, budget-capped
+- [ ] Load shedding returns 503 under overload
+- [ ] Graceful `Shutdown` with handler deadlines
+- [ ] Metrics distinguish timeouts, cancels, and app errors
+- [ ] Single shared clients for outbound deps (pooled)
+
+## Common Pitfalls
+
+1. **`http.Get` in library code** — uses default client, no timeout.
+2. **Ignoring `resp.Body`** — connection pool starvation.
+3. **Retrying POST without idempotency** — double charges / double writes.
+4. **Server `WriteTimeout` too aggressive for large downloads**.
+5. **Context with values used for cancellation only half the stack** — DB layer ignores cancel.
+6. **Global 30s timeout for all outbound calls** — wastes budget on optional paths.
+7. **Fan-out without `errgroup` limits** — one request opens 200 deps.
+
+## Exercises
+
+1. Start a server without timeouts; use a slow client that drips headers; then add `ReadHeaderTimeout` and retest.
+2. Build a client with and without `Timeout`; point at a black hole IP; compare hang vs fail.
+3. Implement status-aware retries with jitter; unit-test that 404 is not retried and 503 is.
+4. Use `httptest.Server` to inject 100ms / 500ms / 2s latencies; verify parent 300ms budget cancels.
+5. Deliberately leak `resp.Body` in a loop; watch `TIME_WAIT` / goroutines / pool behavior; fix.
+6. Add a concurrency limiter middleware; load-test until you see 503s; graph in-flight.
+7. Implement graceful shutdown; send SIGTERM under load; confirm in-flight requests complete within budget.
+8. Split timeouts: dial 200ms, TLS 500ms, headers 500ms, total 2s — document where each is configured.
+9. Compare HTTP/1.1 vs HTTP/2 under many parallel requests to one host; note conn counts.
+10. Write a runbook entry: "p99 latency spike" — which timeout metric do you check first?
+
+## More examples
+
+### Client with transport timeouts (not zero-value)
+
+```bash
+mkdir -p /tmp/go-http-client-to && cd /tmp/go-http-client-to
+go mod init example.com/http-client-to
+```
+
+Save as `main.go`:
+
+```go
+package main
+
+import (
+	"fmt"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"time"
+)
+
+func main() {
+	slow := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(80 * time.Millisecond)
+		fmt.Fprintln(w, "late")
+	}))
+	defer slow.Close()
+
+	client := &http.Client{
+		Timeout: 20 * time.Millisecond,
+		Transport: &http.Transport{
+			DialContext: (&net.Dialer{Timeout: 50 * time.Millisecond}).DialContext,
+			ResponseHeaderTimeout: 50 * time.Millisecond,
+		},
+	}
+	_, err := client.Get(slow.URL)
+	fmt.Println("client timeout:", err != nil)
+
+	fast := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintln(w, "ok")
+	}))
+	defer fast.Close()
+	client.Timeout = time.Second
+	resp, err := client.Get(fast.URL)
+	if err != nil {
+		panic(err)
+	}
+	resp.Body.Close()
+	fmt.Println("fast status:", resp.StatusCode)
+}
+```
+
+```bash
+go run .
+```
+
+**Expected output:**
+
+```
+client timeout: true
+fast status: 200
+```
+
+### Retry only on transient status
+
+```bash
+mkdir -p /tmp/go-http-retry && cd /tmp/go-http-retry
+go mod init example.com/http-retry
+```
+
+Save as `main.go`:
+
+```go
+package main
+
+import (
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"sync/atomic"
+)
+
+func main() {
+	var n atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if n.Add(1) < 3 {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		fmt.Fprintln(w, "ok")
+	}))
+	defer ts.Close()
+
+	var last int
+	for attempt := 1; attempt <= 5; attempt++ {
+		resp, err := http.Get(ts.URL)
+		if err != nil {
+			panic(err)
+		}
+		last = resp.StatusCode
+		resp.Body.Close()
+		if last < 500 {
+			break
+		}
+	}
+	fmt.Println("attempts:", n.Load(), "final:", last)
+}
+```
+
+```bash
+go run .
+```
+
+**Expected output:**
+
+```
+attempts: 3 final: 200
+```
+
+## Runnable example
+
+`httptest` backend with injected latency, a budgeted client, and retries with exponential backoff + jitter—stdlib-only resilience loop.
+
+```bash
+mkdir -p /tmp/go-http-resilience && cd /tmp/go-http-resilience
+go mod init example.com/http-resilience
+```
+
+Save as `main.go`:
+
+```go
+package main
+
+import (
+	"context"
+	"fmt"
+	"io"
+	"math/rand"
+	"net/http"
+	"net/http/httptest"
+	"time"
+)
+
+func backoff(attempt int) time.Duration {
+	// Full jitter: random in [0, base*2^attempt]
+	base := 20 * time.Millisecond
+	max := base << attempt
+	if max > 200*time.Millisecond {
+		max = 200 * time.Millisecond
+	}
+	return time.Duration(rand.Int63n(int64(max) + 1))
+}
+
+func getWithRetry(ctx context.Context, client *http.Client, url string, attempts int) (int, error) {
+	var last error
+	for i := 0; i < attempts; i++ {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+		if err != nil {
+			return 0, err
+		}
+		resp, err := client.Do(req)
+		if err != nil {
+			last = err
+		} else {
+			code := resp.StatusCode
+			io.Copy(io.Discard, resp.Body)
+			resp.Body.Close()
+			if code < 500 {
+				return code, nil // do not retry 4xx
+			}
+			last = fmt.Errorf("status %d", code)
+		}
+		if i+1 == attempts {
+			break
+		}
+		t := time.NewTimer(backoff(i))
+		select {
+		case <-ctx.Done():
+			t.Stop()
+			return 0, ctx.Err()
+		case <-t.C:
+		}
+	}
+	return 0, last
+}
+
+func main() {
+	var calls int
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		if calls < 3 {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		fmt.Fprintln(w, "ok")
+	}))
+	defer ts.Close()
+
+	client := &http.Client{Timeout: 500 * time.Millisecond}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	code, err := getWithRetry(ctx, client, ts.URL, 5)
+	fmt.Printf("final status=%d err=%v upstream_calls=%d\n", code, err, calls)
+
+	// Budget cancel demo: server slower than parent context
+	slow := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(200 * time.Millisecond)
+		fmt.Fprintln(w, "slow")
+	}))
+	defer slow.Close()
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel2()
+	_, err = getWithRetry(ctx2, client, slow.URL, 3)
+	fmt.Println("budget exceeded:", err != nil)
+}
+```
+
+```bash
+go run .
+```
+
+**Expected output** (illustrative):
+
+```
+final status=200 err=<nil> upstream_calls=3
+budget exceeded: true
+```
+
+**What to notice**
+
+- Retry only idempotent-safe cases (here GET) and 5xx/transport errors—not 404.
+- Parent context budget must bound total attempts; infinite retry is an outage amplifier.
+- `httptest.Server` is the right unit-test stand-in for dependency latency and failure.
+
+**Try next**
+
+- Skip retries on `context.Canceled` and count them separately in metrics.
+- Add a concurrency semaphore middleware that returns 503 under overload.
+
+## Further Reading
+
+- Go `net/http` docs for `Transport` fields
+- SRE books on tail latency and load shedding
+- Previous: TCP framing and deadlines
+- Next: **Reverse Proxy and Load Balancing** — centralizing these policies at the edge

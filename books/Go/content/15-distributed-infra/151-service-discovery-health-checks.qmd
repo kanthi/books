@@ -1,31 +1,501 @@
 ---
-title: "151 Service Discovery and Health Checks"
+title: "Service Discovery and Health Checks"
 ---
 
-# 151 Service Discovery and Health Checks
+# Service Discovery and Health Checks
 
-Discovery systems answer two questions: where instances are, and whether they are currently safe to route to.
+Discovery systems answer two questions: **where instances are**, and **whether they are currently safe to route to**. Getting either wrong produces systematic 5xx and mysterious latency.
 
-## System Shape
+## Why / Overview
+
+Hard-coded IPs die in dynamic environments. DNS, kube endpoints, Consul, Eureka, or a custom registry all solve:
 
 ```text
-instance -> register/heartbeat -> registry
-router   -> query endpoints   -> select healthy target
+instance -> register + heartbeat -> registry
+router/client -> resolve -> filter healthy -> call
 ```
 
-## Health Semantics
+Health is not optional metadata; it is **routing input**.
 
-Use distinct checks:
+## Discovery Mechanisms
 
-- Liveness: process is alive.
-- Readiness: instance can serve traffic.
+| Mechanism | Pros | Cons |
+|-----------|------|------|
+| DNS (A/AAAA/SRV) | Simple, universal | TTL lag, limited health |
+| Platform endpoints (K8s) | Integrated readiness | Cluster-centric |
+| Service mesh / lb | Rich policy | Operational weight |
+| Client-side registry | Flexible | Dual-write complexity |
+| Config static list | Debuggable | No dynamism |
 
-Routing on liveness alone creates avoidable errors during warmup, migrations, and degraded dependencies.
+Many Go services use **DNS or platform discovery** plus **client-side health-aware pools**.
 
-## Expiration Strategy
+## Registration and TTL
 
-TTL-based registration prevents stale endpoints from receiving traffic when instances crash or disconnect unexpectedly.
+Without TTL/heartbeat, crashed instances remain targets forever.
 
-## Reliability Principle
+```go
+type Registration struct {
+	ID       string    `json:"id"`
+	Addr     string    `json:"addr"` // host:port
+	Expires  time.Time `json:"expires"`
+	Meta     map[string]string `json:"meta,omitempty"`
+}
 
-Discovery quality directly determines tail latency and error rate. Treat registry correctness as critical infrastructure.
+// Registry.Put sets Expires = now + TTL; instances heartbeat before expiry.
+```
+
+Heartbeat loop:
+
+```go
+func (c *Agent) heartbeat(ctx context.Context) error {
+	t := time.NewTicker(c.ttl / 3)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return c.registry.Deregister(context.Background(), c.id)
+		case <-t.C:
+			if err := c.registry.Refresh(ctx, c.id, c.ttl); err != nil {
+				slog.Error("heartbeat failed", "err", err)
+			}
+		}
+	}
+}
+```
+
+On shutdown: best-effort deregister **and** rely on TTL (network can drop deregister).
+
+## Liveness vs Readiness vs Startup
+
+| Probe | Question | Failure action |
+|-------|----------|----------------|
+| Startup | Has init finished? | Wait; don't kill yet |
+| Liveness | Is process stuck? | Restart process |
+| Readiness | Can it serve traffic? | Remove from LB only |
+
+```go
+var (
+	ready   atomic.Bool
+	started atomic.Bool
+)
+
+func handlers() http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
+		// Liveness: process up; avoid dependency checks here.
+		w.WriteHeader(http.StatusOK)
+	})
+	mux.HandleFunc("GET /readyz", func(w http.ResponseWriter, r *http.Request) {
+		if !ready.Load() {
+			http.Error(w, "not ready", http.StatusServiceUnavailable)
+			return
+		}
+		// Optional: shallow dependency ping with short timeout.
+		ctx, cancel := context.WithTimeout(r.Context(), 200*time.Millisecond)
+		defer cancel()
+		if err := db.PingContext(ctx); err != nil {
+			http.Error(w, "db", http.StatusServiceUnavailable)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	})
+	return mux
+}
+```
+
+**Anti-pattern:** readiness that always returns 200; liveness that checks the database (DB blip restarts all pods).
+
+### Warmup
+
+```go
+func main() {
+	// listen first for probes if needed, ready=false
+	go server.Listen()
+	mustConnectDB()
+	primeCaches()
+	ready.Store(true)
+	<-ctx.Done()
+	ready.Store(false) // stop new traffic
+	shutdown()
+}
+```
+
+## Client-Side Discovery Pool
+
+```go
+type Pool struct {
+	mu    sync.RWMutex
+	addrs []string
+}
+
+func (p *Pool) Update(addrs []string) {
+	p.mu.Lock()
+	p.addrs = append([]string(nil), addrs...)
+	p.mu.Unlock()
+}
+
+func (p *Pool) Pick() (string, error) {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	if len(p.addrs) == 0 {
+		return "", errors.New("no endpoints")
+	}
+	// simple RR or random
+	return p.addrs[rand.Intn(len(p.addrs))], nil
+}
+```
+
+Refresh from DNS:
+
+```go
+func watchDNS(ctx context.Context, host string, every time.Duration, p *Pool) {
+	t := time.NewTicker(every)
+	defer t.Stop()
+	resolver := net.DefaultResolver
+	for {
+		addrs, err := resolver.LookupHost(ctx, host)
+		if err != nil {
+			slog.Warn("dns lookup", "err", err)
+		} else {
+			// attach port, update pool
+			p.Update(withPort(addrs, "8080"))
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+	}
+}
+```
+
+Respect DNS TTL when possible; aggressive refresh can stampede resolvers.
+
+## Passive Health and Outlier Detection
+
+Active probes cost load; passive detection uses real traffic:
+
+```text
+connect error or 5xx streak >= N  -> mark bad for cooldown
+after cooldown, allow probe request (half-open style)
+```
+
+Combine with circuit breakers (next chapter) so discovery and breakers do not fight each other — define a single "eligible endpoints" set.
+
+## Consistency and Split-Brain
+
+Registries can lag:
+
+- Client A sees endpoints {1,2}
+- Client B sees {2,3}
+
+Design for **eventual consistency**: idempotent handlers, no single-instance assumptions without leases/locks.
+
+Leader election (if needed) is a separate, harder problem — prefer cloud primitives or etcd/Consul sessions over home-grown locks unless you must.
+
+## Security Notes
+
+- Authenticate registration if the registry is multi-tenant.
+- Prefer mTLS to discovered peers (part 17).
+- Do not put secrets in registry metadata.
+- Validate advertised addresses (SSRF: instance claims `169.254.169.254`).
+
+## Observability
+
+Metrics:
+
+- `discovery_endpoints{service}` gauge
+- `discovery_refresh_errors_total`
+- `healthcheck_fail_total{type=live|ready}`
+- `endpoint_selected_total{addr}` (careful cardinality — hash or sample)
+
+Logs: registration, deregistration, ready transitions.
+
+## Production Checklist
+
+- [ ] Distinct live vs ready endpoints
+- [ ] Ready checks dependencies with short timeouts
+- [ ] Live checks do not restart on dep failure
+- [ ] TTL or platform removal on crash
+- [ ] Graceful deregister + ready=false before shutdown
+- [ ] Client pool handles empty set (fail fast)
+- [ ] Outlier / passive health for sticky failures
+- [ ] Metrics for endpoint count and probe failures
+- [ ] Document discovery mode (DNS/K8s/custom) in runbooks
+
+## Common Pitfalls
+
+1. **Only liveness** — traffic during warmup/migrations fails.
+2. **Deep checks on liveness** — coordinated restarts under DB blip.
+3. **No TTL** — zombie instances.
+4. **Long DNS TTL** — slow failover (or too short — extra load).
+5. **Ready depends on optional downstream** — optional features take the whole service out.
+6. **Health handler allocates heavily** — becomes its own outage under probe load.
+7. **Publishing localhost** in registry from misconfigured agents.
+
+## Exercises
+
+1. Implement `/healthz` and `/readyz`; toggle ready with an atomic; prove LB behavior with a tiny proxy.
+2. Add DB ping to ready with 100ms timeout; kill DB; confirm live still 200, ready 503.
+3. Write a TTL registry in memory; stop heartbeats; observe expiry.
+4. DNS pool: resolve a name with multiple A records; pull one instance; see traffic shift (use `/etc/hosts` hacks in lab).
+5. Simulate slow ready handler (2s); set probe timeout 200ms; fix the handler.
+6. On SIGTERM, set ready false, sleep 2s, then exit; describe how this helps connection draining.
+7. Implement passive health: three failures mark endpoint down for 10s.
+8. Attempt SSRF-style registration address; add allowlist validation.
+9. Graph endpoint count during a rolling deploy.
+10. Write a runbook: "endpoint count dropped to zero."
+
+## More examples
+
+### In-memory registry with health filter
+
+```bash
+mkdir -p /tmp/go-sd-reg && cd /tmp/go-sd-reg
+go mod init example.com/sd-reg
+```
+
+Save as `main.go`:
+
+```go
+package main
+
+import (
+	"fmt"
+	"sync"
+)
+
+type Endpoint struct {
+	ID      string
+	Addr    string
+	Healthy bool
+}
+
+type Registry struct {
+	mu   sync.RWMutex
+	byID map[string]Endpoint
+}
+
+func NewRegistry() *Registry {
+	return &Registry{byID: map[string]Endpoint{}}
+}
+
+func (r *Registry) Upsert(e Endpoint) {
+	r.mu.Lock()
+	r.byID[e.ID] = e
+	r.mu.Unlock()
+}
+
+func (r *Registry) Healthy() []Endpoint {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	var out []Endpoint
+	for _, e := range r.byID {
+		if e.Healthy {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
+func main() {
+	reg := NewRegistry()
+	reg.Upsert(Endpoint{ID: "a", Addr: "10.0.0.1:8080", Healthy: true})
+	reg.Upsert(Endpoint{ID: "b", Addr: "10.0.0.2:8080", Healthy: false})
+	reg.Upsert(Endpoint{ID: "c", Addr: "10.0.0.3:8080", Healthy: true})
+	h := reg.Healthy()
+	fmt.Println("healthy count:", len(h))
+	reg.Upsert(Endpoint{ID: "b", Addr: "10.0.0.2:8080", Healthy: true})
+	fmt.Println("after b recovers:", len(reg.Healthy()))
+}
+```
+
+```bash
+go run .
+```
+
+**Expected output:**
+
+```
+healthy count: 2
+after b recovers: 3
+```
+
+### /healthz and /readyz with dependency flag
+
+```bash
+mkdir -p /tmp/go-health-ep && cd /tmp/go-health-ep
+go mod init example.com/health-ep
+```
+
+Save as `main.go`:
+
+```go
+package main
+
+import (
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"sync/atomic"
+)
+
+func main() {
+	var ready atomic.Bool
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(200)
+		fmt.Fprintln(w, "ok")
+	})
+	mux.HandleFunc("GET /readyz", func(w http.ResponseWriter, _ *http.Request) {
+		if !ready.Load() {
+			http.Error(w, "not ready", 503)
+			return
+		}
+		fmt.Fprintln(w, "ready")
+	})
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	r, _ := http.Get(ts.URL + "/healthz")
+	r.Body.Close()
+	fmt.Println("live:", r.StatusCode)
+	r, _ = http.Get(ts.URL + "/readyz")
+	r.Body.Close()
+	fmt.Println("ready cold:", r.StatusCode)
+	ready.Store(true)
+	r, _ = http.Get(ts.URL + "/readyz")
+	r.Body.Close()
+	fmt.Println("ready warm:", r.StatusCode)
+}
+```
+
+```bash
+go run .
+```
+
+**Expected output:**
+
+```
+live: 200
+ready cold: 503
+ready warm: 200
+```
+
+## Runnable example
+
+In-memory registry with heartbeats/TTL plus `/healthz` vs `/readyz` on an `httptest` server—live during warmup, ready only when marked.
+
+```bash
+mkdir -p /tmp/go-discovery && cd /tmp/go-discovery
+go mod init example.com/discovery
+```
+
+Save as `main.go`:
+
+```go
+package main
+
+import (
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"sync"
+	"sync/atomic"
+	"time"
+)
+
+type registry struct {
+	mu   sync.Mutex
+	ttl  map[string]time.Time
+}
+
+func newRegistry() *registry { return &registry{ttl: map[string]time.Time{}} }
+
+func (r *registry) upsert(addr string, ttl time.Duration) {
+	r.mu.Lock()
+	r.ttl[addr] = time.Now().Add(ttl)
+	r.mu.Unlock()
+}
+
+func (r *registry) list() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	now := time.Now()
+	var out []string
+	for a, exp := range r.ttl {
+		if now.Before(exp) {
+			out = append(out, a)
+		} else {
+			delete(r.ttl, a)
+		}
+	}
+	return out
+}
+
+func main() {
+	var ready atomic.Bool
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
+	})
+	mux.HandleFunc("GET /readyz", func(w http.ResponseWriter, _ *http.Request) {
+		if !ready.Load() {
+			http.Error(w, "not ready", http.StatusServiceUnavailable)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ready"))
+	})
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	check := func(path string) int {
+		resp, err := http.Get(ts.URL + path)
+		if err != nil {
+			return 0
+		}
+		defer resp.Body.Close()
+		return resp.StatusCode
+	}
+	fmt.Println("live:", check("/healthz"), "ready:", check("/readyz"))
+	ready.Store(true)
+	fmt.Println("after warmup ready:", check("/readyz"))
+
+	reg := newRegistry()
+	reg.upsert(ts.URL, 40*time.Millisecond)
+	reg.upsert("http://10.0.0.9:8080", time.Second)
+	time.Sleep(50 * time.Millisecond)
+	fmt.Println("registry after ttl:", reg.list())
+}
+```
+
+```bash
+go run .
+```
+
+**Expected output:**
+
+```
+live: 200 ready: 503
+after warmup ready: 200
+registry after ttl: [http://10.0.0.9:8080]
+```
+
+**What to notice**
+
+- Liveness ≠ readiness; LB should wait on ready during migrations.
+- TTL registration removes instances that stop heartbeating (zombies).
+- Health handlers must stay cheap—slow probes become outages.
+
+**Try next**
+
+- On shutdown: set ready false, sleep 2s, then exit (connection drain).
+- Passive health: three consecutive proxy errors mark an addr down for 10s.
+
+## Further Reading
+
+- Kubernetes probes documentation
+- Previous part: reverse proxy health-aware pools
+- Next: **Retry and Circuit Breaker Patterns**

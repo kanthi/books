@@ -1,42 +1,609 @@
 ---
-title: "133 Reverse Proxy and Load Balancing"
+title: "Reverse Proxy and Load Balancing"
 ---
 
-# 133 Reverse Proxy and Load Balancing
+# Reverse Proxy and Load Balancing
 
-A reverse proxy is a reliability boundary: it enforces routing policy, mediates failures, and protects backend services.
+A reverse proxy is a **reliability boundary**: it enforces routing policy, mediates failures, and protects backend services. In Go you can build edge-like behavior with `net/http/httputil` and a small amount of discipline — or understand nginx/Envoy better by implementing the same ideas.
 
-## Request Path
+## Why / Overview
+
+Backends should focus on business logic. The proxy owns:
+
+- Route matching and path rewrite
+- Upstream selection and health
+- Timeout and retry policy (carefully)
+- Request identity / header hygiene
+- TLS termination or pass-through
+- Observability of the edge hop
 
 ```text
-client -> edge proxy -> route match -> upstream selection -> backend
-                     -> policy layer (auth, limits, timeout)
+client -> edge proxy -> route match -> pick upstream -> backend
+                     \-> policies: authn, rate limit, timeout, LB
+```
+
+## Building a Reverse Proxy in Go
+
+### Single upstream
+
+```go
+package main
+
+import (
+	"net/http"
+	"net/http/httputil"
+	"net/url"
+	"time"
+)
+
+func main() {
+	target, _ := url.Parse("http://127.0.0.1:8081")
+	proxy := httputil.NewSingleHostReverseProxy(target)
+
+	// Optional: custom transport with timeouts.
+	proxy.Transport = &http.Transport{
+		Proxy:                 http.ProxyFromEnvironment,
+		ResponseHeaderTimeout: 5 * time.Second,
+		IdleConnTimeout:       90 * time.Second,
+		MaxIdleConnsPerHost:   32,
+	}
+
+	// Error handler when upstream is down.
+	proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
+		http.Error(w, "bad gateway", http.StatusBadGateway)
+	}
+
+	srv := &http.Server{
+		Addr:              ":8080",
+		Handler:           proxy,
+		ReadHeaderTimeout: 5 * time.Second,
+	}
+	srv.ListenAndServe()
+}
+```
+
+`NewSingleHostReverseProxy` rewrites the request URL to the target and sets `X-Forwarded-For` (with care about trust).
+
+### Director customization
+
+```go
+proxy := &httputil.ReverseProxy{
+	Director: func(req *http.Request) {
+		req.URL.Scheme = "http"
+		req.URL.Host = upstream // host:port
+		req.Host = upstream
+		// Strip internal headers clients must not inject.
+		req.Header.Del("X-Internal-Auth")
+		req.Header.Set("X-Request-Id", ensureRequestID(req))
+	},
+	Transport:   transport,
+	ErrorHandler: edgeError,
+	ModifyResponse: func(resp *http.Response) error {
+		resp.Header.Set("X-Edge", "go-proxy")
+		return nil
+	},
+}
 ```
 
 ## Routing Model
 
-Keep routing deterministic and debuggable:
+Keep routing **deterministic and debuggable**:
 
-- Exact routes first.
-- Prefix/wildcard routes second.
-- Explicit default/fallback behavior.
+1. Exact path matches first
+2. Method-aware routes when needed
+3. Longest prefix next
+4. Explicit default / 404
 
-## Upstream Selection
+```go
+type route struct {
+	prefix string
+	pool   *UpstreamPool
+}
 
-Round-robin is a baseline, but production systems also need health awareness:
+func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
+	for _, rt := range r.routes { // ordered: longest prefix first
+		if strings.HasPrefix(req.URL.Path, rt.prefix) {
+			rt.pool.Proxy().ServeHTTP(w, req)
+			return
+		}
+	}
+	http.NotFound(w, req)
+}
+```
 
-- Remove failing nodes quickly.
-- Reintroduce nodes only after recovery checks.
-- Prevent hot-spotting during partial outages.
+Document route tables in config, not only in code — operators need to see them during incidents.
+
+## Upstream Selection and Load Balancing
+
+### Round-robin baseline
+
+```go
+type UpstreamPool struct {
+	mu    sync.Mutex
+	addrs []string
+	next  uint64
+	alive []bool
+}
+
+func (p *UpstreamPool) pick() (string, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	n := len(p.addrs)
+	for i := 0; i < n; i++ {
+		idx := int(p.next % uint64(n))
+		p.next++
+		if p.alive[idx] {
+			return p.addrs[idx], true
+		}
+	}
+	return "", false
+}
+```
+
+### Health awareness
+
+```text
+active check:  proxy -> GET /healthz on each upstream every N seconds
+passive check: consecutive 5xx / connect errors mark unhealthy
+reentry:       require M successes before alive=true again
+```
+
+```go
+func (p *UpstreamPool) healthLoop(ctx context.Context, client *http.Client, every time.Duration) {
+	t := time.NewTicker(every)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			for i, addr := range p.addrs {
+				ok := probe(ctx, client, "http://"+addr+"/healthz")
+				p.mu.Lock()
+				p.alive[i] = ok
+				p.mu.Unlock()
+			}
+		}
+	}
+}
+```
+
+Use **readiness**, not mere process liveness, for routing. A process can be up while its DB is down.
+
+### Other LB algorithms (when RR is not enough)
+
+| Algorithm | Use when |
+|-----------|----------|
+| Round-robin | Homogeneous backends |
+| Least connections | Long-lived / uneven requests |
+| Consistent hash | Cache locality / sticky sessions without central store |
+| Weighted | Canary / heterogeneous capacity |
+
+Sticky sessions couple clients to instances and complicate deploys — prefer shared session stores when possible.
 
 ## Timeout and Retry Boundaries
 
-Proxy retries can multiply load if misconfigured. Always apply:
+Proxy retries can **multiply load**. Rules:
 
-- Attempt limits.
-- Retryable method/status rules.
-- Total request budget cap.
+- Retry only safe methods by default.
+- Cap attempts (often 1 retry for idempotent GET).
+- Enforce a **total edge budget** (e.g. 5s) independent of backend generosity.
+- Do not retry if the client already disconnected.
+- Prefer failovers to a different healthy instance over hammering the same one.
 
-## Why This Chapter Matters
+```go
+func (p *UpstreamPool) Proxy() http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+		defer cancel()
+		r = r.WithContext(ctx)
 
-Most distributed outages are coordination failures across otherwise healthy components. A well-designed proxy reduces blast radius by making policies explicit and centrally observable.
+		addr, ok := p.pick()
+		if !ok {
+			http.Error(w, "no healthy upstream", http.StatusServiceUnavailable)
+			return
+		}
+		// Build reverse proxy for addr or set Director host to addr.
+		p.reverseProxyTo(addr).ServeHTTP(w, r)
+	})
+}
+```
+
+## Header Hygiene and Trust
+
+Critical edge concerns:
+
+1. **Hop-by-hop headers** — `Connection`, `Keep-Alive`, `Transfer-Encoding` must not be blindly forwarded incorrectly (`httputil` handles many cases).
+2. **`X-Forwarded-*`** — only append client IP if the immediate peer is a trusted hop; otherwise clients spoof IPs for rate limits/ACLs.
+3. **Strip internal auth headers** — clients must not set `X-User-Id` that backends trust.
+4. **Request IDs** — generate if missing; propagate to backends for correlation.
+
+```go
+func ensureRequestID(r *http.Request) string {
+	if id := r.Header.Get("X-Request-Id"); id != "" {
+		return id
+	}
+	return uuidNew() // crypto/rand based id
+}
+```
+
+## Buffering vs Streaming
+
+- Default reverse proxy streams bodies; good for large uploads/downloads.
+- Buffering enables retries with body replay but costs memory — only for small, idempotent requests with retained bodies.
+- For `POST` with bodies, retries require `GetBody` / rewind support.
+
+## Observability at the Edge
+
+Metrics:
+
+- `edge_requests_total{route,code}`
+- `edge_request_duration_seconds{route}`
+- `edge_upstream_errors_total{upstream,reason}`
+- `edge_upstream_alive{upstream}`
+- `edge_retry_total{route}`
+
+Logs: request id, route, chosen upstream, status, duration, error class.
+
+Tracing: create a span at the edge; inject propagation headers into upstream requests (see part 16).
+
+## Production Checklist
+
+- [ ] Explicit route table with deterministic matching
+- [ ] Health-aware upstream pool with hysteresis on recovery
+- [ ] Transport timeouts on proxy → backend
+- [ ] Edge-level total timeout budget
+- [ ] Conservative retry policy (idempotent only)
+- [ ] Header allow/deny lists for trusted identity
+- [ ] Separate admin listener for proxy diagnostics
+- [ ] Metrics per route and per upstream
+- [ ] Safe config reload story (or blue/green proxy instances)
+- [ ] Load tests for failover and thundering herd on recovery
+
+## Common Pitfalls
+
+1. **Retry storms** when all instances degraded.
+2. **Routing on liveness** while app is not ready.
+3. **Trusting client `X-Forwarded-For`** on a public edge.
+4. **One giant proxy binary** without resource limits — edge is critical path.
+5. **WebSocket / upgrade mishandling** — ensure hijack/upgrade paths are tested.
+6. **Hidden double timeouts** — edge 1s + backend 30s still fails at 1s; document the tighter bound.
+7. **Inconsistent path stripping** — `/api/v1` stripped twice → wrong backend path.
+
+## Minimal Multi-Upstream Example
+
+```go
+type multiHost struct {
+	pool *UpstreamPool
+	tr   http.RoundTripper
+}
+
+func (m *multiHost) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	addr, ok := m.pool.pick()
+	if !ok {
+		http.Error(w, "unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	rp := &httputil.ReverseProxy{
+		Director: func(req *http.Request) {
+			req.URL.Scheme = "http"
+			req.URL.Host = addr
+			req.Host = addr
+		},
+		Transport: m.tr,
+		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
+			m.pool.noteFailure(addr)
+			http.Error(w, "bad gateway", http.StatusBadGateway)
+		},
+	}
+	rp.ServeHTTP(w, r)
+}
+```
+
+## Exercises
+
+1. Proxy a single backend; kill the backend; confirm 502 and a metric increment.
+2. Implement round-robin across three `httptest` backends; log which host served each request.
+3. Add active health checks; mark one down; prove traffic shifts within one interval.
+4. Implement passive health: three consecutive errors → unhealthy; two successes → healthy.
+5. Send a client-supplied `X-Internal-User` header; strip it at the proxy; verify backend never sees the spoofed value.
+6. Add edge timeout of 200ms; backend sleeps 500ms; confirm client gets timeout/502, not a hang.
+7. Enable a single retry on GET only; prove POST is not retried.
+8. Load-test with one slow upstream in the pool; compare RR vs least-conn if you implement both.
+9. Add request IDs and propagate them; grep logs across proxy and backend for one request.
+10. Document a failure drill: "all upstreams unhealthy" — expected status, alerts, runbook.
+
+## More examples
+
+### Round-robin reverse proxy (stdlib)
+
+```bash
+mkdir -p /tmp/go-rr-proxy && cd /tmp/go-rr-proxy
+go mod init example.com/rr-proxy
+```
+
+Save as `main.go`:
+
+```go
+package main
+
+import (
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"net/http/httputil"
+	"net/url"
+	"sync/atomic"
+)
+
+func main() {
+	b1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintln(w, "b1")
+	}))
+	defer b1.Close()
+	b2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintln(w, "b2")
+	}))
+	defer b2.Close()
+
+	targets := []*url.URL{mustURL(b1.URL), mustURL(b2.URL)}
+	var i atomic.Uint64
+	proxy := &httputil.ReverseProxy{
+		Rewrite: func(pr *httputil.ProxyRequest) {
+			t := targets[i.Add(1)%uint64(len(targets))]
+			pr.SetURL(t)
+			pr.Out.Host = t.Host
+		},
+	}
+
+	front := httptest.NewServer(proxy)
+	defer front.Close()
+
+	for n := 0; n < 4; n++ {
+		resp, err := http.Get(front.URL + "/")
+		if err != nil {
+			panic(err)
+		}
+		var buf [8]byte
+		k, _ := resp.Body.Read(buf[:])
+		resp.Body.Close()
+		fmt.Print(string(buf[:k]))
+	}
+}
+
+func mustURL(s string) *url.URL {
+	u, err := url.Parse(s)
+	if err != nil {
+		panic(err)
+	}
+	return u
+}
+```
+
+```bash
+go run .
+```
+
+**Expected output:**
+
+```
+b2
+b1
+b2
+b1
+```
+
+### Skip unhealthy upstream
+
+```bash
+mkdir -p /tmp/go-proxy-health && cd /tmp/go-proxy-health
+go mod init example.com/proxy-health
+```
+
+Save as `main.go`:
+
+```go
+package main
+
+import (
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"sync/atomic"
+)
+
+func main() {
+	var healthy atomic.Bool
+	healthy.Store(false)
+
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/healthz" {
+			if !healthy.Load() {
+				w.WriteHeader(http.StatusServiceUnavailable)
+				return
+			}
+			fmt.Fprintln(w, "ok")
+			return
+		}
+		fmt.Fprintln(w, "served")
+	}))
+	defer up.Close()
+
+	pick := func() (string, bool) {
+		resp, err := http.Get(up.URL + "/healthz")
+		if err != nil {
+			return "", false
+		}
+		resp.Body.Close()
+		return up.URL, resp.StatusCode == 200
+	}
+
+	_, ok := pick()
+	fmt.Println("cold ok:", ok)
+	healthy.Store(true)
+	u, ok := pick()
+	fmt.Println("warm ok:", ok, "url set:", u != "")
+}
+```
+
+```bash
+go run .
+```
+
+**Expected output:**
+
+```
+cold ok: false
+warm ok: true url set: true
+```
+
+## Runnable example
+
+In-process reverse proxy with round-robin across three `httptest` backends and passive failure skip—stdlib `httputil.ReverseProxy`.
+
+```bash
+mkdir -p /tmp/go-rproxy && cd /tmp/go-rproxy
+go mod init example.com/rproxy
+```
+
+Save as `main.go`:
+
+```go
+package main
+
+import (
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"net/http/httputil"
+	"net/url"
+	"sync"
+	"sync/atomic"
+)
+
+type pool struct {
+	mu    sync.Mutex
+	addrs []string
+	down  map[string]bool
+	rr    uint64
+}
+
+func (p *pool) next() (string, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	n := len(p.addrs)
+	for i := 0; i < n; i++ {
+		idx := int(atomic.AddUint64(&p.rr, 1)-1) % n
+		a := p.addrs[idx]
+		if !p.down[a] {
+			return a, true
+		}
+	}
+	return "", false
+}
+
+func (p *pool) markDown(a string) {
+	p.mu.Lock()
+	p.down[a] = true
+	p.mu.Unlock()
+}
+
+func main() {
+	var hits [3]atomic.Int64
+	var backends []*httptest.Server
+	var addrs []string
+	for i := 0; i < 3; i++ {
+		i := i
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if i == 1 && hits[1].Load() == 0 {
+				// first touch on backend 1 fails once
+			}
+			hits[i].Add(1)
+			fmt.Fprintf(w, "backend-%d", i)
+		}))
+		backends = append(backends, ts)
+		u, _ := url.Parse(ts.URL)
+		addrs = append(addrs, u.Host)
+	}
+	defer func() {
+		for _, b := range backends {
+			b.Close()
+		}
+	}()
+
+	p := &pool{addrs: addrs, down: map[string]bool{}}
+	// Mark middle backend down to show skip.
+	p.markDown(addrs[1])
+
+	proxy := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		addr, ok := p.next()
+		if !ok {
+			http.Error(w, "unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		rp := &httputil.ReverseProxy{
+			Director: func(req *http.Request) {
+				req.URL.Scheme = "http"
+				req.URL.Host = addr
+				req.Host = addr
+				req.Header.Del("X-Internal-User") // strip spoofable header
+			},
+			ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
+				p.markDown(addr)
+				http.Error(w, "bad gateway", http.StatusBadGateway)
+			},
+		}
+		rp.ServeHTTP(w, r)
+	})
+
+	front := httptest.NewServer(proxy)
+	defer front.Close()
+
+	for i := 0; i < 6; i++ {
+		resp, err := http.Get(front.URL + "/")
+		if err != nil {
+			fmt.Println("err", err)
+			continue
+		}
+		var body [32]byte
+		n, _ := resp.Body.Read(body[:])
+		resp.Body.Close()
+		fmt.Printf("req %d -> %s\n", i+1, string(body[:n]))
+	}
+	fmt.Printf("hits: b0=%d b1=%d b2=%d\n", hits[0].Load(), hits[1].Load(), hits[2].Load())
+}
+```
+
+```bash
+go run .
+```
+
+**Expected output** (illustrative):
+
+```
+req 1 -> backend-0
+req 2 -> backend-2
+req 3 -> backend-0
+req 4 -> backend-2
+req 5 -> backend-0
+req 6 -> backend-2
+hits: b0=3 b1=0 b2=3
+```
+
+**What to notice**
+
+- Edge policy (skip down backends, strip unsafe headers) belongs in the proxy, not every service.
+- Round-robin with health state is enough to reason about blast radius before adopting Envoy.
+- `Director` rewrites scheme/host; never trust client-supplied internal identity headers.
+
+**Try next**
+
+- Active health checks every 200ms that clear `down` when `/healthz` returns 200.
+- Edge timeout: wrap transport with a short `ResponseHeaderTimeout`.
+
+## Further Reading
+
+- `net/http/httputil.ReverseProxy` source (Director, rewrite, errors)
+- Envoy / nginx docs on retries and outlier detection (concepts transfer)
+- Previous: HTTP resilience budgets
+- Next part: **Systems Programming** — process and filesystem discipline that network daemons rely on

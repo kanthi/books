@@ -1,33 +1,535 @@
 ---
-title: "142 Filesystem Automation and Safe IO"
+title: "Filesystem Automation and Safe IO"
 ---
 
-# 142 Filesystem Automation and Safe IO
+# Filesystem Automation and Safe IO
 
-Filesystem automation fails in subtle ways: partial writes, interrupted updates, and accidental destructive path handling.
+Filesystem automation fails in subtle ways: partial writes, interrupted updates, TOCTOU races, and path traversal. For ops tooling, **predictability beats peak throughput**.
 
-## Safe Write Pattern
+## Why / Overview
+
+Go services and CLIs constantly touch disks:
+
+- Rewrite config and state files
+- Rotate logs and checkpoints
+- Unpack artifacts
+- Cache blobs
+
+A crash mid-write can leave empty or half-written files that break the next start. Untrusted paths can escape into `/etc` or secrets mounts.
 
 ```text
-write temp -> fsync temp -> rename atomic -> fsync parent directory
+unsafe:  open(path) -> write -> close          # torn file on crash
+safe:    write temp -> fsync -> rename -> fsync dir
 ```
 
-This pattern minimizes corruption risk during crashes or power loss.
+## Atomic Replace Pattern
 
-## Path Safety
+POSIX `rename` within the same filesystem is atomic for the directory entry. Combined with temp files:
 
-Treat every path as untrusted until normalized and validated relative to an expected root.
+```go
+package atomicfile
 
-```text
-input path -> clean -> join(root, path) -> verify prefix(root) -> operate
+import (
+	"fmt"
+	"os"
+	"path/filepath"
+)
+
+func WriteFile(path string, data []byte, perm os.FileMode) error {
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, "."+filepath.Base(path)+".tmp-*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	defer func() { _ = os.Remove(tmpName) }() // no-op if rename succeeded
+
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Chmod(perm); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil { // fsync file
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		return err
+	}
+	// Best-effort fsync parent directory so the rename itself is durable.
+	return syncDir(dir)
+}
+
+func syncDir(dir string) error {
+	d, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer d.Close()
+	if err := d.Sync(); err != nil {
+		// Some FS (NFS, certain mounts) may not support directory sync.
+		return fmt.Errorf("sync dir: %w", err)
+	}
+	return nil
+}
 ```
 
-## Operational Tradeoffs
+Notes:
 
-- Durability vs speed: `fsync` improves safety but costs latency.
-- Simplicity vs flexibility: stricter path policy reduces accidental misuse.
-- Portability vs specialization: filesystem semantics vary by OS and mount type.
+- Create the temp file **in the same directory** as the target so `rename` does not cross devices.
+- `Sync` costs latency; for pure caches you may skip durability.
+- On Windows, atomic replace semantics differ; test platform-specific paths.
 
-## Design Principle
+## Path Safety (Root Jail)
 
-For automation tools, predictability is more valuable than peak throughput. It is better to be slower and safe than fast and destructive.
+Treat every user-supplied path as hostile.
+
+```go
+package safepath
+
+import (
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+)
+
+func UnderRoot(root, userPath string) (string, error) {
+	rootAbs, err := filepath.Abs(root)
+	if err != nil {
+		return "", err
+	}
+	// Disallow absolute user paths escaping intent.
+	if filepath.IsAbs(userPath) {
+		return "", fmt.Errorf("absolute paths not allowed")
+	}
+	joined := filepath.Join(rootAbs, userPath)
+	clean := filepath.Clean(joined)
+	rel, err := filepath.Rel(rootAbs, clean)
+	if err != nil {
+		return "", err
+	}
+	if rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
+		return "", fmt.Errorf("path escapes root")
+	}
+	return clean, nil
+}
+```
+
+Symlinks: `filepath.EvalSymlinks` can help but introduces its own races and platform quirks. For high-security tools, open with `O_NOFOLLOW` where available, or reject symlinks after `Lstat`.
+
+## Safe Read Patterns
+
+```go
+// Bound reads from untrusted files.
+f, err := os.Open(path)
+if err != nil {
+	return err
+}
+defer f.Close()
+data, err := io.ReadAll(io.LimitReader(f, 8<<20)) // 8 MiB cap
+```
+
+For line processing of huge logs, stream with `bufio.Scanner` but raise `MaxTokenSize` only deliberately — default token limits exist for a reason.
+
+## Permissions and Umask
+
+```go
+// Secrets on disk: owner read/write only
+if err := atomicfile.WriteFile(secretPath, b, 0o600); err != nil { ... }
+
+// Shared but not world-writable configs
+if err := atomicfile.WriteFile(cfgPath, b, 0o644); err != nil { ... }
+```
+
+Never use `0o777` "to make it work." Fix ownership instead.
+
+## Directory Creation
+
+```go
+if err := os.MkdirAll(dir, 0o755); err != nil {
+	return err
+}
+```
+
+`MkdirAll` is fine; still validate `dir` is under your root when driven by user input.
+
+## Check-Then-Act Races (TOCTOU)
+
+```go
+// racy
+if _, err := os.Stat(path); os.IsNotExist(err) {
+    f, _ = os.Create(path) // another process may have created it
+}
+```
+
+Prefer open flags:
+
+```go
+f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+```
+
+Or accept overwrite with atomic replace.
+
+## Streaming Copy and Spool
+
+```go
+func copyFile(src, dst string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+
+	tmp := dst + ".tmp"
+	out, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o644)
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(out, in); err != nil {
+		out.Close()
+		os.Remove(tmp)
+		return err
+	}
+	if err := out.Sync(); err != nil {
+		out.Close()
+		return err
+	}
+	if err := out.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmp, dst)
+}
+```
+
+For large artifacts, consider checksums (SHA-256) after write before rename promotion.
+
+## Walking Trees
+
+```go
+err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+	if err != nil {
+		return err // or skip
+	}
+	if d.Type()&os.ModeSymlink != 0 {
+		return nil // skip or carefully resolve
+	}
+	// process...
+	return nil
+})
+```
+
+Or `fs.WalkDir` with `os.DirFS` for testability.
+
+## Embed for Static Assets
+
+```go
+//go:embed schemas/*.json
+var schemas embed.FS
+```
+
+Prefer `embed` over shipping loose files when content is part of the binary release — fewer path problems in production.
+
+## Durability vs Speed Tradeoffs
+
+| Workload | fsync? | Pattern |
+|----------|--------|---------|
+| Wallet / ledger checkpoint | Yes | full atomic + dir sync |
+| CDN cache fill | Often no | write + rename optional |
+| Queue spill to disk | Yes on commit | group commits if needed |
+| CLI rewrite of dotfiles | Rename enough | fsync nice-to-have |
+
+Measure: fsync can dominate latency on spinning disks and some cloud volumes.
+
+## Production Checklist
+
+- [ ] Atomic write for any file that must be valid after crash
+- [ ] Temp files on same filesystem as destination
+- [ ] Max size limits on untrusted reads
+- [ ] Path jail for user-controlled paths
+- [ ] Restrictive permissions on secrets
+- [ ] No world-writable dirs in the data path
+- [ ] Explicit symlink policy
+- [ ] Disk-full errors handled (not ignored)
+- [ ] Tests for traversal (`../`) and partial-write recovery
+
+## Common Pitfalls
+
+1. **Write in place** to config files — crash leaves empty file, service won't start.
+2. **Temp in `/tmp` then rename to another mount** — `EXDEV`, copy fallback needed.
+3. **Trusting `Clean` alone** without root prefix check.
+4. **Following symlinks** into sensitive locations.
+5. **Ignoring `ENOSPC`** — loop of failed writes can spam logs forever.
+6. **Scanner default token size** on huge lines — silent early exit if not checking `scanner.Err()`.
+7. **Closing without sync** when durability was required.
+
+## Exercises
+
+1. Implement `WriteFile` atomic helper; kill `-9` mid-write in a loop; prove the target is always old-good or new-good, never empty torn.
+2. Build a path jail; unit-test `../../etc/passwd`, absolute paths, nested `..`.
+3. Write a file with `0o600`; verify mode with `stat`.
+4. Copy a 1GB file with streaming; compare memory RSS to `ReadAll`.
+5. Create a symlink escape scenario; decide reject vs EvalSymlinks policy; document it.
+6. Simulate disk full (`ulimit` or tiny loop mount); ensure errors surface.
+7. Use `O_EXCL` to implement a simple lock file; handle stale locks carefully (advanced).
+8. Walk a tree skipping symlinks; count regular files only.
+9. Add SHA-256 verify-after-write before rename for a download tool.
+10. Benchmark fsync vs no-fsync for 1k small config updates; record tradeoff.
+
+## More examples
+
+### Atomic write via temp + rename
+
+```bash
+mkdir -p /tmp/go-atomic-write && cd /tmp/go-atomic-write
+go mod init example.com/atomic-write
+```
+
+Save as `main.go`:
+
+```go
+package main
+
+import (
+	"fmt"
+	"os"
+	"path/filepath"
+)
+
+func writeAtomic(path string, data []byte) error {
+	dir := filepath.Dir(path)
+	f, err := os.CreateTemp(dir, ".w-*")
+	if err != nil {
+		return err
+	}
+	tmp := f.Name()
+	if _, err := f.Write(data); err != nil {
+		f.Close()
+		os.Remove(tmp)
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		os.Remove(tmp)
+		return err
+	}
+	if err := f.Close(); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	return os.Rename(tmp, path)
+}
+
+func main() {
+	dir, _ := os.MkdirTemp("", "atom")
+	defer os.RemoveAll(dir)
+	path := filepath.Join(dir, "state.json")
+	if err := writeAtomic(path, []byte(`{"v":1}`)); err != nil {
+		panic(err)
+	}
+	if err := writeAtomic(path, []byte(`{"v":2}`)); err != nil {
+		panic(err)
+	}
+	b, _ := os.ReadFile(path)
+	fmt.Println(string(b))
+}
+```
+
+```bash
+go run .
+```
+
+**Expected output:**
+
+```
+{"v":2}
+```
+
+### Walk files, skip dirs and symlinks to dirs
+
+```bash
+mkdir -p /tmp/go-walk-files && cd /tmp/go-walk-files
+go mod init example.com/walk-files
+```
+
+Save as `main.go`:
+
+```go
+package main
+
+import (
+	"fmt"
+	"io/fs"
+	"os"
+	"path/filepath"
+)
+
+func main() {
+	root, _ := os.MkdirTemp("", "walk")
+	defer os.RemoveAll(root)
+	_ = os.WriteFile(filepath.Join(root, "a.txt"), []byte("a"), 0o644)
+	_ = os.Mkdir(filepath.Join(root, "sub"), 0o755)
+	_ = os.WriteFile(filepath.Join(root, "sub", "b.txt"), []byte("b"), 0o644)
+
+	var files []string
+	_ = filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.Type().IsRegular() {
+			rel, _ := filepath.Rel(root, path)
+			files = append(files, rel)
+		}
+		return nil
+	})
+	fmt.Println("files:", files)
+}
+```
+
+```bash
+go run .
+```
+
+**Expected output:**
+
+```
+files: [a.txt sub/b.txt]
+```
+
+## Runnable example
+
+Atomic replace via temp file + rename, a path jail, and restrictive file modes—crash-safe config write pattern in pure stdlib.
+
+```bash
+mkdir -p /tmp/go-safe-fs && cd /tmp/go-safe-fs
+go mod init example.com/safe-fs
+```
+
+Save as `main.go`:
+
+```go
+package main
+
+import (
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+)
+
+func writeFileAtomic(path string, data []byte, mode os.FileMode) error {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o750); err != nil {
+		return err
+	}
+	f, err := os.CreateTemp(dir, ".tmp-*")
+	if err != nil {
+		return err
+	}
+	tmp := f.Name()
+	cleanup := true
+	defer func() {
+		if cleanup {
+			_ = os.Remove(tmp)
+		}
+	}()
+	if _, err := f.Write(data); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Chmod(mode); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		return err
+	}
+	cleanup = false
+	return nil
+}
+
+func underRoot(root, userPath string) (string, error) {
+	rootAbs, err := filepath.Abs(filepath.Clean(root))
+	if err != nil {
+		return "", err
+	}
+	joined := filepath.Join(rootAbs, userPath)
+	abs, err := filepath.Abs(joined)
+	if err != nil {
+		return "", err
+	}
+	rel, err := filepath.Rel(rootAbs, abs)
+	if err != nil || strings.HasPrefix(rel, "..") {
+		return "", fmt.Errorf("escapes root")
+	}
+	return abs, nil
+}
+
+func main() {
+	root := filepath.Join(os.TempDir(), "safe-fs-demo")
+	_ = os.MkdirAll(root, 0o750)
+	target := filepath.Join(root, "config.json")
+
+	if err := writeFileAtomic(target, []byte(`{"v":1}`+"\n"), 0o600); err != nil {
+		panic(err)
+	}
+	b, _ := os.ReadFile(target)
+	fmt.Printf("config: %s", b)
+	fi, _ := os.Stat(target)
+	fmt.Printf("mode: %o\n", fi.Mode().Perm())
+
+	ok, err := underRoot(root, "nested/a.txt")
+	fmt.Println("jail ok:", ok, err)
+	_, err = underRoot(root, "../../etc/passwd")
+	fmt.Println("jail block:", err != nil)
+
+	// Second atomic write replaces cleanly
+	_ = writeFileAtomic(target, []byte(`{"v":2}`+"\n"), 0o600)
+	b, _ = os.ReadFile(target)
+	fmt.Printf("config after: %s", b)
+}
+```
+
+```bash
+go run .
+```
+
+**Expected output** (paths vary):
+
+```
+config: {"v":1}
+mode: 600
+jail ok: /.../safe-fs-demo/nested/a.txt <nil>
+jail block: true
+config after: {"v":2}
+```
+
+**What to notice**
+
+- Rename within the same filesystem is atomic for readers; in-place truncate is how configs go empty on crash.
+- `0o600` for secrets/config; never world-writable automation output.
+- Path jail before any user-influenced open/read/write.
+
+**Try next**
+
+- Kill `-9` mid-write in a loop and prove the target is always old-good or new-good.
+- Handle `EXDEV` (cross-device rename) with copy+rename fallback.
+
+## Further Reading
+
+- POSIX rename and fsync semantics articles
+- Previous: process lifecycle (crash = torn write source)
+- Next: **Unix Pipeline Style CLI Tools**

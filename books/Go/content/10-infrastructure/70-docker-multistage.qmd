@@ -4,39 +4,552 @@ title: "Containerization (Docker)"
 
 # Containerization: Multi-Stage Builds
 
-Go compiles to a static binary. This is its deployment superpower. You do not need the Go compiler on your production server.
+## Overview
 
-## The Multi-Stage Pattern
-We use a "Builder" image to compile, and a "Scratch" (or distroless) image to run.
+Go compiles to a static binary. That is the deployment superpower: production does not need the Go toolchain, a language runtime, or a package manager. Multi-stage Docker builds turn that property into tiny, hard-to-attack images—typically tens of megabytes instead of hundreds.
+
+This chapter covers the production multi-stage pattern, static linking, distroless vs scratch, CA certs and timezones, non-root runtime, healthchecks, and a release checklist.
+
+## Why Multi-Stage Matters
+
+A naive Dockerfile copies the whole module tree into a fat `golang` image and runs the binary there. That ships the compiler, shell, package manager, and build tools into production—large attack surface, slow pulls, noisy CVEs.
+
+Multi-stage splits the world in two:
+
+1. **Builder** — full Go toolchain; compile once.
+2. **Runtime** — only the binary (and maybe CA certs / tzdata). No shell, no package manager.
+
+```text
+source + go.mod
+       |
+       v
+  [builder stage]  go build  -->  static binary
+       |
+       v
+  [runtime stage]  copy binary only  -->  ~10–20 MB image
+```
+
+## The Production Multi-Stage Pattern
 
 ```dockerfile
-# Stage 1: Build
-FROM golang:1.26-alpine AS builder
+# syntax=docker/dockerfile:1
 
-WORKDIR /app
+# ---------- Stage 1: Build ----------
+FROM golang:1.26-bookworm AS builder
+
+WORKDIR /src
+
+# Cache modules separately from source for faster rebuilds.
 COPY go.mod go.sum ./
 RUN go mod download
 
 COPY . .
-# CGO_ENABLED=0 is critical for static binaries (no libc dependency)
-# -ldflags="-w -s" strips debug info for smaller size
-RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-w -s" -o myapp ./cmd/server
 
-# Stage 2: Runtime
-# "scratch" is an empty image (0 bytes).
-# "gcr.io/distroless/static" is better (includes CA Certs and Timezone data).
-FROM gcr.io/distroless/static-debian12
+# CGO_ENABLED=0  => pure static binary (no libc dependency)
+# -trimpath      => strip local paths from the binary
+# -ldflags="-s -w" => strip symbol table and DWARF
+ARG TARGETOS=linux
+ARG TARGETARCH=amd64
+RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
+    go build -trimpath -ldflags="-s -w" -o /out/server ./cmd/server
 
-COPY --from=builder /app/myapp /myapp
+# ---------- Stage 2: Runtime ----------
+# distroless/static includes CA certs + timezone data; no shell.
+FROM gcr.io/distroless/static-debian12:nonroot
 
-ENTRYPOINT ["/myapp"]
+COPY --from=builder /out/server /server
+
+USER nonroot:nonroot
+EXPOSE 8080
+ENTRYPOINT ["/server"]
 ```
 
-## Why this matters
-1.  **Size:** The final image is ~10MB (Binary) + 2MB (OS overhead). Compared to Node/Python images (500MB+), this is tiny.
-2.  **Security:** The runtime image has no shell (`/bin/sh`). Attackers cannot "shell into" your container because there is no shell.
-3.  **Speed:** Pulling and starting a 12MB image is instant.
+Build and inspect:
 
-## Gotchas
-*   **CA Certificates:** If your app talks to HTTPS APIs, `scratch` will fail because it lacks Root CA certs. Use `distroless/static` or manually copy `/etc/ssl/certs` from the builder.
-*   **Timezones:** Similarly, `scratch` lacks `tzdata`. If you rely on `time.LoadLocation`, copy the timezone database.
+```bash
+docker build -t myapp:local .
+docker images myapp:local
+docker run --rm -p 8080:8080 myapp:local
+```
+
+## Static Linking Essentials
+
+| Flag / env | Effect |
+|------------|--------|
+| `CGO_ENABLED=0` | Pure Go binary; runs without glibc/musl |
+| `-trimpath` | Removes host filesystem paths from the binary |
+| `-ldflags="-s -w"` | Smaller binary; harder casual reverse engineering |
+| `-buildmode=pie` | Position-independent executable (ASLR-friendly) |
+
+If you **must** use CGO (SQLite via C, certain crypto, etc.):
+
+```dockerfile
+FROM golang:1.26-bookworm AS builder
+RUN apt-get update && apt-get install -y --no-install-recommends gcc libc6-dev
+# ...
+RUN CGO_ENABLED=1 go build -o /out/server ./cmd/server
+
+FROM gcr.io/distroless/base-debian12:nonroot
+COPY --from=builder /out/server /server
+```
+
+Prefer `CGO_ENABLED=0` whenever the dependency graph allows it.
+
+## Scratch vs Distroless vs Alpine
+
+| Base | Size | Shell | CA certs | Best for |
+|------|------|-------|----------|----------|
+| `scratch` | ~0 + binary | No | No | Fully static apps that never call HTTPS / LoadLocation |
+| `distroless/static` | ~2 MB + binary | No | Yes | Most production Go services |
+| `distroless/base` | larger | No | Yes | CGO / dynamic glibc needs |
+| `alpine` | ~5–8 MB | Yes | Optional | Debugging, ops scripts (larger attack surface) |
+
+**Rule of thumb:** start with `distroless/static-debian12:nonroot`. Drop to `scratch` only when you have proven CA/tz needs are handled and you want absolute minimalism.
+
+## CA Certificates and Timezones
+
+`scratch` fails the moment your app dials `https://…` or calls `time.LoadLocation("America/New_York")`.
+
+Manual copy if you insist on scratch:
+
+```dockerfile
+FROM golang:1.26-bookworm AS builder
+# ... build ...
+
+FROM scratch
+COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
+COPY --from=builder /usr/share/zoneinfo /usr/share/zoneinfo
+COPY --from=builder /out/server /server
+ENTRYPOINT ["/server"]
+```
+
+In application code, prefer UTC in storage and convert only at the edge:
+
+```go
+func main() {
+    // Prefer UTC in process; convert at presentation boundaries.
+    time.Local = time.UTC
+
+    loc, err := time.LoadLocation("America/Los_Angeles")
+    if err != nil {
+        log.Fatal(err) // fail closed if tzdata missing in image
+    }
+    _ = loc
+}
+```
+
+## Non-Root, Health, and Signals
+
+Distroless `:nonroot` images run as UID 65532. Match that in compose/k8s security contexts.
+
+```yaml
+# docker-compose snippet
+services:
+  api:
+    image: myapp:local
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    ports:
+      - "8080:8080"
+```
+
+Handle `SIGTERM` so orchestrators get clean shutdown:
+
+```go
+package main
+
+import (
+    "context"
+    "log"
+    "net/http"
+    "os"
+    "os/signal"
+    "syscall"
+    "time"
+)
+
+func main() {
+    mux := http.NewServeMux()
+    mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
+        w.WriteHeader(http.StatusOK)
+        _, _ = w.Write([]byte("ok"))
+    })
+    mux.HandleFunc("/readyz", func(w http.ResponseWriter, _ *http.Request) {
+        // Check DB/cache if needed; fail closed when not ready.
+        w.WriteHeader(http.StatusOK)
+    })
+
+    srv := &http.Server{
+        Addr:              ":8080",
+        Handler:           mux,
+        ReadHeaderTimeout: 5 * time.Second,
+    }
+
+    go func() {
+        log.Printf("listening on %s", srv.Addr)
+        if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+            log.Fatal(err)
+        }
+    }()
+
+    stop := make(chan os.Signal, 1)
+    signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
+    <-stop
+
+    ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+    defer cancel()
+    if err := srv.Shutdown(ctx); err != nil {
+        log.Printf("shutdown: %v", err)
+    }
+}
+```
+
+## Build Cache and Layer Hygiene
+
+- Copy `go.mod` / `go.sum` before source so module download caches across code-only changes.
+- Use `.dockerignore` aggressively:
+
+```text
+.git
+_book
+**/*_test.go
+**/.DS_Store
+*.md
+.env
+tmp/
+```
+
+- Multi-arch (Buildx):
+
+```bash
+docker buildx build \
+  --platform linux/amd64,linux/arm64 \
+  -t ghcr.io/example/myapp:1.2.3 \
+  --push .
+```
+
+Pass `TARGETOS` / `TARGETARCH` (BuildKit sets them automatically when using `ARG TARGETOS` / `ARG TARGETARCH`).
+
+## Embed Version Metadata
+
+```go
+// cmd/server/main.go
+var (
+    version = "dev"
+    commit  = "none"
+)
+
+func main() {
+    log.Printf("starting version=%s commit=%s", version, commit)
+}
+```
+
+```dockerfile
+ARG VERSION=dev
+ARG COMMIT=none
+RUN CGO_ENABLED=0 go build -trimpath \
+    -ldflags="-s -w -X main.version=${VERSION} -X main.commit=${COMMIT}" \
+    -o /out/server ./cmd/server
+```
+
+## Production Checklist
+
+- [ ] Multi-stage: builder + minimal runtime (`distroless` or carefully prepared `scratch`)
+- [ ] `CGO_ENABLED=0` unless CGO is required and documented
+- [ ] `-trimpath` and `-ldflags="-s -w"` on release builds
+- [ ] Non-root user (`:nonroot` or explicit `USER`)
+- [ ] CA certs present if the app makes HTTPS calls
+- [ ] Timezone data present if `LoadLocation` is used
+- [ ] `.dockerignore` excludes secrets, tests, and junk
+- [ ] `/healthz` and `/readyz` (or platform equivalents)
+- [ ] Graceful shutdown on `SIGTERM`
+- [ ] Image scanned in CI (`trivy`, `grype`, or registry scanning)
+- [ ] Tags immutable (`1.2.3`, digest)—avoid relying only on `latest`
+
+## Common Pitfalls
+
+1. **Shell debugging in distroless** — there is no `/bin/sh`. Debug with a sidecar, ephemeral debug image, or temporary Alpine stage—not by shipping a shell to prod.
+2. **CGO by accident** — a transitive dependency may force CGO; verify with `go build -x` or `ldd` (static binary should not need dynamic libs).
+3. **Wrong GOOS/GOARCH** — building on Apple Silicon without setting `GOARCH` can produce arm64 images that fail on amd64 clusters.
+4. **Huge context** — missing `.dockerignore` sends `node_modules`, `.git`, and secrets into the daemon.
+5. **Listening on localhost only** — inside a container, bind `0.0.0.0:8080` (or `:8080`), not `127.0.0.1`.
+6. **Root for convenience** — root + writable filesystem + shell is the classic container escape path.
+
+## Exercises
+
+1. **Minimal image** — Take any small `net/http` server and produce a multi-stage Dockerfile using `distroless/static-debian12:nonroot`. Measure image size with `docker images`.
+2. **HTTPS smoke test** — Call an external HTTPS API from inside the container. Confirm it works on distroless and fails on bare `scratch` without CA certs.
+3. **Multi-arch** — Build amd64 and arm64 images with Buildx. Run the matching arch on your machine or in CI.
+4. **Signal drill** — Send `docker stop` and confirm your server logs a clean `Shutdown` within the grace period (not a hard kill after timeout).
+5. **Scan** — Run `trivy image myapp:local` (or equivalent) and fix or document any HIGH/CRITICAL findings in base layers.
+
+## More examples
+
+### Health probe and graceful drain (container contract)
+
+Containers need a cheap liveness probe and a clean SIGTERM path. This demo uses `httptest` so it finishes without a forever-listen loop, and models drain with a cancellable context.
+
+```bash
+mkdir -p /tmp/go-docker-health && cd /tmp/go-docker-health
+go mod init example.com/docker-health
+```
+
+Save as `main.go`:
+
+```go
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"sync/atomic"
+	"time"
+)
+
+func main() {
+	var ready atomic.Bool
+	ready.Set(true)
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprintln(w, "ok")
+	})
+	mux.HandleFunc("GET /readyz", func(w http.ResponseWriter, _ *http.Request) {
+		if !ready.Load() {
+			http.Error(w, "not ready", http.StatusServiceUnavailable)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]string{"status": "ready"})
+	})
+	mux.HandleFunc("GET /work", func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-r.Context().Done():
+			return
+		case <-time.After(20 * time.Millisecond):
+			fmt.Fprintln(w, "done")
+		}
+	})
+
+	// Simulate drain: mark not-ready, then cancel in-flight work.
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	resp, err := http.Get(srv.URL + "/healthz")
+	if err != nil {
+		panic(err)
+	}
+	resp.Body.Close()
+	fmt.Println("healthz:", resp.StatusCode)
+
+	resp, err = http.Get(srv.URL + "/readyz")
+	if err != nil {
+		panic(err)
+	}
+	resp.Body.Close()
+	fmt.Println("readyz before drain:", resp.StatusCode)
+
+	ready.Store(false)
+	resp, err = http.Get(srv.URL + "/readyz")
+	if err != nil {
+		panic(err)
+	}
+	resp.Body.Close()
+	fmt.Println("readyz during drain:", resp.StatusCode)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Millisecond)
+	defer cancel()
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, srv.URL+"/work", nil)
+	_, err = http.DefaultClient.Do(req)
+	fmt.Println("in-flight cancelled:", err != nil)
+}
+```
+
+```bash
+go run .
+```
+
+**Expected output:**
+
+```
+healthz: 200
+readyz before drain: 200
+readyz during drain: 503
+in-flight cancelled: true
+```
+
+### Bind address from env (not localhost-only)
+
+```bash
+mkdir -p /tmp/go-docker-bind && cd /tmp/go-docker-bind
+go mod init example.com/docker-bind
+```
+
+Save as `main.go`:
+
+```go
+package main
+
+import (
+	"fmt"
+	"net"
+	"os"
+)
+
+func listenAddr() string {
+	if p := os.Getenv("PORT"); p != "" {
+		return ":" + p
+	}
+	return ":8080"
+}
+
+func main() {
+	// Resolve without accepting forever: prove the address form containers expect.
+	addr := listenAddr()
+	ln, err := net.Listen("tcp", "127.0.0.1"+addr) // local only for the demo
+	if err != nil {
+		panic(err)
+	}
+	fmt.Println("configured bind form:", addr)
+	fmt.Println("listening:", ln.Addr().String())
+	_ = ln.Close()
+
+	os.Setenv("PORT", "9090")
+	fmt.Println("with PORT=9090:", listenAddr())
+}
+```
+
+```bash
+go run .
+```
+
+**Expected output:**
+
+```
+configured bind form: :8080
+listening: 127.0.0.1:8080
+with PORT=9090: :9090
+```
+
+## Runnable example
+
+Multi-stage Docker is prose and Dockerfiles; the Go side is a release-shaped binary with version ldflags, a health endpoint, and graceful shutdown—the process you copy into distroless.
+
+```bash
+mkdir -p /tmp/go-docker-app && cd /tmp/go-docker-app
+go mod init example.com/docker-app
+```
+
+Save as `main.go`:
+
+```go
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"log"
+	"net"
+	"net/http"
+	"time"
+)
+
+// Injected at link time:
+// go build -ldflags="-X main.version=1.2.3 -X main.commit=deadbeef"
+var (
+	version = "dev"
+	commit  = "none"
+)
+
+func main() {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
+	})
+	mux.HandleFunc("GET /version", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"version": version,
+			"commit":  commit,
+		})
+	})
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		log.Fatal(err)
+	}
+	srv := &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second}
+
+	go func() {
+		if err := srv.Serve(ln); err != nil && err != http.ErrServerClosed {
+			log.Fatal(err)
+		}
+	}()
+
+	base := "http://" + ln.Addr().String()
+	fmt.Printf("listening on %s  version=%s commit=%s\n", base, version, commit)
+
+	resp, err := http.Get(base + "/healthz")
+	if err != nil {
+		log.Fatal(err)
+	}
+	resp.Body.Close()
+	fmt.Println("healthz:", resp.StatusCode)
+
+	resp, err = http.Get(base + "/version")
+	if err != nil {
+		log.Fatal(err)
+	}
+	var v map[string]string
+	_ = json.NewDecoder(resp.Body).Decode(&v)
+	resp.Body.Close()
+	fmt.Printf("version payload: %v\n", v)
+
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := srv.Shutdown(shutdownCtx); err != nil {
+		log.Fatal(err)
+	}
+	fmt.Println("shutdown complete")
+}
+```
+
+```bash
+go run -ldflags="-X main.version=1.2.3 -X main.commit=deadbeef" .
+# release-shaped binary (what multi-stage copies):
+# CGO_ENABLED=0 go build -trimpath -ldflags="-s -w -X main.version=1.2.3 -X main.commit=deadbeef" -o server .
+```
+
+**Expected output** (illustrative):
+
+```
+listening on http://127.0.0.1:54321  version=1.2.3 commit=deadbeef
+healthz: 200
+version payload: map[commit:deadbeef version:1.2.3]
+shutdown complete
+```
+
+**What to notice**
+
+- Version injection is link-time (`-X`); the runtime image never needs the Go toolchain.
+- `/healthz` is what Docker `HEALTHCHECK` and orchestrators probe—keep it cheap and dependency-light.
+- `Shutdown` is the process side of multi-stage ops: `docker stop` / Kubernetes send `SIGTERM` and expect a drain.
+
+**Try next**
+
+- Wire `signal.NotifyContext` and run under `docker stop` to confirm clean exit within the grace period.
+- Wrap this binary in the multi-stage Dockerfile from this chapter; compare size to a single-stage `golang` image.
+
+## Related Topics
+
+- [Building and Releasing](74-building-releasing.qmd)
+- [CI/CD & Hardening](73-ci-cd-security.qmd)
+- [Application Hardening](../11-security/81-hardening.qmd)

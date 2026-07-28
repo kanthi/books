@@ -1,47 +1,655 @@
 ---
-title: "131 TCP Services Deep Dive"
+title: "TCP Services Deep Dive"
 ---
 
-# 131 TCP Services Deep Dive
+# TCP Services Deep Dive
 
-TCP is a byte stream, not a message protocol. Most production bugs in custom TCP systems come from this single misunderstanding.
+TCP is a **byte stream**, not a message protocol. Most production bugs in custom TCP systems come from treating partial reads as complete messages, or unbounded buffers as "simpler."
+
+This chapter builds a correct, production-shaped TCP service in Go: framing, deadlines, concurrency limits, graceful shutdown, and observability.
+
+## Why Custom TCP Still Matters
+
+HTTP and gRPC cover most APIs. You still touch raw TCP when:
+
+- Building binary protocols (game servers, market data, device telemetry)
+- Speaking legacy line protocols (SMTP-ish, Redis RESP-like, custom IoT)
+- Implementing proxies, tunnels, or multiplexers
+- Teaching yourself how higher protocols actually work
+
+If you only ever use frameworks, this chapter still upgrades your debugging of "connection stuck" incidents.
 
 ## Core Mental Model
 
 ```text
-application message A+B+C
-        |
-        v
-TCP stream bytes: [A-part][A-rest+B][C-part]...
+application messages:  |  msg A  |  msg B  |  msg C  |
+                       \________/  \_______/
+TCP may deliver:       [A1][A2+B1][B2][C1][C2][C3]...
 ```
 
-Your code must define message boundaries explicitly.
+Rules:
 
-## Framing Strategy
+1. One `Read` can return any number of bytes ≥ 1 (or 0 with error/EOF).
+2. One `Write` may write fewer bytes than you asked; loop until done or use helpers.
+3. Message boundaries are **application-defined**.
 
-A robust approach is length-prefix framing:
+## Framing Strategies
+
+| Strategy | Shape | Pros | Cons |
+|----------|--------|------|------|
+| Length-prefix | `[u32 len][payload]` | Simple, binary-friendly | Need max-size cap |
+| Delimiter | lines / null-terminated | Human debuggable | Escaping, binary pain |
+| Fixed size | always N bytes | Trivial parse | Wasteful / inflexible |
+| Self-describing | protobuf-style | Rich | Heavier stack |
+
+### Length-prefix (recommended baseline)
 
 ```text
-[4-byte length][payload bytes]
+ 0      4           4+N
+ | len  |  payload  |
+   u32 BE   N bytes
 ```
 
-This allows the receiver to know exactly how many bytes belong to one logical message.
+Always enforce `N <= MaxMessage`.
 
-## Connection Lifecycle
+```go
+package frame
+
+import (
+	"encoding/binary"
+	"fmt"
+	"io"
+)
+
+const MaxMessage = 1 << 20 // 1 MiB
+
+func WriteFrame(w io.Writer, payload []byte) error {
+	if len(payload) > MaxMessage {
+		return fmt.Errorf("payload too large: %d", len(payload))
+	}
+	var hdr [4]byte
+	binary.BigEndian.PutUint32(hdr[:], uint32(len(payload)))
+	if _, err := w.Write(hdr[:]); err != nil {
+		return err
+	}
+	_, err := w.Write(payload)
+	return err
+}
+
+func ReadFrame(r io.Reader) ([]byte, error) {
+	var hdr [4]byte
+	if _, err := io.ReadFull(r, hdr[:]); err != nil {
+		return nil, err
+	}
+	n := binary.BigEndian.Uint32(hdr[:])
+	if n > MaxMessage {
+		return nil, fmt.Errorf("frame %d exceeds max %d", n, MaxMessage)
+	}
+	buf := make([]byte, n)
+	if _, err := io.ReadFull(r, buf); err != nil {
+		return nil, err
+	}
+	return buf, nil
+}
+```
+
+`io.ReadFull` is the correct primitive: it loops until the buffer is full or an error occurs.
+
+## Deadlines and Idle Connections
+
+Without deadlines, a client that stops sending after the length header leaves your handler blocked forever.
+
+```go
+func handleConn(conn net.Conn) {
+	defer conn.Close()
+	for {
+		// Per-read idle deadline (sliding).
+		_ = conn.SetReadDeadline(time.Now().Add(30 * time.Second))
+		msg, err := frame.ReadFrame(conn)
+		if err != nil {
+			return // timeout, EOF, protocol error
+		}
+		resp := process(msg)
+		_ = conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+		if err := frame.WriteFrame(conn, resp); err != nil {
+			return
+		}
+	}
+}
+```
+
+Patterns:
+
+- **Idle timeout**: refresh deadline before each read (above).
+- **Absolute request timeout**: set once at accept for request-response protocols.
+- **Separate read/write**: long uploads vs quick control messages need different policies.
+
+## Accept Loop with Backpressure
+
+Unbounded `go handle(conn)` is a classic self-DoS under connection floods.
+
+```go
+package tcpsvc
+
+import (
+	"context"
+	"log/slog"
+	"net"
+	"sync"
+	"time"
+)
+
+type Server struct {
+	Addr     string
+	Sem      chan struct{} // capacity = max concurrent handlers
+	Log      *slog.Logger
+	Handler  func(context.Context, net.Conn)
+}
+
+func (s *Server) ListenAndServe(ctx context.Context) error {
+	ln, err := net.Listen("tcp", s.Addr)
+	if err != nil {
+		return err
+	}
+	defer ln.Close()
+
+	go func() {
+		<-ctx.Done()
+		_ = ln.Close() // unblock Accept
+	}()
+
+	var wg sync.WaitGroup
+	for {
+		conn, err := ln.Accept()
+		if err != nil {
+			select {
+			case <-ctx.Done():
+				wg.Wait()
+				return ctx.Err()
+			default:
+				s.Log.Error("accept", "err", err)
+				continue
+			}
+		}
+
+		select {
+		case s.Sem <- struct{}{}:
+			// acquired slot
+		default:
+			// overload: fail fast
+			_ = conn.Close()
+			s.Log.Warn("reject connection: at capacity")
+			continue
+		}
+
+		wg.Add(1)
+		go func(c net.Conn) {
+			defer wg.Done()
+			defer func() { <-s.Sem }()
+			defer c.Close()
+			s.Handler(ctx, c)
+		}(conn)
+	}
+}
+```
+
+Production refinements:
+
+- Accept a connection then **read a bit** before committing a heavy worker (cheap auth / magic bytes).
+- Use `ListenConfig` with `Control` to set `SO_REUSEADDR` / socket options when needed.
+- Prefer closing the listener on shutdown, then waiting for in-flight handlers with a deadline.
+
+## IO vs Business Logic Separation
+
+Slow CPU work on the same goroutine that reads the socket prevents reading the next frames and can stall peers.
 
 ```text
-accept -> set deadlines -> read frame -> validate -> handle -> write response -> close/reuse
+read loop (per conn) -> jobs channel -> worker pool -> write responses
 ```
 
-Each stage needs failure policy. For example, malformed frames should be rejected quickly, while slow clients should hit read deadlines instead of consuming handlers forever.
+For request/response with ordering requirements, keep per-connection serialization of writes (one writer goroutine or a mutex on write).
 
-## Production Concerns
+```go
+type session struct {
+	conn net.Conn
+	out  chan []byte
+}
 
-- Deadlines: Every read/write path should have bounded time.
-- Memory: Never allocate unbounded payload buffers.
-- Concurrency: Limit active handlers to avoid overload collapse.
-- Observability: Record accepts, active conns, frame errors, and timeouts.
+func (s *session) writer(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case msg, ok := <-s.out:
+			if !ok {
+				return
+			}
+			_ = s.conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+			if err := frame.WriteFrame(s.conn, msg); err != nil {
+				return
+			}
+		}
+	}
+}
+```
 
-## Design Notes
+## Protocol Errors vs Transport Errors
 
-When throughput matters, separate IO and business logic pools so slow CPU work does not block socket reading. When reliability matters, prioritize predictable timeouts and explicit protocol errors over maximum raw throughput.
+Classify failures:
+
+| Class | Examples | Action |
+|-------|----------|--------|
+| Transport | EOF, reset, timeout | Close conn; metric `conn_errors` |
+| Protocol | bad length, unknown type | Close or send error frame; metric `proto_errors` |
+| App | business rejection | Error response frame; keep conn if protocol allows |
+
+Do not retry protocol errors on the same connection without a reset of parser state — your stream may be desynchronized.
+
+## Keepalives and Half-Open Connections
+
+TCP keepalives detect dead peers, but OS defaults are often too long (hours). For application liveness, prefer **application pings** with your own deadlines.
+
+```go
+// Application-level heartbeat every 15s; miss 2 → close.
+```
+
+Also handle half-close: peer may `CloseWrite` while you still flush responses. Know your protocol's rules for FIN.
+
+## TLS on TCP
+
+Wrap accepted conns:
+
+```go
+tlsLn := tls.NewListener(ln, tlsConfig)
+// Accept from tlsLn as usual; deadlines still apply on the underlying net.Conn.
+```
+
+Certificate lifecycle is covered in part 17; from a TCP perspective, handshake timeouts matter:
+
+```go
+_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+tlsConn := tls.Server(conn, cfg)
+if err := tlsConn.HandshakeContext(ctx); err != nil {
+	return err
+}
+_ = tlsConn.SetDeadline(time.Time{}) // clear; use per-op deadlines later
+```
+
+## Observability
+
+Minimum metrics for a TCP service:
+
+- `tcp_accepts_total`
+- `tcp_active_conns`
+- `tcp_rejected_total{reason="capacity|protocol"}`
+- `tcp_read_timeouts_total`
+- `tcp_frame_bytes` (histogram)
+- `tcp_handler_seconds` (histogram)
+
+Log fields: `remote_addr`, `conn_id`, `frame_type`, `err_class`, `duration_ms`.
+
+## Production Checklist
+
+- [ ] Explicit framing with max message size
+- [ ] `SetReadDeadline` / `SetWriteDeadline` on every path
+- [ ] Bounded concurrent handlers (semaphore / worker pool)
+- [ ] Reject or shed on overload instead of unbounded `go`
+- [ ] Graceful shutdown: stop accept → drain → force close after deadline
+- [ ] Metrics for accepts, active, errors, timeouts
+- [ ] Fuzz or property-test the frame parser
+- [ ] Document idle timeout and max frame in the protocol spec
+
+## Common Pitfalls
+
+1. **`ioutil.ReadAll` on a conn** — unbounded memory.
+2. **Assuming one `Read` = one message**.
+3. **Forgetting `Write` can be partial** — use `frame.Write` loops or `io.Copy` patterns carefully.
+4. **Sharing one deadline for the entire connection lifetime** — long sessions need sliding idle deadlines.
+5. **Logging every byte** — CPU and PII risk.
+6. **No max concurrent conns** — memory death under SYN floods / connection storms.
+7. **Mixing buffered readers incorrectly** — if you `bufio.Reader` wrap a conn, never read the conn underneath or you desync.
+
+## Complete Mini Server Skeleton
+
+```go
+func main() {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	s := &tcpsvc.Server{
+		Addr: ":9000",
+		Sem:  make(chan struct{}, 256),
+		Log:  slog.Default(),
+		Handler: func(ctx context.Context, c net.Conn) {
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				default:
+				}
+				_ = c.SetReadDeadline(time.Now().Add(30 * time.Second))
+				msg, err := frame.ReadFrame(c)
+				if err != nil {
+					return
+				}
+				// Echo for demo; replace with real handler.
+				_ = c.SetWriteDeadline(time.Now().Add(10 * time.Second))
+				_ = frame.WriteFrame(c, msg)
+			}
+		},
+	}
+	if err := s.ListenAndServe(ctx); err != nil && !errors.Is(err, context.Canceled) {
+		slog.Error("server exit", "err", err)
+		os.Exit(1)
+	}
+}
+```
+
+## Exercises
+
+1. Implement length-prefix client/server echo; verify multi-message reads with a client that writes two frames in one `Write`.
+2. Send a frame claiming `len = 2GiB`; ensure the server rejects without allocating.
+3. Remove read deadlines and connect with `nc` without sending data; watch goroutine count with `pprof`.
+4. Cap handlers at 2; open 10 connections; confirm extras are closed immediately.
+5. Add a simple opcode byte after the length; fuzz the parser with `go test -fuzz`.
+6. Implement graceful shutdown: in-flight echo must finish within 5s; then force close.
+7. Benchmark frames of 64B vs 64KiB; record allocs/op for `ReadFrame`.
+8. Wrap the server in TLS with a self-signed cert; measure handshake timeout behavior.
+9. Deliberately use `bufio.Reader` for reads and raw `conn` for a side read — observe desync, then fix.
+10. Export Prometheus metrics for active conns and timeouts; load-test and graph them.
+
+## More examples
+
+### Length-prefix TCP session (client + server)
+
+```bash
+mkdir -p /tmp/go-tcp-lp && cd /tmp/go-tcp-lp
+go mod init example.com/tcp-lp
+```
+
+Save as `main.go`:
+
+```go
+package main
+
+import (
+	"encoding/binary"
+	"fmt"
+	"io"
+	"net"
+	"time"
+)
+
+func writeMsg(w io.Writer, s string) error {
+	var h [4]byte
+	binary.BigEndian.PutUint32(h[:], uint32(len(s)))
+	if _, err := w.Write(h[:]); err != nil {
+		return err
+	}
+	_, err := io.WriteString(w, s)
+	return err
+}
+
+func readMsg(r io.Reader) (string, error) {
+	var h [4]byte
+	if _, err := io.ReadFull(r, h[:]); err != nil {
+		return "", err
+	}
+	n := binary.BigEndian.Uint32(h[:])
+	buf := make([]byte, n)
+	if _, err := io.ReadFull(r, buf); err != nil {
+		return "", err
+	}
+	return string(buf), nil
+}
+
+func main() {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		panic(err)
+	}
+	defer ln.Close()
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		c, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer c.Close()
+		_ = c.SetDeadline(time.Now().Add(time.Second))
+		msg, err := readMsg(c)
+		if err != nil {
+			return
+		}
+		_ = writeMsg(c, "echo:"+msg)
+	}()
+
+	c, err := net.DialTimeout("tcp", ln.Addr().String(), time.Second)
+	if err != nil {
+		panic(err)
+	}
+	defer c.Close()
+	_ = c.SetDeadline(time.Now().Add(time.Second))
+	_ = writeMsg(c, "hello")
+	out, err := readMsg(c)
+	if err != nil {
+		panic(err)
+	}
+	fmt.Println(out)
+	<-done
+}
+```
+
+```bash
+go run .
+```
+
+**Expected output:**
+
+```
+echo:hello
+```
+
+### Per-connection deadlines
+
+```bash
+mkdir -p /tmp/go-tcp-deadline && cd /tmp/go-tcp-deadline
+go mod init example.com/tcp-deadline
+```
+
+Save as `main.go`:
+
+```go
+package main
+
+import (
+	"fmt"
+	"net"
+	"time"
+)
+
+func main() {
+	ln, _ := net.Listen("tcp", "127.0.0.1:0")
+	defer ln.Close()
+	go func() {
+		c, _ := ln.Accept()
+		defer c.Close()
+		time.Sleep(50 * time.Millisecond) // slow peer
+	}()
+
+	c, _ := net.Dial("tcp", ln.Addr().String())
+	defer c.Close()
+	_ = c.SetReadDeadline(time.Now().Add(10 * time.Millisecond))
+	buf := make([]byte, 8)
+	_, err := c.Read(buf)
+	fmt.Println("timeout:", err != nil)
+}
+```
+
+```bash
+go run .
+```
+
+**Expected output:**
+
+```
+timeout: true
+```
+
+## Runnable example
+
+Length-prefix framing with max size, deadlines, and a single-process client/server echo—the core TCP service pattern.
+
+```bash
+mkdir -p /tmp/go-tcp-frame && cd /tmp/go-tcp-frame
+go mod init example.com/tcp-frame
+```
+
+Save as `main.go`:
+
+```go
+package main
+
+import (
+	"encoding/binary"
+	"fmt"
+	"io"
+	"log"
+	"net"
+	"time"
+)
+
+const maxMsg = 64 << 10 // 64 KiB
+
+func writeFrame(w io.Writer, payload []byte) error {
+	if len(payload) > maxMsg {
+		return fmt.Errorf("message too large")
+	}
+	var hdr [4]byte
+	binary.BigEndian.PutUint32(hdr[:], uint32(len(payload)))
+	if _, err := w.Write(hdr[:]); err != nil {
+		return err
+	}
+	_, err := w.Write(payload)
+	return err
+}
+
+func readFrame(r io.Reader) ([]byte, error) {
+	var hdr [4]byte
+	if _, err := io.ReadFull(r, hdr[:]); err != nil {
+		return nil, err
+	}
+	n := binary.BigEndian.Uint32(hdr[:])
+	if n > maxMsg {
+		return nil, fmt.Errorf("frame %d exceeds max %d", n, maxMsg)
+	}
+	buf := make([]byte, n)
+	if _, err := io.ReadFull(r, buf); err != nil {
+		return nil, err
+	}
+	return buf, nil
+}
+
+func main() {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer ln.Close()
+
+	errCh := make(chan error, 1)
+	go func() {
+		c, err := ln.Accept()
+		if err != nil {
+			errCh <- err
+			return
+		}
+		defer c.Close()
+		_ = c.SetDeadline(time.Now().Add(5 * time.Second))
+		msg, err := readFrame(c)
+		if err != nil {
+			errCh <- err
+			return
+		}
+		errCh <- writeFrame(c, append([]byte("echo:"), msg...))
+	}()
+
+	conn, err := net.DialTimeout("tcp", ln.Addr().String(), time.Second)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+
+	if err := writeFrame(conn, []byte("hello-tcp")); err != nil {
+		log.Fatal(err)
+	}
+	resp, err := readFrame(conn)
+	if err != nil {
+		log.Fatal(err)
+	}
+	fmt.Printf("response: %q\n", string(resp))
+
+	// Oversized frame rejected
+	conn2, err := net.Dial("tcp", ln.Addr().String())
+	if err == nil {
+		conn2.Close()
+	}
+
+	// Direct unit-style check of max enforcement
+	var bad [4]byte
+	binary.BigEndian.PutUint32(bad[:], uint32(maxMsg)+1)
+	_, err = readFrame(&limitedReader{b: bad[:]})
+	fmt.Println("oversize rejected:", err != nil)
+
+	if err := <-errCh; err != nil {
+		// server may error after client closed second attempt; ignore if already echoed
+		_ = err
+	}
+	fmt.Println("tcp framing ok")
+}
+
+// limitedReader feeds only the header for the oversize demo.
+type limitedReader struct{ b []byte }
+
+func (l *limitedReader) Read(p []byte) (int, error) {
+	if len(l.b) == 0 {
+		return 0, io.EOF
+	}
+	n := copy(p, l.b)
+	l.b = l.b[n:]
+	return n, nil
+}
+```
+
+```bash
+go run .
+```
+
+**Expected output:**
+
+```
+response: "echo:hello-tcp"
+oversize rejected: true
+tcp framing ok
+```
+
+**What to notice**
+
+- `io.ReadFull` is required; one `Read` is never a full frame.
+- Cap `n` before allocating—malicious length prefixes are a memory DoS.
+- Deadlines on the conn protect against silent peers.
+
+**Try next**
+
+- Send two frames in one `Write` and read both on the server loop.
+- Cap concurrent handlers with a buffered channel semaphore.
+
+## Further Reading
+
+- `man 7 tcp`, `man 2 setsockopt` (keepalive, linger)
+- Go blog: deadlines, netpoller behavior
+- Next: **HTTP Client and Server Resilience** — budgets and policy on top of streams
+- Part 17: TLS/mTLS for securing these sockets

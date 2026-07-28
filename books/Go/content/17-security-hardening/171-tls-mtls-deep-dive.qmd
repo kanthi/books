@@ -1,24 +1,467 @@
 ---
-title: "171 TLS and mTLS Deep Dive"
+title: "TLS and mTLS Deep Dive"
 ---
 
-# 171 TLS and mTLS Deep Dive
+# TLS and mTLS Deep Dive
 
-TLS provides confidentiality and integrity. mTLS additionally provides strong client identity at transport level.
+TLS provides confidentiality and integrity for bytes on the wire. **mTLS** additionally authenticates the client with a certificate, giving strong transport-level identity between services.
 
-## Trust Model
+## Why / Overview
+
+Most TLS incidents are lifecycle failures, not breaks of AES:
+
+- Expired certificates
+- Wrong trust bundle after rotation
+- Clients still on TLS 1.0
+- Server name mismatches
+- Half-applied mTLS (server requests client cert but does not verify)
 
 ```text
-client verifies server cert chain
-server verifies client cert chain (mTLS)
+one-way TLS:  client verifies server certificate
+mTLS:         client verifies server AND server verifies client
 ```
 
-## Production Controls
+## Go Server TLS
 
-- Enforce minimum TLS version.
-- Use managed certificate issuance/rotation.
-- Monitor certificate expiry and validation failures.
+```go
+cfg := &tls.Config{
+	MinVersion: tls.VersionTLS12,
+	// Prefer TLS 1.3 when both sides support it (automatic if available).
+	CurvePreferences: []tls.CurveID{
+		tls.X25519,
+		tls.CurveP256,
+	},
+	// Certificates: static or GetCertificate for dynamic reload.
+	Certificates: []tls.Certificate{cert},
+}
 
-## Operational Reality
+srv := &http.Server{
+	Addr:      ":8443",
+	Handler:   mux,
+	TLSConfig: cfg,
+	// timeouts still required
+	ReadHeaderTimeout: 5 * time.Second,
+}
+log.Fatal(srv.ListenAndServeTLS("", "")) // empty if certs in TLSConfig
+```
 
-Most TLS incidents are not cryptographic failures; they are lifecycle failures (expired certs, mismatched trust bundles, incomplete rotation).
+Load cert from PEM:
+
+```go
+cert, err := tls.LoadX509KeyPair("server.crt", "server.key")
+```
+
+### Cipher suites
+
+TLS 1.3 cipher suites are not configurable the same way as 1.2. For 1.2, prefer AEAD suites and avoid legacy CBC/RC4. When in doubt, set `MinVersion: tls.VersionTLS12` and let Go's defaults work; override only with a threat-model reason.
+
+## Dynamic Certificate Reload
+
+Long-lived processes need cert rotation without downtime:
+
+```go
+type certHolder struct {
+	mu   sync.RWMutex
+	cert tls.Certificate
+}
+
+func (h *certHolder) get(_ *tls.ClientHelloInfo) (*tls.Certificate, error) {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	c := h.cert
+	return &c, nil
+}
+
+func (h *certHolder) reload(certFile, keyFile string) error {
+	c, err := tls.LoadX509KeyPair(certFile, keyFile)
+	if err != nil {
+		return err
+	}
+	h.mu.Lock()
+	h.cert = c
+	h.mu.Unlock()
+	return nil
+}
+
+// TLSConfig.GetCertificate = holder.get
+```
+
+Reload on SIGHUP, fs notify, or periodic poll. **Never** replace files non-atomically (see filesystem chapter).
+
+## Client TLS
+
+```go
+rootPEM, _ := os.ReadFile("ca.crt")
+pool := x509.NewCertPool()
+pool.AppendCertsFromPEM(rootPEM)
+
+client := &http.Client{
+	Transport: &http.Transport{
+		TLSClientConfig: &tls.Config{
+			RootCAs:    pool,
+			MinVersion: tls.VersionTLS12,
+			ServerName: "api.internal", // SNI + verify name
+		},
+	},
+	Timeout: 10 * time.Second,
+}
+```
+
+**Never** ship `InsecureSkipVerify: true` in production. If you need custom verify (name overrides, SPIFFE IDs), use `VerifyPeerCertificate` / `VerifyConnection` carefully.
+
+## mTLS
+
+Server requests and verifies client certificates:
+
+```go
+clientCA := x509.NewCertPool()
+clientCA.AppendCertsFromPEM(clientCAPEM)
+
+tlsCfg := &tls.Config{
+	MinVersion: tls.VersionTLS12,
+	ClientAuth: tls.RequireAndVerifyClientCert,
+	ClientCAs:  clientCA,
+	Certificates: []tls.Certificate{serverCert},
+}
+```
+
+Client presents cert:
+
+```go
+cert, _ := tls.LoadX509KeyPair("client.crt", "client.key")
+tlsCfg := &tls.Config{
+	Certificates: []tls.Certificate{cert},
+	RootCAs:      pool,
+	MinVersion:   tls.VersionTLS12,
+	ServerName:   "payments.internal",
+}
+```
+
+### Identity from client cert
+
+```go
+func peerSPIFFEOrCN(r *http.Request) (string, error) {
+	if r.TLS == nil || len(r.TLS.PeerCertificates) == 0 {
+		return "", errors.New("no peer cert")
+	}
+	cert := r.TLS.PeerCertificates[0]
+	// Prefer URI SANs (SPIFFE) over CN in modern designs.
+	for _, u := range cert.URIs {
+		return u.String(), nil
+	}
+	return cert.Subject.CommonName, nil
+}
+```
+
+Authorize **after** extracting identity (next chapter) — transport authn ≠ business authz.
+
+## Trust Bundles and Rotation
+
+Rotation sequence for CAs:
+
+```text
+1. Distribute new CA alongside old (trust both)
+2. Issue leaf certs from new CA
+3. Deploy leaves
+4. Remove old CA only after all leaves rotated
+```
+
+For leaf certs:
+
+```text
+issue new leaf -> dual accept if needed -> switch serve -> revoke/expire old
+```
+
+Monitor:
+
+- Days to expiry (cert exporter / custom metric)
+- Handshake failure rates
+- TLS version negotiation
+
+## HTTP/2 and ALPN
+
+Go enables HTTP/2 over TLS when configured correctly. ALPN negotiates protocols. Mis-set `NextProtos` can break h2.
+
+## Proxies and TLS
+
+Common patterns:
+
+| Pattern | Notes |
+|---------|-------|
+| TLS terminate at edge | Backend may be plain on private net (risk: flat network) |
+| Re-encrypt to backend | Edge → backend TLS |
+| Pass-through | Edge routes TCP; backend terminates |
+| Mesh mTLS | Sidecars handle identity |
+
+If you trust "internal HTTP," document the compensating control (network policy, mesh).
+
+## Production Checklist
+
+- [ ] MinVersion TLS 1.2+
+- [ ] Private keys `0600`, not in image layers with world read
+- [ ] Automated expiry monitoring and paging
+- [ ] Reload path tested for leaf rotation
+- [ ] mTLS: `RequireAndVerifyClientCert` + correct ClientCAs
+- [ ] Clients set ServerName / use proper URL host
+- [ ] No `InsecureSkipVerify` in prod configs
+- [ ] CA rotation dual-trust window documented
+- [ ] Handshake errors metrics + logs (without dumping secrets)
+
+## Common Pitfalls
+
+1. **Clock skew** fails cert validity (`NotBefore`/`NotAfter`).
+2. **Forgetting intermediate certs** in the server chain.
+3. **File replace** of `tls.key` while process holds old fd only — need reload.
+4. **CN-only verification** without SANs (modern clients expect SANs).
+5. **ClientAuth RequestClientCert** without verify — provides no security.
+6. **Logging private keys** during debug.
+7. **Wildcard trust** too broad in ClientCAs.
+
+## Exercises
+
+1. Generate a local CA + server cert with `openssl` or `mkcert`; serve HTTPS with Go.
+2. Connect with the system CA only; observe failure; fix RootCAs.
+3. Enable mTLS; connect without client cert; confirm failure; then succeed with client cert.
+4. Implement `GetCertificate` hot reload; replace files; curl still works.
+5. Set `MinVersion` to TLS 1.3 only; test old client behavior.
+6. Extract URI SAN identity in a handler; map to a principal.
+7. Emit a gauge `tls_cert_not_after_seconds`; alert at < 14 days.
+8. Deliberately expire a cert; document failure symptoms in client and server logs.
+9. Compare edge termination vs app termination threat models in a one-pager.
+10. Rotate CA with dual-trust; prove old leaves still work until cutover completes.
+
+## Certificate File Permissions Checklist
+
+```bash
+# private key must not be group/world readable
+chmod 600 server.key
+# cert can be world-readable
+chmod 644 server.crt
+```
+
+In Kubernetes, use projected secrets with restrictive default modes (`defaultMode: 0400` for keys). Never `console.log` or slog the PEM contents.
+
+## Handshake Failure Debugging Order
+
+1. Clock skew (`NotBefore` / `NotAfter`)
+2. Missing intermediate in server chain
+3. Client trust bundle missing the issuing CA
+4. SNI / `ServerName` mismatch vs certificate SAN
+5. mTLS: client cert not sent or not signed by `ClientCAs`
+6. Version floor: client only offers TLS 1.0, server requires 1.2+
+
+Capture with `openssl s_client -connect host:443 -servername host -showcerts` before changing application code.
+
+## More examples
+
+### TLS server + RootCAs client (httptest)
+
+```bash
+mkdir -p /tmp/go-tls-roots && cd /tmp/go-tls-roots
+go mod init example.com/tls-roots
+```
+
+Save as `main.go`:
+
+```go
+package main
+
+import (
+	"crypto/tls"
+	"crypto/x509"
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
+)
+
+func main() {
+	ts := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, "version_ok=%v", r.TLS != nil)
+	}))
+	defer ts.Close()
+
+	roots := x509.NewCertPool()
+	roots.AddCert(ts.Certificate())
+	client := &http.Client{Transport: &http.Transport{
+		TLSClientConfig: &tls.Config{RootCAs: roots, MinVersion: tls.VersionTLS12},
+	}}
+	resp, err := client.Get(ts.URL)
+	if err != nil {
+		panic(err)
+	}
+	b, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	fmt.Println(string(b))
+	_, err = http.Get(ts.URL)
+	fmt.Println("default client fails:", err != nil)
+}
+```
+
+```bash
+go run .
+```
+
+**Expected output:**
+
+```
+version_ok=true
+default client fails: true
+```
+
+### Inspect peer cert fields in handler
+
+```bash
+mkdir -p /tmp/go-tls-peer && cd /tmp/go-tls-peer
+go mod init example.com/tls-peer
+```
+
+Save as `main.go`:
+
+```go
+package main
+
+import (
+	"crypto/tls"
+	"crypto/x509"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+)
+
+func main() {
+	ts := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.TLS == nil {
+			http.Error(w, "no tls", 500)
+			return
+		}
+		fmt.Fprintf(w, "negotiated>=1.2=%v peers=%d",
+			r.TLS.Version >= tls.VersionTLS12, len(r.TLS.PeerCertificates))
+	}))
+	defer ts.Close()
+
+	roots := x509.NewCertPool()
+	roots.AddCert(ts.Certificate())
+	client := &http.Client{Transport: &http.Transport{
+		TLSClientConfig: &tls.Config{RootCAs: roots, MinVersion: tls.VersionTLS12},
+	}}
+	resp, err := client.Get(ts.URL)
+	if err != nil {
+		panic(err)
+	}
+	defer resp.Body.Close()
+	var buf [64]byte
+	n, _ := resp.Body.Read(buf[:])
+	fmt.Println(string(buf[:n]))
+}
+```
+
+```bash
+go run .
+```
+
+**Expected output:**
+
+```
+negotiated>=1.2=true peers=0
+```
+
+(`peers=0` without client certs; mTLS would raise this.)
+
+## Runnable example
+
+HTTPS with `httptest.NewTLSServer` and a client that uses the server's certificate pool (no `InsecureSkipVerify` in the happy path). Also shows a misconfigured skip-verify client for contrast.
+
+```bash
+mkdir -p /tmp/go-tls-demo && cd /tmp/go-tls-demo
+go mod init example.com/tls-demo
+```
+
+Save as `main.go`:
+
+```go
+package main
+
+import (
+	"crypto/tls"
+	"crypto/x509"
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
+)
+
+func main() {
+	ts := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, "hello tls state=%v\n", r.TLS != nil)
+	}))
+	defer ts.Close()
+
+	// Trust the test server's cert (httptest exposes it).
+	roots := x509.NewCertPool()
+	roots.AddCert(ts.Certificate())
+	secureClient := &http.Client{
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{
+				RootCAs:    roots,
+				MinVersion: tls.VersionTLS12,
+			},
+		},
+	}
+	resp, err := secureClient.Get(ts.URL)
+	if err != nil {
+		panic(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	fmt.Printf("secure: %s", body)
+
+	// Default client does not trust httptest certs → error
+	_, err = http.Get(ts.URL)
+	fmt.Println("default client error:", err != nil)
+
+	// InsecureSkipVerify works but is not production policy
+	insecure := &http.Client{
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true, MinVersion: tls.VersionTLS12},
+		},
+	}
+	resp, err = insecure.Get(ts.URL)
+	if err != nil {
+		panic(err)
+	}
+	resp.Body.Close()
+	fmt.Println("insecure skip verify status:", resp.StatusCode)
+	fmt.Println("MinVersion TLS1.2 configured on both clients")
+}
+```
+
+```bash
+go run .
+```
+
+**Expected output:**
+
+```
+secure: hello tls state=true
+default client error: true
+insecure skip verify status: 200
+MinVersion TLS1.2 configured on both clients
+```
+
+**What to notice**
+
+- Production clients need a real trust bundle (`RootCAs`), not `InsecureSkipVerify`.
+- `httptest.NewTLSServer` is the practical way to exercise TLS in unit tests.
+- Set `MinVersion: tls.VersionTLS12` (or 1.3-only) deliberately.
+
+**Try next**
+
+- Require client certs (`ClientAuth: tls.RequireAndVerifyClientCert`) for an mTLS sketch.
+- Inspect `r.TLS.Version` and peer certificates on the server handler.
+
+## Further Reading
+
+- Go `crypto/tls` configuration documentation
+- Mozilla SSL configuration generator (concepts)
+- Next: **Authentication and Authorization Patterns**
