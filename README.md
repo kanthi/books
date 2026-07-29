@@ -15,7 +15,6 @@ Each book generally follows this pattern:
 - **`content/`**: (Expected) Contains the actual Markdown (`.md`) or Quarto (`.qmd`) source files, organized by folders (chapters/parts).
 - **`scripts/`**:
     - `update-index.sh`: A helper script that scans the `content` directory and automatically generates the navigation structure in `_quarto.yml`.
-    - `render_all_books.sh`: Local rendering script.
 - **`_quarto.yml`**: The Quarto configuration file (often generated/updated by scripts).
 - **`styles/`**: Custom CSS/SCSS for styling the book.
 
@@ -26,6 +25,12 @@ The rendering process is automated via shell scripts that handle indexing, build
 ### Main Scripts (in `/books`)
 
 Run these from the **`books/`** directory.
+
+0.  **`scripts/gen-portal.sh` (Portal Generator)**:
+    - Regenerates `published_books/index.html` and SVG book covers by scanning the `published_books/` tree.
+    - Does **not** render any books — only rebuilds the portal page.
+    - Used by the incremental CI pipeline (`incremental.yml`) after overlaying changed books.
+    - Can also be run locally: `bash scripts/gen-portal.sh` (from `books/`).
 
 1.  **`renderpub-codex-v2.sh` (Master Build / CI path of record)**:
     - **Iterates** through all subdirectories in `books/` looking for `_quarto.yml`.
@@ -92,11 +97,37 @@ Run these from the **`books/`** directory.
 
 ## 3. Deployment (GitHub Actions)
 
-The file `.github/workflows/main.yml` defines the CI/CD pipeline:
-1.  **Trigger**: Pushes to `main`.
-2.  **Setup**: Installs Quarto matching version 1.3.450 and LaTeX (texlive) for PDF generation.
-3.  **Build**: Executes `books/renderpub-codex-v2.sh` (path of record).
-4.  **Deploy**: Pushes the resulting `books/published_books` directory to the `gh-pages` branch, making the library available online.
+Two workflows live under `.github/workflows/`:
+
+### Incremental Pipeline (`incremental.yml`) — **default, push-triggered**
+
+The **primary** CI path. Triggers on push to `main` (only for changes under `books/` or the workflow itself).
+
+**3-stage pipeline:**
+
+| Stage | What it does | Time |
+|-------|-------------|------|
+| **detect** | `git diff` between previous and current commit to find which `books/<Name>/` dirs changed | ~10 sec |
+| **render** | Parallel matrix jobs — one per changed book. Each runs `indipub.sh <Book>` | ~3-5 min |
+| **assemble** | Downloads previous `gh-pages` as baseline, overlays changed books, prunes deleted books, regenerates portal via `gen-portal.sh`, deploys | ~30 sec |
+
+**Key features:**
+- **Incremental** — a single-page edit only renders the affected book (~3-5 min total), not all 13 (~45 min).
+- **Parallel** — multiple changed books render simultaneously (up to 4 concurrent).
+- **Baseline preservation** — previous `gh-pages` is kept as a starting point; unchanged books are untouched.
+- **Concurrency control** — a new push cancels any in-flight run for the same branch.
+- **Prunes deleted books** — if a book directory is removed from the repo, it's cleaned from the deployed site.
+- **Force rebuild** — use `workflow_dispatch` with the `force_all` checkbox to rebuild everything.
+- **Infrastructure changes** (workflow file, `renderpub-codex-v2.sh`, `gen-portal.sh`, `Template-New-1/`) trigger a full rebuild of all books automatically.
+
+### Full Rebuild (`main.yml`) — **manual only**
+
+Legacy workflow, retained for manual full rebuilds of all books via `workflow_dispatch`.
+
+1.  **Trigger**: Manual (`workflow_dispatch`) only — push trigger is disabled.
+2.  **Setup**: Installs Quarto 1.3.450 and LaTeX (texlive) for PDF generation.
+3.  **Build**: Executes `books/renderpub-codex-v2.sh` (renders **all** books sequentially).
+4.  **Deploy**: Pushes `books/published_books` to `gh-pages` (`force_orphan: true`).
 
 ## Summary of Logic
 1.  **Author** writes content in `books/<Topic>/content`.
