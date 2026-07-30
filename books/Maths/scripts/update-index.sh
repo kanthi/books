@@ -192,6 +192,7 @@ format:
     page-navigation: true
 
   pdf:
+    pdf-engine-max-runs: 4
     documentclass: scrreprt
     classoption: ["oneside"]
     number-sections: false
