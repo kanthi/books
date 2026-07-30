@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+export PATH="/opt/homebrew/bin:$PATH"
 
 BOOKS_DIR="$(pwd)"
 PUBLISH_DIR="$BOOKS_DIR/published_books"

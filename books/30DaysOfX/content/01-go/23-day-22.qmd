@@ -1,0 +1,1877 @@
+---
+title: "Day 22 — Caching, Real-time, TLS & Stage VI Gate"
+date-modified: "2025-07-30"
+---
+
+# Day 22 — Caching, Real-time, TLS & Stage VI Gate
+
+
+# Day 58 — caching
+
+**Stage VI · ~3h**  
+**Goal:** Implement a **cache-aside** layer behind a small interface—in-memory with TTL, optional Redis—plus invalidation rules that won’t lie to users.
+
+## Why this day exists
+
+Databases and upstream HTTP are expensive. Caching helps **when**:
+
+- Reads dominate  
+- Slightly stale data is acceptable **or** invalidation is correct  
+- You measure hit rate later (Stage VII metrics)
+
+Caching also hurts when:
+
+- You cache without TTL or invalidation  
+- You cache user-specific data under global keys  
+- Stampede thunders on expiry  
+- You treat cache as source of truth  
+
+Today you build a **correct-by-default** cache-aside path you can disable with a Noop implementation.
+
+---
+
+## Theory 1 — Cache-aside (lazy loading)
+
+```text
+read(key):
+  if val, ok := cache.Get(key); ok { return val }
+  val = db.Load(key)
+  cache.Set(key, val, ttl)
+  return val
+
+write(key, val):
+  db.Save(key, val)
+  cache.Delete(key)   // or Set updated
+```
+
+**Why delete on write?** Avoid dual-write inconsistency when DB succeeds and cache set fails (or vice versa). Re-populate on next read. Write-through (update cache in the write path) is valid but harder to keep consistent under partial failures.
+
+---
+
+## Theory 2 — Interface first
+
+```go
+type Cache interface {
+	Get(ctx context.Context, key string) (string, bool, error)
+	Set(ctx context.Context, key, val string, ttl time.Duration) error
+	Delete(ctx context.Context, key string) error
+}
+```
+
+Implementations:
+
+1. `MemoryCache` — `map` + `sync.RWMutex` + expiry  
+2. `RedisCache` — optional; skip if no Redis  
+3. `NoopCache` — always miss (tests/feature flag)
+
+```go
+type NoopCache struct{}
+
+func (NoopCache) Get(context.Context, string) (string, bool, error) {
+	return "", false, nil
+}
+func (NoopCache) Set(context.Context, string, string, time.Duration) error { return nil }
+func (NoopCache) Delete(context.Context, string) error                    { return nil }
+```
+
+---
+
+## Theory 3 — Memory implementation sketch
+
+```go
+type entry struct {
+	val string
+	exp time.Time
+}
+
+type MemoryCache struct {
+	mu   sync.RWMutex
+	data map[string]entry
+}
+
+func NewMemoryCache() *MemoryCache {
+	return &MemoryCache{data: make(map[string]entry)}
+}
+
+func (c *MemoryCache) Get(_ context.Context, key string) (string, bool, error) {
+	c.mu.RLock()
+	e, ok := c.data[key]
+	c.mu.RUnlock()
+	if !ok || time.Now().After(e.exp) {
+		if ok {
+			_ = c.Delete(context.Background(), key)
+		}
+		return "", false, nil
+	}
+	return e.val, true, nil
+}
+
+func (c *MemoryCache) Set(_ context.Context, key, val string, ttl time.Duration) error {
+	c.mu.Lock()
+	c.data[key] = entry{val: val, exp: time.Now().Add(ttl)}
+	c.mu.Unlock()
+	return nil
+}
+
+func (c *MemoryCache) Delete(_ context.Context, key string) error {
+	c.mu.Lock()
+	delete(c.data, key)
+	c.mu.Unlock()
+	return nil
+}
+```
+
+### Janitor
+
+Optional goroutine ticking every minute to drop expired keys (or lazy delete only). Bound map size (max entries + eviction) for production; lab can document unbounded risk.
+
+```go
+func (c *MemoryCache) Janitor(stop <-chan struct{}, every time.Duration) {
+	t := time.NewTicker(every)
+	defer t.Stop()
+	for {
+		select {
+		case <-stop:
+			return
+		case <-t.C:
+			now := time.Now()
+			c.mu.Lock()
+			for k, e := range c.data {
+				if now.After(e.exp) {
+					delete(c.data, k)
+				}
+			}
+			c.mu.Unlock()
+		}
+	}
+}
+```
+
+---
+
+## Theory 4 — Key design
+
+```text
+item:v1:{id}
+user:v1:{id}:items
+```
+
+Include **version prefix** so you can bust all keys by deploying a new version. Include tenant/user when data is private:
+
+```text
+item:v1:{userID}:{id}
+```
+
+Never use raw user input without sanitizing separators. Prefer fixed prefixes + opaque ids.
+
+---
+
+## Theory 5 — Stampede control (awareness)
+
+When popular key expires, N requests hit DB. Mitigations:
+
+- Singleflight (`golang.org/x/sync/singleflight`)  
+- Probabilistic early expiration  
+- Lock per key  
+
+```go
+var g singleflight.Group
+
+func (r *CachedItemRepo) Get(ctx context.Context, id string) (Item, error) {
+	key := "item:v1:" + id
+	if raw, ok, err := r.cache.Get(ctx, key); err != nil {
+		return Item{}, err
+	} else if ok {
+		var it Item
+		if err := json.Unmarshal([]byte(raw), &it); err == nil {
+			return it, nil
+		}
+	}
+	v, err, _ := g.Do(key, func() (any, error) {
+		it, err := r.inner.Get(ctx, id)
+		if err != nil {
+			return Item{}, err
+		}
+		b, _ := json.Marshal(it)
+		_ = r.cache.Set(ctx, key, string(b), r.ttl)
+		return it, nil
+	})
+	if err != nil {
+		return Item{}, err
+	}
+	return v.(Item), nil
+}
+```
+
+Lab stretch: prove concurrent Gets coalesce to one load.
+
+---
+
+## Theory 6 — HTTP caching vs app cache
+
+| Layer | Mechanism |
+|-------|-----------|
+| Client/CDN | `Cache-Control`, ETag (Day 56 R) |
+| App memory/Redis | Cache interface today |
+| DB | Materialized views / query cache (DBA) |
+
+Do not confuse `Cache-Control: private` personal data with public CDN caching. App caches are not a substitute for HTTP cache headers when browsers/CDNs are the consumers.
+
+### Negative caching
+
+Caching “not found” can protect the DB from hammering missing keys—use a **short** TTL and never confuse it with a real item payload (store a sentinel or separate negative map).
+
+---
+
+## Worked example — repo with cache-aside
+
+```go
+type CachedItemRepo struct {
+	inner ItemReaderWriter // interface to real store
+	cache Cache
+	ttl   time.Duration
+	log   *slog.Logger
+}
+
+func (r *CachedItemRepo) Get(ctx context.Context, id string) (Item, error) {
+	key := "item:v1:" + id
+	if raw, ok, err := r.cache.Get(ctx, key); err != nil {
+		return Item{}, err
+	} else if ok {
+		var it Item
+		if err := json.Unmarshal([]byte(raw), &it); err == nil {
+			r.log.Debug("cache hit", "key", key)
+			return it, nil
+		}
+	}
+	it, err := r.inner.Get(ctx, id)
+	if err != nil {
+		return it, err
+	}
+	b, err := json.Marshal(it)
+	if err == nil {
+		_ = r.cache.Set(ctx, key, string(b), r.ttl)
+	}
+	return it, nil
+}
+
+func (r *CachedItemRepo) Update(ctx context.Context, it Item) error {
+	if err := r.inner.Update(ctx, it); err != nil {
+		return err
+	}
+	return r.cache.Delete(ctx, "item:v1:"+it.ID)
+}
+```
+
+---
+
+## Lab 1 — Setup
+
+```bash
+mkdir -p ~/lab/90daysofx/01-go/day58
+cd ~/lab/90daysofx/01-go/day58
+go mod init example.com/day58
+```
+
+Package layout: `cache/`, `store/`, optional `api/` wiring.
+
+---
+
+## Lab 2 — MemoryCache tests
+
+1. Set/Get hit  
+2. Expiry miss after TTL  
+3. Delete removes key  
+4. Concurrent Set/Get with `-race`  
+
+Use short TTLs (`20 * time.Millisecond`) + `time.Sleep` carefully or inject a clock interface for purity.
+
+```bash
+go test ./cache/ -race -count=1
+```
+
+---
+
+## Lab 3 — Wire into API
+
+`GET /v1/items/{id}` goes through cached repo. Manually:
+
+1. Get (miss → DB)  
+2. Get again (hit—log optional `cache_hit=true`)  
+3. Update/Delete invalidates  
+4. Get loads fresh  
+
+Optional counter metrics later (Day 69); for now slog Debug is enough.
+
+---
+
+## Lab 4 — Optional Redis
+
+If Redis available:
+
+```go
+rdb := redis.NewClient(&redis.Options{Addr: "127.0.0.1:6379"})
+// GET / SET with expiration / DEL — implement Cache
+```
+
+Skip with build tag or runtime detect—document “Redis not used” if skipped. Never fail unit tests because Redis is down.
+
+---
+
+## Lab 5 — singleflight stretch
+
+Prove with a slow DB fake that 20 concurrent Gets cause ~1 load:
+
+```go
+var loads atomic.Int64
+// inner.Get sleeps 50ms and increments loads
+// 20 goroutines call Cached Get same id
+// assert loads == 1 (or very close) with singleflight
+```
+
+---
+
+## Common gotchas
+
+| Gotcha | Fix |
+|--------|-----|
+| Cache forever | TTL always |
+| No invalidation on write | Delete/Set |
+| Caching errors/404 forever | Don’t cache misses **or** short negative TTL deliberately |
+| Global keys for private data | Namespace by user |
+| Huge values | Bound size |
+| Ignoring ctx in Redis | Use context variants |
+| Race on map | Mutex |
+| Caching mutable pointers shared with callers | Marshal copies / return new structs |
+
+---
+
+## Checkpoint
+
+- [ ] `Cache` interface + Memory impl  
+- [ ] Cache-aside Get + invalidate on write  
+- [ ] Tests for TTL and race  
+- [ ] Key naming scheme documented  
+- [ ] Optional Redis or explicit skip note  
+- [ ] Know when not to cache  
+
+### Commit
+
+```bash
+git add .
+git commit -m "day58: cache-aside interface and memory TTL cache"
+```
+
+Write three personal gotchas before continuing.
+
+---
+
+## Tomorrow
+
+**Day 59 — WebSockets or SSE:** pick one realtime pattern; push live updates from your service.
+
+---
+
+
+# Day 59 — WebSockets or SSE
+
+**Stage VI · ~3h**  
+**Goal:** Add **one** realtime channel—**Server-Sent Events (SSE)** or **WebSockets**—with clear lifecycle, client test/script, and documentation of the trade-off.
+
+::: {.callout-important}
+Pick **one**. Implementing both shallowly is worse than one solid path.
+:::
+
+## Why this day exists
+
+Request/response REST is not enough for:
+
+- Live dashboards  
+- Notifications  
+- Collaborative presence  
+
+Two stdlib-friendly options dominate simple Go services:
+
+| | **SSE** | **WebSocket** |
+|--|---------|----------------|
+| Direction | Server → client (HTTP) | Full duplex |
+| Protocol | HTTP response stream | HTTP Upgrade → WS |
+| Reconnect | Easy (EventSource) | Manual or lib |
+| Proxies | Usually friendly | Need Upgrade support |
+| Binary | Awkward (text events) | Natural |
+| Stdlib | `net/http` only | Library preferred |
+
+---
+
+## Theory 1 — SSE fundamentals
+
+Response headers:
+
+```http
+HTTP/1.1 200 OK
+Content-Type: text/event-stream
+Cache-Control: no-cache
+Connection: keep-alive
+```
+
+Body frames:
+
+```text
+event: item_created
+data: {"id":"1","name":"x"}
+
+: keep-alive comment
+
+data: plain line
+
+```
+
+Rules:
+
+- Blank line ends an event  
+- `data:` may repeat (joined with `\n`)  
+- Comments start with `:`  
+- Client `EventSource` auto-reconnects  
+
+### Go handler sketch
+
+```go
+func (s *Server) streamEvents(w http.ResponseWriter, r *http.Request) {
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "streaming unsupported", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.WriteHeader(http.StatusOK)
+	flusher.Flush()
+
+	ch := s.hub.Subscribe()
+	defer s.hub.Unsubscribe(ch)
+
+	ticker := time.NewTicker(15 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-r.Context().Done():
+			return
+		case <-ticker.C:
+			_, _ = io.WriteString(w, ": ping\n\n")
+			flusher.Flush()
+		case msg, ok := <-ch:
+			if !ok {
+				return
+			}
+			_, _ = fmt.Fprintf(w, "event: %s\ndata: %s\n\n", msg.Event, msg.Data)
+			flusher.Flush()
+		}
+	}
+}
+```
+
+### Fan-out hub
+
+```go
+type Message struct {
+	Event string
+	Data  string
+}
+
+type Hub struct {
+	mu   sync.Mutex
+	subs map[chan Message]struct{}
+}
+
+func NewHub() *Hub {
+	return &Hub{subs: make(map[chan Message]struct{})}
+}
+
+func (h *Hub) Subscribe() chan Message {
+	ch := make(chan Message, 8)
+	h.mu.Lock()
+	h.subs[ch] = struct{}{}
+	h.mu.Unlock()
+	return ch
+}
+
+func (h *Hub) Unsubscribe(ch chan Message) {
+	h.mu.Lock()
+	delete(h.subs, ch)
+	h.mu.Unlock()
+	close(ch)
+}
+
+func (h *Hub) Publish(msg Message) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for ch := range h.subs {
+		select {
+		case ch <- msg:
+		default:
+			// slow consumer: drop (or disconnect policy)
+		}
+	}
+}
+```
+
+Publish from `createItem` after successful DB write.
+
+---
+
+## Theory 2 — WebSocket fundamentals
+
+Handshake: `Connection: Upgrade`, `Upgrade: websocket`, `Sec-WebSocket-Key`, …
+
+### Library choice (pragmatic)
+
+| Library | Notes |
+|---------|-------|
+| `github.com/coder/websocket` | Modern, good defaults |
+| `github.com/gorilla/websocket` | Widely known |
+| `golang.org/x/net/websocket` | Older; less preferred |
+
+Stdlib does not yet provide a full WS server as ergonomic as these. Using one well-known package is acceptable for this day—document it.
+
+### Patterns
+
+- Read loop + write loop (often separate goroutines)  
+- Ping/pong for keepalive  
+- Auth on connect (query token or first message)—prefer **before** upgrade when possible  
+
+```go
+// conceptual — coder/websocket
+c, err := websocket.Accept(w, r, &websocket.AcceptOptions{
+	OriginPatterns: []string{"localhost:*"},
+})
+if err != nil {
+	return
+}
+defer c.Close(websocket.StatusNormalClosure, "")
+
+ctx := r.Context()
+for {
+	_, data, err := c.Read(ctx)
+	if err != nil {
+		return
+	}
+	_ = c.Write(ctx, websocket.MessageText, data) // echo lab
+}
+```
+
+---
+
+## Theory 3 — Auth and multi-tenant streams
+
+- SSE: `Authorization` header works with some clients; browsers’ `EventSource` cannot set custom headers—use **httpOnly cookie session** or short-lived query token (careful with logs and referrer leakage).  
+- WS: same issues; cookies sent on same-site connects.  
+
+Filter events by `userID` from auth context so users don’t see others’ data.
+
+```go
+// publish user-scoped
+s.hub.Publish(Message{
+	Event: "item_created",
+	Data:  string(payload),
+})
+// subscriber filters or hub stores per-user channels
+```
+
+---
+
+## Theory 4 — Backpressure & disconnects
+
+- Detect `r.Context().Done()`  
+- Bound subscription channel buffers  
+- Drop or disconnect slow clients  
+- Do not let Publish block on one bad consumer  
+- Cap max subscribers per process for lab safety  
+
+`http.Server` write deadlines can interfere with long-lived streams—tune `WriteTimeout` to `0` for the stream server or use a separate server/listener pattern in real systems. Document what you did.
+
+---
+
+## Theory 5 — Testing strategy
+
+| Layer | Approach |
+|-------|----------|
+| Hub | Unit tests: subscribe, publish, unsubscribe, drop policy |
+| SSE handler | `httptest.NewServer` + short context; read until first event |
+| WS | Small Go client against `NewServer` |
+
+```go
+func TestHubFanout(t *testing.T) {
+	h := NewHub()
+	a, b := h.Subscribe(), h.Subscribe()
+	h.Publish(Message{Event: "x", Data: "1"})
+	select {
+	case m := <-a:
+		if m.Data != "1" {
+			t.Fatal(m)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timeout a")
+	}
+	<-b
+	h.Unsubscribe(a)
+	h.Unsubscribe(b)
+}
+```
+
+---
+
+## Worked example — choose SSE for lab default
+
+SSE is pure stdlib and enough for “item created” feeds. Prefer SSE unless you need client→server messages over the same socket (chat, collaborative cursors).
+
+README declaration:
+
+```text
+realtime: sse
+```
+
+---
+
+## Lab 1 — Setup
+
+```bash
+mkdir -p ~/lab/90daysofx/01-go/day59
+cd ~/lab/90daysofx/01-go/day59
+go mod init example.com/day59
+```
+
+Declare track in README: `realtime: sse` or `realtime: websocket`.
+
+---
+
+## Lab 2A — SSE path
+
+1. Hub with Subscribe/Unsubscribe/Publish  
+2. `GET /v1/events` SSE handler  
+3. Publish on item create  
+4. Manual test:
+
+```bash
+curl -N -H 'Accept: text/event-stream' http://127.0.0.1:8080/v1/events
+# other terminal: create item
+```
+
+5. Auto test: unit-test Hub thoroughly + thin handler test with cancelled context after one event.
+
+---
+
+## Lab 2B — WebSocket path
+
+1. Accept connection  
+2. Broadcast item JSON messages  
+3. Script or small Go client reading one message  
+4. Origin check configured for lab  
+
+---
+
+## Lab 3 — Auth gate
+
+Only authenticated users subscribe. Unauthorized → 401 **before** stream starts (do not flush event-stream headers first).
+
+---
+
+## Lab 4 — Load lite
+
+100 subscribers + 10 publishes; ensure no deadlock (`-race` test with fake hub consumers). Assert Publish returns quickly even with full buffers (drop policy).
+
+---
+
+## Common gotchas
+
+| Gotcha | Fix |
+|--------|-----|
+| Forgetting Flush | Call after each event |
+| Buffering proxy | `X-Accel-Buffering: no` (nginx) awareness |
+| Blocking Publish | default drop policy |
+| Browser EventSource + bearer header | Cookies or ticket |
+| WS without ping | Idle timeouts kill conns |
+| Both protocols half-done | Pick one |
+| WriteTimeout killing streams | Configure for long-lived connections |
+| Leaking subscriptions | `defer Unsubscribe` |
+
+---
+
+## Checkpoint
+
+- [ ] One realtime protocol working end-to-end  
+- [ ] Hub or equivalent fan-out  
+- [ ] Disconnect cleans subscription  
+- [ ] Auth considered  
+- [ ] Trade-off documented  
+- [ ] Demo script in README  
+
+### Commit
+
+```bash
+git add .
+git commit -m "day59: realtime SSE or WebSocket live updates"
+```
+
+Write three personal gotchas before continuing.
+
+---
+
+## Tomorrow
+
+**Day 60 — TLS awareness:** local HTTPS, `tls.Config` minimum versions, and terminate-at-proxy architecture notes.
+
+---
+
+
+# Day 60 — TLS awareness
+
+**Stage VI · ~3h**  
+**Goal:** Gain operational literacy for **TLS in Go services**—serve HTTPS locally with sane `tls.Config`, or document **terminate-at-proxy** with correct forwarded headers—and never casually disable verification.
+
+::: {.callout-note}
+You are not becoming a PKI engineer today. You are becoming **hard to fool**: where TLS ends, what clients verify, and why `InsecureSkipVerify` is almost always wrong.
+:::
+
+## Why this day exists
+
+Encryption in transit is table stakes. Go developers must know:
+
+- Where TLS terminates (app vs load balancer)  
+- How to set minimum TLS version and cipher policy  
+- How HTTP clients verify certificates  
+- What `InsecureSkipVerify` actually does  
+
+Stage VI APIs that only speak cleartext on a laptop are incomplete for production mental models—even when the final deploy terminates TLS at a proxy.
+
+---
+
+## Theory 1 — What TLS gives you
+
+1. **Confidentiality** — eavesdroppers don’t read payloads  
+2. **Integrity** — tampering detected  
+3. **Authentication** — server identity (and optionally client certs)
+
+Certificates bind a **public key** to a **name** (SAN DNS/IP) via a chain of trust to a root CA. Modern clients match against **Subject Alternative Name (SAN)**, not only the legacy Common Name (CN).
+
+```text
+Client hello → Server cert chain → Verify name + chain → Keys → Encrypted HTTP
+```
+
+---
+
+## Theory 2 — Terminate at app vs proxy
+
+```text
+[Client] --TLS--> [App :443]                    // app terminates
+
+[Client] --TLS--> [LB/Proxy] --HTTP--> [App :8080]  // proxy terminates
+```
+
+| Mode | Pros | Cons |
+|------|------|------|
+| App TLS | End-to-end to process; simpler network trust | Cert reload, CPU on app |
+| Proxy TLS | Central certs (ACME), WAF | App must trust private network; need real IP headers |
+
+Many K8s setups terminate at ingress; apps speak cleartext inside the mesh or network policy. **Document your trust boundary.**
+
+### Choosing for the lab
+
+| Situation | Pick |
+|-----------|------|
+| Learning `tls.Config` API | Lab A (app TLS) |
+| Already designing ingress | Lab B (proxy doc) |
+| Unsure | Lab A first; add Lab B notes if time |
+
+---
+
+## Theory 3 — `http.Server` HTTPS
+
+```go
+srv := &http.Server{
+	Addr:              ":8443",
+	Handler:           handler,
+	ReadHeaderTimeout: 5 * time.Second,
+	ReadTimeout:       15 * time.Second,
+	WriteTimeout:      30 * time.Second,
+	TLSConfig: &tls.Config{
+		MinVersion: tls.VersionTLS12, // prefer TLS 1.3 when clients allow
+	},
+}
+err := srv.ListenAndServeTLS("cert.pem", "key.pem")
+```
+
+Or build the listener yourself:
+
+```go
+ln, err := tls.Listen("tcp", ":8443", srv.TLSConfig)
+if err != nil {
+	return err
+}
+err = srv.Serve(ln)
+```
+
+Always keep `ReadHeaderTimeout`—TLS does not remove slowloris-style header tricks.
+
+### Generate local self-signed (lab)
+
+```bash
+openssl req -x509 -newkey rsa:2048 -keyout key.pem -out cert.pem -days 30 -nodes \
+  -subj "/CN=localhost" \
+  -addext "subjectAltName=DNS:localhost,IP:127.0.0.1"
+```
+
+Browsers will warn; curl needs `-k` **only for this self-signed lab** when you have not installed the cert as a trusted CA.
+
+```bash
+# preferred lab proof (no skip-verify):
+curl --cacert cert.pem https://127.0.0.1:8443/healthz
+```
+
+---
+
+## Theory 4 — Client verification
+
+```go
+tr := &http.Transport{
+	TLSClientConfig: &tls.Config{
+		MinVersion: tls.VersionTLS12,
+		// RootCAs: custom pool for private CA
+	},
+	// ForceHTTP2 / idle conns — tune later; defaults OK for lab
+}
+client := &http.Client{Transport: tr, Timeout: 10 * time.Second}
+```
+
+### Private CA
+
+```go
+pemCerts, err := os.ReadFile("rootCA.pem")
+if err != nil {
+	return err
+}
+pool := x509.NewCertPool()
+if !pool.AppendCertsFromPEM(pemCerts) {
+	return errors.New("no certs appended")
+}
+cfg := &tls.Config{
+	RootCAs:    pool,
+	MinVersion: tls.VersionTLS12,
+	ServerName: "api.internal.example", // if dialing by IP
+}
+```
+
+### The footgun
+
+```go
+TLSClientConfig: &tls.Config{InsecureSkipVerify: true} // MITM-able
+```
+
+Allowed only for ephemeral debug with eyes open—never default, never copy into prod configs. If tests need it, isolate:
+
+```go
+// test helper only — file name tls_lab_test.go
+func labInsecureClient() *http.Client {
+	return &http.Client{
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, // lab only
+		},
+		Timeout: 5 * time.Second,
+	}
+}
+```
+
+---
+
+## Theory 5 — Forwarded headers (proxy mode)
+
+When proxy terminates TLS:
+
+```http
+X-Forwarded-Proto: https
+X-Forwarded-For: 203.0.113.10, 10.0.0.5
+X-Forwarded-Host: api.example.com
+```
+
+App must **only trust these from the proxy IP**. Spoofed `X-Forwarded-For` from the public internet is a classic auth/audit bug.
+
+```go
+func realIP(r *http.Request, trustProxy bool) string {
+	if trustProxy {
+		if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+			return strings.TrimSpace(strings.Split(xff, ",")[0])
+		}
+	}
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return r.RemoteAddr
+	}
+	return host
+}
+
+func isHTTPS(r *http.Request, trustProxy bool) bool {
+	if r.TLS != nil {
+		return true
+	}
+	if trustProxy && strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https") {
+		return true
+	}
+	return false
+}
+```
+
+Secure cookies: `Secure: true` when served over HTTPS (or when `X-Forwarded-Proto` is https **and** proxy is trusted).
+
+---
+
+## Theory 6 — Redirect HTTP→HTTPS and HSTS
+
+```go
+go func() {
+	_ = http.ListenAndServe(":8080", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		host := r.Host
+		target := "https://" + host + r.URL.RequestURI()
+		http.Redirect(w, r, target, http.StatusMovedPermanently)
+	}))
+}()
+```
+
+HSTS header (careful on localhost—browsers remember):
+
+```go
+w.Header().Set("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+```
+
+Do **not** enable HSTS on throwaway lab hostnames you share with other apps.
+
+---
+
+## Theory 7 — mTLS awareness (read-only depth)
+
+Mutual TLS authenticates **clients** with certificates. Go sketch:
+
+```go
+cfg := &tls.Config{
+	MinVersion: tls.VersionTLS12,
+	ClientAuth: tls.RequireAndVerifyClientCert,
+	ClientCAs:  clientCAPool,
+}
+```
+
+You will not implement a full PKI today. Know that service mesh (Istio, Linkerd) often does mTLS **between proxies**, not necessarily in your Go process.
+
+---
+
+## Worked example — TLS server config baseline
+
+```go
+func baselineTLS() *tls.Config {
+	return &tls.Config{
+		MinVersion: tls.VersionTLS12,
+		CurvePreferences: []tls.CurveID{
+			tls.X25519,
+			tls.CurveP256,
+		},
+		// Prefer server cipher suites on TLS 1.2; TLS 1.3 has its own suite set
+		// PreferServerCipherSuites is ignored for TLS 1.3
+	}
+}
+```
+
+Prefer TLS 1.3 when clients allow (`MinVersion: tls.VersionTLS13` for hardened internal services).
+
+### Worked example — client with custom CA
+
+```go
+func clientWithRoot(caPath string) (*http.Client, error) {
+	pem, err := os.ReadFile(caPath)
+	if err != nil {
+		return nil, err
+	}
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM(pem) {
+		return nil, errors.New("append CA")
+	}
+	return &http.Client{
+		Timeout: 10 * time.Second,
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{
+				RootCAs:    pool,
+				MinVersion: tls.VersionTLS12,
+			},
+		},
+	}, nil
+}
+```
+
+---
+
+## Lab options (pick A or B)
+
+```bash
+mkdir -p ~/lab/90daysofx/01-go/day60
+cd ~/lab/90daysofx/01-go/day60
+go mod init example.com/day60
+```
+
+### Lab A — App-terminated HTTPS
+
+1. Generate self-signed certs with SAN for localhost + 127.0.0.1.  
+2. Serve Stage VI API (or a minimal mux) on `:8443` with `MinVersion: TLS1_2`.  
+3. Client test using custom `RootCAs` **or** documented `InsecureSkipVerify` only in a test helper named `// lab only`.  
+4. Prove `curl --cacert cert.pem https://127.0.0.1:8443/healthz` works.  
+5. `gitignore` private keys (`*.pem` keys; keep sample cert generation script).
+
+### Lab B — Terminate-at-proxy design
+
+1. Write architecture doc: Caddy/nginx/envoy terminates TLS, app on `127.0.0.1:8080`.  
+2. Sample Caddyfile or nginx site snippet.  
+3. App notes: trust hop, `X-Forwarded-Proto`, cookie Secure.  
+4. Checklist for production cert automation (ACME).  
+5. Explicit “app does not call `ListenAndServeTLS`” decision recorded.
+
+Either lab fully done beats both half-done.
+
+### Sample Caddyfile (Lab B)
+
+```text
+api.localhost {
+	reverse_proxy 127.0.0.1:8080
+}
+```
+
+### Sample nginx sketch (Lab B)
+
+```nginx
+server {
+  listen 443 ssl;
+  ssl_certificate     /etc/ssl/certs/fullchain.pem;
+  ssl_certificate_key /etc/ssl/private/privkey.pem;
+  location / {
+    proxy_pass http://127.0.0.1:8080;
+    proxy_set_header Host $host;
+    proxy_set_header X-Forwarded-Proto https;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+  }
+}
+```
+
+---
+
+## Common gotchas
+
+| Gotcha | Fix |
+|--------|-----|
+| CN only without SAN | Modern clients want SAN |
+| `InsecureSkipVerify` in prod | Custom CA pool |
+| Trusting X-Forwarded-* from world | Proxy-only / network policy |
+| Missing ReadHeaderTimeout on TLS server | Still set it |
+| Committing private keys | gitignore `*key*.pem` |
+| Mixed content / Secure cookie wrong | Align with termination mode |
+| Dial by IP with cert for DNS name | Set `ServerName` or use the DNS name |
+| TLS 1.0 still allowed by empty config | Set `MinVersion` explicitly |
+| “HTTPS so we skip auth” | Orthogonal; auth is Day 54 |
+
+---
+
+## Checkpoint
+
+- [ ] Can draw app vs proxy termination  
+- [ ] Lab A **or** B complete  
+- [ ] `tls.Config` MinVersion set  
+- [ ] Know why skip-verify is dangerous  
+- [ ] Keys not committed  
+- [ ] Forwarded header trust story written  
+- [ ] ReadHeaderTimeout present on HTTPS server  
+
+### Commit
+
+```bash
+git add .
+git commit -m "day60: TLS awareness HTTPS or proxy termination"
+```
+
+Write three personal gotchas before continuing.
+
+---
+
+## Tomorrow
+
+**Day 61 — integration tests:** real dependencies (SQLite/Postgres/docker/testcontainers) with cleanup discipline.
+
+---
+
+
+# Day 61 — integration tests
+
+**Stage VI · ~3h**  
+**Goal:** Write **integration tests** that exercise real storage (and optionally HTTP+DB together) with reliable setup/teardown—using SQLite, Docker, or testcontainers when available.
+
+## Why this day exists
+
+Unit tests with fakes are fast but lie about SQL dialects, constraints, and transactions. Integration tests catch:
+
+- Wrong placeholders  
+- Migration mistakes  
+- Unique index conflicts  
+- Scan/NULL issues  
+- Timezone / TEXT affinity surprises on SQLite  
+
+Balance: keep unit tests for pure logic; integration for the repository and optionally the full handler stack. Stage VI gate expects evidence that storage is real.
+
+---
+
+## Theory 1 — Test pyramid for services
+
+```text
+        /  e2e few  \          (browser/k8s — later)
+       / integration  \        (DB, cache, optional network)
+      /    unit many    \      (validation, mappers, pure)
+```
+
+Flags/tags to separate:
+
+```go
+//go:build integration
+
+package store_test
+```
+
+```bash
+go test ./...                        # unit default
+go test -tags=integration ./...      # integration
+```
+
+Or environment gate:
+
+```go
+if os.Getenv("INTEGRATION") == "" {
+	t.Skip("set INTEGRATION=1")
+}
+```
+
+Prefer **tags** for files that import heavy deps; prefer **env** for optional slow suites in already-built packages.
+
+---
+
+## Theory 2 — Isolation strategies
+
+| Strategy | How | Notes |
+|----------|-----|-------|
+| In-memory SQLite | New DB per test | Fast; dialect ≠ Postgres |
+| Temp file SQLite | `t.TempDir()` | Easy cleanup |
+| Transaction rollback | Begin tx; inject tx; rollback | Fast; limited if code uses `*sql.DB` only |
+| Docker Postgres | testcontainers / compose | Closest to prod |
+| Shared DB + truncate | Truncate tables | Parallelism hard |
+
+Prefer **fresh schema per test** via migrations.
+
+```go
+func openTestDB(t *testing.T) *sql.DB {
+	t.Helper()
+	dsn := "file:" + filepath.Join(t.TempDir(), "test.db") + "?_pragma=foreign_keys(1)"
+	db, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	ctx := context.Background()
+	if err := migrate.Apply(ctx, db, migrations); err != nil {
+		t.Fatal(err)
+	}
+	return db
+}
+```
+
+---
+
+## Theory 3 — testcontainers awareness
+
+```go
+// conceptual
+req := testcontainers.ContainerRequest{
+	Image:        "postgres:16-alpine",
+	ExposedPorts: []string{"5432/tcp"},
+	Env: map[string]string{
+		"POSTGRES_PASSWORD": "pass",
+		"POSTGRES_DB":       "app",
+	},
+	WaitingFor: wait.ForListeningPort("5432/tcp"),
+}
+```
+
+Use when dialect fidelity matters. Skip if Docker unavailable:
+
+```go
+if _, err := exec.LookPath("docker"); err != nil {
+	t.Skip("docker not available")
+}
+```
+
+Do not make default CI red when Docker is missing—gate with tags (`integration,postgres`).
+
+---
+
+## Theory 4 — HTTP+DB integration
+
+```go
+func TestCreateAndGet(t *testing.T) {
+	db := openTestDB(t)
+	repo := store.NewItemRepo(db)
+	h := api.New(repo, log).Handler()
+	ts := httptest.NewServer(h)
+	t.Cleanup(ts.Close)
+
+	resp, err := ts.Client().Post(ts.URL+"/v1/items",
+		"application/json", strings.NewReader(`{"name":"alpha"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("status=%d", resp.StatusCode)
+	}
+	// decode id; GET; assert name; also SELECT from db for belt-and-suspenders
+}
+```
+
+This catches routing + serialization + SQL together.
+
+---
+
+## Theory 5 — Cleanup and parallelism
+
+- `t.Cleanup` over manual defer for readability  
+- `t.Parallel()` only with isolated DBs  
+- Do not share `*sql.DB` with mutable global schema across parallel tests without locking  
+
+### Golden data builders
+
+```go
+func seedUser(t *testing.T, repo *UserRepo, email, password string) string {
+	t.Helper()
+	id := newID()
+	hash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.MinCost)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.Create(context.Background(), id, email, hash); err != nil {
+		t.Fatal(err)
+	}
+	return id
+}
+```
+
+Use `MinCost` in tests for speed; production uses `DefaultCost`.
+
+---
+
+## Theory 6 — What belongs where
+
+| Kind | Examples | Location |
+|------|----------|----------|
+| Unit | `validateCreateItem`, DTO mapping | `_test.go` no tag |
+| Integration | Repo CRUD, migrations | `//go:build integration` |
+| Contract HTTP | httptest + fake repo | unit-ish, fast |
+| HTTP+DB | NewServer + real repo | integration tag |
+
+Do not delete unit tests when you add integration—keep both.
+
+---
+
+## Worked example — build-tagged integration test
+
+```go
+// file: store/item_integration_test.go
+//go:build integration
+
+package store_test
+
+import (
+	"context"
+	"testing"
+
+	"example.com/day61/store"
+)
+
+func TestItemRepoIntegration(t *testing.T) {
+	db := openTestDB(t)
+	repo := store.NewItemRepo(db)
+	ctx := context.Background()
+
+	if err := repo.Create(ctx, "id1", "alpha"); err != nil {
+		t.Fatal(err)
+	}
+	got, err := repo.Get(ctx, "id1")
+	if err != nil || got.Name != "alpha" {
+		t.Fatalf("%+v %v", got, err)
+	}
+
+	// unique constraint / PK conflict
+	if err := repo.Create(ctx, "id1", "dup"); err == nil {
+		t.Fatal("expected conflict")
+	}
+
+	if _, err := repo.Get(ctx, "missing"); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("want not found, got %v", err)
+	}
+}
+```
+
+---
+
+## Lab 1 — Setup
+
+```bash
+mkdir -p ~/lab/90daysofx/01-go/day61
+cd ~/lab/90daysofx/01-go/day61
+go mod init example.com/day61
+```
+
+Bring store + migrations + API from prior days (or minimal subset with create/get).
+
+---
+
+## Lab 2 — Repository integration suite
+
+Tests:
+
+1. Migrate fresh DB  
+2. CRUD lifecycle  
+3. Not found  
+4. Conflict on PK/unique  
+5. List limit  
+
+```bash
+go test -tags=integration ./store/ -count=1 -race
+```
+
+---
+
+## Lab 3 — API integration
+
+httptest server + real repo + create/login/get protected route if auth present. Assert both HTTP status and a DB row when relevant.
+
+```go
+func TestAPICreatePersists(t *testing.T) {
+	if os.Getenv("INTEGRATION") == "" {
+		t.Skip("INTEGRATION=1")
+	}
+	db := openTestDB(t)
+	repo := store.NewItemRepo(db)
+	ts := httptest.NewServer(api.New(repo, slog.Default()).Handler())
+	t.Cleanup(ts.Close)
+
+	resp, err := ts.Client().Post(ts.URL+"/v1/items",
+		"application/json", strings.NewReader(`{"name":"persist-me"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("status=%d", resp.StatusCode)
+	}
+	// decode id from JSON, then:
+	// got, err := repo.Get(context.Background(), id)
+	// assert name
+}
+```
+
+---
+
+## Lab 4 — CI-friendly skip
+
+Document in README:
+
+```bash
+go test ./...                      # units
+INTEGRATION=1 go test ./... -tags=integration
+```
+
+Ensure default `go test ./...` stays green without Docker and without `-tags=integration`.
+
+---
+
+## Lab 5 — Optional Postgres container
+
+If Docker works, one test file `//go:build integration,postgres` proving the same repo against Postgres DSN. Note placeholder differences (`$1` vs `?`)—use driver-specific SQL files or a small query abstraction.
+
+If you skip: write two sentences on dialect risk and when you would invest in Postgres CI.
+
+---
+
+## Common gotchas
+
+| Gotcha | Fix |
+|--------|-----|
+| Tests depend on developer’s laptop DB state | Fresh migrate each test |
+| Parallel + shared DB | Isolate or serial |
+| Forgetting Cleanup close | `t.Cleanup` |
+| Integration always on by default | Tags/env skip |
+| Flaky sleeps | Wait on readiness, not blind sleep (containers) |
+| Asserting only status, not DB rows | Read back from DB |
+| Using production bcrypt cost in huge suites | `MinCost` in tests |
+| SQLite-only CI, Postgres in prod | At least one dialect-fidelity path |
+
+---
+
+## Checkpoint
+
+- [ ] Integration tests for repo with real SQL engine  
+- [ ] Migrations applied in test setup  
+- [ ] Cleanup reliable  
+- [ ] Default unit tests don’t require Docker  
+- [ ] Optional HTTP+DB path  
+- [ ] README explains how to run  
+
+### Commit
+
+```bash
+git add .
+git commit -m "day61: integration tests for store and API"
+```
+
+Write three personal gotchas before continuing.
+
+---
+
+## Tomorrow
+
+**Day 62 — Stage VI gate:** ship a service with **data store + auth + tests**—architecture paragraph included.
+
+---
+
+
+# Day 62 — Stage VI gate
+
+**Stage VI · Gate day · ~3h (integration / ship)**  
+**Goal:** Close the data & APIs stage by shipping a **service + persistent store + auth + tests**, with a clear architecture README and operational basics from Days 51–61.
+
+::: {.callout-important}
+Gates are **pass/fail against a rubric**. A pretty half-wired API fails. A small vertical slice that persists, authenticates, and tests cleanly passes.
+:::
+
+## Why this day exists
+
+Stage VI introduced persistence, REST (or gRPC branch), auth, validation, caching, realtime, TLS literacy, and integration tests. The gate asks: **can you assemble a credible vertical slice?**
+
+Not every elective must be in the gate binary—but **core bar items must**. Stage VII (build tags, pprof, containers, metrics, govulncheck) will profile and package **this** service. Spaghetti now becomes expensive later.
+
+---
+
+## Theory 1 — Gate bar (definition of done)
+
+| Requirement | Evidence |
+|-------------|----------|
+| Persistent store via `database/sql` | Migrations + repo; data survives restart |
+| Versioned schema migrations | Idempotent apply (up files or embed) |
+| HTTP JSON API under `/v1` (or gRPC + documented HTTP health) | Routes work end-to-end |
+| Auth protecting at least one mutating route | 401 without creds |
+| Consistent error envelope | Day 55 shape (code/message/details) |
+| Integration or solid repo tests + handler tests | `go test` green on Go 1.26 |
+| Graceful shutdown | SIGINT/SIGTERM → clean exit |
+| slog logging | Structured request or lifecycle logs |
+| README architecture paragraph | Trust boundaries, boxes |
+| Race clean on unit/integration you claim | `-race` where applicable |
+
+### Strongly recommended (bonus)
+
+- Cache-aside on hot GET  
+- One realtime endpoint **or** documented skip with reason  
+- TLS lab notes linked (Day 60)  
+- Elective track (Days 56–57) merged or archived with reason  
+- Request body limits + server timeouts  
+
+### Explicit non-goals
+
+- Perfect OpenAPI client SDK  
+- Multi-region HA  
+- Full OAuth provider  
+- Every Stage VI elective feature in one binary  
+
+---
+
+## Theory 2 — Vertical slice over horizontal sprawl
+
+Prefer:
+
+- One resource fully done (users + items with ownership)  
+
+Over:
+
+- Five half-wired resources  
+
+Gate reviewers (including future you) should:
+
+1. Register / login  
+2. Create an item (authenticated)  
+3. Fetch it after **process restart** (persistence!)  
+4. See tests pass  
+
+### Trust boundary diagram (required)
+
+```text
+[Client]
+   |
+   v
+[http.Server + timeouts]
+   |
+   +--> [auth middleware] -- 401 if missing/invalid
+   |
+   v
+[handlers] -- validate -- map domain errors --> error envelope
+   |
+   v
+[app/service] -- business rules
+   |
+   +--> [repo] --> [sql.DB] --> [SQLite|Postgres]
+   |
+   +--> [cache?] (optional, in-process)
+```
+
+---
+
+## Theory 3 — Architecture paragraph (README)
+
+Write in README (replace placeholders with yours):
+
+```markdown
+## Architecture
+
+Clients call the HTTP API (`/v1/*`). Authentication uses <JWT|sessions>.
+Handlers validate input, call repository interfaces (or app services), and map
+domain errors to HTTP status + a consistent error envelope. `database/sql`
+talks to <SQLite|Postgres> with versioned SQL migrations applied at startup
+(or via a migrate command). Optional in-process cache sits in front of hot
+item reads. TLS is <terminated at the app|terminated at the proxy>.
+Realtime updates use <SSE|WebSocket|none — skipped because ...>.
+```
+
+Include the text diagram above (adapted). Stage VII reviewers will re-read this when wiring metrics and containers.
+
+---
+
+## Theory 4 — Suggested package layout
+
+```text
+cmd/service/main.go          # composition root, signals, listen
+internal/httpapi/            # handlers, middleware, routes
+internal/auth/               # password hash, token/session
+internal/store/              # sql repo
+internal/migrate/            # apply versioned SQL
+internal/cache/              # optional
+internal/domain/             # errors, entities (if extracted)
+migrations/*.sql
+scripts/demo.sh
+README.md
+```
+
+`internal/` prevents external import of private code—good monorepo hygiene.
+
+### Composition root sketch
+
+```go
+func main() {
+	cfg := config.Load()
+	log := slog.New(slog.NewJSONHandler(os.Stdout, nil))
+
+	db, err := sql.Open(cfg.Driver, cfg.DSN)
+	must(err)
+	defer db.Close()
+	must(migrate.Up(context.Background(), db))
+
+	repo := store.NewItemRepo(db)
+	auth := auth.NewService(cfg.JWTSecret, repo /* users */)
+	api := httpapi.New(log, auth, repo)
+
+	srv := &http.Server{
+		Addr:              cfg.Addr,
+		Handler:           api.Routes(),
+		ReadHeaderTimeout: 5 * time.Second,
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	go func() {
+		log.Info("listen", "addr", cfg.Addr)
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Error("serve", "err", err)
+			stop()
+		}
+	}()
+
+	<-ctx.Done()
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	_ = srv.Shutdown(shutdownCtx)
+}
+```
+
+---
+
+## Theory 5 — Auth and error envelope bars
+
+### Auth minimum
+
+| Check | Pass looks like |
+|-------|-----------------|
+| Register | Hashed password stored (bcrypt/argon2/scrypt) |
+| Login | Returns token or session cookie |
+| Mutating route | Create item without creds → **401** |
+| Ownership (bonus) | User A cannot mutate User B’s item → **403/404** |
+
+### Error envelope minimum (Day 55 shape)
+
+```json
+{
+  "error": {
+    "code": "not_found",
+    "message": "item not found"
+  }
+}
+```
+
+Map domain sentinels consistently:
+
+| Domain | HTTP |
+|--------|------|
+| validation | 400 |
+| unauthenticated | 401 |
+| forbidden | 403 |
+| not found | 404 |
+| conflict | 409 |
+| internal | 500 (no stack traces to client) |
+
+---
+
+## Theory 6 — Rubric (score yourself)
+
+| Criterion | Weight | 0 | 1 | 2 |
+|-----------|--------|---|---|---|
+| Persistence + migrations | 20% | memory only | SQL flaky | restart-safe |
+| Auth on mutating route | 15% | none | partial | solid 401 |
+| API + error envelope | 15% | ad-hoc | inconsistent | Day 55 shape |
+| Tests (unit/handler/integ) | 15% | none | thin | green suite |
+| Shutdown + slog | 10% | hang/noisy | partial | clean |
+| README architecture | 10% | missing | thin | diagram+paragraph |
+| Race / quality | 10% | fails race | untested | `-race` green |
+| Demo script | 5% | none | manual only | `demo.sh` works |
+
+**Pass:** ≥ 80% with **no zero** on persistence or auth.
+
+---
+
+## Lab 1 — Promote or assemble the gate module
+
+```bash
+mkdir -p ~/lab/90daysofx/01-go/day62
+cd ~/lab/90daysofx/01-go/day62
+# or: copy/promote day61 service and tag as day62
+go mod init example.com/day62
+# ensure: go 1.26
+```
+
+Checklist before demos:
+
+1. Migrations apply on empty DB.  
+2. Register + login work.  
+3. Create + get item works.  
+4. Kill process; restart; get still works.  
+5. `go test ./...` and `go test -race ./...` as applicable.
+
+---
+
+## Lab 2 — Demo script `scripts/demo.sh`
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+base="${BASE_URL:-http://127.0.0.1:8080}"
+
+curl -sf "$base/healthz" >/dev/null
+
+# register
+curl -sf -X POST "$base/v1/auth/register" \
+  -H 'Content-Type: application/json' \
+  -d '{"email":"gate@example.com","password":"correct-horse-battery"}' \
+  >/dev/null || true
+
+# login → TOKEN
+TOKEN=$(curl -sf -X POST "$base/v1/auth/login" \
+  -H 'Content-Type: application/json' \
+  -d '{"email":"gate@example.com","password":"correct-horse-battery"}' \
+  | jq -r '.token // .access_token')
+
+test -n "$TOKEN" && test "$TOKEN" != "null"
+
+# unauthenticated create must fail
+code=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$base/v1/items" \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"nope"}')
+test "$code" = "401"
+
+# authenticated create
+id=$(curl -sf -X POST "$base/v1/items" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"gate-item"}' | jq -r '.id')
+
+curl -sf -H "Authorization: Bearer $TOKEN" "$base/v1/items/$id" | grep -q gate-item
+echo "OK id=$id"
+```
+
+Run against a live server; then restart the server and re-fetch `$id` to prove persistence.
+
+---
+
+## Lab 3 — Verification commands
+
+```bash
+go test ./... -count=1
+go test ./... -race -count=1
+# if you use build tags:
+go test -tags=integration ./... -count=1
+
+go run ./cmd/service &
+sleep 1
+bash scripts/demo.sh
+kill -TERM %1
+wait || true
+```
+
+### Self-review questions (answer in `GATE-VI.md`)
+
+1. Can a stranger run the service from README alone?  
+2. Does data survive process restart?  
+3. Are secrets from env (not committed)?  
+4. Do 500 responses hide internals?  
+5. Is every `*sql` query using `Context`?  
+6. Are request bodies limited (`MaxBytesReader`)?  
+7. Is shutdown clean (no hang)?  
+8. What elective did you skip and why?
+
+---
+
+## Lab 4 — Fill the evidence table
+
+Create `GATE-VI.md`:
+
+```markdown
+# Stage VI Gate
+
+Date:
+Module:
+Go: go1.26.x
+
+## Rubric scores
+| Criterion | Score | Notes |
+|-----------|-------|-------|
+| Persistence |  |  |
+| Auth |  |  |
+| Envelope |  |  |
+| Tests |  |  |
+| Shutdown/slog |  |  |
+| README |  |  |
+| Race |  |  |
+| Demo |  |  |
+
+## Worked checklist
+| Area | File(s) | Done? |
+|------|---------|-------|
+| Migrations | migrations/ | |
+| Repo | internal/store | |
+| Auth | internal/auth | |
+| Errors | writeDomainErr | |
+| Tests | *_test.go | |
+| Shutdown | main.go | |
+| README | architecture | |
+
+## Retrospective
+1. sqlc/raw/ORM choice:
+2. JWT vs session pain:
+3. What Stage VII needs from this service:
+```
+
+---
+
+## Lab 5 — Deliberate persistence proof
+
+1. Create item; note id.  
+2. `kill -TERM` the process; confirm exit.  
+3. Start again with **same DSN/file**.  
+4. GET item by id succeeds.  
+
+If you only ever used `:memory:` SQLite—**fail**. Use a file DSN for the gate demo.
+
+```text
+# example SQLite DSN
+file:gate.db?_pragma=foreign_keys(1)
+```
+
+---
+
+## Hour-by-hour suggestion
+
+| Time | Focus |
+|------|-------|
+| 0:00–0:30 | Gap analysis vs gate bar |
+| 0:30–1:30 | Fix persistence/auth/envelope holes |
+| 1:30–2:10 | Tests + race |
+| 2:10–2:40 | demo.sh + restart proof |
+| 2:40–3:00 | GATE-VI.md + README architecture |
+
+---
+
+## Common gotchas
+
+| Gotcha | Fix |
+|--------|-----|
+| In-memory only “DB” | Real SQL file/engine |
+| Auth demo-only hardcoded user | Register + hashed password |
+| README lists endpoints that 404 | Re-run smoke |
+| Integration tests not runnable | Document tags / skip policy |
+| Elective half-merge breaking build | Feature flag or remove |
+| Leaked goroutines from hub/cache | Shutdown hooks |
+| JWT secret committed | Env + `.env.example` only |
+| No `ReadHeaderTimeout` | Set server timeouts |
+| 500 with raw `err.Error()` to clients | Log server-side; generic client message |
+
+---
+
+## Checkpoint (gate)
+
+- [ ] All gate bar rows satisfied  
+- [ ] Demo script succeeds against running server  
+- [ ] Data persists across restart  
+- [ ] Architecture paragraph + diagram present  
+- [ ] `go test -race` green for default tests you claim  
+- [ ] Rubric ≥ 80%, no zero on persistence/auth  
+- [ ] Personal retrospective: Stage VI hardest topic  
+
+### Commit
+
+```bash
+git add .
+git commit -m "day62: stage VI gate service store auth tests"
+```
+
+Write three personal gotchas before continuing.
+
+---
+
+## Stage VI retrospective prompts
+
+Answer briefly in `GATE-VI.md`:
+
+1. sqlc / raw SQL / ORM—what did you choose and would you keep it?  
+2. JWT vs session—what broke first?  
+3. What will Stage VII (pprof, containers, metrics) need from this service?  
+4. Which elective (gRPC/REST-deep, cache, WS/SSE) paid off most?
+
+---
+
+## Tomorrow
+
+**Stage VII begins — Day 63 build tags & cross-compile:** ship multi-arch artifacts and understand file-level build constraints—on the path from “works on my laptop” to “releasable binary.”

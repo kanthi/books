@@ -1,4 +1,5 @@
 #!/bin/bash
+export PATH="/opt/homebrew/bin:$PATH"
 
 # Check if book name is provided
 if [ $# -ne 1 ]; then

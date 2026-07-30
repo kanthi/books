@@ -65,7 +65,7 @@ $$
 
 ### Worked example 5 — variance
 
-One-pass $ \sum x_i^2 - n\bar{x}^2 $ can cancel. Use Welford’s method or two-pass with compensated arithmetic.
+One-pass $\sum x_i^2 - n\bar{x}^2$ can cancel. Use Welford’s method or two-pass with compensated arithmetic.
 
 ### Worked example 6 — `log1p` / `expm1`
 
