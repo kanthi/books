@@ -1,7 +1,7 @@
 # uptime
 
 ## Overview
-The `uptime` command shows how long the system has been running, along with the current time, number of users, and system load averages.
+The `uptime` command shows how long the system has been running. It displays the current time, system uptime, number of users, and load averages.
 
 ## Syntax
 ```bash
@@ -11,17 +11,31 @@ uptime [options]
 ## Common Options
 | Option | Description |
 |--------|-------------|
-| `-p, --pretty` | Show uptime in pretty format |
-| `-s, --since` | System up since |
-| `-V, --version` | Display version |
-| `-h, --help` | Display help |
+| `-p` | Pretty format |
+| `-s` | Since date |
+| `-h` | Show help |
+| `-V` | Show version |
+| `--pretty` | Pretty output |
+| `--since` | Boot time |
+| `--help` | Show help |
+| `--version` | Show version |
+
+## Output Fields
+| Field | Description |
+|-------|-------------|
+| Time | Current time |
+| Uptime | Running time |
+| Users | Connected users |
+| Load1 | 1 minute load |
+| Load5 | 5 minute load |
+| Load15 | 15 minute load |
 
 ## Key Use Cases
 1. System monitoring
-2. Performance analysis
-3. Load tracking
-4. User activity monitoring
-5. System availability checks
+2. Load analysis
+3. Uptime tracking
+4. User activity
+5. Performance checking
 
 ## Examples with Explanations
 ### Example 1: Basic Usage
@@ -34,69 +48,71 @@ Show all information
 ```bash
 uptime -p
 ```
-Show uptime in readable format
+Human readable time
 
 ### Example 3: Boot Time
 ```bash
 uptime -s
 ```
-Show system start time
-
-## Understanding Output
-Example output:
-```
-14:28:00 up 1 day, 2:03, 5 users, load average: 0.52, 0.58, 0.59
-```
-Components:
-- Current time
-- System uptime
-- Number of users
-- Load averages (1, 5, 15 minutes)
+System start time
 
 ## Common Usage Patterns
-1. Quick system check:
+1. Quick check:
    ```bash
    uptime
    ```
-2. Monitor load:
+2. Simple format:
    ```bash
-   watch uptime
+   uptime -p
    ```
-3. Uptime logging:
+3. Boot time:
    ```bash
-   uptime >> uptime.log
+   uptime -s
    ```
 
-## Performance Analysis
-- Instant execution
-- Minimal resource usage
-- Real-time information
-- Load average calculation
-- User session counting
+## System Information
+1. Running time
+2. System load
+3. User count
+4. Current time
+5. Load trends
 
 ## Related Commands
-- `w` - Show who is logged in
-- `top` - System monitoring
-- `who` - Show logged in users
+- `w` - Who is logged in
+- `top` - System monitor
+- `who` - Show users
 - `last` - Login history
-- `procinfo` - System statistics
+- `procinfo` - System stats
 
 ## Additional Resources
-- [GNU Coreutils - uptime](https://www.gnu.org/software/coreutils/manual/html_node/uptime-invocation.html)
-- [System Monitoring Guide](https://www.tecmint.com/linux-system-monitoring-tools/)
-- [Load Average Explained](http://www.brendangregg.com/blog/2017-08-08/linux-load-averages.html)
-
-## Load Average
-Understanding load averages:
-1. 1-minute average
-2. 5-minute average
-3. 15-minute average
-4. Interpretation
-5. Thresholds
+- [Uptime Manual](https://man7.org/linux/man-pages/man1/uptime.1.html)
+- [System Guide](https://www.cyberciti.biz/faq/linux-uptime-command-examples-usage-syntax/)
+- [System Administration](https://www.tecmint.com/linux-uptime-command-examples/)
 
 ## Best Practices
-1. Regular monitoring
-2. Load tracking
-3. Trend analysis
-4. Alert thresholds
-5. Performance correlation
+1. Regular checking
+2. Load monitoring
+3. User tracking
+4. Documentation
+5. Trend analysis
+
+## Performance Analysis
+1. Load averages
+2. User activity
+3. System stability
+4. Uptime goals
+5. Resource usage
+
+## Troubleshooting
+1. High load
+2. User issues
+3. System stability
+4. Resource problems
+5. Performance degradation
+
+## Common Uses
+1. System monitoring
+2. Performance checks
+3. Availability tracking
+4. Load analysis
+5. User activity

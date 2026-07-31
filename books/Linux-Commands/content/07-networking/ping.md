@@ -1,7 +1,7 @@
 # ping
 
 ## Overview
-The `ping` command sends ICMP ECHO_REQUEST packets to network hosts. It's used to test network connectivity and measure response time.
+`ping` sends ICMP echo requests to test reachability and round-trip time. First tool for “is the host up / is the network path alive?”.
 
 ## Syntax
 ```bash
@@ -11,105 +11,38 @@ ping [options] destination
 ## Common Options
 | Option | Description |
 |--------|-------------|
-| `-c count` | Stop after count packets |
-| `-i interval` | Seconds between packets |
-| `-s packetsize` | Set packet size |
-| `-q` | Quiet output |
-| `-w deadline` | Timeout in seconds |
-| `-4` | IPv4 only |
-| `-6` | IPv6 only |
-| `-f` | Flood ping |
-| `-n` | Numeric output only |
-| `-v` | Verbose output |
-
-## Key Use Cases
-1. Network connectivity
-2. Response time
-3. Host availability
-4. Network quality
-5. Route testing
+| `-c N` | Count then exit |
+| `-i sec` | Interval |
+| `-W sec` | Wait for reply |
+| `-w sec` | Overall deadline |
+| `-s size` | Payload size |
+| `-M do` | DF bit (PMTU probe) |
+| `-4` / `-6` | Force family |
+| `-n` | No reverse DNS |
+| `-q` | Quiet summary |
 
 ## Examples with Explanations
-### Example 1: Basic Usage
 ```bash
-ping google.com
+ping -c 4 1.1.1.1
+ping -c 4 example.com
+ping -c 10 -i 0.2 192.168.1.1
+ping -c 3 -W 1 10.0.0.1
+ping -6 -c 4 2606:4700:4700::1111
+ping -M do -s 1472 example.com    # DF PMTU experiments
 ```
-Continuous ping to Google
 
-### Example 2: Limited Count
+### Script-friendly
 ```bash
-ping -c 4 192.168.1.1
+if ping -c 1 -W 2 gateway >/dev/null; then echo up; else echo down; fi
 ```
-Send 4 packets only
 
-### Example 3: Custom Interval
-```bash
-ping -i 2 hostname
-```
-Ping every 2 seconds
-
-## Understanding Output
-Example output:
-```
-64 bytes from 192.168.1.1: icmp_seq=1 ttl=64 time=0.043 ms
-```
-Components:
-- Packet size
-- Source address
-- Sequence number
-- Time-to-live
-- Round-trip time
-
-## Common Usage Patterns
-1. Quick test:
-   ```bash
-   ping -c 1 host
-   ```
-2. Extended monitoring:
-   ```bash
-   ping -i 60 host
-   ```
-3. Network quality:
-   ```bash
-   ping -f host
-   ```
-
-## Performance Analysis
-- Response time
-- Packet loss
-- Jitter
-- Route stability
-- Network latency
+## Notes
+- ICMP may be blocked while TCP works — try `curl`/`nc` too.  
+- Privileges: unprivileged ping works on modern Linux via socket flags; very low intervals may need root.  
+- High packet size tests fragmentation/PMTU issues.
 
 ## Related Commands
-- `traceroute` - Trace route
-- `mtr` - Network diagnostic
-- `nmap` - Network scanner
-- `netstat` - Network statistics
-- `ip` - IP utilities
-
-## Additional Resources
-- [Ping Manual](https://man7.org/linux/man-pages/man8/ping.8.html)
-- [Network Testing Guide](https://www.cyberciti.biz/faq/linux-ping-command-examples/)
-- [ICMP Protocol](https://tools.ietf.org/html/rfc792)
-
-## Best Practices
-1. Use count limits
-2. Appropriate intervals
-3. Size considerations
-4. Regular testing
-5. Documentation
-
-## Troubleshooting
-1. No response
-2. High latency
-3. Packet loss
-4. Route issues
-5. DNS problems
-
-## Network Metrics
-1. Round-trip time
-2. Packet loss rate
-3. Response variation
-4. Time-to-live
-5. Path MTU
+- `traceroute` / `mtr`  
+- `ip route get`  
+- `ss` / `curl`  
+- `ping6` — older alias

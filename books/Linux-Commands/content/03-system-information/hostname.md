@@ -1,7 +1,7 @@
 # hostname
 
 ## Overview
-The `hostname` command shows or sets the system's host name. It's used to identify the system on a network and can display various forms of the hostname.
+The `hostname` command shows or sets the system's host name. It displays the name by which the system is known on a network.
 
 ## Syntax
 ```bash
@@ -11,93 +11,109 @@ hostname [options] [hostname]
 ## Common Options
 | Option | Description |
 |--------|-------------|
-| `-a` | Display alias names |
-| `-A` | Display all FQDNs |
-| `-d` | Display DNS domain |
-| `-f` | Display FQDN |
-| `-i` | Display IP addresses |
-| `-I` | Display all network addresses |
-| `-s` | Display short hostname |
-| `-y` | Display NIS domain name |
-| `--help` | Display help message |
+| `-a` | Alias names |
+| `-A` | All FQDNs |
+| `-d` | DNS domain |
+| `-f` | FQDN name |
+| `-i` | IP addresses |
+| `-I` | All addresses |
+| `-s` | Short name |
+| `-y` | NIS domain |
+| `--help` | Show help |
+| `--version` | Show version |
+
+## Output Types
+| Type | Description |
+|------|-------------|
+| Short | Simple hostname |
+| FQDN | Full domain name |
+| Domain | DNS domain |
+| IP | IP addresses |
+| Alias | Alternative names |
 
 ## Key Use Cases
 1. System identification
 2. Network configuration
-3. DNS troubleshooting
-4. System administration
-5. Network diagnostics
+3. DNS setup
+4. Host verification
+5. Network troubleshooting
 
 ## Examples with Explanations
-### Example 1: Display Hostname
+### Example 1: Show Name
 ```bash
 hostname
 ```
-Show system hostname
+Display hostname
 
 ### Example 2: Show FQDN
 ```bash
 hostname -f
 ```
-Display fully qualified domain name
+Full domain name
 
-### Example 3: Show IP Addresses
+### Example 3: Show IPs
 ```bash
 hostname -I
 ```
-Display all network addresses
-
-## Understanding Output
-Types of output:
-- Short hostname
-- FQDN (fully qualified domain name)
-- IP addresses
-- Domain names
-- Alias names
+All IP addresses
 
 ## Common Usage Patterns
-1. Get short name:
+1. Basic check:
    ```bash
-   hostname -s
+   hostname
    ```
-2. Check IP addresses:
+2. Network info:
    ```bash
    hostname -i
    ```
-3. View domain:
+3. Domain name:
    ```bash
    hostname -d
    ```
 
-## Performance Analysis
-- Quick execution
-- Network query impact
-- DNS resolution time
-- Cache utilization
-- System file access
+## Network Information
+1. Host name
+2. Domain name
+3. IP addresses
+4. Alias names
+5. Network identity
 
 ## Related Commands
+- `uname` - System info
+- `domainname` - NIS domain
+- `dnsdomainname` - DNS domain
 - `hostnamectl` - Control hostname
-- `domainname` - Show/set domain name
-- `dnsdomainname` - Show DNS domain
-- `uname` - System information
-- `host` - DNS lookup utility
+- `host` - DNS lookup
 
 ## Additional Resources
 - [Hostname Manual](https://man7.org/linux/man-pages/man1/hostname.1.html)
-- [Network Configuration Guide](https://www.tecmint.com/linux-networking-commands/)
-- [System Administration Guide](https://tldp.org/LDP/sag/html/index.html)
-
-## Configuration Files
-1. /etc/hostname
-2. /etc/hosts
-3. /etc/resolv.conf
-4. /etc/sysconfig/network
-5. /etc/networks
+- [Network Guide](https://www.cyberciti.biz/faq/linux-hostname-command-examples-usage-syntax/)
+- [System Administration](https://www.tecmint.com/linux-hostname-command-examples/)
 
 ## Best Practices
-1. Use FQDN when possible
-2. Regular DNS verification
-3. Keep hosts file updated
-4. Monitor network changes
-5. Document hostname changes
+1. Proper naming
+2. DNS alignment
+3. Network consistency
+4. Documentation
+5. Regular verification
+
+## Network Analysis
+1. Name resolution
+2. IP configuration
+3. Domain setup
+4. Network identity
+5. System naming
+
+## Troubleshooting
+1. Name resolution
+2. DNS issues
+3. Network problems
+4. Configuration errors
+5. Identity conflicts
+
+## Common Uses
+1. System setup
+2. Network config
+3. DNS management
+4. Identity verification
+5. Documentation

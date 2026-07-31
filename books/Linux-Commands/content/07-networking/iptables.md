@@ -1,282 +1,87 @@
 # iptables
 
 ## Overview
-The `iptables` command is a user-space utility for configuring Linux kernel firewall rules. It controls network packet filtering, NAT, and packet mangling through the netfilter framework.
+`iptables` configures IPv4 packet filtering/NAT via **netfilter**. Many modern distros (Ubuntu 22.04+) use **nftables** underneath (`iptables-nft` compatibility). Prefer **`ufw`** or **`nft`** for new designs; still know `iptables` for legacy hosts and debugging.
 
 ## Syntax
 ```bash
-iptables [options] -t table -A chain rule-specification
-iptables [options] -t table -D chain rule-specification
-iptables [options] -t table -L [chain]
+iptables [-t table] command chain [rule...]
+iptables-save / iptables-restore
 ```
+
+## Tables & common chains
+| Table | Chains | Role |
+|-------|--------|------|
+| `filter` (default) | INPUT, FORWARD, OUTPUT | Allow/deny |
+| `nat` | PREROUTING, POSTROUTING, OUTPUT | DNAT/SNAT/MASQUERADE |
+| `mangle` | * | TTL/mark rewrite |
+| `raw` | PREROUTING, OUTPUT | Conntrack exceptions |
+
+Targets: `ACCEPT`, `DROP`, `REJECT`, `LOG`, `RETURN`, …
 
 ## Common Options
 | Option | Description |
 |--------|-------------|
-| `-A chain` | Append rule to chain |
-| `-D chain` | Delete rule from chain |
-| `-I chain` | Insert rule in chain |
-| `-L` | List rules |
-| `-F` | Flush all rules |
-| `-P chain target` | Set default policy |
-| `-t table` | Specify table |
-| `-j target` | Jump to target |
-| `-p protocol` | Protocol (tcp, udp, icmp) |
-| `-s source` | Source address |
-| `-d destination` | Destination address |
-| `--dport port` | Destination port |
-| `--sport port` | Source port |
-| `-i interface` | Input interface |
-| `-o interface` | Output interface |
+| `-A`/`-I`/`-D` | Append / insert / delete |
+| `-L -n -v` | List numeric verbose |
+| `-F` | Flush chain |
+| `-P chain target` | Default policy |
+| `-s`/`-d` | Source/dest |
+| `-p tcp/udp/icmp` | Protocol |
+| `--dport`/`--sport` | Ports (with `-m tcp`) |
+| `-i`/`-o` | In/out interface |
+| `-m conntrack --ctstate` | State match |
+| `-j` | Target |
 
-## Tables
-| Table | Purpose |
-|-------|---------|
-| `filter` | Packet filtering (default) |
-| `nat` | Network Address Translation |
-| `mangle` | Packet alteration |
-| `raw` | Connection tracking exemption |
-
-## Chains
-| Chain | Description |
-|-------|-------------|
-| `INPUT` | Incoming packets |
-| `OUTPUT` | Outgoing packets |
-| `FORWARD` | Forwarded packets |
-| `PREROUTING` | Before routing decision |
-| `POSTROUTING` | After routing decision |
-
-## Key Use Cases
-1. Firewall configuration
-2. Network security
-3. Port blocking/allowing
-4. NAT configuration
-5. Traffic filtering
+## Safety
+**Remote lockout risk:** open SSH before default DROP. Use console access when changing INPUT policy. Persist rules (`iptables-save`, distro-specific services) or they vanish on reboot.
 
 ## Examples with Explanations
-### Example 1: List Current Rules
+### List
 ```bash
-iptables -L -n -v
+sudo iptables -L -n -v
+sudo iptables -t nat -L -n -v
 ```
-Shows all rules with packet counts and no DNS resolution
 
-### Example 2: Allow SSH
+### Allow SSH, HTTP; default drop (sketch)
 ```bash
-iptables -A INPUT -p tcp --dport 22 -j ACCEPT
+sudo iptables -A INPUT -i lo -j ACCEPT
+sudo iptables -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+sudo iptables -A INPUT -p tcp --dport 22 -j ACCEPT
+sudo iptables -A INPUT -p tcp --dport 80 -j ACCEPT
+sudo iptables -A INPUT -p tcp --dport 443 -j ACCEPT
+sudo iptables -P INPUT DROP
+sudo iptables -P FORWARD DROP
+# OUTPUT often left ACCEPT
 ```
-Allows incoming SSH connections on port 22
 
-### Example 3: Block IP Address
+### NAT masquerade (router)
 ```bash
-iptables -A INPUT -s 192.168.1.100 -j DROP
+sudo sysctl -w net.ipv4.ip_forward=1
+sudo iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE
 ```
-Blocks all traffic from specific IP address
 
-### Example 4: Allow HTTP and HTTPS
+### Save (Debian/Ubuntu example)
 ```bash
-iptables -A INPUT -p tcp --dport 80 -j ACCEPT
-iptables -A INPUT -p tcp --dport 443 -j ACCEPT
+sudo apt install iptables-persistent
+sudo netfilter-persistent save
+# or: sudo iptables-save | sudo tee /etc/iptables/rules.v4
 ```
-Allows web traffic on ports 80 and 443
 
-## Basic Firewall Setup
-1. Set default policies:
-   ```bash
-   iptables -P INPUT DROP
-   iptables -P FORWARD DROP
-   iptables -P OUTPUT ACCEPT
-   ```
-2. Allow loopback:
-   ```bash
-   iptables -A INPUT -i lo -j ACCEPT
-   iptables -A OUTPUT -o lo -j ACCEPT
-   ```
-3. Allow established connections:
-   ```bash
-   iptables -A INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
-   ```
+### Prefer UFW on Ubuntu
+```bash
+sudo ufw allow OpenSSH
+sudo ufw allow 80,443/tcp
+sudo ufw enable
+```
 
-## Common Rules
-1. Allow ping:
-   ```bash
-   iptables -A INPUT -p icmp --icmp-type echo-request -j ACCEPT
-   ```
-2. Allow specific subnet:
-   ```bash
-   iptables -A INPUT -s 192.168.1.0/24 -j ACCEPT
-   ```
-3. Rate limiting:
-   ```bash
-   iptables -A INPUT -p tcp --dport 22 -m limit --limit 3/min -j ACCEPT
-   ```
-
-## NAT Configuration
-1. SNAT (Source NAT):
-   ```bash
-   iptables -t nat -A POSTROUTING -o eth0 -j SNAT --to-source 203.0.113.1
-   ```
-2. DNAT (Destination NAT):
-   ```bash
-   iptables -t nat -A PREROUTING -p tcp --dport 80 -j DNAT --to-destination 192.168.1.10:8080
-   ```
-3. Masquerading:
-   ```bash
-   iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE
-   ```
-
-## Port Forwarding
-1. Forward external port to internal:
-   ```bash
-   iptables -t nat -A PREROUTING -p tcp --dport 8080 -j DNAT --to-destination 192.168.1.10:80
-   iptables -A FORWARD -p tcp -d 192.168.1.10 --dport 80 -j ACCEPT
-   ```
-
-## Advanced Filtering
-1. Connection tracking:
-   ```bash
-   iptables -A INPUT -m conntrack --ctstate NEW,ESTABLISHED -j ACCEPT
-   ```
-2. Time-based rules:
-   ```bash
-   iptables -A INPUT -p tcp --dport 80 -m time --timestart 09:00 --timestop 17:00 -j ACCEPT
-   ```
-3. String matching:
-   ```bash
-   iptables -A INPUT -p tcp --dport 80 -m string --string "malware" -j DROP
-   ```
-
-## Performance Analysis
-- Kernel-level filtering (fast)
-- Rules processed sequentially
-- First match wins
-- Can impact network performance
-- Optimize rule order
+## Notes
+- IPv6 uses `ip6tables`.  
+- Docker injects its own chains — order interactions carefully.  
+- `nft list ruleset` shows backend on nft systems.
 
 ## Related Commands
-- `ip6tables` - IPv6 firewall
-- `ufw` - Uncomplicated Firewall
-- `firewalld` - Dynamic firewall
-- `nftables` - Modern replacement
-- `netstat` - Network connections
-
-## Best Practices
-1. Always have a backup plan
-2. Test rules before applying
-3. Use specific rules over general ones
-4. Document your rules
-5. Regular rule auditing
-
-## Rule Management
-1. Save rules:
-   ```bash
-   iptables-save > /etc/iptables/rules.v4
-   ```
-2. Restore rules:
-   ```bash
-   iptables-restore < /etc/iptables/rules.v4
-   ```
-3. Delete specific rule:
-   ```bash
-   iptables -D INPUT 3  # Delete rule number 3
-   ```
-
-## Logging
-1. Log dropped packets:
-   ```bash
-   iptables -A INPUT -j LOG --log-prefix "DROPPED: "
-   iptables -A INPUT -j DROP
-   ```
-2. Log specific traffic:
-   ```bash
-   iptables -A INPUT -p tcp --dport 22 -j LOG --log-prefix "SSH: "
-   ```
-
-## Scripting Applications
-1. Firewall script:
-   ```bash
-   #!/bin/bash
-   # Flush existing rules
-   iptables -F
-   iptables -X
-
-   # Set default policies
-   iptables -P INPUT DROP
-   iptables -P FORWARD DROP
-   iptables -P OUTPUT ACCEPT
-
-   # Allow loopback
-   iptables -A INPUT -i lo -j ACCEPT
-
-   # Allow established connections
-   iptables -A INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
-
-   # Allow SSH
-   iptables -A INPUT -p tcp --dport 22 -j ACCEPT
-
-   # Save rules
-   iptables-save > /etc/iptables/rules.v4
-   ```
-
-## Security Applications
-1. DDoS protection:
-   ```bash
-   iptables -A INPUT -p tcp --dport 80 -m limit --limit 25/minute --limit-burst 100 -j ACCEPT
-   ```
-2. Block port scanning:
-   ```bash
-   iptables -A INPUT -m recent --name portscan --rcheck --seconds 86400 -j DROP
-   iptables -A INPUT -m recent --name portscan --set -j LOG --log-prefix "Portscan: "
-   ```
-
-## Troubleshooting
-1. Check rule syntax before applying
-2. Use -v for verbose output
-3. Test connectivity after changes
-4. Keep backup of working rules
-5. Use logging for debugging
-
-## Integration Examples
-1. With fail2ban:
-   ```bash
-   # fail2ban creates iptables rules automatically
-   fail2ban-client status sshd
-   ```
-2. With monitoring:
-   ```bash
-   # Monitor dropped packets
-   iptables -L -n -v | grep DROP
-   ```
-
-## Common Mistakes
-1. Locking yourself out via SSH
-2. Wrong rule order
-3. Forgetting to save rules
-4. Not testing rules
-5. Overly permissive rules
-
-## Migration to nftables
-Modern systems use nftables:
-```bash
-# Translate iptables rules
-iptables-translate -A INPUT -p tcp --dport 22 -j ACCEPT
-```
-
-## Backup and Recovery
-1. Backup current rules:
-   ```bash
-   iptables-save > iptables-backup-$(date +%Y%m%d).rules
-   ```
-2. Emergency reset:
-   ```bash
-   iptables -P INPUT ACCEPT
-   iptables -P FORWARD ACCEPT
-   iptables -P OUTPUT ACCEPT
-   iptables -F
-   ```
-
-## Performance Optimization
-1. Put most common rules first
-2. Use specific matches
-3. Avoid unnecessary logging
-4. Use connection tracking efficiently
-5. Consider rule consolidation
+- `ufw` — Ubuntu host firewall  
+- `nft` — nftables CLI  
+- `ss -lntp` — listeners  
+- `tcpdump` — packet proof

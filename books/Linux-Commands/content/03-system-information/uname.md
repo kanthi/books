@@ -106,3 +106,10 @@ Components:
 3. Combine with other commands
 4. Script automation
 5. Regular monitoring
+## Additional Examples
+```bash
+uname -a
+uname -r          # kernel release
+uname -m          # machine arch
+uname -n          # hostname
+```

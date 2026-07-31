@@ -14,7 +14,11 @@ Linux-Commands/
 ```
 
 Parts under `content/` (ignored dirs start with `_`):  
-00-help-documentation,01-file-directory-management,02-archiving-compression,03-system-information,04-process-management,05-system-monitoring,06-user-group-management,07-networking,08-filesystem-management,09-scheduling,10-logging,11-hardware-management,13-filesystem,14-archive,15-documentation,16-terminal,17-text-processing,18-network,19-process,20-performance,21-system-info,22-user-management,23-package-management,24-system-runtime,25-scheduling,26-logging,28-printing,99-miscellaneous,
+00-help-and-docs, 01-files-and-paths, 02-archives-and-compression, 03-system-information, 04-processes-and-jobs, 05-system-monitoring, 06-users-and-groups, 07-networking, 08-scheduling, 09-logging, 10-hardware, 11-storage-and-filesystems, 12-terminals-and-mux, 13-text-and-pipes, 14-packages, 15-services-and-runtime, 16-printing, 99-appendices
+
+
+
+Phase 1 (2026-07) removed duplicate parallel parts (`08`, `14`, `15`, `18`, `19`, `20`, `21`, `22`, `25`, `26`) after merging the better page bodies into the primary parts. See `content/_planning/phase1-dedupe.log`.
 
 ## Local commands
 

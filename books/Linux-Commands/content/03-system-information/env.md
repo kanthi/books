@@ -138,3 +138,10 @@ Common variables:
 3. Locale problems
 4. Permission errors
 5. Variable inheritance issues
+## Additional Examples
+```bash
+env
+env | grep PATH
+env -i HOME="$HOME" bash --noprofile --norc
+FOO=bar env | grep FOO
+```

@@ -1,118 +1,127 @@
 # ip
 
 ## Overview
-The `ip` command shows and manipulates routing, devices, policy routing, and tunnels. It's a powerful tool for configuring network interfaces and routing.
+`ip` (from **iproute2**) configures and displays interfaces, addresses, routes, neighbors, rules, and tunnels. It replaces legacy `ifconfig`/`route`/`arp` for modern Linux networking.
 
 ## Syntax
 ```bash
-ip [options] OBJECT {COMMAND | help}
+ip [OPTIONS] OBJECT COMMAND
+ip -h                    # help
+ip OBJECT help           # object-specific help
 ```
 
-## Common Objects
-| Object | Description |
-|--------|-------------|
-| `link` | Network devices |
-| `address` | Protocol addresses |
-| `route` | Routing table entries |
-| `neigh` | ARP or NDISC cache |
-| `tunnel` | Tunnel over IP |
-| `maddr` | Multicast addresses |
-| `rule` | Routing policy |
-| `netns` | Network namespaces |
+Common objects: `link`, `address` (`addr`), `route`, `neigh`, `rule`, `netns`, `xfrm`.
 
 ## Common Options
 | Option | Description |
 |--------|-------------|
-| `-4` | IPv4 only |
-| `-6` | IPv6 only |
-| `-s` | Statistics |
-| `-d` | Details |
-| `-h` | Human readable |
-| `-br` | Brief output |
-| `-c` | Color output |
-| `-o` | Output format |
+| `-4` / `-6` | IPv4 / IPv6 only |
+| `-s` | Statistics (can repeat for more detail) |
+| `-d` | Extra detail |
+| `-br` | Brief columnar output |
+| `-c` | Color |
+| `-o` | One-line output |
+| `-j` / `-p` | JSON / pretty JSON (newer iproute2) |
 
 ## Key Use Cases
-1. Network configuration
-2. Interface management
-3. Routing setup
-4. Address assignment
-5. Network troubleshooting
+1. Inspect and set addresses  
+2. Bring links up/down, set MTU/MAC  
+3. Manage default and static routes  
+4. Debug neighbor (ARP/ND) tables  
+5. Work with network namespaces  
+
+## Safety
+Address and route changes can drop your SSH session. Prefer a **console/IPMI** session or a scripted rollback when changing the only default route. On Ubuntu servers, prefer **netplan** or **NetworkManager** for persistent config; use `ip` for live debug.
 
 ## Examples with Explanations
-### Example 1: Show Interfaces
+### Brief overview
 ```bash
-ip link show
+ip -br link
+ip -br addr
+ip route
 ```
-Display network interfaces
+Fast “what interfaces, what IPs, what default route?”.
 
-### Example 2: IP Addresses
+### Full address list
 ```bash
 ip addr show
+ip -4 addr show dev eth0
 ```
-Show IP addresses
 
-### Example 3: Routing Table
+### Bring link up/down
 ```bash
-ip route show
+sudo ip link set dev eth0 up
+sudo ip link set dev eth0 down
 ```
-Display routing table
 
-## Common Commands
-1. Link operations:
-   ```bash
-   ip link set dev eth0 up
-   ip link set dev eth0 down
-   ```
+### Add/remove an address
+```bash
+sudo ip addr add 192.168.1.50/24 dev eth0
+sudo ip addr del 192.168.1.50/24 dev eth0
+```
+Prefix length is required. Secondary addresses are normal on multi-homed hosts.
 
-2. Address management:
-   ```bash
-   ip addr add 192.168.1.10/24 dev eth0
-   ip addr del 192.168.1.10/24 dev eth0
-   ```
+### Default route
+```bash
+sudo ip route add default via 192.168.1.1 dev eth0
+sudo ip route replace default via 192.168.1.1 dev eth0
+ip route get 1.1.1.1
+```
+`route get` shows which path the kernel would use.
 
-3. Route management:
-   ```bash
-   ip route add default via 192.168.1.1
-   ip route del default
-   ```
+### Static route
+```bash
+sudo ip route add 10.0.0.0/8 via 192.168.1.254
+sudo ip route del 10.0.0.0/8
+```
 
-## Performance Analysis
-- Interface statistics
-- Routing efficiency
-- Address configuration
-- Network namespace impact
-- Protocol overhead
+### Neighbor table (ARP)
+```bash
+ip neigh show
+sudo ip neigh flush dev eth0
+```
+
+### Statistics
+```bash
+ip -s link show eth0
+ip -s -s link show eth0   # more error detail
+```
+
+### Network namespace (quick)
+```bash
+sudo ip netns add lab
+sudo ip netns exec lab ip link
+sudo ip netns delete lab
+```
+
+## Understanding Output
+- `UP`/`LOWER_UP` on links: admin up vs carrier present  
+- `inet` / `inet6` lines: addresses and scopes (`global`, `link`)  
+- `proto kernel` vs `proto static` / `dhcp` on routes: origin of the route  
+
+## Common Usage Patterns
+### Live IP on a server you did not configure
+```bash
+ip -br a; ip r; resolvectl status 2>/dev/null || cat /etc/resolv.conf
+```
+
+### Flush all IPv4 addresses on a NIC (careful)
+```bash
+sudo ip -4 addr flush dev eth0
+```
+
+## Notes & Pitfalls
+- Changes with `ip` are **not durable** across reboot unless persisted by netplan/NM/scripts.  
+- Interface names may be predictable (`enp3s0`) not `eth0`.  
+- Policy routing uses `ip rule` + multiple tables — advanced; see `man ip-rule`.  
 
 ## Related Commands
-- `ifconfig` - Configure interface
-- `route` - Show/manipulate route
-- `netstat` - Network statistics
-- `ss` - Socket statistics
-- `arp` - Address resolution
+- `nmcli` — NetworkManager CLI  
+- `resolvectl` — DNS via systemd-resolved  
+- `ss` — sockets  
+- `ping` / `traceroute` — path checks  
+- `ifconfig` — legacy; prefer `ip`  
 
 ## Additional Resources
-- [IP Command Guide](https://man7.org/linux/man-pages/man8/ip.8.html)
-- [Network Configuration](https://www.tecmint.com/ip-command-examples/)
-- [Linux Networking](https://www.cyberciti.biz/faq/linux-ip-command-examples/)
-
-## Best Practices
-1. Document changes
-2. Backup configurations
-3. Test changes
-4. Monitor impact
-5. Security awareness
-
-## Troubleshooting
-1. Interface status
-2. Address conflicts
-3. Routing issues
-4. DNS problems
-5. Network connectivity
-
-## Advanced Features
-1. Network namespaces
-2. Policy routing
-3. Tunneling
-4. VLANs
-5. Multicast
+- `man ip`, `man ip-link`, `man ip-route`  
+- iproute2 documentation

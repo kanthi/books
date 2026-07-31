@@ -166,3 +166,10 @@ Components:
 3. Group membership problems
 4. Effective vs real ID confusion
 5. Numeric vs name resolution
+## Additional Examples
+```bash
+id
+id alice
+id -u
+id -gn
+```
