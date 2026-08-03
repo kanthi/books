@@ -118,12 +118,22 @@ find_html_entry() {
 }
 
 write_index_header() {
-  cat > "$PUBLISH_DIR/index.html" <<'HTML'
+  # Shared GA snippet (same file books inject via Quarto include-in-header)
+  local ga_file="$BOOKS_DIR/includes/google-analytics.inc"
+
+  {
+    cat <<'HTML'
 <!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
+HTML
+    if [ -f "$ga_file" ]; then
+      cat "$ga_file"
+      printf '\n'
+    fi
+    cat <<'HTML'
   <title>Published Books</title>
   <style>
     :root {
@@ -299,6 +309,7 @@ write_index_header() {
 
     <section id="bookGrid" class="grid">
 HTML
+  } > "$PUBLISH_DIR/index.html"
 }
 
 write_index_footer() {
