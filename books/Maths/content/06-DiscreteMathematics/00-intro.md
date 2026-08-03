@@ -1,5 +1,15 @@
 # Introduction to Discrete Mathematics: The Mathematics of Distinct Objects
 
+## Chapters in this part
+
+| Chapter | Focus |
+|---------|--------|
+| Logic and proofs | Propositional/predicate reasoning |
+| Sets and relations | Relations, functions, orderings |
+| Combinatorics | Counting principles |
+| Recurrence relations | Linear recurrences, Master theorem |
+| Induction and invariants | Induction, loop invariants |
+
 ## What is Discrete Mathematics?
 
 Discrete mathematics is the study of mathematical structures that are fundamentally discrete rather than continuous. Unlike calculus, which deals with smooth, continuous functions, discrete mathematics focuses on countable, distinct objects and their relationships.

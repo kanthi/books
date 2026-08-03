@@ -1,0 +1,140 @@
+---
+title: "Netpoller and Network I/O"
+---
+
+# Netpoller and Network I/O
+
+## Overview
+
+Blocking on a socket in Go rarely blocks an OS thread the way a naive `read()` would in a 1:1 thread model. The **netpoller** integrates with the scheduler: a G waiting on network readiness parks, its M can run other work, and the poller wakes the G when the FD is ready.
+
+This is why Go servers scale to huge connection counts with modest `GOMAXPROCS`.
+
+> Companion: [Internals for Interns — Network Poller](https://internals-for-interns.com/posts/go-netpoller/) (who calls `netpoll` from `findrunnable` / sysmon).
+
+
+## Diagram: Netpoll park
+
+```text
+sequence (top → bottom):
+  actors: goroutine, runtime, epoll/kqueue/IOCP
+  goroutine --> runtime  : Read would block
+  runtime --> goroutine  : park netpoll wait
+  runtime --> epoll/kqueue/IOCP  : register FD
+  epoll/kqueue/IOCP --> runtime  : readable
+  runtime --> goroutine  : goready
+  goroutine --> goroutine  : Read completes
+```
+
+## Mental Model
+
+```text
+G calls conn.Read
+  -> runtime sees would-block
+  -> G parks on netpoll wait
+  -> M may run other Gs
+  ...
+kernel marks FD readable
+  -> netpoller (epoll/kqueue/IOCP) notices
+  -> G becomes runnable
+  -> Read completes
+```
+
+Platform backends:
+
+| OS | Mechanism |
+|----|-----------|
+| Linux | epoll |
+| BSD/macOS | kqueue |
+| Windows | IOCP |
+
+## Deadlines vs Poller
+
+`SetDeadline` / `context` cancellation arm timers that **also** wake blocked network ops. Without deadlines, a stuck peer can pin a G forever (goroutine + buffer memory).
+
+```go
+_ = conn.SetReadDeadline(time.Now().Add(30 * time.Second))
+// or
+ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+defer cancel()
+// http and many APIs use Request.Context()
+```
+
+## Interaction With Syscalls
+
+Not every I/O goes through netpoll. File I/O and some cgo paths still block Ms. Network sockets registered with the poller are the sweet spot for massive concurrency.
+
+Go 1.26 simplified how **P** tracks syscall state (derive from G instead of a dedicated P-syscall state), which helps syscall/cgo-heavy paths. See [cgo & scheduler](228-cgo-scheduler-transitions.qmd).
+
+## Zero-Copy Adjacent
+
+`io.Copy` between sockets may use `splice`/`sendfile` on Linux when types allow — poller still owns readiness. TLS usually **cannot** sendfile the cleartext path the same way. See [zero-copy I/O](224-zero-copy-io.qmd).
+
+## Diagnosis
+
+| Symptom | Check |
+|---------|--------|
+| Goroutines stuck in `net.Read` | Deadlines? peer hang? |
+| Threads exploding | Blocking syscalls / DNS / cgo, not poller waits |
+| High latency, low CPU | Downstream wait; trace shows park on poll |
+
+```bash
+go tool pprof http://localhost:6060/debug/pprof/goroutine
+# look for runtime.netpollblock, internal/poll.runtime_pollWait
+```
+
+## Experiment
+
+```bash
+go mod init example
+go run .
+```
+
+```go
+package main
+
+import (
+	"fmt"
+	"io"
+	"net"
+	"time"
+)
+
+func main() {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		panic(err)
+	}
+	defer ln.Close()
+
+	go func() {
+		c, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer c.Close()
+		time.Sleep(50 * time.Millisecond)
+		_, _ = c.Write([]byte("hello"))
+	}()
+
+	c, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		panic(err)
+	}
+	defer c.Close()
+	_ = c.SetReadDeadline(time.Now().Add(time.Second))
+	buf := make([]byte, 16)
+	n, err := c.Read(buf)
+	fmt.Printf("read %q err=%v\n", buf[:n], err)
+
+	// deadline fire
+	_ = c.SetReadDeadline(time.Now().Add(20 * time.Millisecond))
+	_, err = c.Read(buf)
+	fmt.Printf("timeout? %v\n", err)
+	_, _ = io.WriteString(c, "x")
+}
+```
+
+**What to notice:** Read waits without spinning a CPU core; deadlines surface as errors, not hangs.
+
+**Try next:** Open 10k localhost connections with short deadlines; watch RSS and goroutine count stay manageable.

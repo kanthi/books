@@ -31,15 +31,14 @@ A **directed graph** (digraph) uses ordered pairs $(u,v)\in V\times V$.
 6. **Flow:** max-flow / min-cut; bipartite matching
 7. **Systems patterns:** PageRank, dependency scheduling, routing
 
-```mermaid
-flowchart LR
-  A[Representation] --> B[BFS/DFS]
-  B --> C[Components / Topo]
-  A --> D[Weights]
-  D --> E[Dijkstra / BF]
-  D --> F[MST]
-  B --> G[SCC]
-  G --> H[Flow / Matching]
+```text
+flow:
+  B -> C
+  A -> D
+  D -> E
+  D -> F
+  B -> G
+  G -> H
 ```
 
 ## Proof techniques you will reuse

@@ -2,6 +2,16 @@
 
 Machine learning systems are optimization procedures applied to statistical models expressed with linear algebra and calculus. This part focuses on the mathematical objects that appear in almost every pipeline: data matrices, embeddings, losses, gradients, and the probabilistic semantics of prediction. The goal is not to catalog algorithms, but to make the math **legible** so you can read papers, debug training, and choose models deliberately.
 
+## Chapters in this part
+
+| Chapter | Focus |
+|---------|--------|
+| Linear algebra for ML | Data matrices, similarity, least squares view |
+| Gradients and loss | Risk, GD/SGD, chain rule / backprop sketch |
+| Probability for ML | Likelihood, MAP, calibration, softmax |
+| Neural nets math sketch | Affine + nonlinearity, depth, gradients |
+| Matrix calculus for ML | Practical identities and grad checks |
+
 ## What an ML problem looks like mathematically
 
 **Data.** $n$ examples with inputs $x_i\in\mathbb{R}^d$ and targets $y_i\in\mathcal{Y}$. Stack inputs as

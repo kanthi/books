@@ -15,17 +15,16 @@ Number theory studies the integers—and in CS it is the mathematics of modular 
 
 ## Concept map
 
-```mermaid
-flowchart LR
-  A[Divisibility] --> B[GCD / Euclid]
-  B --> C[Bézout]
-  B --> D[Modular inverse]
-  C --> E[Linear congruences]
-  E --> F[Chinese Remainder Theorem]
-  E --> G[Fermat / Euler]
-  G --> H[RSA sketch]
-  A --> I[Primes]
-  I --> H
+```text
+flow:
+  B -> C
+  B -> D
+  C -> E
+  E -> F
+  E -> G
+  G -> H
+  A -> I
+  I -> H
 ```
 
 ## Divisibility and gcd (preview)

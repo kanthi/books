@@ -22,16 +22,15 @@ Calculus studies continuous change: limits, derivatives, integrals, and infinite
 4. **Multivariable calculus** — gradients, Jacobians, Hessians for ML  
 5. **Series and approximations** — Taylor models used everywhere in numerics  
 
-```mermaid
-flowchart LR
-  A[Functions] --> B[Limits]
-  B --> C[Continuity]
-  C --> D[Derivatives]
-  D --> E[Optimization]
-  D --> F[Gradients / Backprop]
-  B --> G[Integrals]
-  G --> H[Probability / Accumulation]
-  D --> I[Taylor Series]
+```text
+flow:
+  B -> C
+  C -> D
+  D -> E
+  D -> F
+  B -> G
+  G -> H
+  D -> I
 ```
 
 ## The derivative in one sentence

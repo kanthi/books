@@ -13,12 +13,11 @@ Advanced linear algebra studies structure beyond “multiply matrices”: spectr
 
 ## Learning path
 
-```mermaid
-flowchart LR
-  A[Eigenvalues] --> B[Orthogonality]
-  B --> C[SVD / PCA]
-  C --> D[Least Squares / Conditioning]
-  A --> C
+```text
+flow:
+  B -> C
+  C -> D
+  A -> C
 ```
 
 ## Matrix as linear map

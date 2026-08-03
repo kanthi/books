@@ -22,13 +22,12 @@ A method can be **mathematically convergent** yet **numerically useless** if uns
 4. **Linear systems** (direct and iterative)  
 5. **Numerical optimization** (smooth methods in finite precision)
 
-```mermaid
-flowchart LR
-  A[FP model] --> B[Error analysis]
-  B --> C[Root finding]
-  B --> D[Linear systems]
-  B --> E[Optimization]
-  D --> E
+```text
+flow:
+  B -> C
+  B -> D
+  B -> E
+  D -> E
 ```
 
 ## Conditioning vs stability (preview)

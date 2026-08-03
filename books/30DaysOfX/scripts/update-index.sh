@@ -186,8 +186,8 @@ language:
 format:
   html:
     theme:
-      light: [cosmo, styles/light.scss]
       dark: [darkly, styles/dark.scss]
+      light: [cosmo, styles/light.scss]
     code-fold: true
     toc: true
     number-sections: false

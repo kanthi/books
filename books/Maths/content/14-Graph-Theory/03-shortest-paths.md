@@ -97,15 +97,14 @@ APSP on sparse graphs with negatives (no neg cycles): Bellman–Ford potentials 
 
 ## 7. Algorithm selection
 
-```mermaid
-flowchart TD
-  A[Shortest paths] --> B{Weights?}
-  B -->|all equal / unweighted| C[BFS]
-  B -->|nonnegative| D[Dijkstra]
-  B -->|negatives| E[Bellman-Ford]
-  A --> F{All pairs?}
-  F -->|yes dense| G[Floyd-Warshall]
-  F -->|yes sparse| H[Johnson / n x Dijkstra]
+```text
+flow:
+  B -> C  (all equal / unweighted)
+  B -> D  (nonnegative)
+  B -> E  (negatives)
+  A -> F
+  F -> G  (yes dense)
+  F -> H  (yes sparse)
 ```
 
 ### Worked example 8 — maps

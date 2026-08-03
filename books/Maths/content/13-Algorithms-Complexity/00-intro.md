@@ -14,6 +14,8 @@ Algorithms transform inputs into outputs with finite resources. **Complexity the
 
 Complexity is not only academia: billing, capacity planning, cryptography assumptions, and compiler optimization all rest on resource reasoning.
 
+**Next step:** for hardness proofs and space classes, continue in **part 19 Complexity-Theory** (this part emphasizes analyzing concrete algorithms).
+
 ## Two complementary activities
 
 ### 1. Algorithm analysis

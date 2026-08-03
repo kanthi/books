@@ -633,14 +633,13 @@ Understanding these concepts enables you to write more efficient code and make i
 
 For recurrences like `T(n)=2T(n/2)+n`, a recurrence tree helps visualize per-level work.
 
-```mermaid
-flowchart TD
-  A[T(n): n work] --> B[T(n/2): n/2]
-  A --> C[T(n/2): n/2]
-  B --> D[T(n/4): n/4]
-  B --> E[T(n/4): n/4]
-  C --> F[T(n/4): n/4]
-  C --> G[T(n/4): n/4]
+```text
+flow:
+  A -> C
+  B -> D
+  B -> E
+  C -> F
+  C -> G
 ```
 
 Each level contributes about `n` total work; there are `log n` levels, giving `Theta(n log n)`.

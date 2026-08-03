@@ -12,16 +12,26 @@ Complexity theory classifies problems by the resources—time, space, randomness
 | Verifier architectures | NP certificates, interactive proofs (advanced) |
 | Memory-tight algorithms | L, NL, PSPACE |
 
+## Relation to Algorithms & Complexity (part 13)
+
+| Part | Role |
+|------|------|
+| **13 Algorithms-Complexity** | Analyze *algorithms*: asymptotics, recurrences, class *intuition* |
+| **19 Complexity-Theory** | Classify *problems*: reductions craft, NP-complete, space, approx hardness |
+
+Read 13 first for big-O fluency; use 19 when proving hardness or choosing exact vs approximate solvers.
+
 ## Core map
 
-```mermaid
-flowchart LR
-  A[Decision Problems] --> B[Classes P NP]
-  B --> C[Reductions]
-  C --> D[NP-Complete]
-  B --> E[Randomized]
-  B --> F[Space]
-  D --> G[Approximation hardness]
+```text
+  decision problems
+         │
+         v
+    classes P / NP ──► reductions ──► NP-complete
+         │
+         ├── randomized classes
+         ├── space (L, NL, PSPACE)
+         └── approximation hardness
 ```
 
 ## Decision problems first

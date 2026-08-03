@@ -1011,10 +1011,9 @@ Matrices represent the computational heart of linear algebra, providing both the
 
 A matrix is not just a table of numbers; it is a transformation from one vector space to another.
 
-```mermaid
-flowchart LR
-  V[Input vector x] --> A[Apply matrix A]
-  A --> Y[Output vector y = Ax]
+```text
+flow:
+  A -> Y
 ```
 
 Example transformation:

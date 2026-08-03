@@ -4,6 +4,15 @@ Information theory quantifies **uncertainty**, **information**, and **communicat
 
 This section is mathematical, but every definition maps to engineering practice: compression codecs, error-correcting codes, ML loss functions, feature selection, and privacy leakage analysis.
 
+## Chapters in this part
+
+| Chapter | Focus |
+|---------|--------|
+| Entropy and information | Self-information, $H(X)$ |
+| Mutual information and capacity | $I(X;Y)$, channels |
+| KL divergence and coding | Cross-entropy, coding length, ML loss |
+| Applications | Compression, trees, features, perplexity |
+
 ## What “information” means here
 
 Everyday language treats “information” as content or meaning. Shannon information is **not** about semantics. It is about **surprise under a probability model**.

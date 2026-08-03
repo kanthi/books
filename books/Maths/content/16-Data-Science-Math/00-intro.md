@@ -2,6 +2,15 @@
 
 Data science turns measurements into decisions under uncertainty. The mathematics is not a single theorem but a **stack**: descriptive summaries, probability models, estimation, hypothesis testing, prediction, and experimental design—implemented at scale with linear algebra and optimization. This part emphasizes statistical foundations with CS systems awareness (pipelines, A/B tests, metrics).
 
+## Chapters in this part
+
+| Chapter | Focus |
+|---------|--------|
+| Statistical foundations | Descriptive stats and core toolkit |
+| Sampling and bias | Frames, SE, train/val/test discipline |
+| Hypothesis testing for data | Practical tests, bootstrap, reporting |
+| Dimensionality and features | Curse of dimensionality, scaling, PCA map |
+
 ## The data science loop (mathematical view)
 
 1. **Collect** samples from a process (ideally i.i.d. or with known dependence)

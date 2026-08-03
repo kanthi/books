@@ -2,6 +2,16 @@
 
 Optimization is the mathematical study of **choosing the best feasible point**. Almost every modern CS stack hides an optimizer: training a model, allocating resources, compiling code, routing traffic, or packing VMs. This part develops the language (objectives, constraints, convexity), the guarantees (global vs local minima, duality), and the algorithms (gradients, projections, regularized objectives) that make those systems work.
 
+## Chapters in this part
+
+| Chapter | Focus |
+|---------|--------|
+| Convexity | Convex sets/functions, why local = global |
+| Constrained optimization | Feasibility, KKT intuition |
+| Regularization | Ridge/Lasso and generalization |
+| First-order methods playbook | GD, SGD, momentum, Adam diagnostics |
+| Gradient methods | Deeper gradient algorithms |
+
 ## The canonical problem
 
 $$

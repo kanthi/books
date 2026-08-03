@@ -885,14 +885,13 @@ Understanding probability is essential not only for advanced statistical methods
 The probability distributions and techniques you've learned form the building blocks for statistical inference, where we use sample data to draw conclusions about populations. As you progress to inferential statistics, these probability concepts will provide the theoretical justification for confidence intervals, hypothesis tests, and other methods that allow us to quantify our uncertainty and make reliable generalizations from limited data.
 ## Bayes with Probability Tree (Medical Test)
 
-```mermaid
-flowchart TD
-  A[Population] -->|1%| B[Disease]
-  A -->|99%| C[No Disease]
-  B -->|95%| D[Test +]
-  B -->|5%| E[Test -]
-  C -->|10%| F[Test +]
-  C -->|90%| G[Test -]
+```text
+flow:
+  A -> C  (99%)
+  B -> D  (95%)
+  B -> E  (5%)
+  C -> F  (10%)
+  C -> G  (90%)
 ```
 
 From the tree:

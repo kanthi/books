@@ -16,14 +16,13 @@ Probability is the mathematics of uncertainty. Advanced probability for CS/AI go
 
 ## Learning path
 
-```mermaid
-flowchart LR
-  A[Random Variables] --> B[Expectation Variance]
-  B --> C[Limit Theorems]
-  B --> D[Bayesian Inference]
-  C --> E[Concentration]
-  D --> F[Markov Chains / MCMC]
-  E --> F
+```text
+flow:
+  B -> C
+  B -> D
+  C -> E
+  D -> F
+  E -> F
 ```
 
 ## Random experiments and models
