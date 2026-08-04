@@ -1,0 +1,234 @@
+---
+title: "Sessions, Authentication, and Authorization"
+---
+
+# Sessions, Authentication, and Authorization
+
+## Overview
+
+Authentication answers *who are you?* Authorization answers *what may you do?* Sessions keep users logged in across requests. This chapter implements a straightforward Bookstore flow: password hashing, login, secure cookies, and role checks—without drowning in every OAuth edge case.
+
+## Concepts
+
+```text
+  Authn:  credentials → identity (user id)
+  Session: identity stored server-side or in signed cookie
+  Authz:  identity + role/permission → allow or deny
+```
+
+| Term | Bookstore example |
+|------|-------------------|
+| Authentication | Email + password login |
+| Session | Cookie `session_id` → user in store |
+| Authorization | Only `admin` may `POST /api/books` |
+| Password hash | `bcrypt` / `argon2` of password; never store plaintext |
+
+## Password hashing
+
+```go
+import "golang.org/x/crypto/bcrypt"
+
+func HashPassword(plain string) (string, error) {
+	b, err := bcrypt.GenerateFromPassword([]byte(plain), bcrypt.DefaultCost)
+	return string(b), err
+}
+
+func CheckPassword(hash, plain string) bool {
+	return bcrypt.CompareHashAndPassword([]byte(hash), []byte(plain)) == nil
+}
+```
+
+Never log passwords. Prefer constant-time compare (bcrypt already does).
+
+## User model
+
+```go
+type User struct {
+	ID           string `json:"id"`
+	Email        string `json:"email"`
+	PasswordHash string `json:"-"` // never serialize
+	Role         string `json:"role"` // "customer" | "admin"
+}
+```
+
+## Session store (server-side)
+
+Simple and clear for learning:
+
+```go
+type Session struct {
+	UserID    string
+	ExpiresAt time.Time
+}
+
+type SessionStore struct {
+	mu   sync.Mutex
+	byID map[string]Session
+}
+
+func (s *SessionStore) Create(userID string, ttl time.Duration) (string, error) {
+	id, err := randomID(32)
+	if err != nil {
+		return "", err
+	}
+	s.mu.Lock()
+	s.byID[id] = Session{UserID: userID, ExpiresAt: time.Now().Add(ttl)}
+	s.mu.Unlock()
+	return id, nil
+}
+
+func (s *SessionStore) Get(id string) (Session, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	sess, ok := s.byID[id]
+	if !ok || time.Now().After(sess.ExpiresAt) {
+		delete(s.byID, id)
+		return Session{}, false
+	}
+	return sess, true
+}
+
+func (s *SessionStore) Delete(id string) {
+	s.mu.Lock()
+	delete(s.byID, id)
+	s.mu.Unlock()
+}
+```
+
+Production often uses Redis or signed/encrypted cookies (JWT or iron-cookie style). Server-side sessions are easy to revoke.
+
+## Secure cookie
+
+```go
+func setSessionCookie(w http.ResponseWriter, sessionID string, secure bool) {
+	http.SetCookie(w, &http.Cookie{
+		Name:     "session_id",
+		Value:    sessionID,
+		Path:     "/",
+		HttpOnly: true,                       // not readable from JS
+		Secure:   secure,                     // HTTPS only in prod
+		SameSite: http.SameSiteLaxMode,       // CSRF mitigation baseline
+		MaxAge:   int((24 * time.Hour).Seconds()),
+	})
+}
+```
+
+| Flag | Why |
+|------|-----|
+| `HttpOnly` | Stops XSS from stealing the cookie via `document.cookie` |
+| `Secure` | Cookie only on HTTPS |
+| `SameSite` | Reduces cross-site cookie sends |
+
+## Login handler
+
+```go
+func (s *Server) login(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Email    string `json:"email"`
+		Password string `json:"password"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+		writeError(w, http.StatusBadRequest, "bad_json", "invalid body")
+		return
+	}
+
+	user, err := s.users.ByEmail(r.Context(), in.Email)
+	if err != nil || !CheckPassword(user.PasswordHash, in.Password) {
+		// same message for unknown user and bad password
+		writeError(w, http.StatusUnauthorized, "auth_failed", "invalid email or password")
+		return
+	}
+
+	sid, err := s.sessions.Create(user.ID, 24*time.Hour)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "session", "could not create session")
+		return
+	}
+	setSessionCookie(w, sid, s.secureCookies)
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+```
+
+## Auth middleware
+
+```go
+type ctxKey int
+
+const userIDKey ctxKey = 1
+
+func (s *Server) requireAuth(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		c, err := r.Cookie("session_id")
+		if err != nil {
+			writeError(w, http.StatusUnauthorized, "auth_required", "login required")
+			return
+		}
+		sess, ok := s.sessions.Get(c.Value)
+		if !ok {
+			writeError(w, http.StatusUnauthorized, "auth_required", "login required")
+			return
+		}
+		ctx := context.WithValue(r.Context(), userIDKey, sess.UserID)
+		next.ServeHTTP(w, r.WithContext(ctx))
+	})
+}
+
+func UserIDFrom(ctx context.Context) (string, bool) {
+	id, ok := ctx.Value(userIDKey).(string)
+	return id, ok
+}
+```
+
+## Role-based access
+
+```go
+func (s *Server) requireRole(role string, next http.Handler) http.Handler {
+	return s.requireAuth(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		uid, _ := UserIDFrom(r.Context())
+		user, err := s.users.Get(r.Context(), uid)
+		if err != nil || user.Role != role {
+			writeError(w, http.StatusForbidden, "forbidden", "insufficient role")
+			return
+		}
+		next.ServeHTTP(w, r)
+	}))
+}
+
+// registration
+mux.Handle("POST /api/books", s.requireRole("admin", http.HandlerFunc(s.createBook)))
+```
+
+**401** = not logged in. **403** = logged in but not allowed. Keep them distinct.
+
+## Logout
+
+```go
+func (s *Server) logout(w http.ResponseWriter, r *http.Request) {
+	if c, err := r.Cookie("session_id"); err == nil {
+		s.sessions.Delete(c.Value)
+	}
+	http.SetCookie(w, &http.Cookie{
+		Name: "session_id", Value: "", Path: "/", MaxAge: -1, HttpOnly: true,
+	})
+	writeJSON(w, http.StatusOK, map[string]string{"status": "logged_out"})
+}
+```
+
+## CSRF note (HTML forms)
+
+Cookie sessions + browser forms need CSRF tokens (double-submit or synchronizer token). JSON APIs called with custom headers from SPAs have a different threat model. For Bookstore HTML admin, add a CSRF token in forms before production.
+
+## Rules of thumb
+
+| Do | Don't |
+|----|--------|
+| Hash passwords with bcrypt/argon2 | Store plaintext or reversible encryption as “hash” |
+| HttpOnly + Secure + SameSite cookies | Put tokens in `localStorage` without XSS plan |
+| Generic login failure messages | Reveal “email not found” vs “bad password” |
+| Check roles server-side every request | Trust a client-sent `role=admin` field |
+
+## Try next
+
+1. Add `POST /api/auth/register` with email uniqueness.
+2. Protect `POST /api/books` with admin role.
+3. Expire sessions and confirm `/api/me` returns 401 after expiry.

@@ -1,0 +1,681 @@
+---
+title: "Project: Network CLI Tools (Ping, DNS, Scan, Probe)"
+---
+
+# Project: Network CLI Tools (Ping, DNS, Scan, Probe)
+
+## Overview
+
+Build **`netkit`**, a multi-command networking CLI using **stdlib only** (plus optional Cobra later). You implement tools people actually run while debugging connectivity:
+
+| Subcommand | What it does |
+|------------|----------------|
+| `ping` | TCP connect RTT (works without root; not ICMP) |
+| `dns` | Resolve A/AAAA (and optional reverse) |
+| `scan` | Concurrent TCP port scan on a host |
+| `probe` | HTTP(S) latency + status code check |
+| `whoami` | Local addresses / outbound path sketch |
+
+This project ties together flags, subcommands, exit codes, timeouts, concurrency, and signals from earlier chapters.
+
+> **Related.** Single-tool lab in projects: [CLI Ping Tool](../99-projects/99a-cli-ping-tool.qmd). Deeper TCP: [131 TCP services](../13-network-systems/131-tcp-services-deep-dive.qmd). Stdlib sockets: [994 net dial/listen](../98-stdlib/994-net-dial-listen-stdlib.qmd).
+
+## Goals
+
+1. Ship one binary with several network diagnostic verbs  
+2. Always use **timeouts** and **context cancel** (Ctrl-C)  
+3. Keep **data on stdout**, diagnostics on stderr  
+4. Exit **0** on success, **1** on failure, **2** on misuse  
+5. Structure code so probes are unit-testable without the network (interfaces + fakes)
+
+## Scaffold
+
+```bash
+mkdir -p netkit/cmd/netkit netkit/internal/{app,netutil}
+cd netkit
+go mod init example.com/netkit
+```
+
+```text
+netkit/
+  cmd/netkit/main.go
+  internal/app/app.go          # dispatch + shared flags
+  internal/app/ping.go
+  internal/app/dns.go
+  internal/app/scan.go
+  internal/app/probe.go
+  internal/netutil/dial.go     # shared dial helpers
+  internal/netutil/stats.go
+```
+
+### main.go
+
+```go
+package main
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"os/signal"
+	"syscall"
+
+	"example.com/netkit/internal/app"
+)
+
+func main() {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	a := app.New(os.Stdout, os.Stderr)
+	if err := a.Run(ctx, os.Args[1:]); err != nil {
+		fmt.Fprintln(os.Stderr, "netkit:", err)
+		code := 1
+		if app.IsUsage(err) {
+			code = 2
+		}
+		if ctx.Err() != nil {
+			code = 130
+		}
+		os.Exit(code)
+	}
+}
+```
+
+### app.go (dispatch)
+
+```go
+package app
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"io"
+)
+
+var ErrUsage = errors.New("usage")
+
+func IsUsage(err error) bool { return errors.Is(err, ErrUsage) }
+
+type App struct {
+	Stdout io.Writer
+	Stderr io.Writer
+}
+
+func New(stdout, stderr io.Writer) *App {
+	return &App{Stdout: stdout, Stderr: stderr}
+}
+
+func (a *App) Run(ctx context.Context, args []string) error {
+	if len(args) < 1 {
+		return a.usage()
+	}
+	switch args[0] {
+	case "ping":
+		return a.cmdPing(ctx, args[1:])
+	case "dns":
+		return a.cmdDNS(ctx, args[1:])
+	case "scan":
+		return a.cmdScan(ctx, args[1:])
+	case "probe":
+		return a.cmdProbe(ctx, args[1:])
+	case "whoami":
+		return a.cmdWhoami(ctx, args[1:])
+	case "help", "-h", "--help":
+		return a.usage()
+	default:
+		fmt.Fprintf(a.Stderr, "unknown command %q\n", args[0])
+		return a.usage()
+	}
+}
+
+func (a *App) usage() error {
+	fmt.Fprintf(a.Stderr, `Usage: netkit <command> [flags]
+
+Commands:
+  ping    TCP connect ping (RTT stats)
+  dns     DNS lookup (A/AAAA)
+  scan    TCP port scan
+  probe   HTTP(S) status + latency
+  whoami  local network identity
+
+Run "netkit <command> -h" for command flags.
+`)
+	return ErrUsage
+}
+```
+
+---
+
+## Tool 1: `ping` — TCP connect RTT
+
+Classic ICMP ping needs raw sockets (often root). **TCP ping** dials a port (default 443) and measures connect time—enough for “is the service reachable?” diagnostics.
+
+### netutil helpers
+
+```go
+package netutil
+
+import (
+	"context"
+	"net"
+	"time"
+)
+
+type ProbeResult struct {
+	OK  bool
+	RTT time.Duration
+	Err error
+}
+
+func TCPPing(ctx context.Context, address string, timeout time.Duration) ProbeResult {
+	d := net.Dialer{Timeout: timeout}
+	start := time.Now()
+	conn, err := d.DialContext(ctx, "tcp", address)
+	if err != nil {
+		return ProbeResult{OK: false, Err: err}
+	}
+	_ = conn.Close()
+	return ProbeResult{OK: true, RTT: time.Since(start)}
+}
+
+type Stats struct {
+	Sent, Recv int
+	Min, Max, Sum time.Duration
+}
+
+func (s *Stats) Add(r ProbeResult) {
+	s.Sent++
+	if !r.OK {
+		return
+	}
+	s.Recv++
+	if s.Recv == 1 || r.RTT < s.Min {
+		s.Min = r.RTT
+	}
+	if r.RTT > s.Max {
+		s.Max = r.RTT
+	}
+	s.Sum += r.RTT
+}
+
+func (s Stats) LossPct() float64 {
+	if s.Sent == 0 {
+		return 0
+	}
+	return float64(s.Sent-s.Recv) / float64(s.Sent) * 100
+}
+
+func (s Stats) Avg() time.Duration {
+	if s.Recv == 0 {
+		return 0
+	}
+	return s.Sum / time.Duration(s.Recv)
+}
+```
+
+### cmdPing
+
+```go
+package app
+
+import (
+	"context"
+	"flag"
+	"fmt"
+	"net"
+	"time"
+
+	"example.com/netkit/internal/netutil"
+)
+
+func (a *App) cmdPing(ctx context.Context, args []string) error {
+	fs := flag.NewFlagSet("ping", flag.ContinueOnError)
+	fs.SetOutput(a.Stderr)
+	count := fs.Int("c", 4, "number of probes")
+	interval := fs.Duration("i", time.Second, "interval between probes")
+	timeout := fs.Duration("t", 2*time.Second, "per-probe timeout")
+	port := fs.String("p", "443", "TCP port")
+	jsonOut := fs.Bool("json", false, "machine-readable summary on stdout")
+	if err := fs.Parse(args); err != nil {
+		return ErrUsage
+	}
+	if fs.NArg() != 1 {
+		fmt.Fprintln(a.Stderr, "usage: netkit ping [flags] <host>")
+		fs.PrintDefaults()
+		return ErrUsage
+	}
+	host := fs.Arg(0)
+
+	ips, err := net.DefaultResolver.LookupIPAddr(ctx, host)
+	if err != nil || len(ips) == 0 {
+		return fmt.Errorf("resolve %s: %w", host, err)
+	}
+	ip := ips[0].IP.String()
+	addr := net.JoinHostPort(ip, *port)
+
+	fmt.Fprintf(a.Stderr, "PING %s (%s) TCP/%s\n", host, ip, *port)
+
+	var st netutil.Stats
+	samples := make([]time.Duration, 0, *count)
+
+	for i := 1; i <= *count; i++ {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		r := netutil.TCPPing(ctx, addr, *timeout)
+		st.Add(r)
+		if r.OK {
+			samples = append(samples, r.RTT)
+			fmt.Fprintf(a.Stdout, "%d: open rtt=%v\n", i, r.RTT)
+		} else {
+			fmt.Fprintf(a.Stdout, "%d: fail err=%v\n", i, r.Err)
+		}
+		if i < *count {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(*interval):
+			}
+		}
+	}
+
+	fmt.Fprintf(a.Stderr, "--- %s ping stats ---\n", host)
+	fmt.Fprintf(a.Stderr, "%d sent, %d ok, %.1f%% loss\n", st.Sent, st.Recv, st.LossPct())
+	fmt.Fprintf(a.Stderr, "rtt min/avg/max = %v/%v/%v\n", st.Min, st.Avg(), st.Max)
+
+	if *jsonOut {
+		// summary JSON for scripts (optional: encode struct)
+		fmt.Fprintf(a.Stdout, `{"host":%q,"ip":%q,"port":%q,"sent":%d,"ok":%d,"loss_pct":%.2f,"min_ns":%d,"avg_ns":%d,"max_ns":%d}`+"\n",
+			host, ip, *port, st.Sent, st.Recv, st.LossPct(), st.Min, st.Avg(), st.Max)
+	}
+
+	if st.Recv == 0 {
+		return fmt.Errorf("all probes failed")
+	}
+	_ = samples
+	return nil
+}
+```
+
+```bash
+go run ./cmd/netkit ping example.com
+go run ./cmd/netkit ping -c 5 -p 80 -i 200ms example.com
+```
+
+**Stretch:** probe every resolved IP; compute jitter (stddev of samples).
+
+---
+
+## Tool 2: `dns` — lookup
+
+```go
+func (a *App) cmdDNS(ctx context.Context, args []string) error {
+	fs := flag.NewFlagSet("dns", flag.ContinueOnError)
+	fs.SetOutput(a.Stderr)
+	typ := fs.String("type", "ip", "ip|host (reverse)")
+	if err := fs.Parse(args); err != nil {
+		return ErrUsage
+	}
+	if fs.NArg() != 1 {
+		fmt.Fprintln(a.Stderr, "usage: netkit dns [-type ip|host] <name-or-ip>")
+		return ErrUsage
+	}
+	name := fs.Arg(0)
+
+	switch *typ {
+	case "ip":
+		ips, err := net.DefaultResolver.LookupIPAddr(ctx, name)
+		if err != nil {
+			return err
+		}
+		for _, ip := range ips {
+			fmt.Fprintln(a.Stdout, ip.IP.String())
+		}
+	case "host":
+		hosts, err := net.DefaultResolver.LookupAddr(ctx, name)
+		if err != nil {
+			return err
+		}
+		for _, h := range hosts {
+			fmt.Fprintln(a.Stdout, h)
+		}
+	default:
+		return fmt.Errorf("unknown -type %q", *typ)
+	}
+	return nil
+}
+```
+
+```bash
+go run ./cmd/netkit dns example.com
+go run ./cmd/netkit dns -type host 1.1.1.1
+```
+
+**Stretch:** `LookupMX`, `LookupTXT`, `LookupCNAME` behind `-type mx|txt|cname`.
+
+---
+
+## Tool 3: `scan` — concurrent TCP ports
+
+```go
+func (a *App) cmdScan(ctx context.Context, args []string) error {
+	fs := flag.NewFlagSet("scan", flag.ContinueOnError)
+	fs.SetOutput(a.Stderr)
+	ports := fs.String("ports", "22,80,443,8080", "comma-separated ports or start-end range")
+	timeout := fs.Duration("t", 500*time.Millisecond, "dial timeout per port")
+	workers := fs.Int("w", 32, "concurrent workers")
+	if err := fs.Parse(args); err != nil {
+		return ErrUsage
+	}
+	if fs.NArg() != 1 {
+		fmt.Fprintln(a.Stderr, "usage: netkit scan [flags] <host>")
+		return ErrUsage
+	}
+	host := fs.Arg(0)
+
+	list, err := parsePorts(*ports)
+	if err != nil {
+		return err
+	}
+
+	type job struct{ port int }
+	type res struct {
+		port int
+		open bool
+	}
+
+	jobs := make(chan job)
+	results := make(chan res)
+	var wg sync.WaitGroup
+
+	worker := func() {
+		defer wg.Done()
+		for j := range jobs {
+			addr := net.JoinHostPort(host, strconv.Itoa(j.port))
+			d := net.Dialer{Timeout: *timeout}
+			conn, err := d.DialContext(ctx, "tcp", addr)
+			if err == nil {
+				_ = conn.Close()
+				results <- res{port: j.port, open: true}
+			} else {
+				results <- res{port: j.port, open: false}
+			}
+		}
+	}
+
+	n := *workers
+	if n > len(list) {
+		n = len(list)
+	}
+	wg.Add(n)
+	for i := 0; i < n; i++ {
+		go worker()
+	}
+
+	go func() {
+		defer close(jobs)
+		for _, p := range list {
+			select {
+			case <-ctx.Done():
+				return
+			case jobs <- job{port: p}:
+			}
+		}
+	}()
+
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+
+	openN := 0
+	for r := range results {
+		if r.open {
+			openN++
+			fmt.Fprintf(a.Stdout, "%d/tcp open\n", r.port)
+		}
+	}
+	fmt.Fprintf(a.Stderr, "scanned %d ports, %d open\n", len(list), openN)
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	return nil
+}
+
+func parsePorts(s string) ([]int, error) {
+	var out []int
+	for _, part := range strings.Split(s, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		if lo, hi, ok := strings.Cut(part, "-"); ok {
+			a, err1 := strconv.Atoi(lo)
+			b, err2 := strconv.Atoi(hi)
+			if err1 != nil || err2 != nil || a < 1 || b > 65535 || a > b {
+				return nil, fmt.Errorf("bad range %q", part)
+			}
+			for p := a; p <= b; p++ {
+				out = append(out, p)
+			}
+			continue
+		}
+		p, err := strconv.Atoi(part)
+		if err != nil || p < 1 || p > 65535 {
+			return nil, fmt.Errorf("bad port %q", part)
+		}
+		out = append(out, p)
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("no ports")
+	}
+	return out, nil
+}
+```
+
+```bash
+go run ./cmd/netkit scan -ports 80,443,22 example.com
+go run ./cmd/netkit scan -ports 1-1024 -w 64 -t 200ms 127.0.0.1
+```
+
+**Ethics note:** only scan hosts you own or have permission to test. Rate-limit (`-w`, `-t`) on shared networks.
+
+---
+
+## Tool 4: `probe` — HTTP status + latency
+
+```go
+func (a *App) cmdProbe(ctx context.Context, args []string) error {
+	fs := flag.NewFlagSet("probe", flag.ContinueOnError)
+	fs.SetOutput(a.Stderr)
+	timeout := fs.Duration("t", 10*time.Second, "total timeout")
+	method := fs.String("X", http.MethodGet, "HTTP method")
+	expect := fs.Int("expect", 0, "expected status (0=any 2xx/3xx)")
+	if err := fs.Parse(args); err != nil {
+		return ErrUsage
+	}
+	if fs.NArg() != 1 {
+		fmt.Fprintln(a.Stderr, "usage: netkit probe [flags] <url>")
+		return ErrUsage
+	}
+	rawURL := fs.Arg(0)
+
+	ctx, cancel := context.WithTimeout(ctx, *timeout)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, *method, rawURL, nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("User-Agent", "netkit/1.0")
+
+	client := &http.Client{
+		Timeout: *timeout,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) >= 10 {
+				return fmt.Errorf("too many redirects")
+			}
+			return nil
+		},
+	}
+
+	start := time.Now()
+	resp, err := client.Do(req)
+	rtt := time.Since(start)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
+
+	fmt.Fprintf(a.Stdout, "status=%d rtt=%v url=%s\n", resp.StatusCode, rtt, rawURL)
+
+	if *expect > 0 && resp.StatusCode != *expect {
+		return fmt.Errorf("status %d want %d", resp.StatusCode, *expect)
+	}
+	if *expect == 0 && resp.StatusCode >= 400 {
+		return fmt.Errorf("status %d", resp.StatusCode)
+	}
+	return nil
+}
+```
+
+```bash
+go run ./cmd/netkit probe https://example.com
+go run ./cmd/netkit probe -expect 200 -t 3s https://example.com
+```
+
+---
+
+## Tool 5: `whoami` — local identity
+
+```go
+func (a *App) cmdWhoami(ctx context.Context, args []string) error {
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return err
+	}
+	for _, iface := range ifaces {
+		if iface.Flags&net.FlagUp == 0 {
+			continue
+		}
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, addr := range addrs {
+			fmt.Fprintf(a.Stdout, "%s\t%s\n", iface.Name, addr.String())
+		}
+	}
+
+	// optional: discover outbound IP by dialing UDP (no packets need succeed)
+	conn, err := net.Dial("udp", "8.8.8.8:80")
+	if err == nil {
+		if ua, ok := conn.LocalAddr().(*net.UDPAddr); ok {
+			fmt.Fprintf(a.Stdout, "outbound\t%s\n", ua.IP)
+		}
+		_ = conn.Close()
+	}
+	return nil
+}
+```
+
+---
+
+## Optional: Cobra wrapper
+
+When the command tree grows, map each `cmdX` to a Cobra command (chapter 311) but **keep** `netutil` pure:
+
+```go
+// sketch
+pingCmd := &cobra.Command{
+	Use:  "ping HOST",
+	Args: cobra.ExactArgs(1),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		return a.cmdPing(cmd.Context(), append(flagArgs, args...))
+	},
+}
+```
+
+Domain stays in `netutil`; Cobra only parses and calls.
+
+---
+
+## Tests (no live network required)
+
+```go
+func TestParsePorts(t *testing.T) {
+	got, err := parsePorts("22,80-82")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []int{22, 80, 81, 82}
+	if !slices.Equal(got, want) {
+		t.Fatalf("got %v want %v", got, want)
+	}
+}
+
+func TestStats(t *testing.T) {
+	var s netutil.Stats
+	s.Add(netutil.ProbeResult{OK: true, RTT: 10 * time.Millisecond})
+	s.Add(netutil.ProbeResult{OK: false, Err: context.DeadlineExceeded})
+	if s.Recv != 1 || s.Sent != 2 {
+		t.Fatalf("stats %+v", s)
+	}
+}
+```
+
+For dial logic, introduce:
+
+```go
+type Dialer interface {
+	DialContext(ctx context.Context, network, address string) (net.Conn, error)
+}
+```
+
+Inject a fake that returns after `N` ms or errors—table-test `ping` loop without the internet.
+
+---
+
+## Acceptance checklist
+
+- [ ] `netkit ping example.com` prints per-probe RTT and summary  
+- [ ] Ctrl-C stops mid-scan / mid-ping promptly  
+- [ ] `scan -ports 80,443` lists only open ports on stdout  
+- [ ] `dns` prints one IP per line (pipe-friendly)  
+- [ ] `probe -expect 200` fails non-zero on 404  
+- [ ] Misuse (`netkit`, `netkit ping`) exits 2 with usage on stderr  
+- [ ] At least `parsePorts` + `Stats` unit tests pass  
+
+```bash
+go test ./...
+go build -o netkit ./cmd/netkit
+./netkit ping -c 3 1.1.1.1
+./netkit scan -ports 53,80,443 1.1.1.1
+./netkit probe https://1.1.1.1
+```
+
+## Stretch goals
+
+1. **JSON mode** for every command (`-json`) for CI scripts  
+2. **ICMP ping** via `golang.org/x/net/icmp` (needs privileges; document)  
+3. **Traceroute-style** increasing TTL (OS-specific; advanced)  
+4. **CIDR scan** for lab networks only  
+5. **TLS probe**: dial TLS, print cert expiry (`crypto/tls`)  
+6. Publish with version ldflags (chapter 315)
+
+## What you practiced
+
+| Skill | Where |
+|-------|--------|
+| Subcommands + FlagSet | each `cmd*` |
+| Timeouts / Dialer | `TCPPing`, scan, probe |
+| Concurrency + cancel | scan workers + ctx |
+| Stdout/stderr contract | results vs stats |
+| Testable packages | `netutil`, `parsePorts` |
+
+You now have a real **network diagnostics CLI**—the same genre as `ping`, `dig`, and port scanners—implemented the Go way: simple protocols, explicit deadlines, one static binary.
+
+**Next:** simple security helpers (TLS cert days left, security headers, banners, secret scan) in [318 Network security mini-tools](318-project-network-security-mini-tools.qmd).

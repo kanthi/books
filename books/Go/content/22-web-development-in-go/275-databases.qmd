@@ -1,0 +1,245 @@
+---
+title: "Interaction with Databases"
+---
+
+# Interaction with Databases
+
+## Overview
+
+Bookstore data needs a durable store. Go’s `database/sql` is the standard entry point: open a pool, run queries with context, scan into domain types. Keep SQL behind a repository so handlers stay free of driver details—and so tests can swap an in-memory implementation.
+
+## Principles
+
+1. **Context on every query** — cancel when the client disconnects
+2. **Interfaces at the boundary** — `BookRepository` in chapter 272
+3. **Money as integers** — `price_cents`, not `float64`
+4. **Pool settings matter** — open connections, idle lifetime, max lifetime
+5. **Migrations outside the hot path** — version schema deliberately
+
+## Schema (Postgres-flavored)
+
+```sql
+CREATE TABLE books (
+  id          TEXT PRIMARY KEY,
+  title       TEXT NOT NULL,
+  author      TEXT NOT NULL,
+  isbn        TEXT NOT NULL UNIQUE,
+  price_cents INT  NOT NULL CHECK (price_cents >= 0),
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+```
+
+SQLite works for local demos; production Bookstores often use Postgres.
+
+## Open a pool
+
+```go
+import (
+	"database/sql"
+	"time"
+
+	_ "github.com/jackc/pgx/v5/stdlib" // or modernc.org/sqlite, etc.
+)
+
+func OpenDB(url string) (*sql.DB, error) {
+	db, err := sql.Open("pgx", url)
+	if err != nil {
+		return nil, err
+	}
+	db.SetMaxOpenConns(10)
+	db.SetMaxIdleConns(5)
+	db.SetConnMaxLifetime(time.Hour)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if err := db.PingContext(ctx); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	return db, nil
+}
+```
+
+`sql.Open` does not always connect immediately—**Ping** (with timeout) fails fast at boot.
+
+## Postgres repository
+
+```go
+package postgres
+
+import (
+	"context"
+	"database/sql"
+	"errors"
+	"fmt"
+
+	"example.com/bookstore/internal/domain"
+	"github.com/google/uuid"
+)
+
+type BookRepo struct {
+	db *sql.DB
+}
+
+func NewBookRepo(db *sql.DB) *BookRepo {
+	return &BookRepo{db: db}
+}
+
+func (r *BookRepo) List(ctx context.Context) ([]domain.Book, error) {
+	rows, err := r.db.QueryContext(ctx,
+		`SELECT id, title, author, isbn, price_cents FROM books ORDER BY title`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []domain.Book
+	for rows.Next() {
+		var b domain.Book
+		if err := rows.Scan(&b.ID, &b.Title, &b.Author, &b.ISBN, &b.Price); err != nil {
+			return nil, err
+		}
+		out = append(out, b)
+	}
+	return out, rows.Err()
+}
+
+func (r *BookRepo) Get(ctx context.Context, id string) (domain.Book, error) {
+	var b domain.Book
+	err := r.db.QueryRowContext(ctx,
+		`SELECT id, title, author, isbn, price_cents FROM books WHERE id = $1`, id,
+	).Scan(&b.ID, &b.Title, &b.Author, &b.ISBN, &b.Price)
+	if errors.Is(err, sql.ErrNoRows) {
+		return domain.Book{}, fmt.Errorf("book %s: %w", id, errNotFound)
+	}
+	return b, err
+}
+
+func (r *BookRepo) Create(ctx context.Context, b domain.Book) (domain.Book, error) {
+	if b.ID == "" {
+		b.ID = uuid.NewString()
+	}
+	_, err := r.db.ExecContext(ctx,
+		`INSERT INTO books (id, title, author, isbn, price_cents)
+		 VALUES ($1,$2,$3,$4,$5)`,
+		b.ID, b.Title, b.Author, b.ISBN, b.Price,
+	)
+	return b, err
+}
+```
+
+Define a package-level `errNotFound` (or domain sentinel) so handlers map to 404 with `errors.Is`.
+
+## In-memory repository (demo + tests)
+
+```go
+package memory
+
+import (
+	"context"
+	"fmt"
+	"sync"
+
+	"example.com/bookstore/internal/domain"
+	"github.com/google/uuid"
+)
+
+type BookRepo struct {
+	mu   sync.RWMutex
+	byID map[string]domain.Book
+}
+
+func NewBookRepo() *BookRepo {
+	return &BookRepo{byID: map[string]domain.Book{}}
+}
+
+func (r *BookRepo) List(ctx context.Context) ([]domain.Book, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	out := make([]domain.Book, 0, len(r.byID))
+	for _, b := range r.byID {
+		out = append(out, b)
+	}
+	return out, nil
+}
+
+func (r *BookRepo) Get(ctx context.Context, id string) (domain.Book, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	b, ok := r.byID[id]
+	if !ok {
+		return domain.Book{}, fmt.Errorf("not found")
+	}
+	return b, nil
+}
+
+func (r *BookRepo) Create(ctx context.Context, b domain.Book) (domain.Book, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if b.ID == "" {
+		b.ID = uuid.NewString()
+	}
+	if _, exists := r.byID[b.ID]; exists {
+		return domain.Book{}, fmt.Errorf("duplicate id")
+	}
+	r.byID[b.ID] = b
+	return b, nil
+}
+```
+
+Use memory in early chapters and unit tests; switch `main` to Postgres when ready.
+
+## Transactions
+
+Checkout / multi-table writes need transactions:
+
+```go
+tx, err := db.BeginTx(ctx, nil)
+if err != nil {
+	return err
+}
+defer tx.Rollback() // no-op after Commit
+
+// tx.ExecContext(...); tx.ExecContext(...)
+return tx.Commit()
+```
+
+Keep transactions short. Do not hold a tx open across external HTTP calls (payment gateway)—prepare locally, then commit, or use outbox patterns later.
+
+## N+1 and simple query design
+
+Bad: list books, then one query per author detail in a loop.  
+Good: join or batch IDs in one query.
+
+```sql
+SELECT b.id, b.title, a.name
+FROM books b
+JOIN authors a ON a.id = b.author_id
+WHERE b.id = ANY($1);
+```
+
+## Connection errors vs not found
+
+| Situation | Handler response |
+|-----------|------------------|
+| `sql.ErrNoRows` | 404 |
+| Unique violation | 409 |
+| Context deadline | 504 or 503 |
+| Driver/network | 500 + log |
+
+Log the real error; return a safe client message.
+
+## Rules of thumb
+
+| Do | Don't |
+|----|--------|
+| Parameterized queries (`$1`, `?`) | String-concatenate user input into SQL |
+| Set pool limits | Leave unlimited open connections |
+| Hide SQL behind repositories | Scatter queries through every handler |
+| Test with memory or testcontainers | Require a full prod DB for every unit test |
+
+## Try next
+
+1. Add `Update` and `Delete` to both memory and SQL repos.
+2. Seed three sample books at startup in memory mode.
+3. Map unique ISBN conflicts to HTTP 409 in the create handler.

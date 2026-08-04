@@ -1,0 +1,687 @@
+---
+title: "Project: Simple Network Security Mini-Tools"
+---
+
+# Project: Simple Network Security Mini-Tools
+
+## Overview
+
+Build **`netsec`**, a small multi-command CLI of **minimal security helpers**—not a scanner suite, not Metasploit. Each subcommand is short, stdlib-only, and useful for day-to-day checks: TLS certs, security headers, banners, redirects, and local hygiene.
+
+Use only against systems you own or have permission to test.
+
+| Subcommand | Purpose |
+|------------|---------|
+| `tls` | Show cert expiry, SANs, issuer |
+| `headers` | Check common HTTP security headers |
+| `banner` | Read first bytes from a TCP service |
+| `redirects` | Follow HTTP redirect chain |
+| `cidr` | Test if an IP is inside a CIDR |
+| `cookies` | Inspect `Set-Cookie` flags |
+| `hash` | SHA-256 a file (integrity) |
+| `secret` | Naive secret-pattern scan on files |
+| `rand` | Generate a random token (crypto/rand) |
+| `listen` | Bind a port (check free / demos) |
+
+Pair with diagnostics from [317 netkit](317-project-network-cli-tools.qmd). Hardening depth: [17 Security](../17-security-hardening/170-security-hardening-index.qmd).
+
+## Goals
+
+1. One binary, many tiny verbs  
+2. Timeouts on every network call  
+3. Clear pass/fail exit codes for CI (`headers`, `tls --min-days`)  
+4. Stdout = facts; stderr = warnings  
+5. Keep each command under ~80 lines of real logic  
+
+## Scaffold
+
+```bash
+mkdir -p netsec/cmd/netsec netsec/internal/app
+cd netsec
+go mod init example.com/netsec
+```
+
+```text
+netsec/
+  cmd/netsec/main.go
+  internal/app/app.go
+  internal/app/tls.go
+  internal/app/headers.go
+  internal/app/banner.go
+  # ... one file per command is fine
+```
+
+### main + dispatch (same pattern as netkit)
+
+```go
+package main
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"os/signal"
+	"syscall"
+
+	"example.com/netsec/internal/app"
+)
+
+func main() {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	if err := app.New(os.Stdout, os.Stderr).Run(ctx, os.Args[1:]); err != nil {
+		fmt.Fprintln(os.Stderr, "netsec:", err)
+		os.Exit(app.ExitCode(err))
+	}
+}
+```
+
+```go
+// internal/app/app.go — switch on tls|headers|banner|...
+// ErrUsage → exit 2; other errors → exit 1; nil → 0
+```
+
+---
+
+## 1. `tls` — certificate peek
+
+```go
+func (a *App) cmdTLS(ctx context.Context, args []string) error {
+	fs := flag.NewFlagSet("tls", flag.ContinueOnError)
+	fs.SetOutput(a.Stderr)
+	addr := fs.String("addr", "", "host:port (default host:443)")
+	serverName := fs.String("servername", "", "SNI override")
+	minDays := fs.Int("min-days", 0, "fail if not valid at least this many days (0=off)")
+	timeout := fs.Duration("t", 8*time.Second, "timeout")
+	if err := fs.Parse(args); err != nil {
+		return ErrUsage
+	}
+	if fs.NArg() != 1 {
+		fmt.Fprintln(a.Stderr, "usage: netsec tls [flags] <host>")
+		return ErrUsage
+	}
+	host := fs.Arg(0)
+	target := *addr
+	if target == "" {
+		target = net.JoinHostPort(host, "443")
+	}
+	sni := *serverName
+	if sni == "" {
+		sni = host
+	}
+
+	d := &net.Dialer{Timeout: *timeout}
+	raw, err := d.DialContext(ctx, "tcp", target)
+	if err != nil {
+		return err
+	}
+	defer raw.Close()
+	_ = raw.SetDeadline(time.Now().Add(*timeout))
+
+	cfg := &tls.Config{ServerName: sni, MinVersion: tls.VersionTLS12}
+	conn := tls.Client(raw, cfg)
+	if err := conn.HandshakeContext(ctx); err != nil {
+		return err
+	}
+	defer conn.Close()
+
+	state := conn.ConnectionState()
+	if len(state.PeerCertificates) == 0 {
+		return fmt.Errorf("no peer certificates")
+	}
+	cert := state.PeerCertificates[0]
+	days := int(time.Until(cert.NotAfter).Hours() / 24)
+
+	fmt.Fprintf(a.Stdout, "subject\t%s\n", cert.Subject.CommonName)
+	fmt.Fprintf(a.Stdout, "issuer\t%s\n", cert.Issuer.CommonName)
+	fmt.Fprintf(a.Stdout, "not_before\t%s\n", cert.NotBefore.Format(time.RFC3339))
+	fmt.Fprintf(a.Stdout, "not_after\t%s\n", cert.NotAfter.Format(time.RFC3339))
+	fmt.Fprintf(a.Stdout, "days_left\t%d\n", days)
+	fmt.Fprintf(a.Stdout, "version\t%s\n", tls.VersionName(state.Version))
+	for _, san := range cert.DNSNames {
+		fmt.Fprintf(a.Stdout, "san\t%s\n", san)
+	}
+
+	if *minDays > 0 && days < *minDays {
+		return fmt.Errorf("cert expires in %d days (need >= %d)", days, *minDays)
+	}
+	if time.Now().After(cert.NotAfter) {
+		return fmt.Errorf("certificate expired")
+	}
+	return nil
+}
+```
+
+```bash
+go run ./cmd/netsec tls example.com
+go run ./cmd/netsec tls -min-days 14 example.com   # CI gate
+```
+
+---
+
+## 2. `headers` — security header checklist
+
+Minimal checks only—no full browser security model.
+
+```go
+var interesting = []string{
+	"Strict-Transport-Security",
+	"Content-Security-Policy",
+	"X-Content-Type-Options",
+	"X-Frame-Options",
+	"Referrer-Policy",
+	"Permissions-Policy",
+	"Cross-Origin-Opener-Policy",
+}
+
+func (a *App) cmdHeaders(ctx context.Context, args []string) error {
+	fs := flag.NewFlagSet("headers", flag.ContinueOnError)
+	fs.SetOutput(a.Stderr)
+	timeout := fs.Duration("t", 10*time.Second, "timeout")
+	strict := fs.Bool("strict", false, "exit 1 if any recommended header missing")
+	if err := fs.Parse(args); err != nil {
+		return ErrUsage
+	}
+	if fs.NArg() != 1 {
+		fmt.Fprintln(a.Stderr, "usage: netsec headers [-strict] <url>")
+		return ErrUsage
+	}
+	url := fs.Arg(0)
+
+	ctx, cancel := context.WithTimeout(ctx, *timeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return err
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
+
+	missing := 0
+	for _, h := range interesting {
+		v := resp.Header.Get(h)
+		if v == "" {
+			missing++
+			fmt.Fprintf(a.Stdout, "MISSING\t%s\n", h)
+		} else {
+			fmt.Fprintf(a.Stdout, "OK\t%s\t%s\n", h, v)
+		}
+	}
+	if *strict && missing > 0 {
+		return fmt.Errorf("%d recommended headers missing", missing)
+	}
+	return nil
+}
+```
+
+```bash
+go run ./cmd/netsec headers https://example.com
+go run ./cmd/netsec headers -strict https://example.com
+```
+
+---
+
+## 3. `banner` — first bytes (service fingerprint sketch)
+
+```go
+func (a *App) cmdBanner(ctx context.Context, args []string) error {
+	fs := flag.NewFlagSet("banner", flag.ContinueOnError)
+	fs.SetOutput(a.Stderr)
+	timeout := fs.Duration("t", 3*time.Second, "timeout")
+	max := fs.Int("n", 256, "max bytes to read")
+	if err := fs.Parse(args); err != nil {
+		return ErrUsage
+	}
+	if fs.NArg() != 1 {
+		fmt.Fprintln(a.Stderr, "usage: netsec banner host:port")
+		return ErrUsage
+	}
+	addr := fs.Arg(0)
+
+	d := net.Dialer{Timeout: *timeout}
+	conn, err := d.DialContext(ctx, "tcp", addr)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(*timeout))
+
+	// some services need a poke (HTTP)
+	_, _ = io.WriteString(conn, "\r\n")
+
+	buf := make([]byte, *max)
+	n, err := conn.Read(buf)
+	if n > 0 {
+		// printable-ish for terminals
+		s := strings.Map(func(r rune) rune {
+			if r >= 32 && r < 127 || r == '\n' || r == '\r' || r == '\t' {
+				return r
+			}
+			return '.'
+		}, string(buf[:n]))
+		fmt.Fprint(a.Stdout, s)
+		if !strings.HasSuffix(s, "\n") {
+			fmt.Fprintln(a.Stdout)
+		}
+	}
+	if err != nil && !errors.Is(err, io.EOF) {
+		// timeout with partial banner is still useful
+		if n == 0 {
+			return err
+		}
+	}
+	return nil
+}
+```
+
+```bash
+go run ./cmd/netsec banner example.com:80
+go run ./cmd/netsec banner 127.0.0.1:22
+```
+
+---
+
+## 4. `redirects` — chain walk
+
+```go
+func (a *App) cmdRedirects(ctx context.Context, args []string) error {
+	fs := flag.NewFlagSet("redirects", flag.ContinueOnError)
+	fs.SetOutput(a.Stderr)
+	max := fs.Int("max", 10, "max hops")
+	timeout := fs.Duration("t", 10*time.Second, "timeout")
+	if err := fs.Parse(args); err != nil {
+		return ErrUsage
+	}
+	if fs.NArg() != 1 {
+		return ErrUsage
+	}
+	url := fs.Arg(0)
+	client := &http.Client{
+		Timeout: *timeout,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse // manual walk
+		},
+	}
+
+	for i := 0; i < *max; i++ {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+		if err != nil {
+			return err
+		}
+		resp, err := client.Do(req)
+		if err != nil {
+			return err
+		}
+		loc := resp.Header.Get("Location")
+		fmt.Fprintf(a.Stdout, "%d\t%d\t%s\n", i, resp.StatusCode, url)
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 8<<10))
+		resp.Body.Close()
+
+		if resp.StatusCode < 300 || resp.StatusCode >= 400 || loc == "" {
+			return nil
+		}
+		next, err := resp.Request.URL.Parse(loc)
+		if err != nil {
+			return err
+		}
+		// weak open-redirect hint: scheme jump to different host
+		if i == 0 {
+			// continue
+		}
+		url = next.String()
+	}
+	return fmt.Errorf("too many redirects (>%d)", *max)
+}
+```
+
+```bash
+go run ./cmd/netsec redirects http://example.com
+```
+
+---
+
+## 5. `cidr` — membership check
+
+```go
+func (a *App) cmdCIDR(ctx context.Context, args []string) error {
+	fs := flag.NewFlagSet("cidr", flag.ContinueOnError)
+	fs.SetOutput(a.Stderr)
+	if err := fs.Parse(args); err != nil {
+		return ErrUsage
+	}
+	// netsec cidr <ip> <cidr>
+	if fs.NArg() != 2 {
+		fmt.Fprintln(a.Stderr, "usage: netsec cidr <ip> <cidr>")
+		return ErrUsage
+	}
+	ip := net.ParseIP(fs.Arg(0))
+	if ip == nil {
+		return fmt.Errorf("bad ip")
+	}
+	_, network, err := net.ParseCIDR(fs.Arg(1))
+	if err != nil {
+		return err
+	}
+	ok := network.Contains(ip)
+	fmt.Fprintf(a.Stdout, "%t\n", ok)
+	if !ok {
+		return fmt.Errorf("not in network")
+	}
+	return nil
+}
+```
+
+```bash
+go run ./cmd/netsec cidr 10.0.0.5 10.0.0.0/8 ; echo $?
+```
+
+Useful in allowlist scripts and tiny policy checks.
+
+---
+
+## 6. `cookies` — flag hygiene
+
+```go
+func (a *App) cmdCookies(ctx context.Context, args []string) error {
+	fs := flag.NewFlagSet("cookies", flag.ContinueOnError)
+	fs.SetOutput(a.Stderr)
+	timeout := fs.Duration("t", 10*time.Second, "timeout")
+	strict := fs.Bool("strict", false, "fail if session-like cookie lacks Secure+HttpOnly")
+	if err := fs.Parse(args); err != nil {
+		return ErrUsage
+	}
+	if fs.NArg() != 1 {
+		return ErrUsage
+	}
+	ctx, cancel := context.WithTimeout(ctx, *timeout)
+	defer cancel()
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, fs.Arg(0), nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
+
+	bad := 0
+	for _, c := range resp.Cookies() {
+		fmt.Fprintf(a.Stdout, "name=%s secure=%v httponly=%v samesite=%v\n",
+			c.Name, c.Secure, c.HttpOnly, c.SameSite)
+		// heuristic: names containing session/token
+		n := strings.ToLower(c.Name)
+		if strings.Contains(n, "session") || strings.Contains(n, "token") || strings.Contains(n, "sid") {
+			if !c.Secure || !c.HttpOnly {
+				bad++
+				fmt.Fprintf(a.Stderr, "warn: %s should be Secure+HttpOnly\n", c.Name)
+			}
+		}
+	}
+	if *strict && bad > 0 {
+		return fmt.Errorf("%d weak cookies", bad)
+	}
+	return nil
+}
+```
+
+---
+
+## 7. `hash` — file integrity
+
+```go
+func (a *App) cmdHash(ctx context.Context, args []string) error {
+	fs := flag.NewFlagSet("hash", flag.ContinueOnError)
+	fs.SetOutput(a.Stderr)
+	if err := fs.Parse(args); err != nil {
+		return ErrUsage
+	}
+	if fs.NArg() < 1 {
+		fmt.Fprintln(a.Stderr, "usage: netsec hash <files...>")
+		return ErrUsage
+	}
+	for _, path := range fs.Args() {
+		f, err := os.Open(path)
+		if err != nil {
+			return err
+		}
+		h := sha256.New()
+		if _, err := io.Copy(h, f); err != nil {
+			f.Close()
+			return err
+		}
+		f.Close()
+		fmt.Fprintf(a.Stdout, "%x  %s\n", h.Sum(nil), path)
+	}
+	return nil
+}
+```
+
+```bash
+go run ./cmd/netsec hash ./cmd/netsec/main.go
+```
+
+---
+
+## 8. `secret` — naive leak hunt (local files)
+
+**Not** a replacement for gitleaks/trufflehog—teaching regex + walk.
+
+```go
+var patterns = []*regexp.Regexp{
+	regexp.MustCompile(`(?i)api[_-]?key\s*[:=]\s*['"][^'"]{8,}`),
+	regexp.MustCompile(`(?i)secret\s*[:=]\s*['"][^'"]{8,}`),
+	regexp.MustCompile(`AKIA[0-9A-Z]{16}`), // AWS key id shape
+	regexp.MustCompile(`-----BEGIN (RSA |EC )?PRIVATE KEY-----`),
+}
+
+func (a *App) cmdSecret(ctx context.Context, args []string) error {
+	fs := flag.NewFlagSet("secret", flag.ContinueOnError)
+	fs.SetOutput(a.Stderr)
+	root := fs.String("root", ".", "directory")
+	if err := fs.Parse(args); err != nil {
+		return ErrUsage
+	}
+	found := 0
+	err := filepath.WalkDir(*root, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if d.IsDir() {
+			name := d.Name()
+			if name == ".git" || name == "node_modules" || name == "vendor" {
+				return fs.SkipDir
+			}
+			return nil
+		}
+		// skip large / binary-ish
+		info, err := d.Info()
+		if err != nil || info.Size() > 1<<20 {
+			return nil
+		}
+		b, err := os.ReadFile(path)
+		if err != nil {
+			return nil
+		}
+		if bytes.IndexByte(b, 0) >= 0 {
+			return nil // binary
+		}
+		for _, re := range patterns {
+			if re.Find(b) != nil {
+				found++
+				fmt.Fprintf(a.Stdout, "%s\t%s\n", path, re.String())
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	if found > 0 {
+		return fmt.Errorf("found %d potential secret matches", found)
+	}
+	return nil
+}
+```
+
+```bash
+go run ./cmd/netsec secret -root .
+```
+
+---
+
+## 9. `rand` — tokens with crypto/rand
+
+```go
+func (a *App) cmdRand(ctx context.Context, args []string) error {
+	fs := flag.NewFlagSet("rand", flag.ContinueOnError)
+	fs.SetOutput(a.Stderr)
+	n := fs.Int("n", 32, "bytes of entropy")
+	hexOut := fs.Bool("hex", true, "hex encode (false=raw base64)")
+	if err := fs.Parse(args); err != nil {
+		return ErrUsage
+	}
+	b := make([]byte, *n)
+	if _, err := rand.Read(b); err != nil {
+		return err
+	}
+	if *hexOut {
+		fmt.Fprintf(a.Stdout, "%x\n", b)
+	} else {
+		fmt.Fprintln(a.Stdout, base64.RawURLEncoding.EncodeToString(b))
+	}
+	return nil
+}
+```
+
+Never use `math/rand` for tokens or session IDs.
+
+---
+
+## 10. `listen` — bind check / tiny sink
+
+```go
+func (a *App) cmdListen(ctx context.Context, args []string) error {
+	fs := flag.NewFlagSet("listen", flag.ContinueOnError)
+	fs.SetOutput(a.Stderr)
+	addr := fs.String("addr", "127.0.0.1:0", "listen address (:0 = ephemeral)")
+	if err := fs.Parse(args); err != nil {
+		return ErrUsage
+	}
+	ln, err := net.Listen("tcp", *addr)
+	if err != nil {
+		return err // port in use / permission
+	}
+	defer ln.Close()
+	fmt.Fprintf(a.Stdout, "listening\t%s\n", ln.Addr().String())
+	// wait until cancel — useful smoke for firewall demos
+	<-ctx.Done()
+	return nil
+}
+```
+
+```bash
+go run ./cmd/netsec listen -addr 127.0.0.1:9999
+# Ctrl-C to stop
+```
+
+---
+
+## Wire the switch
+
+```go
+func (a *App) Run(ctx context.Context, args []string) error {
+	if len(args) < 1 {
+		return a.usage()
+	}
+	switch args[0] {
+	case "tls":
+		return a.cmdTLS(ctx, args[1:])
+	case "headers":
+		return a.cmdHeaders(ctx, args[1:])
+	case "banner":
+		return a.cmdBanner(ctx, args[1:])
+	case "redirects":
+		return a.cmdRedirects(ctx, args[1:])
+	case "cidr":
+		return a.cmdCIDR(ctx, args[1:])
+	case "cookies":
+		return a.cmdCookies(ctx, args[1:])
+	case "hash":
+		return a.cmdHash(ctx, args[1:])
+	case "secret":
+		return a.cmdSecret(ctx, args[1:])
+	case "rand":
+		return a.cmdRand(ctx, args[1:])
+	case "listen":
+		return a.cmdListen(ctx, args[1:])
+	default:
+		return a.usage()
+	}
+}
+```
+
+---
+
+## Minimal tests
+
+```go
+func TestCIDR(t *testing.T) {
+	_, n, _ := net.ParseCIDR("10.0.0.0/8")
+	if !n.Contains(net.ParseIP("10.1.2.3")) {
+		t.Fatal("expected contain")
+	}
+}
+
+func TestRandLen(t *testing.T) {
+	b := make([]byte, 16)
+	if _, err := rand.Read(b); err != nil {
+		t.Fatal(err)
+	}
+}
+```
+
+Network-backed commands: test with `httptest` for `headers` / `cookies` (inject a test server that sets headers).
+
+---
+
+## Suggested lab order
+
+```text
+1. hash + rand          (no network)
+2. cidr                 (pure logic)
+3. tls + headers        (HTTPS)
+4. banner + redirects   (TCP/HTTP)
+5. cookies + secret     (hygiene)
+6. listen               (local)
+```
+
+## Ethics & scope
+
+| Do | Don't |
+|----|--------|
+| Test your apps and labs | Scan random internet hosts |
+| Use `-strict` in **your** CI | Treat this as a pentest platform |
+| Document false positives (`secret`) | Commit real secrets to fix tests |
+
+## Stretch (still minimal)
+
+1. `tls --json` for monitors  
+2. `headers` allowlist config file  
+3. Merge `netsec` under `netkit sec …` as a Cobra parent  
+4. `tls` print leaf + intermediates briefly  
+5. Simple **HSTS** max-age parser  
+
+## Acceptance checklist
+
+- [ ] `tls example.com` prints `days_left`  
+- [ ] `tls -min-days 30` fails near expiry (simulate with low threshold)  
+- [ ] `headers -strict` non-zero when headers missing  
+- [ ] `hash` matches `shasum -a 256` on a file  
+- [ ] `secret` finds a planted fake `api_key=...` in a temp file  
+- [ ] `rand -n 16` prints 32 hex chars  
+- [ ] Misuse exits 2  
+
+These tools stay **small on purpose**: enough to learn `crypto/tls`, `net/http`, and safe CLI habits—without building a security product.
