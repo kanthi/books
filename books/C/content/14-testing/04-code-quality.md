@@ -1,6 +1,12 @@
 # Code Quality
 
-Code quality is a measure of how well software code meets specified requirements and satisfies user needs. High-quality code is not only functional but also maintainable, readable, and efficient. This chapter explores various aspects of code quality in C programming and best practices to achieve it.
+Code quality is a measure of how well software code meets specified requirements and satisfies user needs. High-quality code is not only functional but also maintainable, readable, and efficient. This chapter explores various aspects of code quality in C programming and best practices to achieve it — with **complete programs** you can compile under a strict warning set.
+
+```bash
+gcc -std=c17 -Wall -Wextra -Wpedantic -Werror -o prog prog.c
+```
+
+Treat `-Werror` as a quality gate once the code is past the first sketch.
 
 ## Introduction to Code Quality
 
@@ -498,6 +504,365 @@ double calculate_discount(double price, CustomerType customer_type, int quantity
 }
 ```
 
+## Full Programs: Quality Gates You Can Run Locally
+
+### Program 1 — Strict-warning “clean” module (`clamp_lib`)
+
+A small pure function plus a self-test binary. Clean under `-Werror`.
+
+```c
+/* file: clamp.c */
+#include <stdio.h>
+#include <stdlib.h>
+#include <limits.h>
+
+/* Returns x clamped to [lo, hi]. If lo > hi, returns lo (documented choice). */
+int clamp(int x, int lo, int hi) {
+    if (lo > hi) {
+        return lo;
+    }
+    if (x < lo) {
+        return lo;
+    }
+    if (x > hi) {
+        return hi;
+    }
+    return x;
+}
+
+#ifdef CLAMP_MAIN
+int main(void) {
+    struct {
+        int x, lo, hi, want;
+    } cases[] = {
+        {5, 0, 10, 5},
+        {-1, 0, 10, 0},
+        {99, 0, 10, 10},
+        {0, 0, 0, 0},
+        {INT_MAX, 0, 10, 10},
+        {INT_MIN, -10, 10, -10},
+    };
+    size_t i;
+    int failed = 0;
+
+    for (i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+        int got = clamp(cases[i].x, cases[i].lo, cases[i].hi);
+        if (got != cases[i].want) {
+            fprintf(stderr, "case %zu: clamp(%d,%d,%d)=%d want %d\n",
+                    i, cases[i].x, cases[i].lo, cases[i].hi, got, cases[i].want);
+            failed = 1;
+        }
+    }
+    if (failed) {
+        return EXIT_FAILURE;
+    }
+    puts("clamp: all cases passed");
+    return EXIT_SUCCESS;
+}
+#endif
+```
+
+```bash
+gcc -std=c17 -Wall -Wextra -Wpedantic -Werror -DCLAMP_MAIN -o clamp_test clamp.c
+./clamp_test
+```
+
+### Program 2 — Warning archaeology (`smell.c` → `clean.c`)
+
+Start with a deliberately smelly program, record warnings, then fix.
+
+```c
+/* file: smell.c — DO NOT ship; for warning lab only */
+#include <stdio.h>
+#include <string.h>
+
+int helper();  /* no prototype details */
+
+int main() {
+    int unused;
+    char buf[8];
+    char *p = 0;
+
+    strcpy(buf, "toolongforbuffer");  /* overflow risk */
+    if (p)
+        printf("%s\n", p);
+    printf("%d\n", helper(1, 2));
+    return 0;
+}
+
+int helper(int a, int b) {
+    return a + b;
+}
+```
+
+```bash
+gcc -std=c17 -Wall -Wextra -Wpedantic -c smell.c 2> smell_warnings.txt
+cat smell_warnings.txt
+```
+
+Clean rewrite:
+
+```c
+/* file: clean.c */
+#include <stdio.h>
+#include <string.h>
+
+static int helper(int a, int b);
+
+int main(void) {
+    char buf[8];
+
+    /* bounded copy + explicit truncation detection */
+    if (snprintf(buf, sizeof buf, "%s", "toolongforbuffer") >= (int)sizeof buf) {
+        fprintf(stderr, "warning: truncated\n");
+    }
+    printf("buf=\"%s\"\n", buf);
+    printf("sum=%d\n", helper(1, 2));
+    return 0;
+}
+
+static int helper(int a, int b) {
+    return a + b;
+}
+```
+
+```bash
+gcc -std=c17 -Wall -Wextra -Wpedantic -Werror -o clean clean.c
+./clean
+```
+
+### Program 3 — Complexity reduction: nested ifs → early return
+
+```c
+/* file: access.c */
+#include <stdio.h>
+#include <stdbool.h>
+
+struct User {
+    bool active;
+    bool banned;
+    int age;
+    int role;  /* 0 guest, 1 user, 2 admin */
+};
+
+/* Opaque quality: one exit path per failure reason, easy to test. */
+const char *can_edit(const struct User *u) {
+    if (u == NULL) {
+        return "null user";
+    }
+    if (!u->active) {
+        return "inactive";
+    }
+    if (u->banned) {
+        return "banned";
+    }
+    if (u->age < 13) {
+        return "underage";
+    }
+    if (u->role < 1) {
+        return "guest cannot edit";
+    }
+    return NULL;  /* allowed */
+}
+
+int main(void) {
+    struct User samples[] = {
+        {true, false, 20, 1},
+        {false, false, 20, 1},
+        {true, true, 20, 2},
+        {true, false, 10, 1},
+        {true, false, 25, 0},
+    };
+    size_t i;
+
+    for (i = 0; i < sizeof samples / sizeof samples[0]; i++) {
+        const char *err = can_edit(&samples[i]);
+        if (err == NULL) {
+            printf("sample %zu: OK\n", i);
+        } else {
+            printf("sample %zu: DENY (%s)\n", i, err);
+        }
+    }
+    return 0;
+}
+```
+
+```bash
+gcc -std=c17 -Wall -Wextra -Wpedantic -Werror -o access access.c
+./access
+```
+
+### Program 4 — Static assertions and size contracts
+
+```c
+/* file: layout_check.c */
+#include <stdio.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <assert.h>
+
+struct PacketHdr {
+    uint16_t type;
+    uint16_t len;
+    uint32_t id;
+};
+
+/* Catch ABI surprises at compile time */
+_Static_assert(sizeof(struct PacketHdr) == 8, "PacketHdr must be 8 bytes");
+_Static_assert(offsetof(struct PacketHdr, id) == 4, "id offset");
+
+int main(void) {
+    struct PacketHdr h = {1, 16, 42};
+    printf("type=%u len=%u id=%u size=%zu\n",
+           h.type, h.len, h.id, sizeof h);
+    return 0;
+}
+```
+
+```bash
+gcc -std=c17 -Wall -Wextra -Wpedantic -Werror -o layout_check layout_check.c
+./layout_check
+```
+
+### Program 5 — Local quality script (`check.sh` + target)
+
+```c
+/* file: avg.c */
+#include <stdio.h>
+#include <stdlib.h>
+
+double average(const int *a, size_t n) {
+    size_t i;
+    long sum = 0;
+
+    if (a == NULL || n == 0) {
+        return 0.0;
+    }
+    for (i = 0; i < n; i++) {
+        sum += a[i];
+    }
+    return (double)sum / (double)n;
+}
+
+int main(void) {
+    int v[] = {1, 2, 3, 4};
+    printf("%.2f\n", average(v, 4));
+    return 0;
+}
+```
+
+```bash
+# file: check.sh
+#!/usr/bin/env bash
+set -euo pipefail
+CFLAGS=(-std=c17 -Wall -Wextra -Wpedantic -Werror -g)
+gcc "${CFLAGS[@]}" -o avg avg.c
+./avg
+# optional tools if installed:
+if command -v cppcheck >/dev/null; then
+  cppcheck --enable=warning,style --error-exitcode=1 avg.c
+fi
+if command -v valgrind >/dev/null; then
+  valgrind --error-exitcode=1 --leak-check=full ./avg
+fi
+echo "quality gate: OK"
+```
+
+```bash
+chmod +x check.sh
+./check.sh
+```
+
+### Program 6 — Review checklist applied to a PR-sized change
+
+Before you merge any non-trivial C change, walk this list (paste into PR template if you want):
+
+```text
+[ ] Builds with -std=c17 -Wall -Wextra (and -Werror in CI)
+[ ] No new compiler warnings
+[ ] Every public function documents ownership (who frees?)
+[ ] Error paths free / close what success paths free / close
+[ ] No unbounded strcpy/sprintf/gets
+[ ] Integer sizes / casts reviewed for truncation
+[ ] Tests or a tiny main demo for the changed logic
+[ ] Sanitizer or Valgrind run if memory/pointers touched
+```
+
+Example “before” (fails several checks):
+
+```c
+char *load(const char *path) {
+    FILE *fp = fopen(path, "r");
+    char *buf = malloc(1024);
+    fread(buf, 1, 1024, fp);  /* no checks, no NUL, leak on error */
+    return buf;
+}
+```
+
+Example “after”:
+
+```c
+/* file: load_text.c */
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <errno.h>
+
+/* Caller frees the returned buffer. Returns NULL on error. */
+char *load_text(const char *path, size_t max_n) {
+    FILE *fp;
+    char *buf;
+    size_t n;
+
+    if (path == NULL || max_n == 0) {
+        return NULL;
+    }
+    fp = fopen(path, "rb");
+    if (fp == NULL) {
+        return NULL;
+    }
+    buf = malloc(max_n + 1);
+    if (buf == NULL) {
+        fclose(fp);
+        return NULL;
+    }
+    n = fread(buf, 1, max_n, fp);
+    if (ferror(fp)) {
+        free(buf);
+        fclose(fp);
+        return NULL;
+    }
+    buf[n] = '\0';
+    fclose(fp);
+    return buf;
+}
+
+int main(int argc, char *argv[]) {
+    char *s;
+
+    if (argc != 2) {
+        fprintf(stderr, "Usage: %s <file>\n", argv[0]);
+        return EXIT_FAILURE;
+    }
+    s = load_text(argv[1], 4096);
+    if (s == NULL) {
+        fprintf(stderr, "load failed: %s\n", strerror(errno));
+        return EXIT_FAILURE;
+    }
+    fputs(s, stdout);
+    free(s);
+    return EXIT_SUCCESS;
+}
+```
+
+```bash
+gcc -std=c17 -Wall -Wextra -Wpedantic -Werror -o load_text load_text.c
+echo 'hello quality' > t.txt
+./load_text t.txt
+```
+
+---
+
 ## Continuous Integration and Quality Gates
 
 Continuous Integration (CI) helps maintain code quality by automatically testing and validating changes.
@@ -522,28 +887,70 @@ on: [push, pull_request]
 jobs:
   build:
     runs-on: ubuntu-latest
-    
+
     steps:
-    - uses: actions/checkout@v2
-    
+    - uses: actions/checkout@v4
+
     - name: Install dependencies
       run: |
         sudo apt-get update
         sudo apt-get install -y gcc valgrind cppcheck
-    
-    - name: Compile with warnings
-      run: gcc -Wall -Wextra -Werror -o program program.c
-    
+
+    - name: Compile with warnings as errors
+      run: gcc -std=c17 -Wall -Wextra -Wpedantic -Werror -o program program.c
+
     - name: Static analysis
-      run: cppcheck --enable=all --error-exitcode=1 .
-    
+      run: cppcheck --enable=warning,style --error-exitcode=1 .
+
     - name: Run tests
       run: ./run_tests.sh
-    
+
     - name: Memory check
-      run: valgrind --error-exitcode=1 ./program
+      run: valgrind --error-exitcode=1 --leak-check=full ./program
 ```
+
+### Local gate ≈ CI gate
+
+If it does not pass `check.sh` on your laptop, it should not pass in CI. Keep the same flags in both places.
+
+---
+
+## Exercises
+
+```bash
+gcc -std=c17 -Wall -Wextra -Wpedantic -Werror -o exN exN.c
+```
+
+1. **Warning farm** — Write a 20-line file that triggers at least four distinct `-Wall -Wextra` diagnostics. Fix them one by one until `-Werror` is clean. Keep the smelly version in a comment.
+
+2. **`clamp` table** — Add five more edge cases to `clamp_test` (including `lo > hi`) and make the policy explicit in a comment.
+
+3. **Refactor nest** — Take a function with three nested `if`s from your own code (or invent one) and rewrite with early returns. Confirm behavior with a small table of cases.
+
+4. **`_Static_assert`** — Define a struct with intentional padding; assert `sizeof` and an `offsetof`. Change a field type and watch the assert fire.
+
+5. **`load_text` growth** — Extend `load_text` to grow with `realloc` until EOF (cap at e.g. 1 MiB). Prove no leaks under Valgrind or ASan.
+
+6. **`check.sh` for multi-file** — Point the script at `main.c` + `util.c`, fail the script if any command fails, and add an optional sanitizer build.
+
+7. **Review role-play** — Review `smell.c` as if it were a PR. Write five bullet comments a reviewer should leave.
+
+8. **Complexity budget** — Count decision points (`if`/`case`/`&&`/`||`/`for`/`while`) in one function; if over 10, split it.
+
+---
 
 ## Conclusion
 
-Code quality is not a one-time achievement but an ongoing commitment. By following established coding standards, conducting regular code reviews, using automated tools, and continuously refactoring, developers can maintain high-quality codebases that are robust, maintainable, and secure. The investment in code quality pays dividends throughout the software lifecycle, reducing bugs, improving maintainability, and enhancing the overall developer experience.
+Code quality is not a one-time achievement but an ongoing commitment. By following established coding standards, conducting regular code reviews, using automated tools, and continuously refactoring, developers can maintain high-quality codebases that are robust, maintainable, and secure.
+
+Practical baseline for this book:
+
+| Gate | Command / habit |
+|------|------------------|
+| Warnings | `-Wall -Wextra -Wpedantic` (+ `-Werror` in CI) |
+| Memory | ASan/UBSan or Valgrind on pointer-heavy changes |
+| Structure | Early returns, clear ownership, small functions |
+| Proof | Table-driven tests or a tiny self-check `main` |
+| Process | Checklist + same flags locally and in CI |
+
+The investment in code quality pays dividends throughout the software lifecycle, reducing bugs, improving maintainability, and enhancing the overall developer experience.

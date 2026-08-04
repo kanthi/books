@@ -2,332 +2,529 @@
 
 ## Introduction
 
-In this chapter, we'll write and run your first C program. This will introduce you to the basic structure of C programs, the compilation process, and how to execute your code.
+This chapter moves from “what C is” to a working edit–compile–run loop. You will write complete programs, read compiler diagnostics, split a tiny program across multiple files, and finish a short lab (personal info printer + unit converter).
 
-## The Classic "Hello, World!" Program
+Default compile line for every example:
 
-Let's start with the traditional first program in any language - printing "Hello, World!" to the screen:
+```bash
+gcc -std=c17 -Wall -Wextra -Wpedantic -o prog prog.c
+```
+
+---
+
+## The classic “Hello, World!”
 
 ```c
 #include <stdio.h>
 
-int main() {
+int main(void) {
     printf("Hello, World!\n");
     return 0;
 }
 ```
 
-Let's break down each part of this program:
+### Line-by-line
 
-### Preprocessor Directive
-```c
-#include <stdio.h>
-```
-This line tells the preprocessor to include the standard input/output library. The `#include` directive is processed before compilation and essentially copies the contents of the specified file into your program.
+| Piece | Meaning |
+|-------|---------|
+| `#include <stdio.h>` | Bring in declarations for standard I/O (`printf`, `scanf`, …). |
+| `int main(void)` | Entry point; returns an `int` status; no parameters. |
+| `printf(...)` | Library call writing to standard output. |
+| `\n` | Newline character in the string. |
+| `return 0;` | Report success to the operating system / shell. |
 
-### Main Function
-```c
-int main() {
-    // function body
-}
-```
-The `main()` function is the entry point of every C program. When you run your program, execution starts here. The `int` before `main` indicates that this function returns an integer value.
+### Create, compile, run
 
-### Function Body
-```c
-{
-    printf("Hello, World!\n");
-    return 0;
-}
-```
-The curly braces `{}` define the beginning and end of the function body. Everything between them is executed when the function is called.
-
-### Output Statement
-```c
-printf("Hello, World!\n");
-```
-This line calls the `printf()` function from the stdio library to print text to the console. The `\n` is an escape sequence that adds a newline character.
-
-### Return Statement
-```c
-return 0;
-```
-This statement returns the value 0 to the operating system, indicating that the program executed successfully.
-
-## Creating and Saving Your Program
-
-### Step 1: Create a New File
-Create a new file named `hello.c` using your preferred text editor or IDE.
-
-### Step 2: Type the Code
-Enter the following code into your file:
-
-```c
-#include <stdio.h>
-
-int main() {
-    printf("Hello, World!\n");
-    return 0;
-}
-```
-
-### Step 3: Save the File
-Save the file with the `.c` extension, which indicates it's a C source file.
-
-## Compilation Process
-
-Before you can run your C program, you need to compile it. Compilation is the process of translating human-readable source code into machine-readable binary code.
-
-### Using GCC
 ```bash
-gcc hello.c -o hello
-```
-
-This command:
-- `gcc` invokes the GNU Compiler Collection
-- `hello.c` specifies the source file to compile
-- `-o hello` specifies the name of the output executable file
-
-### Using Clang
-```bash
-clang hello.c -o hello
-```
-
-### Using Visual Studio (Windows)
-If you're using Visual Studio on Windows:
-1. Create a new C++ project
-2. Add your `.c` file to the project
-3. Build the project (Ctrl+Shift+B)
-
-## Running Your Program
-
-After successful compilation, you'll have an executable file. Run it using:
-
-### Linux/macOS
-```bash
+# create hello.c with your editor, then:
+gcc -std=c17 -Wall -Wextra -Wpedantic -o hello hello.c
 ./hello
 ```
 
-### Windows
-```cmd
-hello.exe
+On Windows (MinGW / similar), the executable may be `hello.exe`; run `hello` or `.\hello.exe` depending on your shell.
+
+---
+
+## What the compiler does (short version)
+
+```
+hello.c  →  preprocess  →  compile  →  assemble  →  link  →  hello
 ```
 
-You should see the output:
-```
-Hello, World!
-```
+| Stage | Flag to stop here | Output |
+|-------|-------------------|--------|
+| Preprocess | `-E` | Preprocessed source (`.i`) |
+| Compile to assembly | `-S` | Assembly (`.s`) |
+| Assemble only | `-c` | Object file (`.o`) |
+| Full link | (default) | Executable |
 
-## Understanding the Compilation Process
-
-The compilation process involves several stages:
-
-### 1. Preprocessing
-The preprocessor handles directives like `#include` and `#define`. It essentially performs text replacement before compilation.
-
-### 2. Compilation
-The compiler translates the preprocessed C code into assembly language.
-
-### 3. Assembly
-The assembler converts the assembly code into object code (machine code in binary format).
-
-### 4. Linking
-The linker combines the object code with any necessary library functions to create the final executable.
-
-## Exploring Compilation Steps Individually
-
-You can see each step of the compilation process:
-
-### Preprocessing Only
 ```bash
-gcc -E hello.c -o hello.i
+gcc -std=c17 -E hello.c -o hello.i
+gcc -std=c17 -S hello.c -o hello.s
+gcc -std=c17 -c hello.c -o hello.o
+gcc -o hello hello.o
 ```
 
-### Compilation to Assembly
+Useful flags you will reuse:
+
 ```bash
-gcc -S hello.c -o hello.s
+gcc -std=c17 -Wall -Wextra -Wpedantic -g -O0 -o hello hello.c   # debug-friendly
+gcc -std=c17 -Wall -Wextra -Wpedantic -O2 -o hello hello.c      # optimized release-ish
 ```
 
-### Assembly to Object Code
-```bash
-gcc -c hello.s -o hello.o
-```
+| Flag | Role |
+|------|------|
+| `-std=c17` | Language dialect |
+| `-Wall -Wextra -Wpedantic` | Strong warnings |
+| `-g` | Debug symbols (GDB/LLDB) |
+| `-O0` / `-O2` | Optimization level |
+| `-o name` | Output file name |
 
-### Linking
-```bash
-gcc hello.o -o hello
-```
+---
 
-## Common Compilation Flags
-
-### Debug Information
-```bash
-gcc -g hello.c -o hello
-```
-The `-g` flag includes debugging information, allowing you to use debuggers like GDB.
-
-### Warning Levels
-```bash
-gcc -Wall -Wextra hello.c -o hello
-```
-- `-Wall` enables most common warnings
-- `-Wextra` enables additional warnings
-
-### Optimization
-```bash
-gcc -O2 hello.c -o hello
-```
-The `-O2` flag enables level 2 optimizations.
-
-### C Standard Selection
-```bash
-gcc -std=c99 hello.c -o hello
-gcc -std=c11 hello.c -o hello
-gcc -std=c17 hello.c -o hello
-gcc -std=c23 hello.c -o hello
-```
-
-## Structure of a C Program
-
-Every C program follows a general structure:
+## Structure of a C program
 
 ```c
-/* Preprocessor Directives */
-#include <header_files.h>
-#define CONSTANTS
+/* 1. Preprocessor directives */
+#include <stdio.h>
+#define APP_NAME "demo"
 
-/* Global Declarations */
-int global_variable;
-void function_prototypes();
+/* 2. Optional global declarations / prototypes */
+void greet(const char *who);
 
-/* Main Function */
-int main() {
-    /* Local Declarations */
-    int local_variable;
-    
-    /* Statements */
-    printf("Hello, World!\n");
-    
+/* 3. main — required for hosted programs */
+int main(void) {
+    greet("World");
     return 0;
 }
 
-/* User-defined Functions */
-void function_definitions() {
-    // function code
+/* 4. Other function definitions */
+void greet(const char *who) {
+    printf("Hello, %s!\n", who);
 }
 ```
 
-### Key Components
+Order rules of thumb:
 
-1. **Preprocessor Directives**: Instructions processed before compilation
-2. **Global Declarations**: Variables and functions accessible throughout the program
-3. **Main Function**: Entry point of the program
-4. **Local Declarations**: Variables declared within functions
-5. **Statements**: Executable instructions
-6. **User-defined Functions**: Custom functions created by the programmer
+1. Includes and macros at the top.
+2. Prototypes before first use (or define functions before `main`).
+3. One clear `main`.
+4. Keep globals rare; prefer locals and parameters.
 
-## Comments in C
+### Comments
 
-Comments are used to document your code and are ignored by the compiler.
-
-### Single-line Comments
 ```c
-// This is a single-line comment
-int x = 5; // This comment is at the end of a line
-```
+// Single-line comment (C99+)
 
-### Multi-line Comments
-```c
 /*
-This is a multi-line comment
-that spans several lines
-*/
-int y = 10;
+ * Multi-line comment
+ * useful for file headers or longer notes
+ */
 ```
 
-## Common Beginner Mistakes
+Prefer comments that explain **why** or non-obvious constraints. Restating `i++` as “increment i” adds noise.
 
-### Missing Semicolons
-```c
-// Incorrect
-printf("Hello, World!\n")
+---
 
-// Correct
-printf("Hello, World!\n");
-```
+## More complete single-file examples
 
-### Missing Header Files
-```c
-// Incorrect - will cause compilation error
-int main() {
-    printf("Hello, World!\n");
-    return 0;
-}
+### Greeting with command-line arguments
 
-// Correct
-#include <stdio.h>
-
-int main() {
-    printf("Hello, World!\n");
-    return 0;
-}
-```
-
-### Case Sensitivity
-```c
-// Incorrect - C is case-sensitive
-Printf("Hello, World!\n");
-
-// Correct
-printf("Hello, World!\n");
-```
-
-### Forgetting Return Statement
-```c
-// Incorrect - may cause warnings
-int main() {
-    printf("Hello, World!\n");
-}
-
-// Correct
-int main() {
-    printf("Hello, World!\n");
-    return 0;
-}
-```
-
-## Variations of the Hello World Program
-
-### Without Return Statement (C99+)
-In C99 and later standards, you can omit the return statement in main:
-
-```c
-#include <stdio.h>
-
-int main() {
-    printf("Hello, World!\n");
-    // return 0; is implicit in C99+
-}
-```
-
-### With Command Line Arguments
 ```c
 #include <stdio.h>
 
 int main(int argc, char *argv[]) {
-    printf("Hello, World!\n");
-    printf("Program name: %s\n", argv[0]);
+    if (argc < 2) {
+        printf("Usage: %s <name>\n", argv[0]);
+        return 1;
+    }
+
+    printf("Hello, %s!\n", argv[1]);
+    printf("Argument count: %d\n", argc);
     return 0;
 }
 ```
 
-### With Function Prototypes
+```bash
+gcc -std=c17 -Wall -Wextra -Wpedantic -o greeter greeter.c
+./greeter Ada
+./greeter          # should print usage and exit non-zero
+```
+
+`argv[0]` is usually the program name as invoked. `argc` is the count of elements in `argv`.
+
+### Sum of two integers (with validation)
+
+```c
+#include <stdio.h>
+
+int main(void) {
+    int a, b;
+
+    printf("Enter two integers: ");
+    if (scanf("%d %d", &a, &b) != 2) {
+        fprintf(stderr, "error: expected two integers\n");
+        return 1;
+    }
+
+    printf("%d + %d = %d\n", a, b, a + b);
+    return 0;
+}
+```
+
+### Multiple helpers in one file
+
+```c
+#include <stdio.h>
+
+static int square(int x) {
+    return x * x;
+}
+
+static int max2(int a, int b) {
+    return (a > b) ? a : b;
+}
+
+int main(void) {
+    int x = 5;
+    int y = 12;
+
+    printf("square(%d) = %d\n", x, square(x));
+    printf("max(%d, %d) = %d\n", x, y, max2(x, y));
+    return 0;
+}
+```
+
+`static` on a function at file scope means “internal linkage”: the name is not exported to the linker for other `.c` files. That keeps helpers private to the translation unit.
+
+### Print a small banner
+
+```c
+#include <stdio.h>
+
+int main(void) {
+    puts("**************************");
+    puts("*   My First C Program   *");
+    puts("**************************");
+    return 0;
+}
+```
+
+`puts` appends a newline for you and is convenient for simple strings. Prefer `printf` when you need formatting.
+
+---
+
+## Multi-file tiny program
+
+Real projects split declarations (headers) from definitions (source files). Minimal pattern:
+
+**`util.h`**
+
+```c
+#ifndef UTIL_H
+#define UTIL_H
+
+int add(int a, int b);
+void print_sum(int a, int b);
+
+#endif /* UTIL_H */
+```
+
+**`util.c`**
+
+```c
+#include <stdio.h>
+#include "util.h"
+
+int add(int a, int b) {
+    return a + b;
+}
+
+void print_sum(int a, int b) {
+    printf("%d + %d = %d\n", a, b, add(a, b));
+}
+```
+
+**`main.c`**
+
+```c
+#include "util.h"
+
+int main(void) {
+    print_sum(3, 4);
+    return 0;
+}
+```
+
+### Build it
+
+```bash
+# Separate compile + link
+gcc -std=c17 -Wall -Wextra -Wpedantic -c util.c -o util.o
+gcc -std=c17 -Wall -Wextra -Wpedantic -c main.c -o main.o
+gcc -o multifile main.o util.o
+
+# Or one shot
+gcc -std=c17 -Wall -Wextra -Wpedantic -o multifile main.c util.c
+
+./multifile
+```
+
+### Why the include guard?
+
+```c
+#ifndef UTIL_H
+#define UTIL_H
+/* declarations */
+#endif
+```
+
+If two files include `util.h` and a third includes both, guards prevent duplicate declarations in one translation unit.
+
+### Header vs source rules
+
+| Put in `.h` | Put in `.c` |
+|-------------|-------------|
+| Function prototypes | Function bodies |
+| Shared `struct` types (later) | `static` helpers |
+| `extern` data declarations (rare) | Definitions of globals |
+
+Include your own headers with quotes: `#include "util.h"`. System headers use angle brackets: `#include <stdio.h>`.
+
+---
+
+## Common compile errors (with explanations)
+
+### Missing semicolon
+
+```c
+printf("hi\n")   /* error: expected ';' */
+```
+
+**Fix:** statements end with `;`. The diagnostic often points at the *next* line—check the previous statement.
+
+### Missing `#include <stdio.h>`
+
+```c
+int main(void) {
+    printf("hi\n");
+    return 0;
+}
+```
+
+**Symptom:** implicit declaration / unknown identifier `printf`.  
+**Fix:** include the proper header.
+
+### Wrong main spelling or signature
+
+```c
+int mian(void) { return 0; }
+```
+
+**Symptom:** linker error `undefined reference to main`.  
+**Fix:** the entry point must be named `main`.
+
+### Case sensitivity
+
+```c
+Printf("hi\n");  /* wrong */
+```
+
+**Fix:** `printf`, not `Printf`.
+
+### Undeclared function (multi-file)
+
+`main.c` calls `add` but never includes `util.h` and has no prototype:
+
+**Symptom:** implicit declaration warning/error, sometimes wrong assumptions about types.  
+**Fix:** `#include "util.h"` or declare `int add(int, int);` before use.
+
+### Multiple definition of a function
+
+Defining `int add(int a, int b) { ... }` in a header that two `.c` files include.
+
+**Symptom:** linker `multiple definition of add`.  
+**Fix:** declare in the header; define in exactly one `.c` file.
+
+### Forgetting to link a file
+
+```bash
+gcc -std=c17 -Wall -Wextra -Wpedantic -o multifile main.c
+# undefined reference to print_sum
+```
+
+**Fix:** include every translation unit: `main.c util.c`.
+
+### Format / type mismatch (warning)
+
+```c
+int x = 3;
+printf("%f\n", x);  /* wrong specifier for int */
+```
+
+**Fix:** use `%d` for `int`. Enable `-Wall`; modern GCC/Clang catch many of these.
+
+### Using `=` instead of `==` in a condition (logic bug; may still compile)
+
+```c
+int x = 0;
+if (x = 1) {  /* assignment; always true here */
+    printf("oops\n");
+}
+```
+
+**Mitigation:** `-Wall` often warns about suspicious assignments in conditions. Prefer clear comparisons.
+
+### Unterminated string
+
+```c
+printf("hello\n);
+```
+
+**Symptom:** missing terminating `"` / stray errors cascading.  
+**Fix:** close the string literal; recompile—cascading errors often shrink after the first fix.
+
+### Tips for reading diagnostics
+
+1. Start with the **first** error, not the last.
+2. Fix includes and syntax before chasing linker issues.
+3. Recompile after each fix; noise often disappears.
+4. If the message is opaque, reduce to a 10-line file that still fails.
+
+---
+
+## Lab A — Personal info printer
+
+**Goal:** print a short personal profile using variables and formatted output.
+
+```c
+#include <stdio.h>
+
+int main(void) {
+    char name[] = "Ada Lovelace";
+    int age = 36;
+    char city[] = "London";
+    char language[] = "C";
+    double years_experience = 2.5;
+
+    printf("==============================\n");
+    printf("       PERSONAL PROFILE\n");
+    printf("==============================\n");
+    printf("Name:       %s\n", name);
+    printf("Age:        %d\n", age);
+    printf("City:       %s\n", city);
+    printf("Language:   %s\n", language);
+    printf("Experience: %.1f years\n", years_experience);
+    printf("==============================\n");
+
+    return 0;
+}
+```
+
+```bash
+gcc -std=c17 -Wall -Wextra -Wpedantic -o profile profile.c
+./profile
+```
+
+**Lab stretch:**
+
+1. Change the data to your own details.
+2. Add a second `printf` block that re-prints the same data as a single comma-separated line.
+3. Replace hard-coded values with `scanf` / `fgets` input (after the next chapter if needed).
+
+---
+
+## Lab B — Unit converter
+
+**Goal:** convert between a few everyday units with a tiny menu.
+
+```c
+#include <stdio.h>
+
+int main(void) {
+    int choice;
+    double input;
+    double output;
+
+    printf("Unit converter\n");
+    printf("  1) kilometers to miles\n");
+    printf("  2) miles to kilometers\n");
+    printf("  3) kilograms to pounds\n");
+    printf("  4) pounds to kilograms\n");
+    printf("Select: ");
+
+    if (scanf("%d", &choice) != 1) {
+        fprintf(stderr, "Invalid menu selection\n");
+        return 1;
+    }
+
+    printf("Value: ");
+    if (scanf("%lf", &input) != 1) {
+        fprintf(stderr, "Invalid numeric value\n");
+        return 1;
+    }
+
+    switch (choice) {
+    case 1:
+        output = input * 0.621371;
+        printf("%.4f km = %.4f mi\n", input, output);
+        break;
+    case 2:
+        output = input * 1.60934;
+        printf("%.4f mi = %.4f km\n", input, output);
+        break;
+    case 3:
+        output = input * 2.20462;
+        printf("%.4f kg = %.4f lb\n", input, output);
+        break;
+    case 4:
+        output = input * 0.453592;
+        printf("%.4f lb = %.4f kg\n", input, output);
+        break;
+    default:
+        fprintf(stderr, "Unknown option %d\n", choice);
+        return 1;
+    }
+
+    return 0;
+}
+```
+
+```bash
+gcc -std=c17 -Wall -Wextra -Wpedantic -o units units.c
+./units
+```
+
+**Lab stretch:**
+
+1. Add Celsius ↔ Fahrenheit (reuse logic from the intro chapter).
+2. Split conversion formulas into functions in a second file (`convert.c` / `convert.h`) and link them.
+3. Loop the menu until the user chooses `0` to quit (preview of control flow).
+
+---
+
+## Variations worth knowing
+
+### Implicit `return 0` in `main` (C99+)
+
+```c
+#include <stdio.h>
+
+int main(void) {
+    printf("Hello, World!\n");
+}
+```
+
+Legal in C99 and later for `main` only. Prefer an explicit `return` while learning.
+
+### Prototype before `main`
+
 ```c
 #include <stdio.h>
 
 void print_greeting(void);
 
-int main() {
+int main(void) {
     print_greeting();
     return 0;
 }
@@ -337,30 +534,64 @@ void print_greeting(void) {
 }
 ```
 
-## Object Files and Executables
+### Using `stderr` for errors
 
-When you compile a C program, you can generate different types of output:
+```c
+#include <stdio.h>
 
-### Object File
-```bash
-gcc -c hello.c -o hello.o
+int main(void) {
+    fprintf(stderr, "This goes to standard error\n");
+    printf("This goes to standard output\n");
+    return 1;
+}
 ```
-An object file (.o or .obj) contains compiled code but is not yet executable.
 
-### Executable File
 ```bash
-gcc hello.c -o hello
+./prog >out.txt 2>err.txt
 ```
-An executable file can be run directly by the operating system.
+
+---
+
+## Beginner mistakes checklist
+
+| Mistake | Fix |
+|---------|-----|
+| Missing `;` | Terminate statements |
+| Missing header | `#include <stdio.h>` etc. |
+| `void main()` | Use `int main(void)` |
+| Calling without prototype | Declare or include header |
+| Ignoring warnings | Compile with `-Wall -Wextra -Wpedantic` |
+| Wrong file extension / dialect | Save as `.c`, pass `-std=c17` |
+| Editing the wrong directory | Confirm path before compile |
+| Running old binary | Rebuild after every edit |
+
+---
 
 ## Summary
 
-In this chapter, you've learned:
+- Every hosted C program needs a `main` and usually standard library headers for I/O.
+- Compilation is a pipeline; object files link into executables.
+- Multi-file programs separate **declarations** (headers) from **definitions** (sources).
+- Learn to read the **first** compiler/linker diagnostic.
+- Labs: personal profile printer and unit converter reinforce the full cycle.
 
-1. **Basic C Program Structure**: How to write a simple C program with `#include`, `main()`, and `printf()`
-2. **Compilation Process**: The steps from source code to executable
-3. **Running Programs**: How to execute your compiled programs
-4. **Common Syntax**: Essential elements like semicolons, braces, and comments
-5. **Compilation Flags**: Useful options for debugging, warnings, and optimization
+Next: *Basic Input and Output* — format strings, `scanf` pitfalls, and safer line input with `fgets`.
 
-This foundation will serve as the building block for all future C programming concepts. In the next chapter, we'll explore basic input and output operations in more detail.
+---
+
+## Exercises
+
+Compile each with:
+
+```bash
+gcc -std=c17 -Wall -Wextra -Wpedantic -o exN exN.c
+```
+
+1. **Banner** — Print a boxed title using only `printf` or `puts` (no user input).
+2. **Three-file arithmetic** — Create `mathx.h`, `mathx.c` (`mul`, `div_safe`), and `main.c`. `div_safe` should return `0` and print an error to `stderr` when dividing by zero (or use an `int` status code—your design, document it).
+3. **Argc printer** — Print all command-line arguments, one per line, including `argv[0]`.
+4. **Warning hunt** — Write a file that triggers at least two different warnings under `-Wall -Wextra`, then fix them. Save both versions in comments at the bottom of the file.
+5. **Profile lab upgrade** — Personal info printer that reads age with `scanf` and name with a fixed string or `scanf("%49s", ...)`.
+6. **Converter lab upgrade** — Add an option `0` to exit; use a loop if you already know `while`/`for`, otherwise document that the stretch is deferred.
+7. **Explain a log** — Deliberately omit `util.o` from a multi-file link command and paste the linker error into a comment; explain it in one sentence.
+8. **Style pass** — Reformat one lab with consistent indentation (4 spaces), braces on the same style throughout, and a one-line file header comment with your name and purpose.

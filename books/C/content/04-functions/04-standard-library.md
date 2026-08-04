@@ -4,6 +4,14 @@
 
 The C standard library is a collection of functions, macros, and type definitions that are part of the C programming language specification. These functions provide essential functionality for input/output operations, string manipulation, mathematical computations, memory management, and more. Understanding and effectively using the standard library is crucial for C programmers as it provides a foundation for building robust applications.
 
+This chapter mixes **API maps** with **complete, compilable programs**. Prefer the programs: type them, break them, and re-run.
+
+```bash
+gcc -std=c17 -Wall -Wextra -o prog prog.c
+# math examples need the math library on many systems:
+gcc -std=c17 -Wall -Wextra -o prog prog.c -lm
+```
+
 ## String Functions (<string.h>)
 
 ### String Copying
@@ -481,6 +489,452 @@ int main() {
 }
 ```
 
+## Full Programs: Standard Library in Practice
+
+The snippets above are reference maps. The programs below are meant to be **typed, compiled, and run**.
+
+### Program 1 — Safe string toolbox (`strtool.c`)
+
+Demonstrates length, bounded copy, search, tokenize, and compare without buffer overflows.
+
+```c
+/* file: strtool.c */
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <ctype.h>
+
+/* Copy src into dest; always NUL-terminates if dest_sz > 0.
+ * Returns 0 on full copy, -1 if truncated or bad args. */
+static int str_copy(char *dest, size_t dest_sz, const char *src) {
+    size_t i;
+
+    if (dest == NULL || src == NULL || dest_sz == 0) {
+        return -1;
+    }
+    for (i = 0; i + 1 < dest_sz && src[i] != '\0'; i++) {
+        dest[i] = src[i];
+    }
+    dest[i] = '\0';
+    return (src[i] == '\0') ? 0 : -1;
+}
+
+static void trim_inplace(char *s) {
+    char *start, *end;
+    size_t len;
+
+    if (s == NULL) {
+        return;
+    }
+    start = s;
+    while (*start != '\0' && isspace((unsigned char)*start)) {
+        start++;
+    }
+    if (*start == '\0') {
+        s[0] = '\0';
+        return;
+    }
+    end = start + strlen(start) - 1;
+    while (end > start && isspace((unsigned char)*end)) {
+        end--;
+    }
+    len = (size_t)(end - start + 1);
+    memmove(s, start, len);
+    s[len] = '\0';
+}
+
+int main(void) {
+    char line[128];
+    char key[32];
+    char *tok;
+    const char *hay = "the quick brown fox jumps over the lazy dog";
+    const char *needle = "fox";
+    char *found;
+
+    printf("strlen(hay) = %zu\n", strlen(hay));
+    found = strstr(hay, needle);
+    if (found != NULL) {
+        printf("strstr: \"%s\" at offset %td\n", needle, found - hay);
+    }
+
+    if (str_copy(key, sizeof key, "port=8080#comment") != 0) {
+        fprintf(stderr, "key truncated\n");
+    }
+    printf("copy: \"%s\"\n", key);
+
+    /* strtok is standard C (not reentrant — fine for this demo) */
+    {
+        char mutable[] = "alice,bob,carol";
+        printf("tokens:");
+        for (tok = strtok(mutable, ","); tok != NULL; tok = strtok(NULL, ",")) {
+            printf(" [%s]", tok);
+        }
+        printf("\n");
+    }
+
+    printf("Enter a line to trim: ");
+    if (fgets(line, sizeof line, stdin) == NULL) {
+        return EXIT_FAILURE;
+    }
+    /* strip newline then trim spaces */
+    line[strcspn(line, "\n")] = '\0';
+    trim_inplace(line);
+    printf("trimmed: \"%s\"\n", line);
+
+    if (strcmp(line, "quit") == 0) {
+        printf("matched quit\n");
+    } else {
+        printf("strcmp vs \"quit\": %d\n", strcmp(line, "quit"));
+    }
+
+    return EXIT_SUCCESS;
+}
+```
+
+```bash
+gcc -std=c17 -Wall -Wextra -o strtool strtool.c
+./strtool
+```
+
+**Notes**
+
+- Prefer `strcspn` / manual copies / `snprintf` over unbounded `strcpy`/`strcat`.  
+- Cast to `unsigned char` before `isspace` / `ctype.h` macros.  
+- `strtok` modifies its buffer and keeps hidden state — fine for simple tools; avoid in threaded code.
+
+### Program 2 — Math lab: vectors and roots (`mathlab.c`)
+
+```c
+/* file: mathlab.c */
+#include <stdio.h>
+#include <stdlib.h>
+#include <math.h>
+#include <errno.h>
+
+struct Vec2 {
+    double x;
+    double y;
+};
+
+static double vec_len(struct Vec2 v) {
+    return hypot(v.x, v.y);  /* safer than sqrt(x*x + y*y) for large values */
+}
+
+static struct Vec2 vec_norm(struct Vec2 v) {
+    double len = vec_len(v);
+    struct Vec2 out = {0.0, 0.0};
+    if (len > 0.0) {
+        out.x = v.x / len;
+        out.y = v.y / len;
+    }
+    return out;
+}
+
+static int safe_sqrt(double x, double *out) {
+    if (out == NULL) {
+        return -1;
+    }
+    if (x < 0.0) {
+        errno = EDOM;
+        return -1;
+    }
+    *out = sqrt(x);
+    return 0;
+}
+
+int main(void) {
+    struct Vec2 a = {3.0, 4.0};
+    struct Vec2 n = vec_norm(a);
+    double root;
+    double angle;
+
+    printf("|a| = %.6f\n", vec_len(a));
+    printf("unit(a) = (%.6f, %.6f)\n", n.x, n.y);
+
+    angle = atan2(a.y, a.x);
+    printf("atan2(y,x) = %.6f rad (%.2f deg)\n",
+           angle, angle * 180.0 / 3.14159265358979323846);
+
+    if (safe_sqrt(2.0, &root) == 0) {
+        printf("sqrt(2) = %.10f\n", root);
+    }
+    if (safe_sqrt(-1.0, &root) != 0) {
+        printf("sqrt(-1) rejected (errno may be EDOM)\n");
+    }
+
+    printf("pow(2,10) = %.0f\n", pow(2.0, 10.0));
+    printf("floor(3.7)=%.1f ceil(3.2)=%.1f round(3.5)=%.1f\n",
+           floor(3.7), ceil(3.2), round(3.5));
+
+    return 0;
+}
+```
+
+```bash
+gcc -std=c17 -Wall -Wextra -o mathlab mathlab.c -lm
+./mathlab
+```
+
+### Program 3 — Character classifier report (`ctype_report.c`)
+
+```c
+/* file: ctype_report.c */
+#include <stdio.h>
+#include <ctype.h>
+#include <string.h>
+
+static void classify(int ch) {
+    unsigned char c = (unsigned char)ch;
+    printf("'%c' (0x%02x):", (c >= 32 && c < 127) ? c : '?', c);
+    if (isdigit(c))  printf(" digit");
+    if (isalpha(c))  printf(" alpha");
+    if (isalnum(c))  printf(" alnum");
+    if (isspace(c))  printf(" space");
+    if (ispunct(c))  printf(" punct");
+    if (isupper(c))  printf(" upper");
+    if (islower(c))  printf(" lower");
+    printf(" -> upper='%c' lower='%c'\n",
+           toupper(c), tolower(c));
+}
+
+int main(int argc, char *argv[]) {
+    const char *s;
+    size_t i;
+
+    if (argc < 2) {
+        fprintf(stderr, "Usage: %s <string>\n", argv[0]);
+        return 1;
+    }
+    s = argv[1];
+    for (i = 0; s[i] != '\0'; i++) {
+        classify((unsigned char)s[i]);
+    }
+    return 0;
+}
+```
+
+```bash
+gcc -std=c17 -Wall -Wextra -o ctype_report ctype_report.c
+./ctype_report 'Hi 42!'
+```
+
+### Program 4 — Time stamps and elapsed work (`timelab.c`)
+
+```c
+/* file: timelab.c */
+#include <stdio.h>
+#include <time.h>
+#include <string.h>
+
+int main(void) {
+    time_t now;
+    struct tm local_tm;
+    char buf[64];
+    clock_t t0, t1;
+    volatile double sink = 0.0;
+    long i;
+
+    now = time(NULL);
+    if (now == (time_t)-1) {
+        perror("time");
+        return 1;
+    }
+
+#if defined(_POSIX_VERSION)
+    if (localtime_r(&now, &local_tm) == NULL) {
+        perror("localtime_r");
+        return 1;
+    }
+#else
+    {
+        struct tm *p = localtime(&now);
+        if (p == NULL) {
+            return 1;
+        }
+        local_tm = *p;
+    }
+#endif
+
+    if (strftime(buf, sizeof buf, "%Y-%m-%d %H:%M:%S %Z", &local_tm) == 0) {
+        fprintf(stderr, "strftime failed\n");
+        return 1;
+    }
+    printf("local: %s\n", buf);
+    printf("asctime: %s", asctime(&local_tm));  /* includes newline */
+
+    t0 = clock();
+    for (i = 0; i < 10000000L; i++) {
+        sink += 1.0;
+    }
+    t1 = clock();
+    printf("busy loop: %.3f seconds of CPU (clock)\n",
+           (double)(t1 - t0) / (double)CLOCKS_PER_SEC);
+    printf("sink=%.0f\n", sink);
+
+    return 0;
+}
+```
+
+```bash
+gcc -std=c17 -Wall -Wextra -o timelab timelab.c
+./timelab
+```
+
+### Program 5 — `qsort` + `bsearch` + `stdlib` utilities (`sortlab.c`)
+
+```c
+/* file: sortlab.c */
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+static int cmp_int_asc(const void *a, const void *b) {
+    int x = *(const int *)a;
+    int y = *(const int *)b;
+    return (x > y) - (x < y);
+}
+
+static int cmp_str(const void *a, const void *b) {
+    const char *const *sa = a;
+    const char *const *sb = b;
+    return strcmp(*sa, *sb);
+}
+
+int main(void) {
+    int nums[] = {42, 7, 19, 3, 100, 19};
+    size_t n = sizeof nums / sizeof nums[0];
+    int key = 19;
+    int *found;
+    const char *words[] = {"pear", "apple", "orange", "banana"};
+    size_t wn = sizeof words / sizeof words[0];
+    size_t i;
+    char *end;
+    long port;
+
+    qsort(nums, n, sizeof nums[0], cmp_int_asc);
+    printf("sorted ints:");
+    for (i = 0; i < n; i++) {
+        printf(" %d", nums[i]);
+    }
+    printf("\n");
+
+    found = bsearch(&key, nums, n, sizeof nums[0], cmp_int_asc);
+    if (found != NULL) {
+        printf("bsearch %d -> index %td\n", key, found - nums);
+    }
+
+    qsort(words, wn, sizeof words[0], cmp_str);
+    printf("sorted words:");
+    for (i = 0; i < wn; i++) {
+        printf(" %s", words[i]);
+    }
+    printf("\n");
+
+    port = strtol("8080", &end, 10);
+    if (end != NULL && *end == '\0' && port > 0 && port <= 65535) {
+        printf("parsed port: %ld\n", port);
+    }
+
+    printf("abs(-12)=%d, RAND_MAX=%d, rand sample=%d\n",
+           abs(-12), RAND_MAX, rand() % 100);
+
+    return 0;
+}
+```
+
+```bash
+gcc -std=c17 -Wall -Wextra -o sortlab sortlab.c
+./sortlab
+```
+
+### Program 6 — Mini word frequency with `string.h` + heap (`wfreq.c`)
+
+```c
+/* file: wfreq.c — counts words from stdin (letters/digits only) */
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <ctype.h>
+
+#define MAX_WORD 64
+#define MAX_ENTRIES 256
+
+struct Entry {
+    char word[MAX_WORD];
+    int count;
+};
+
+static int find_or_add(struct Entry *tab, int *n, const char *w) {
+    int i;
+    for (i = 0; i < *n; i++) {
+        if (strcmp(tab[i].word, w) == 0) {
+            tab[i].count++;
+            return 0;
+        }
+    }
+    if (*n >= MAX_ENTRIES) {
+        return -1;
+    }
+    if (strlen(w) >= MAX_WORD) {
+        return -1;
+    }
+    strcpy(tab[*n].word, w);  /* bounded by check above */
+    tab[*n].count = 1;
+    (*n)++;
+    return 0;
+}
+
+static int cmp_entry_desc(const void *a, const void *b) {
+    const struct Entry *ea = a;
+    const struct Entry *eb = b;
+    if (ea->count != eb->count) {
+        return eb->count - ea->count;
+    }
+    return strcmp(ea->word, eb->word);
+}
+
+int main(void) {
+    struct Entry table[MAX_ENTRIES];
+    int n = 0;
+    char word[MAX_WORD];
+    int wi = 0;
+    int ch;
+    int i;
+
+    while ((ch = getchar()) != EOF) {
+        if (isalnum((unsigned char)ch)) {
+            if (wi + 1 < MAX_WORD) {
+                word[wi++] = (char)tolower((unsigned char)ch);
+            }
+        } else if (wi > 0) {
+            word[wi] = '\0';
+            if (find_or_add(table, &n, word) != 0) {
+                fprintf(stderr, "table full or word too long\n");
+                return EXIT_FAILURE;
+            }
+            wi = 0;
+        }
+    }
+    if (wi > 0) {
+        word[wi] = '\0';
+        find_or_add(table, &n, word);
+    }
+
+    qsort(table, (size_t)n, sizeof table[0], cmp_entry_desc);
+    for (i = 0; i < n; i++) {
+        printf("%4d  %s\n", table[i].count, table[i].word);
+    }
+    return 0;
+}
+```
+
+```bash
+gcc -std=c17 -Wall -Wextra -o wfreq wfreq.c
+echo 'To be or not to be' | ./wfreq
+```
+
+---
+
 ## Best Practices for Using Standard Library Functions
 
 ### 1. Error Checking
@@ -500,6 +954,16 @@ char buffer[100];
 // Safe approach
 if (fgets(buffer, sizeof(buffer), stdin) != NULL) {
     // Process input
+}
+```
+
+Prefer `snprintf` over `sprintf`:
+
+```c
+char path[64];
+int n = snprintf(path, sizeof path, "/tmp/%s.log", "app");
+if (n < 0 || (size_t)n >= sizeof path) {
+    /* truncated or error */
 }
 ```
 
@@ -525,21 +989,54 @@ setlocale(LC_ALL, "");  // Use system locale
 ### 5. Thread Safety
 Some standard library functions are not thread-safe. Use reentrant versions when needed:
 ```c
-// Thread-safe version
+// Thread-safe version (POSIX)
 struct tm tm_result;
 localtime_r(&rawtime, &tm_result);
 ```
+
+### 6. Link math explicitly
+On many Linux toolchains, math symbols live in `libm`:
+
+```bash
+gcc -std=c17 -Wall -Wextra -o mathlab mathlab.c -lm
+```
+
+---
+
+## Exercises
+
+```bash
+gcc -std=c17 -Wall -Wextra -o exN exN.c    # add -lm when using <math.h>
+```
+
+1. **Bounded concat** — Write `int str_cat(char *dest, size_t dest_sz, const char *src)` that appends without overflow and always NUL-terminates. Unit-test with full and almost-full buffers.
+
+2. **`strtol` port parser** — Accept a string; accept only `1`…`65535`; reject junk, empty, negatives, and overflow. Return status codes, not just print.
+
+3. **Case-insensitive compare** — Implement `int str_casecmp(const char *a, const char *b)` with `tolower((unsigned char)…)` and test `"Hello"` vs `"hello"`.
+
+4. **Math: distance** — Given two `Vec2` points, print Euclidean distance with `hypot`. Compare naive `sqrt(dx*dx+dy*dy)` on large coordinates (optional exploration).
+
+5. **`qsort` structs** — Sort an array of `{name, score}` by score descending, then name ascending.
+
+6. **Time format** — Print “days since epoch” and a `strftime` format `YYYY-MM-DDThh:mm:ss`.
+
+7. **`wfreq` upgrade** — Read from a filename in `argv[1]` instead of stdin; print only the top 10 words.
+
+8. **ctype filter** — Read stdin, write only alphanumeric characters and spaces to stdout (like a crude sanitizer).
+
+---
 
 ## Summary
 
 The C standard library provides a rich set of functions that form the foundation of most C programs. Mastering these functions is essential for effective C programming. Key points to remember:
 
-1. **String Functions**: Essential for text processing and manipulation
-2. **Mathematical Functions**: Provide a wide range of mathematical operations
-3. **Character Functions**: Enable character classification and conversion
-4. **Time Functions**: Handle time-related operations and formatting
-5. **I/O Functions**: Enable file and console input/output operations
-6. **Memory Management**: Provide dynamic memory allocation capabilities
-7. **Utility Functions**: Offer various helper functions for common tasks
+1. **String Functions**: Essential for text processing and manipulation — prefer bounded copies and `snprintf`
+2. **Mathematical Functions**: Provide a wide range of mathematical operations — link with `-lm`
+3. **Character Functions**: Enable character classification and conversion — cast to `unsigned char`
+4. **Time Functions**: Handle time-related operations and formatting — prefer reentrant APIs when available
+5. **I/O Functions**: Enable file and console input/output operations — always check returns
+6. **Memory Management**: Provide dynamic memory allocation capabilities — pair every `malloc` with `free`
+7. **Utility Functions**: `qsort`, `bsearch`, `strtol`, `abs`, `rand` cover many everyday needs
 
 Understanding and properly using these standard library functions will make your C programs more robust, portable, and efficient. Always consult the documentation for specific behavior and error handling requirements of each function.

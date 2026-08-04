@@ -1,117 +1,126 @@
 # yum
 
 ## Overview
-The `yum` (Yellowdog Updater Modified) command manages packages in RPM-based Linux systems. It handles package installation, updates, and removal.
+
+`yum` (Yellowdog Updater Modified) is the classic RPM package manager front-end for older RHEL/CentOS/Scientific Linux systems. On **RHEL 8+/Fedora/CentOS Stream**, the command is typically a compatibility wrapper around **`dnf`**. Prefer `dnf` on modern systems; learn `yum` for legacy fleets and muscle-memory commands that still work.
 
 ## Syntax
+
 ```bash
-yum [options] command [package...]
+yum [options] command
 ```
 
 ## Common Commands
+
 | Command | Description |
 |---------|-------------|
 | `install` | Install packages |
-| `update` | Update packages |
-| `remove` | Remove packages |
-| `search` | Search packages |
-| `info` | Show package info |
+| `remove` / `erase` | Remove packages |
+| `update` / `upgrade` | Update packages |
+| `info` | Package details |
 | `list` | List packages |
-| `check-update` | Check updates |
-| `clean` | Clean cache |
-| `groupinstall` | Install group |
-| `groupremove` | Remove group |
+| `search` | Search metadata |
+| `provides` / `whatprovides` | Which package owns a capability/file |
+| `repolist` | Enabled repos |
+| `clean all` | Clean caches |
 | `history` | Transaction history |
-| `provides` | Find package providing file |
+| `groupinstall` | Group install |
+| `check-update` | Check without installing |
 
 ## Common Options
+
 | Option | Description |
 |--------|-------------|
 | `-y` | Assume yes |
-| `-q` | Quiet mode |
-| `--nogpgcheck` | Skip GPG check |
-| `--enablerepo` | Enable repository |
-| `--disablerepo` | Disable repository |
-| `--exclude` | Exclude packages |
-| `--downloadonly` | Download only |
-| `--skip-broken` | Skip broken packages |
-
-## Key Use Cases
-1. Package management
-2. System updates
-3. Dependency resolution
-4. Repository management
-5. System maintenance
+| `-q` | Quiet |
+| `--enablerepo=` / `--disablerepo=` | Toggle repos for one shot |
+| `--setopt=` | Override config |
+| `--downloadonly` | Download, don’t install |
+| `--security` | Security updates (plugin/platform dependent) |
+| `-C` | Run from cache only |
 
 ## Examples with Explanations
-### Example 1: Install Package
+
+### Everyday
+
 ```bash
-yum install package_name
+sudo yum check-update
+sudo yum update -y
+sudo yum install -y curl vim
+sudo yum remove -y oldpkg
 ```
-Install specific package
 
-### Example 2: Update System
+### Search and info
+
 ```bash
-yum update
+yum search nginx
+yum info nginx
+yum list installed 'nginx*'
+yum provides /usr/bin/ps
 ```
-Update all packages
 
-### Example 3: Search Package
+### Repos
+
 ```bash
-yum search keyword
+yum repolist
+yum repolist all
+sudo yum-config-manager --enable powertools   # platform specific
 ```
-Search for packages
 
-## Common Usage Patterns
-1. System update:
-   ```bash
-   yum check-update && yum update
-   ```
-2. Group install:
-   ```bash
-   yum groupinstall "Development Tools"
-   ```
-3. Clean cache:
-   ```bash
-   yum clean all
-   ```
+### History / undo
 
-## Security Considerations
-1. Repository security
-2. GPG verification
-3. Root privileges
-4. Network security
-5. Version control
+```bash
+sudo yum history
+sudo yum history info 42
+sudo yum history undo 42
+```
+
+### Clean cache
+
+```bash
+sudo yum clean all
+sudo yum makecache
+```
+
+### Prefer dnf when present
+
+```bash
+command -v dnf && dnf --version
+sudo dnf install -y htop      # modern path
+# yum may redirect:
+yum --version
+```
+
+### Groups
+
+```bash
+yum group list
+sudo yum groupinstall -y "Development Tools"
+```
+
+## Notes / Pitfalls
+
+- RHEL 8+: `yum` → `dnf` API; some old yum plugins differ.
+- `-y` in unattended scripts needs good testing (major upgrades).
+- Multiple transactions: watch disk space for `/var/cache`.
+- Proxy and mirror issues show as metadata download failures.
+- EPEL and third-party repos change availability — pin carefully.
+
+## 2026-relevant notes
+
+- New work: document **`dnf`** first; mention `yum` as alias/legacy.
+- CentOS Linux classic is EOL — care with unmaintained mirrors.
+- For containers, use minimal base images and explicit package lists rather than interactive yum sessions.
 
 ## Related Commands
-- `rpm` - Package manager
-- `dnf` - Next-gen package manager
-- `createrepo` - Create repository
-- `repoquery` - Query packages
-- `yumdownloader` - Download packages
+
+- `dnf` — modern replacement
+- `rpm` — low-level RPM queries/installs
+- `repoquery` — rich queries (dnf/yum tools)
+- `subscription-manager` — RHEL entitlements
+- `apt` — Debian family analog
 
 ## Additional Resources
-- [Yum Documentation](https://access.redhat.com/documentation/en-us/red_hat_enterprise_linux/7/html/system_administrators_guide/ch-yum)
-- [Package Management Guide](https://www.cyberciti.biz/faq/rhel-centos-fedora-linux-yum-command-howto/)
-- [System Administration](https://www.tecmint.com/20-linux-yum-yellowdog-updater-modified-commands-for-package-mangement/)
 
-## Best Practices
-1. Regular updates
-2. Clean cache
-3. Verify packages
-4. Backup configuration
-5. Test updates
-
-## Repository Management
-1. Configuration
-2. Priorities
-3. GPG keys
-4. Mirrors
-5. Custom repos
-
-## Troubleshooting
-1. Dependency issues
-2. Repository problems
-3. Network errors
-4. Space issues
-5. Lock files
+- `man yum`, `man dnf`
+- RHEL system admin docs for your major version

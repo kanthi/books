@@ -1,84 +1,102 @@
 # whoami
 
 ## Overview
-The `whoami` command prints the effective username of the current user. It's a simple but essential command for user identification in scripts and system administration.
+
+`whoami` prints the **effective** username of the current user. It is a tiny identity check for scripts and for noticing when `sudo`/`su` changed who you are. For full identity (uid, gid, groups) use `id`. For login name from the controlling terminal, see `logname` (different edge cases).
 
 ## Syntax
+
 ```bash
-whoami
+whoami [OPTION]
+# usually no options needed
 ```
+
+## Common Options
+
+| Option | Description |
+|--------|-------------|
+| `--help` | Help |
+| `--version` | Version |
 
 ## Key Use Cases
-1. User identification in scripts
-2. Security verification
-3. System administration
-4. Access control checks
-5. Logging and auditing
+
+1. Confirm effective user in a shell
+2. Guard scripts that must (or must not) run as root
+3. Annotate logs with actor name
+4. Verify `sudo -u` targets
 
 ## Examples with Explanations
-### Example 1: Basic Usage
+
+### Basics
+
 ```bash
 whoami
+sudo whoami                 # usually root
+sudo -u nobody whoami
+su - alice -c whoami
 ```
-Returns the current username
 
-### Example 2: Script Usage
+### Script guards
+
 ```bash
-if [ "$(whoami)" != "root" ]; then
-    echo "This script must be run as root"
-    exit 1
+if [ "$(whoami)" != root ]; then
+  echo "run as root" >&2
+  exit 1
+fi
+
+# prefer numeric for reliability:
+if [ "$(id -u)" -ne 0 ]; then
+  echo "run as root" >&2
+  exit 1
 fi
 ```
 
-## Common Usage Patterns
-1. Root check:
-   ```bash
-   [ "$(whoami)" = "root" ] && echo "Running as root"
-   ```
-2. User-specific paths:
-   ```bash
-   USER=$(whoami)
-   CONFIG_DIR="/home/$USER/.config"
-   ```
-3. Logging:
-   ```bash
-   echo "$(date): $(whoami) executed script" >> audit.log
-   ```
+### Contrast with id / logname
+
+```bash
+whoami
+id -un                      # equivalent effective username
+id
+logname                     # user logged on the tty (may differ)
+```
+
+After `sudo -s`, `whoami` is `root` while `logname` may still show the original login user.
+
+### Logging
+
+```bash
+echo "$(date -Is) user=$(whoami) action=deploy" >> deploy.log
+```
+
+### Containers
+
+```bash
+whoami
+id
+# USER instruction in Dockerfile determines default
+```
+
+## Notes / Pitfalls
+
+- Reflects **effective** ids (setuid binaries can change this).
+- Prefer `id -u` for root checks — numeric, locale-proof.
+- Not a substitute for authentication/authorization in applications.
+- May print `I have no name!` style issues only via related tools when passwd entry missing; `whoami` uses libc name lookup.
+
+## 2026-relevant notes
+
+- In Kubernetes/pods, check whether the container runs as non-root (`whoami` / `id`).
+- Rootless Podman maps users — names inside may differ from host.
+- Automation should key off uid numbers stored in configs, not display names alone.
 
 ## Related Commands
-- `id` - Show user and group IDs
-- `who` - Show logged-in users
-- `w` - Show who is logged on
-- `logname` - Print login name
-- `users` - Show current users
 
-## Best Practices
-1. Use in security-sensitive scripts
-2. Combine with conditional statements
-3. Consider using `id -u` for numeric UID
-4. Use for user-specific configurations
-5. Include in audit trails
+- `id` — full identity
+- `logname` — login name from utmp
+- `who` / `w` — logged-in sessions
+- `sudo` / `su` — change user
+- `getent passwd` — account database
 
-## Integration Examples
-1. Backup script:
-   ```bash
-   BACKUP_DIR="/backups/$(whoami)"
-   mkdir -p "$BACKUP_DIR"
-   ```
-2. Temporary files:
-   ```bash
-   TEMP_FILE="/tmp/$(whoami)_$$_temp"
-   ```
-3. Permission check:
-   ```bash
-   if [ "$(whoami)" != "admin" ]; then
-       echo "Access denied"
-       exit 1
-   fi
-   ```
+## Additional Resources
 
-## Security Considerations
-- Shows effective user, not real user
-- Can be different in sudo context
-- Use `logname` for original login name
-- Consider `id` for more detailed info
+- `man whoami`

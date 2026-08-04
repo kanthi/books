@@ -1,115 +1,104 @@
 # reboot
 
 ## Overview
-The `reboot` command restarts the system. It's a simplified interface for the shutdown command that performs a system reboot.
+
+`reboot` restarts the system. On modern systemd systems it is typically a symlink or wrapper around **`systemctl reboot`**. Prefer explicit `systemctl` forms in scripts for clarity and options (wall messages, force flags). Always ensure workloads can stop cleanly.
 
 ## Syntax
+
 ```bash
 reboot [options]
+systemctl reboot
+systemctl reboot --message="..."
 ```
 
 ## Common Options
-| Option | Description |
-|--------|-------------|
-| `-f, --force` | Force reboot |
-| `-w, --wtmp-only` | Just write wtmp record |
-| `-d, --no-wtmp` | Don't write wtmp record |
-| `-n, --no-sync` | Don't sync before reboot |
-| `-p, --poweroff` | Power off instead |
-| `--halt` | Halt the system |
-| `-h, --help` | Show help |
-| `-v, --version` | Show version |
 
-## Key Use Cases
-1. System restart
-2. Maintenance reboot
-3. Emergency restart
-4. Kernel updates
-5. Hardware changes
+| Option / form | Description |
+|---------------|-------------|
+| *(none)* | Normal reboot via init/systemd |
+| `--help` | Help |
+| `systemctl reboot -i` | Ignore inhibitors (careful) |
+| `systemctl reboot --force` | Forceful (see man) |
+| `systemctl reboot --firmware-setup` | Reboot to firmware setup (UEFI) when supported |
+| `shutdown -r now` | Equivalent classic form |
+| `shutdown -r +15 "msg"` | Scheduled reboot |
 
 ## Examples with Explanations
-### Example 1: Basic Usage
+
+### Normal reboot
+
 ```bash
-reboot
+sudo reboot
+sudo systemctl reboot
+sudo shutdown -r now
 ```
-Normal system reboot
 
-### Example 2: Force Reboot
+### Scheduled
+
 ```bash
-reboot -f
+sudo shutdown -r +30 "Reboot for kernel update"
+sudo shutdown -c                     # cancel
 ```
-Force immediate reboot
 
-### Example 3: Write Log Only
+### With broadcast message
+
 ```bash
-reboot -w
+sudo systemctl reboot --message="Kernel update; back in 5 minutes"
 ```
-Only write wtmp record
 
-## Understanding Output
-System messages:
-- Broadcast notification
-- Service shutdown
-- Process termination
-- System restart
+### Inhibitors
 
-## Common Usage Patterns
-1. Safe reboot:
-   ```bash
-   reboot
-   ```
-2. Emergency reboot:
-   ```bash
-   reboot -f
-   ```
-3. Simulate reboot:
-   ```bash
-   reboot -w
-   ```
+```bash
+systemd-inhibit --list
+sudo systemctl reboot -i             # ignore inhibitors if stuck
+```
 
-## Security Considerations
-1. User permissions
-2. Process handling
-3. Data integrity
-4. Service shutdown
-5. Hardware safety
+### Firmware setup (UEFI)
+
+```bash
+sudo systemctl reboot --firmware-setup
+```
+
+### After kernel install
+
+```bash
+# apply new kernel
+sudo reboot
+uname -r                             # after boot
+```
+
+### Containers / hosts
+
+```bash
+# inside a container, reboot may be blocked or reboot the host depending on privileges —
+# almost always wrong. Restart the container instead:
+podman restart myctr
+systemctl restart myapp.service
+```
+
+## Notes / Pitfalls
+
+- Unsaved work dies; notify users (`wall`, tickets) on multi-user systems.
+- Force flags can skip clean unmounts — risk filesystem recovery work.
+- Cloud VMs: reboot vs stop/start may change ephemeral networking or public IPs depending on provider.
+- Serial/console access ready before remote reboot of network-critical hosts.
+- `reboot` during package transactions can leave broken state — finish `apt`/`dnf` first.
+
+## 2026-relevant notes
+
+- Live kernel patching reduces some reboot urgency; still needed for many updates.
+- Immutable OS / image-based systems reboot into new deployments more often — treat as normal.
+- Prefer orchestration drain (k8s) before node reboot.
 
 ## Related Commands
-- `shutdown` - System shutdown
-- `poweroff` - Power off
-- `halt` - Stop system
-- `init` - Change runlevel
-- `systemctl` - System control
+
+- `shutdown` / `poweroff` / `halt`
+- `systemctl reboot` / `poweroff`
+- `timedatectl` / `hostnamectl` — post-boot identity
+- `journalctl -b` — logs for current boot
+- `who` / `w` — who is logged in before reboot
 
 ## Additional Resources
-- [Reboot Manual](https://man7.org/linux/man-pages/man8/reboot.8.html)
-- [System Administration](https://www.cyberciti.biz/faq/howto-reboot-linux/)
-- [Process Management](https://www.tecmint.com/linux-process-management/)
 
-## Best Practices
-1. Schedule reboots
-2. Notify users
-3. Check processes
-4. Save data
-5. Document actions
-
-## Process Handling
-1. Service shutdown
-2. Process termination
-3. File system sync
-4. Memory cleanup
-5. Hardware reset
-
-## Safety Checks
-1. Active users
-2. Running processes
-3. Open files
-4. System services
-5. Hardware status
-## Additional Examples
-```bash
-sudo systemctl reboot
-sudo reboot
-sudo shutdown -r now
-sudo shutdown -r +10 "reboot in 10 minutes"
-```
+- `man reboot`, `man systemctl`, `man shutdown`

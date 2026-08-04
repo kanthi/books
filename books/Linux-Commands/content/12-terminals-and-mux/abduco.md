@@ -1,111 +1,111 @@
 # abduco
 
 ## Overview
-The `abduco` command provides session management with a focus on simplicity. It allows you to create, attach, and detach from sessions while maintaining their state.
+
+`abduco` is a minimal **session attach/detach** tool: it runs a process under a controlling terminal session you can disconnect from and reattach to later. Lighter than full multiplexers (`tmux`, `screen`) — no window manager, just detachable sessions. Often paired with `dvtm` for tiling inside the session.
+
+Optional package; not installed by default on most distros.
 
 ## Syntax
+
 ```bash
-abduco [options] [-e detach] {-A|-a} session [command]
+abduco [options] [-e key] [-r] name
+abduco -A name [command...]
+abduco -l
 ```
 
 ## Common Options
+
 | Option | Description |
 |--------|-------------|
-| `-A` | Attach or create |
-| `-a` | Attach to session |
-| `-c` | Create new session |
-| `-n` | Create new session |
+| `-A name` | Attach or create session `name` |
+| `-a name` | Attach to existing session |
+| `-c name command` | Create session running command |
+| `-e key` | Escape key (default `Ctrl-\`) |
 | `-r` | Read-only attach |
-| `-e key` | Set detach key |
-| `-v` | Show version |
-| `-h` | Show help |
 | `-l` | List sessions |
-| `-f` | Force operation |
+| `-n` | Create but don’t attach |
+| `-f` | Force (see man for attach behavior) |
+| `-q` | Quiet |
 
-## Key Bindings
-| Command | Action |
-|---------|---------|
-| `Ctrl-\` | Detach session |
-| `Ctrl-c` | Interrupt |
-| `Ctrl-d` | EOF |
-| `Ctrl-z` | Suspend |
-
-## Key Use Cases
-1. Session persistence
-2. Remote work
-3. Long-running tasks
-4. Process management
-5. Simple multiplexing
+Exact flags can vary slightly by version — check `abduco -h`.
 
 ## Examples with Explanations
-### Example 1: Create Session
-```bash
-abduco -c mysession bash
-```
-Create new session
 
-### Example 2: Attach Session
-```bash
-abduco -a mysession
-```
-Attach to existing session
+### Create / attach
 
-### Example 3: List Sessions
+```bash
+abduco -A work
+# runs $SHELL by default in a new session if needed
+```
+
+### Run a specific command
+
+```bash
+abduco -c build make -j$(nproc)
+abduco -a build
+```
+
+### List and reattach
+
 ```bash
 abduco -l
+abduco -a work
 ```
-Show running sessions
 
-## Common Usage Patterns
-1. Create/attach:
-   ```bash
-   abduco -A name bash
-   ```
-2. Read-only:
-   ```bash
-   abduco -r name
-   ```
-3. Custom detach:
-   ```bash
-   abduco -e ^q -c name
-   ```
+### Detach
 
-## Security Considerations
-1. Session access
-2. Multi-user mode
-3. Process isolation
-4. File permissions
-5. System resources
+```text
+Ctrl-\   (default detach key — confirm with man/help)
+```
+
+Or close the SSH client carefully knowing the session survives.
+
+### Read-only observe
+
+```bash
+abduco -r -a work
+```
+
+### Pair with dvtm
+
+```bash
+abduco -A dev dvtm
+```
+
+`dvtm` provides tiling; `abduco` provides detach.
+
+### vs tmux
+
+```bash
+# tmux: windows, panes, scripting, ecosystem
+tmux new -s work
+# abduco: tiny attach/detach
+abduco -A work
+```
+
+## Notes / Pitfalls
+
+- Must be installed; rare on enterprise minimal images.
+- Escape key conflicts — rebind with `-e` if needed.
+- Not a full replacement for tmux scripting/automation.
+- Session socket location depends on build (`ABDUCO_SOCKET_DIR` / runtime dir).
+- Sharing sessions multi-user needs careful permissions (prefer tmux/socket policies or separate tools).
+
+## 2026-relevant notes
+
+- Nice for constrained environments where tmux feels heavy, or for teaching detach basics.
+- For production admin work, **tmux** or **systemd** still dominate.
+- Combine with mosh/SSH keepalive for flaky links.
 
 ## Related Commands
-- `tmux` - Terminal multiplexer
-- `screen` - Terminal multiplexer
-- `dtach` - Session detachment
-- `dvtm` - Terminal manager
-- `nohup` - Run background
+
+- `tmux` / `screen` — full multiplexers
+- `dvtm` — tiling wm for terminal
+- `dtach` — similar detach tool
+- `nohup` / `disown` — weaker persistence
+- `systemd-run` — transient services
 
 ## Additional Resources
-- [Abduco Manual](https://www.brain-dump.org/projects/abduco/)
-- [GitHub Repository](https://github.com/martanne/abduco)
-- [Usage Guide](https://www.brain-dump.org/projects/abduco/abduco.1.html)
 
-## Best Practices
-1. Name sessions
-2. Monitor state
-3. Clean unused
-4. Document usage
-5. Regular checks
-
-## Configuration
-1. Detach key
-2. Session naming
-3. Command options
-4. Environment
-5. Permissions
-
-## Troubleshooting
-1. Session errors
-2. Attach issues
-3. Permission problems
-4. Process state
-5. Resource limits
+- `abduco -h`, project docs (martanne/abduco)

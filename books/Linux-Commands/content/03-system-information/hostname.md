@@ -1,119 +1,101 @@
 # hostname
 
 ## Overview
-The `hostname` command shows or sets the system's host name. It displays the name by which the system is known on a network.
+
+`hostname` prints or sets the system hostname. On modern systemd systems, prefer **`hostnamectl`** for persistent hostname changes and clearer status. The classic `hostname` command remains useful for quick reads and scripts.
+
+Related names: static hostname, pretty hostname, transient hostname (DHCP/cloud).
 
 ## Syntax
+
 ```bash
-hostname [options] [hostname]
+hostname [options] [name]
 ```
 
 ## Common Options
+
 | Option | Description |
 |--------|-------------|
-| `-a` | Alias names |
+| *(none)* | Print hostname |
+| `name` | Set hostname (needs root; often transient without systemd integration) |
+| `-f`, `--fqdn` | Fully qualified domain name (best effort) |
+| `-s`, `--short` | Short name (before first dot) |
+| `-i`, `--ip-address` | Addresses for host (unreliable; prefer `ip`) |
+| `-I` | All IP addresses on interfaces (not DNS) |
+| `-d` | DNS domain name (best effort) |
 | `-A` | All FQDNs |
-| `-d` | DNS domain |
-| `-f` | FQDN name |
-| `-i` | IP addresses |
-| `-I` | All addresses |
-| `-s` | Short name |
 | `-y` | NIS domain |
-| `--help` | Show help |
-| `--version` | Show version |
+| `--help` | Help |
 
-## Output Types
-| Type | Description |
-|------|-------------|
-| Short | Simple hostname |
-| FQDN | Full domain name |
-| Domain | DNS domain |
-| IP | IP addresses |
-| Alias | Alternative names |
-
-## Key Use Cases
-1. System identification
-2. Network configuration
-3. DNS setup
-4. Host verification
-5. Network troubleshooting
+Behavior of DNS-related flags depends on resolver configuration and `/etc/hosts`.
 
 ## Examples with Explanations
-### Example 1: Show Name
+
+### Read
+
 ```bash
 hostname
-```
-Display hostname
-
-### Example 2: Show FQDN
-```bash
+hostname -s
 hostname -f
-```
-Full domain name
-
-### Example 3: Show IPs
-```bash
 hostname -I
 ```
-All IP addresses
 
-## Common Usage Patterns
-1. Basic check:
-   ```bash
-   hostname
-   ```
-2. Network info:
-   ```bash
-   hostname -i
-   ```
-3. Domain name:
-   ```bash
-   hostname -d
-   ```
+### Prefer hostnamectl on systemd
 
-## Network Information
-1. Host name
-2. Domain name
-3. IP addresses
-4. Alias names
-5. Network identity
+```bash
+hostnamectl
+hostnamectl status
+sudo hostnamectl set-hostname app-01
+```
+
+This updates the persistent hostname properly on systemd hosts.
+
+### Temporary classic set (legacy)
+
+```bash
+sudo hostname app-temp
+# may not survive reboot without writing config / hostnamectl
+```
+
+### Scripts
+
+```bash
+h=$(hostname -s)
+echo "running on $h"
+```
+
+### Correlate with DNS / addresses
+
+```bash
+hostname -f
+getent hosts "$(hostname -f)"
+ip -br addr
+```
+
+`-i`/`-f` can lie if `/etc/hosts` and DNS disagree — verify with `ip` and `resolvectl`.
+
+## Notes / Pitfalls
+
+- Setting via bare `hostname` without `hostnamectl`/config is a common “lost after reboot” mistake.
+- Cloud images may regenerate hostnames via cloud-init.
+- FQDN detection is best-effort, not a pure DNS authoritative query.
+- Containers have their own hostname (pod name, docker `--hostname`).
+- Valid hostname rules: prefer short DNS labels (`a-z`, `0-9`, `-`).
+
+## 2026-relevant notes
+
+- systemd hosts: **`hostnamectl`** is the supported admin interface.
+- Kubernetes sets pod hostnames independently of node hostname.
+- Inventory tools (Ansible) often use inventory names that differ from `hostname` — don’t assume equality.
 
 ## Related Commands
-- `uname` - System info
-- `domainname` - NIS domain
-- `dnsdomainname` - DNS domain
-- `hostnamectl` - Control hostname
-- `host` - DNS lookup
+
+- `hostnamectl` — systemd hostname management
+- `resolvectl` / `getent hosts` — name resolution
+- `ip` — addresses
+- `uname -n` — nodename (usually same as hostname)
+- `nmcli` — NetworkManager host/domain bits
 
 ## Additional Resources
-- [Hostname Manual](https://man7.org/linux/man-pages/man1/hostname.1.html)
-- [Network Guide](https://www.cyberciti.biz/faq/linux-hostname-command-examples-usage-syntax/)
-- [System Administration](https://www.tecmint.com/linux-hostname-command-examples/)
 
-## Best Practices
-1. Proper naming
-2. DNS alignment
-3. Network consistency
-4. Documentation
-5. Regular verification
-
-## Network Analysis
-1. Name resolution
-2. IP configuration
-3. Domain setup
-4. Network identity
-5. System naming
-
-## Troubleshooting
-1. Name resolution
-2. DNS issues
-3. Network problems
-4. Configuration errors
-5. Identity conflicts
-
-## Common Uses
-1. System setup
-2. Network config
-3. DNS management
-4. Identity verification
-5. Documentation
+- `man hostname`, `man hostnamectl`

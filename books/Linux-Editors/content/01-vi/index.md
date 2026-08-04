@@ -519,3 +519,8 @@ vi -r
 ```
 
 Vi remains an essential skill for any Linux user or system administrator. While modern editors offer more features, vi's simplicity, universality, and efficiency make it invaluable for quick edits, system recovery, and situations where other editors aren't available.
+## Next steps
+
+- [Vim](../02-vim/index.md) — everyday improved vi
+- [tmux](../11-tmux/index.md) — keep vi sessions alive over SSH
+- [Choosing an Editor](../00-intro/01-choosing-an-editor.md) — when to graduate beyond vi

@@ -752,3 +752,8 @@ vim.keymap.set('n', '<leader>lr', ':LspRestart<CR>')
 ```
 
 Neovim represents the future of modal editing, combining Vim's efficiency with modern development tools and practices. Its built-in LSP support, Lua scripting, and active plugin ecosystem make it an excellent choice for developers seeking a powerful, customizable editor.
+## Next steps
+
+- [LazyVim](../06-lazyvim/index.md) — batteries-included Neovim
+- [tmux](../11-tmux/index.md) · [Herdr](../12-herdr/index.md) — session layers
+- [Workflows](../14-workflows/index.md) — compose a daily stack

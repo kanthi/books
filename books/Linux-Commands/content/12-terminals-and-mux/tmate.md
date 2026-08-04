@@ -1,118 +1,96 @@
 # tmate
 
 ## Overview
-The `tmate` command is a terminal sharing tool based on tmux. It allows instant terminal sharing over SSH with automatic server provisioning.
+
+`tmate` is a fork of tmux focused on **instant terminal sharing**. It creates a session and prints SSH/web URLs so collaborators can attach remotely. Great for pair debugging; treat access tokens as secrets. For local-only multiplexing without sharing, use stock `tmux`.
 
 ## Syntax
+
 ```bash
-tmate [options] [command]
+tmate [tmux-compatible options]
+tmate show-messages
+tmate wait tmate-ready
 ```
 
-## Common Options
-| Option | Description |
-|--------|-------------|
-| `-S socket` | Socket path |
-| `-V` | Show version |
-| `-v` | Increase verbosity |
-| `-F` | Foreground mode |
-| `-k` | SSH key path |
-| `-n name` | Session name |
-| `-r` | Read-only mode |
-| `-h` | Show help |
-| `--host` | Custom host |
-| `--port` | Custom port |
-| `--api-key` | API key |
+Most session control mirrors **tmux** keybindings and commands.
 
-## Key Bindings
-| Command | Action |
-|---------|---------|
-| `Ctrl-b d` | Detach session |
-| `Ctrl-b c` | New window |
-| `Ctrl-b n` | Next window |
-| `Ctrl-b p` | Previous window |
-| `Ctrl-b %` | Split vertical |
-| `Ctrl-b "` | Split horizontal |
-| `Ctrl-b x` | Kill pane |
-| `Ctrl-b ?` | Show help |
-| `Ctrl-b :` | Command mode |
-| `Ctrl-b [` | Copy mode |
+## Common usage patterns
 
-## Key Use Cases
-1. Remote support
-2. Pair programming
-3. Training sessions
-4. Collaboration
-5. Remote access
+| Action | Example |
+|--------|---------|
+| Start shared session | `tmate` |
+| Wait until ready | `tmate wait tmate-ready` |
+| Print connection info | `tmate show-messages` / display-panes messages |
+| Detach | `Ctrl-b d` (default prefix like tmux) |
+| Local config | `~/.tmate.conf` |
 
 ## Examples with Explanations
-### Example 1: Start Session
+
+### Start a session
+
 ```bash
 tmate
+# note the ssh and web URLs printed
+tmate wait tmate-ready
+tmate show-messages
 ```
-Start sharing session
 
-### Example 2: Named Session
+### Capture SSH URL for a colleague
+
 ```bash
-tmate -n mysession
+tmate -F show-messages | grep 'ssh session:'
+# or scripted:
+tmate -S /tmp/tmate.sock new-session -d
+tmate -S /tmp/tmate.sock wait tmate-ready
+tmate -S /tmp/tmate.sock display -p '#{tmate_ssh}'
 ```
-Create named session
 
-### Example 3: Read-only
+### Read-only vs read-write links
+
+tmate provides different access strings (RO/RW). Share **read-only** by default; only give RW to trusted peers.
+
+### Config sketch
+
 ```bash
-tmate -r
+# ~/.tmate.conf
+set -g tmate-server-host ssh.tmate.io
+# org-hosted servers possible for privacy
 ```
-Start read-only session
 
-## Common Usage Patterns
-1. Basic sharing:
-   ```bash
-   tmate show-messages
-   ```
-2. Custom server:
-   ```bash
-   tmate -h host.example.com
-   ```
-3. SSH config:
-   ```bash
-   tmate -k ~/.ssh/id_rsa
-   ```
+### End session
 
-## Security Considerations
-1. SSH security
-2. Session access
-3. Read-only mode
-4. Server trust
-5. Key management
+```bash
+# exit shells or kill-session
+tmate kill-server
+```
+
+### Prefer local tmux when not sharing
+
+```bash
+tmux new -s solo
+```
+
+## Notes / Pitfalls
+
+- Default public relay means session metadata/paths may transit third parties — use a **self-hosted** tmate server for sensitive work.
+- Anyone with the RW SSH string has full terminal control — treat like a root password.
+- Corporate networks may block outbound SSH to tmate hosts.
+- Still tmux-based: know prefix keys, panes, and copy-mode.
+- Don’t leave orphan shared sessions on bastion hosts.
+
+## 2026-relevant notes
+
+- Alternatives: VS Code Live Share, SSH with `tmux` + explicit user accounts, commercial pair tools.
+- For regulated environments, mandate self-hosted relays or forbid tmate.
+- Rotate by killing sessions after the pairing call ends.
 
 ## Related Commands
-- `tmux` - Terminal multiplexer
-- `screen` - Terminal multiplexer
-- `byobu` - Terminal wrapper
-- `ssh` - Secure shell
-- `ngrok` - Tunnel tool
+
+- `tmux` — local multiplexer foundation
+- `screen` — classic alternative
+- `ssh` — direct remote access
+- `script` / `asciinema` — record sessions without live share
 
 ## Additional Resources
-- [Tmate Documentation](https://tmate.io/)
-- [GitHub Repository](https://github.com/tmate-io/tmate)
-- [Usage Guide](https://tmate.io/guides/)
 
-## Best Practices
-1. Verify connections
-2. Use read-only
-3. Monitor sessions
-4. Secure keys
-5. Clean up
-
-## Configuration
-1. SSH keys
-2. Custom server
-3. Session options
-4. Access control
-5. Logging
-
-## Troubleshooting
-1. Connection issues
-2. Key problems
-3. Server errors
-4. Permission denied
-5. Display problems
+- `man tmate`, tmate.io documentation

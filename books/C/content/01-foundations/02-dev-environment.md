@@ -2,7 +2,19 @@
 
 ## Introduction
 
-Setting up a proper development environment is crucial for effective C programming. This chapter will guide you through installing compilers, choosing development tools, and configuring your system for C development.
+Setting up a proper development environment is crucial for effective C programming. This chapter walks through installing compilers, choosing editors, configuring debuggers, and — most importantly — **real day-to-day workflows**: multi-file builds, Make, a mini CMake project, and GCC vs Clang diagnostics.
+
+Default compile line used throughout this book:
+
+```bash
+gcc -std=c17 -Wall -Wextra -Wpedantic -o prog prog.c
+```
+
+Clang is a fine drop-in for learning:
+
+```bash
+clang -std=c17 -Wall -Wextra -Wpedantic -o prog prog.c
+```
 
 ## Installing Compilers
 
@@ -367,11 +379,503 @@ docker build -t c-program .
 docker run c-program
 ```
 
+## Real Workflows: From One File to a Small Project
+
+Installation is only half the job. This section is the **daily loop** you will use for the rest of the book.
+
+### Single-file recipe
+
+```bash
+# write hello.c, then:
+gcc -std=c17 -Wall -Wextra -Wpedantic -o hello hello.c
+./hello
+echo $?          # exit status: 0 means success
+```
+
+Debug-friendly variant:
+
+```bash
+gcc -std=c17 -Wall -Wextra -g -O0 -o hello hello.c
+gdb ./hello      # or lldb on macOS
+```
+
+Release-ish variant:
+
+```bash
+gcc -std=c17 -Wall -Wextra -O2 -o hello hello.c
+```
+
+### Multi-file build recipes
+
+Suppose you have:
+
+```
+util.h
+util.c
+main.c
+```
+
+**`util.h`**
+
+```c
+#ifndef UTIL_H
+#define UTIL_H
+
+int add(int a, int b);
+void greet(const char *name);
+
+#endif
+```
+
+**`util.c`**
+
+```c
+#include "util.h"
+#include <stdio.h>
+
+int add(int a, int b) {
+    return a + b;
+}
+
+void greet(const char *name) {
+    if (name == NULL) {
+        name = "(null)";
+    }
+    printf("Hello, %s!\n", name);
+}
+```
+
+**`main.c`**
+
+```c
+#include <stdio.h>
+#include "util.h"
+
+int main(void) {
+    greet("C developer");
+    printf("2 + 3 = %d\n", add(2, 3));
+    return 0;
+}
+```
+
+#### Recipe A — one-shot link
+
+```bash
+gcc -std=c17 -Wall -Wextra -Wpedantic -o app main.c util.c
+./app
+```
+
+#### Recipe B — separate compile, then link (scales better)
+
+```bash
+gcc -std=c17 -Wall -Wextra -Wpedantic -c main.c -o main.o
+gcc -std=c17 -Wall -Wextra -Wpedantic -c util.c -o util.o
+gcc -o app main.o util.o
+./app
+```
+
+When you change only `util.c`, recompile that object and re-link:
+
+```bash
+gcc -std=c17 -Wall -Wextra -Wpedantic -c util.c -o util.o
+gcc -o app main.o util.o
+```
+
+#### Recipe C — show each stage (learning aid)
+
+```bash
+gcc -std=c17 -E util.c -o util.i     # preprocess
+gcc -std=c17 -S util.c -o util.s     # assembly
+gcc -std=c17 -c util.c -o util.o     # object
+nm util.o                            # symbols defined/referenced
+```
+
+### Full program: tiny CLI calculator (single file)
+
+Type this, compile it, break it on purpose, fix warnings.
+
+```c
+/* file: calc.c */
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+static void usage(const char *prog) {
+    fprintf(stderr, "Usage: %s <add|sub|mul|div> <a> <b>\n", prog);
+}
+
+int main(int argc, char *argv[]) {
+    double a, b, result;
+    char *end;
+
+    if (argc != 4) {
+        usage(argv[0]);
+        return EXIT_FAILURE;
+    }
+
+    a = strtod(argv[2], &end);
+    if (end == argv[2] || *end != '\0') {
+        fprintf(stderr, "invalid number: %s\n", argv[2]);
+        return EXIT_FAILURE;
+    }
+    b = strtod(argv[3], &end);
+    if (end == argv[3] || *end != '\0') {
+        fprintf(stderr, "invalid number: %s\n", argv[3]);
+        return EXIT_FAILURE;
+    }
+
+    if (strcmp(argv[1], "add") == 0) {
+        result = a + b;
+    } else if (strcmp(argv[1], "sub") == 0) {
+        result = a - b;
+    } else if (strcmp(argv[1], "mul") == 0) {
+        result = a * b;
+    } else if (strcmp(argv[1], "div") == 0) {
+        if (b == 0.0) {
+            fprintf(stderr, "division by zero\n");
+            return EXIT_FAILURE;
+        }
+        result = a / b;
+    } else {
+        usage(argv[0]);
+        return EXIT_FAILURE;
+    }
+
+    printf("%.10g\n", result);
+    return EXIT_SUCCESS;
+}
+```
+
+```bash
+gcc -std=c17 -Wall -Wextra -Wpedantic -o calc calc.c
+./calc add 2 3
+./calc div 10 4
+./calc div 1 0    # should fail cleanly
+```
+
+---
+
+## GCC vs Clang (What Actually Differs)
+
+Both implement the C language and understand the same core flags. Prefer **either** for learning; use both occasionally so diagnostics look familiar.
+
+| Topic | GCC | Clang |
+|-------|-----|-------|
+| Typical binary | `gcc` | `clang` |
+| Error style | Compact, classic | Often more “caret” detail / notes |
+| Sanitizers | Excellent (`-fsanitize=…`) | Excellent (often slightly clearer reports) |
+| Static analysis extras | `-fanalyzer` (GCC) | `clang --analyze` / clang-tidy ecosystem |
+| Default on macOS | Homebrew `gcc` or Xcode’s `clang` as `gcc` alias | Xcode CLT is Clang under the hood |
+
+### Side-by-side on the same bug
+
+```c
+/* file: warn_me.c — deliberately sloppy */
+#include <stdio.h>
+
+int main(void) {
+    int x;
+    printf("%d\n", x);   /* uninitialized use */
+    return 0;
+}
+```
+
+```bash
+gcc   -std=c17 -Wall -Wextra -Wpedantic -o warn_me warn_me.c
+clang -std=c17 -Wall -Wextra -Wpedantic -o warn_me warn_me.c
+```
+
+Compare messages. Fix:
+
+```c
+int x = 0;
+```
+
+### Useful shared flags
+
+```bash
+# Treat warnings as errors once you are comfortable
+gcc -std=c17 -Wall -Wextra -Wpedantic -Werror -o prog prog.c
+
+# Extra useful warnings (optional)
+gcc -std=c17 -Wall -Wextra -Wpedantic -Wshadow -Wconversion -o prog prog.c
+
+# Sanitizers (Linux/macOS; great for learning memory bugs)
+gcc -std=c17 -Wall -Wextra -g -O1 -fsanitize=address,undefined -o prog prog.c
+```
+
+### macOS note
+
+`gcc --version` on stock macOS often prints **Apple Clang**. For real GCC:
+
+```bash
+brew install gcc
+# then use gcc-14 / g++-14 (version may differ)
+```
+
+---
+
+## Make: Multi-File Builds Without Typing Everything
+
+### Minimal `Makefile` for the util/main project
+
+```makefile
+# Makefile
+CC      = gcc
+CFLAGS  = -std=c17 -Wall -Wextra -Wpedantic
+LDFLAGS =
+TARGET  = app
+OBJS    = main.o util.o
+
+.PHONY: all clean run
+
+all: $(TARGET)
+
+$(TARGET): $(OBJS)
+	$(CC) $(LDFLAGS) -o $@ $(OBJS)
+
+%.o: %.c
+	$(CC) $(CFLAGS) -c $< -o $@
+
+# Rebuild if headers change (simple approach)
+main.o: main.c util.h
+util.o: util.c util.h
+
+run: $(TARGET)
+	./$(TARGET)
+
+clean:
+	rm -f $(OBJS) $(TARGET)
+```
+
+```bash
+make
+make run
+make clean
+```
+
+### Full program + Make: word count of argv strings
+
+**`wcargs.c`**
+
+```c
+/* file: wcargs.c */
+#include <stdio.h>
+#include <string.h>
+
+int main(int argc, char *argv[]) {
+    int i;
+    size_t total = 0;
+
+    for (i = 1; i < argc; i++) {
+        size_t n = strlen(argv[i]);
+        printf("%zu\t%s\n", n, argv[i]);
+        total += n;
+    }
+    printf("%zu\ttotal chars (no spaces between args)\n", total);
+    return 0;
+}
+```
+
+```makefile
+# one-file Makefile variant
+CC = gcc
+CFLAGS = -std=c17 -Wall -Wextra -Wpedantic
+wcargs: wcargs.c
+	$(CC) $(CFLAGS) -o $@ $<
+```
+
+```bash
+make wcargs
+./wcargs hello world
+```
+
+---
+
+## CMake Mini-Project (Practical One-Pager)
+
+CMake generates native build files (Make, Ninja, Xcode, VS). For a tiny C project:
+
+```
+mini_cmake/
+├── CMakeLists.txt
+├── include/
+│   └── util.h
+└── src/
+    ├── util.c
+    └── main.c
+```
+
+**`CMakeLists.txt`**
+
+```cmake
+cmake_minimum_required(VERSION 3.16)
+project(mini_app C)
+
+set(CMAKE_C_STANDARD 17)
+set(CMAKE_C_STANDARD_REQUIRED ON)
+set(CMAKE_C_EXTENSIONS OFF)
+
+add_compile_options(-Wall -Wextra -Wpedantic)
+
+add_executable(mini_app
+    src/main.c
+    src/util.c
+)
+
+target_include_directories(mini_app PRIVATE include)
+```
+
+Copy the same `util.h` / `util.c` / `main.c` content from the multi-file section (put `util.h` under `include/`, sources under `src/`, and use `#include "util.h"`).
+
+### Configure, build, run
+
+```bash
+cd mini_cmake
+cmake -S . -B build
+cmake --build build
+./build/mini_app
+```
+
+Debug build:
+
+```bash
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
+cmake --build build
+```
+
+Out-of-source `build/` keeps sources clean. Delete `build/` anytime and reconfigure.
+
+### Optional: compile_commands.json for editors
+
+```bash
+cmake -S . -B build -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+# many editors read build/compile_commands.json (or a symlink at repo root)
+```
+
+---
+
+## Editor + Debugger One-Pager
+
+You do not need a heavy IDE. You need: **edit → build → run under a debugger**.
+
+### Terminal editor + GDB (always works)
+
+```bash
+# 1. edit files in vim/nano/emacs/VS Code
+# 2. build with symbols
+gcc -std=c17 -Wall -Wextra -g -O0 -o app main.c util.c
+
+# 3. debug
+gdb ./app
+```
+
+Essential GDB session:
+
+```text
+(gdb) break main
+(gdb) run
+(gdb) next          # step over
+(gdb) step          # step into
+(gdb) print a
+(gdb) backtrace     # or: bt
+(gdb) continue
+(gdb) quit
+```
+
+### LLDB (macOS default)
+
+```bash
+clang -std=c17 -Wall -Wextra -g -O0 -o app main.c util.c
+lldb ./app
+```
+
+```text
+(lldb) b main
+(lldb) run
+(lldb) n
+(lldb) p a
+(lldb) bt
+(lldb) c
+(lldb) q
+```
+
+### VS Code (minimum useful setup)
+
+1. Install **C/C++** extension (Microsoft) or clangd-based setup.  
+2. Ensure `gcc`/`clang` and `gdb`/`lldb` are on `PATH`.  
+3. Use the earlier `tasks.json` / `launch.json`, **or** just open an integrated terminal and run `make` + `gdb`.  
+4. Prefer a multi-file task that builds the whole project, not only the active file, once you leave single-file labs.
+
+### GDB against a real bug (complete mini-lab)
+
+```c
+/* file: off_by_one.c */
+#include <stdio.h>
+
+static int sum_first_n(const int *a, int n) {
+    int total = 0;
+    int i;
+    /* BUG: i <= n reads one past the end when n is the count */
+    for (i = 0; i <= n; i++) {
+        total += a[i];
+    }
+    return total;
+}
+
+int main(void) {
+    int data[5] = {1, 2, 3, 4, 5};
+    printf("sum = %d\n", sum_first_n(data, 5));
+    return 0;
+}
+```
+
+```bash
+gcc -std=c17 -Wall -Wextra -g -O0 -o off_by_one off_by_one.c
+gdb ./off_by_one
+```
+
+```text
+(gdb) break sum_first_n
+(gdb) run
+(gdb) print n
+(gdb) print i
+(gdb) next
+# watch i go to 5 while valid indices are 0..4
+```
+
+Fix the loop to `i < n`, rebuild, confirm `sum = 15`.
+
+---
+
+## Sanitizers and Memory Tools (Environment Checklist)
+
+```bash
+# Address + undefined behavior (recommended learning default)
+gcc -std=c17 -Wall -Wextra -g -O1 -fsanitize=address,undefined -o app main.c util.c
+./app
+
+# Valgrind Memcheck (Linux; limited/absent on modern macOS)
+gcc -std=c17 -Wall -Wextra -g -O0 -o app main.c util.c
+valgrind --leak-check=full ./app
+```
+
+Keep a personal alias if you like:
+
+```bash
+alias c17='gcc -std=c17 -Wall -Wextra -Wpedantic'
+alias c17san='gcc -std=c17 -Wall -Wextra -g -O1 -fsanitize=address,undefined'
+```
+
+---
+
 ## Modern Development Practices
 
 ### Version Control Workflow
-1. Initialize a Git repository: `git init`
-2. Create a `.gitignore` file for C projects:
+
+1. Initialize a Git repository: `git init`  
+2. Create a `.gitignore` for C projects:
+
 ```
 # Compiled objects
 *.o
@@ -381,55 +885,120 @@ docker run c-program
 *.exe
 *.out
 a.out
+app
+calc
 
 # Debug files
 *.dSYM/
+core
+core.*
 
 # Build directories
 build/
 cmake-build-*/
+compile_commands.json
+
+# Editor
+.vscode/
+.idea/
 ```
 
+3. Commit early, commit small: “compiles with -Wall” is a good checkpoint.
+
 ### Project Structure
-Organize your C projects with a standard structure:
+
 ```
 project/
 ├── src/           # Source files
 ├── include/       # Header files
 ├── tests/         # Test files
 ├── docs/          # Documentation
-├── build/         # Build output
-├── CMakeLists.txt # Build configuration
-└── README.md      # Project documentation
+├── build/         # Build output (gitignored)
+├── CMakeLists.txt # or Makefile
+└── README.md
 ```
 
 ### Continuous Integration
-Set up CI with GitHub Actions:
+
 ```yaml
+# .github/workflows/c-ci.yml
 name: C CI
 
-on: [push]
+on: [push, pull_request]
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    
     steps:
-    - uses: actions/checkout@v2
-    - name: Compile
-      run: gcc -Wall -Wextra -std=c99 -o program src/*.c
-    - name: Run tests
-      run: ./program
+      - uses: actions/checkout@v4
+      - name: Compile
+        run: gcc -std=c17 -Wall -Wextra -Wpedantic -Werror -o app src/*.c -I include
+      - name: Run
+        run: ./app
 ```
+
+---
+
+## Verify Your Setup (Smoke Tests)
+
+Run these once after installing tools:
+
+```bash
+# Compilers
+gcc --version
+clang --version   # if installed
+
+# Build tools
+make --version
+cmake --version
+
+# Debuggers
+gdb --version     # or: lldb --version
+
+# Sanitizer smoke
+printf '%s\n' '#include <stdio.h>' 'int main(void){puts("ok");}' > t.c
+gcc -std=c17 -Wall -Wextra -fsanitize=address,undefined -o t t.c && ./t
+```
+
+Expected: versions print without error; `./t` prints `ok`.
+
+---
+
+## Exercises
+
+Compile every program with:
+
+```bash
+gcc -std=c17 -Wall -Wextra -Wpedantic -o <name> <sources...>
+```
+
+1. **Hello toolchain** — Compile the same `hello.c` with both `gcc` and `clang` (if available). Note any diagnostic differences when you introduce an unused variable.
+
+2. **Multi-file link** — Create `add.h` / `add.c` / `main.c`. Build with Recipe A and Recipe B. Delete `add.o` and rebuild only what is needed.
+
+3. **Makefile** — Write a `Makefile` that builds the multi-file app, supports `make clean` and `make run`, and rebuilds when a header changes.
+
+4. **CMake mini** — Recreate the `mini_cmake` layout. Configure an out-of-source `build/`, build, and run. Then change `util.c`, rebuild, and confirm only the needed objects recompile (watch timestamps / build log).
+
+5. **Debugger lab** — Use GDB or LLDB on `off_by_one.c`. Set a breakpoint, print `i` and `a[i]`, fix the bug, and show the correct sum.
+
+6. **Sanitizer lab** — Write a program that does `int *p = NULL; *p = 1;`. Run it normally (crash), then under AddressSanitizer. Paste the first few lines of the ASan report into a comment in your fixed file.
+
+7. **calc CLI** — Extend `calc.c` with a `mod` operation using integers (`strtol`) and reject non-integers cleanly.
+
+8. **gitignore** — Initialize git in a throwaway folder, build an app, confirm artifacts are ignored, and make one commit of sources only.
+
+---
 
 ## Summary
 
-Setting up a proper C development environment involves:
-1. Choosing and installing a suitable compiler (GCC, Clang, or MSVC)
-2. Selecting an IDE or editor (VS Code, CLion, etc.)
-3. Configuring debugging tools (GDB, Valgrind, AddressSanitizer)
-4. Setting up build tools (Make, CMake)
-5. Implementing version control (Git)
-6. Considering modern practices (CI/CD, containerization)
+A solid C environment is:
 
-With these tools properly configured, you'll have a robust environment for C development that supports everything from simple programs to complex systems projects. The choice of specific tools often depends on your platform, project requirements, and personal preferences.
+1. **Compiler** — GCC and/or Clang with `-std=c17 -Wall -Wextra`  
+2. **Editor** — anything that edits text reliably; IDE optional  
+3. **Debugger** — GDB/LLDB with `-g -O0` builds  
+4. **Build tools** — one-shot `gcc`, then Make, then CMake as projects grow  
+5. **Sanitizers / Valgrind** — treat memory and UB as first-class  
+6. **Git** — ignore build products; commit sources  
+
+Master the multi-file and debugger loops now; every later module assumes you can edit, build, run, and inspect without friction.

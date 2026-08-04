@@ -1,88 +1,132 @@
 # basename
 
 ## Overview
-The `basename` command strips directory and suffix from filenames, returning just the filename portion of a path. It's essential for path manipulation in scripts.
+
+`basename` strips the directory portion (and optionally a suffix) from a path, leaving the final component. It is the complement of `dirname` for simple path surgery in shell scripts — naming logs, deriving output files, and parsing `$0`.
 
 ## Syntax
+
 ```bash
-basename name [suffix]
-basename option... name...
+basename NAME [SUFFIX]
+basename OPTION... NAME...
 ```
 
 ## Common Options
+
 | Option | Description |
 |--------|-------------|
-| `-a` | Support multiple arguments |
-| `-s suffix` | Remove trailing suffix |
-| `-z` | End output with NUL character |
+| `-a`, `--multiple` | Treat all arguments as NAMEs |
+| `-s SUF`, `--suffix=SUF` | Strip suffix (implies multiple mode when combined properly) |
+| `-z`, `--zero` | NUL-terminated output |
+
+Traditional form: `basename /path/to/file.txt .txt` → `file`.
 
 ## Key Use Cases
-1. Extract filename from path
-2. Remove file extensions
-3. Script path manipulation
-4. Batch file processing
-5. Log file naming
+
+1. Extract filename from a path
+2. Strip extensions
+3. Derive names from `$0` or CLI args
+4. Build sibling output paths in loops
+5. Clean display names in logs
 
 ## Examples with Explanations
-### Example 1: Basic Usage
+
+### Basics
+
 ```bash
 basename /path/to/file.txt
-```
-Returns: `file.txt`
-
-### Example 2: Remove Extension
-```bash
+# file.txt
 basename /path/to/file.txt .txt
+# file
+basename /path/to/dir/
+# dir
+basename /
+# /   (or implementation-defined root behavior)
 ```
-Returns: `file`
 
-### Example 3: Multiple Files
+### Multiple names
+
 ```bash
-basename -a /path/file1.txt /other/file2.log
+basename -a /a/b /c/d
+basename -a -s .conf /etc/ssh/sshd_config /etc/systemd/logind.conf
 ```
-Returns: `file1.txt` and `file2.log`
 
-## Common Usage Patterns
-1. Script naming:
-   ```bash
-   SCRIPT_NAME=$(basename "$0")
-   ```
-2. Remove extensions:
-   ```bash
-   basename "$file" .conf
-   ```
-3. Process multiple files:
-   ```bash
-   for file in *.txt; do
-       name=$(basename "$file" .txt)
-       echo "Processing: $name"
-   done
-   ```
+### Script name
+
+```bash
+SCRIPT_NAME=$(basename "$0")
+echo "usage: $SCRIPT_NAME [options]"
+```
+
+### Strip extension patterns
+
+```bash
+f=/data/report.2024.csv
+base=$(basename "$f")           # report.2024.csv
+stem=$(basename "$f" .csv)      # report.2024
+# careful: only strips exact suffix match at end
+```
+
+### Loop rename
+
+```bash
+for f in /var/log/app/*.log; do
+  b=$(basename "$f")
+  gzip -c "$f" > "/backup/${b}.gz"
+done
+```
+
+### Combine with dirname
+
+```bash
+path=/opt/app/bin/tool
+echo "dir=$(dirname "$path") name=$(basename "$path")"
+```
+
+### NUL-safe pipeline
+
+```bash
+find . -type f -name '*.md' -print0 |
+  while IFS= read -r -d '' f; do
+    basename -z "$f"
+  done
+```
+
+### Parameter expansion alternative
+
+```bash
+# bash-only equivalents often used instead of basename
+f=/path/to/file.txt
+echo "${f##*/}"           # file.txt
+echo "${f##*/}" | sed 's/\.txt$//'
+# or
+b=${f##*/}; echo "${b%.txt}"
+```
+
+Builtins avoid spawning `basename` in hot loops.
+
+## Notes / Pitfalls
+
+- Suffix strip requires an **exact** trailing match; `.tar.gz` must be stripped carefully (often twice or with special logic).
+- Trailing slashes: GNU `basename` handles them; still quote variables.
+- Don’t use for security canonicalization — use `realpath` / proper validation.
+- BusyBox `basename` may lack `-a`/`-z`.
+- Filenames with newlines need `-z` / careful reading.
+
+## 2026-relevant notes
+
+- In hot path bash, prefer `${var##*/}` over external `basename`.
+- Still excellent for readability in admin scripts and one-liners.
+- Pair with `realpath` when the path may contain `..` or symlinks before basenaming for display only.
 
 ## Related Commands
-- `dirname` - Extract directory path
-- `realpath` - Get absolute path
-- `pathchk` - Check path validity
 
-## Best Practices
-1. Quote variables to handle spaces
-2. Use with dirname for complete path manipulation
-3. Consider using parameter expansion as alternative
-4. Test with edge cases (empty paths, root directory)
+- `dirname` — parent path
+- `realpath` — canonicalize
+- `readlink` — resolve links
+- bash parameter expansion — `${f##*/}`, `${f%.*}`
+- `cut` / `sed` — ad-hoc parsing
 
-## Integration Examples
-1. Backup script:
-   ```bash
-   backup_name="backup-$(basename "$PWD")-$(date +%Y%m%d)"
-   ```
-2. Log rotation:
-   ```bash
-   logname=$(basename "$logfile" .log)
-   mv "$logfile" "${logname}-$(date +%Y%m%d).log"
-   ```
-## Additional Examples
-```bash
-basename /usr/local/bin/tool
-basename /path/to/file.txt .txt     # strip suffix → file
-basename -a /a/b /c/d
-```
+## Additional Resources
+
+- `man basename`

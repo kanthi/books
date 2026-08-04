@@ -1,243 +1,104 @@
 # ftp
 
 ## Overview
-The `ftp` command is a file transfer protocol client used to transfer files between local and remote systems. While largely superseded by more secure alternatives, it's still used for legacy systems and public file servers.
+
+`ftp` is the classic interactive client for the **File Transfer Protocol**. On modern systems it is largely superseded by **`sftp`/`scp`/`rsync` over SSH** and HTTPS downloads (`curl`/`wget`). Prefer encrypted channels whenever possible — plain FTP sends credentials and data in cleartext.
+
+Many distros ship `ftp` as `ftp` or `tnftp` / require installing `ftp` package; some only provide `lftp` or `sftp`.
 
 ## Syntax
+
 ```bash
 ftp [options] [host]
+ftp ftp://user@host/path     # URL form on some clients
 ```
 
-## Common Options
-| Option | Description |
-|--------|-------------|
-| `-4` | Use IPv4 only |
-| `-6` | Use IPv6 only |
-| `-A` | Force active mode |
-| `-a` | Use anonymous login |
-| `-d` | Enable debugging |
-| `-e` | Disable command editing |
-| `-g` | Disable filename globbing |
-| `-i` | Turn off interactive prompting |
-| `-n` | No auto-login |
-| `-p` | Use passive mode |
-| `-v` | Verbose output |
+## Common Options / commands
 
-## Key Use Cases
-1. File transfer to/from FTP servers
-2. Legacy system integration
-3. Public file downloads
-4. Automated file transfers
-5. System administration
+Client option flags vary. Once connected, interactive commands include:
 
-## Examples with Explanations
-### Example 1: Connect to FTP Server
-```bash
-ftp ftp.example.com
-```
-Connects to FTP server and prompts for credentials
-
-### Example 2: Anonymous FTP
-```bash
-ftp -a ftp.example.com
-```
-Connects using anonymous login
-
-### Example 3: Non-interactive Mode
-```bash
-ftp -n ftp.example.com
-```
-Connects without automatic login
-
-## FTP Commands
 | Command | Description |
 |---------|-------------|
-| `ls` | List remote files |
-| `cd` | Change remote directory |
-| `lcd` | Change local directory |
-| `pwd` | Show remote directory |
-| `lpwd` | Show local directory |
-| `get` | Download file |
-| `put` | Upload file |
-| `mget` | Download multiple files |
-| `mput` | Upload multiple files |
-| `binary` | Set binary transfer mode |
-| `ascii` | Set ASCII transfer mode |
-| `passive` | Toggle passive mode |
-| `quit` | Exit FTP |
+| `open host` | Connect |
+| `user` | Authenticate |
+| `ls` / `dir` | List remote |
+| `cd` / `lcd` | Remote / local directory |
+| `get` / `mget` | Download |
+| `put` / `mput` | Upload |
+| `binary` / `ascii` | Transfer mode |
+| `passive` / `passive on` | Passive mode (usually required today) |
+| `bye` / `quit` | Exit |
+| `hash` | Progress hashes |
+| `prompt` | Toggle mget/mput prompts |
 
-## File Transfer Examples
-### Download Files
+## Examples with Explanations
+
+### Interactive session
+
 ```bash
-ftp> get filename.txt
-ftp> mget *.txt
-ftp> get remote.txt local.txt
+ftp ftp.example.com
+# Name: anonymous
+# Password: user@email
+binary
+passive
+ls
+get README
+bye
 ```
 
-### Upload Files
+### Prefer SFTP instead
+
 ```bash
-ftp> put filename.txt
-ftp> mput *.txt
-ftp> put local.txt remote.txt
+sftp user@host
+scp file user@host:/path/
+rsync -avP file user@host:/path/
 ```
 
-## Transfer Modes
-| Mode | Description |
-|------|-------------|
-| ASCII | Text files (default) |
-| Binary | Binary files |
-| Auto | Automatic detection |
+### lftp (better modern client)
 
-Set transfer mode:
 ```bash
-ftp> binary
-ftp> ascii
+lftp ftp://user@host
+lftp -e 'set ftp:passive-mode true; mirror -c remote local; bye' host
 ```
 
-## Common Usage Patterns
-1. Batch download:
-   ```bash
-   ftp> mget *.log
-   ```
-2. Directory synchronization:
-   ```bash
-   ftp> lcd /local/path
-   ftp> cd /remote/path
-   ftp> mget *
-   ```
-3. Automated transfer:
-   ```bash
-   ftp> prompt off
-   ftp> mput *.txt
-   ```
+### Scripted (discouraged for secrets)
 
-## Passive vs Active Mode
-- **Active Mode**: Server connects back to client
-- **Passive Mode**: Client connects to server for data
-
-Enable passive mode:
 ```bash
-ftp> passive
+ftp -n host <<'EOF'
+user anonymous guest@
+binary
+get file.bin
+bye
+EOF
 ```
 
-## Scripting FTP Operations
-1. Using here document:
-   ```bash
-   ftp -n ftp.example.com << EOF
-   user username password
-   binary
-   cd /remote/path
-   lcd /local/path
-   mget *.txt
-   quit
-   EOF
-   ```
-2. Using command file:
-   ```bash
-   echo "user username password
-   binary
-   get file.txt
-   quit" > ftp_commands.txt
-   ftp -n ftp.example.com < ftp_commands.txt
-   ```
+Credentials in scripts leak; use SSH keys or secret stores.
 
-## Security Considerations
-1. Unencrypted protocol
-2. Credentials sent in plain text
-3. Data transmitted unencrypted
-4. Use SFTP/SCP for secure transfers
-5. Firewall configuration needed
+### Firewall note
+
+Active FTP fails behind NATs; **passive mode** is the norm. Still painful vs SSH.
+
+## Notes / Pitfalls
+
+- Cleartext auth and data — avoid on untrusted networks.
+- FTPS (FTP over TLS) is different from SFTP (SSH); know which you need.
+- Corporate scanners still find open FTP servers — disable if unused.
+- ASCII mode corrupts binaries — use `binary`.
+- Many public mirrors moved to HTTPS only.
+
+## 2026-relevant notes
+
+- Treat FTP as legacy interoperability only.
+- Default transfer should be `sftp`/`rsync`/`curl` https.
+- If you must run a server, prefer SFTP chroots or HTTPS object storage.
 
 ## Related Commands
-- `sftp` - Secure FTP
-- `scp` - Secure copy
-- `rsync` - Synchronization tool
-- `wget` - Web downloader
-- `curl` - Data transfer tool
 
-## Best Practices
-1. Use secure alternatives when possible
-2. Use passive mode for firewalls
-3. Set appropriate transfer modes
-4. Verify file transfers
-5. Use automation for repetitive tasks
+- `sftp` / `scp` / `rsync` — SSH-based transfer
+- `lftp` / `ncftp` — richer FTP clients
+- `curl` / `wget` — URL downloads
+- `ssh` — remote shell + tunnels
 
-## Automated FTP Scripts
-1. Backup script:
-   ```bash
-   #!/bin/bash
-   HOST="backup.server.com"
-   USER="backup_user"
-   PASS="backup_pass"
+## Additional Resources
 
-   ftp -n $HOST << EOF
-   user $USER $PASS
-   binary
-   cd /backups
-   lcd /local/backups
-   mput *.tar.gz
-   quit
-   EOF
-   ```
-2. Download script:
-   ```bash
-   #!/bin/bash
-   ftp -n ftp.example.com << EOF
-   user anonymous anonymous@domain.com
-   binary
-   cd /pub/files
-   mget *.zip
-   quit
-   EOF
-   ```
-
-## Error Handling
-1. Connection errors:
-   ```bash
-   ftp -v ftp.server.com 2>&1 | grep -i error
-   ```
-2. Transfer verification:
-   ```bash
-   ftp> hash  # Show progress
-   ftp> status  # Show connection status
-   ```
-
-## Performance Optimization
-1. Use binary mode for non-text files
-2. Enable hash marks for progress
-3. Use passive mode for better connectivity
-4. Consider parallel transfers for multiple files
-
-## Troubleshooting
-1. Connection refused
-2. Login failures
-3. Transfer mode issues
-4. Firewall problems
-5. Permission errors
-
-## Modern Alternatives
-Instead of FTP, consider:
-1. `sftp` - Secure FTP over SSH
-2. `scp` - Secure copy over SSH
-3. `rsync` - Efficient file synchronization
-4. `curl` - Modern data transfer
-5. `wget` - Web-based downloads
-
-## Integration Examples
-1. Log rotation upload:
-   ```bash
-   # Upload rotated logs
-   find /var/log -name "*.gz" -mtime -1 | while read file; do
-       echo "put $file" | ftp -n backup.server.com
-   done
-   ```
-2. Configuration deployment:
-   ```bash
-   ftp -n config.server.com << EOF
-   user deploy deploy_pass
-   ascii
-   cd /configs
-   mput *.conf
-   quit
-   EOF
-   ```
+- `man ftp`, `man sftp`

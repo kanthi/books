@@ -1,31 +1,102 @@
 # visudo
 
 ## Overview
-`visudo` safely edits the `/etc/sudoers` file. It locks the file against simultaneous edits and performs syntax checking before saving to prevent accidental lockout.
+
+`visudo` safely edits the **sudoers** configuration (`/etc/sudoers` and files under `/etc/sudoers.d/`). It locks the file and **syntax-checks** before installing changes — preventing a bad edit from locking out all sudo access. Always use `visudo` instead of editing sudoers directly with a random editor.
 
 ## Syntax
+
 ```bash
 visudo [options]
+visudo -f file
 ```
 
 ## Common Options
+
 | Option | Description |
 |--------|-------------|
-| `-c`, `--check` | Check syntax of sudoers file without editing |
-| `-f`, `--file FILE` | Edit or check specified file instead of default `/etc/sudoers` |
-| `-s`, `--strict` | Enable strict syntax checking |
+| `-f file`, `--file=file` | Edit a specific file (e.g. drop-in) |
+| `-c`, `--check` | Check syntax only |
+| `-s`, `--strict` | Stricter parse |
+| `-q`, `--quiet` | Quiet |
+| `-x file` | Export as JSON (newer) / legacy dump options vary |
+| `-N` | No default includes (see man) |
 
-## Key Use Cases
-1. Safely modifying administrative permissions in `/etc/sudoers`.
-2. Validating custom sudo configuration files in `/etc/sudoers.d/`.
+Editor from `$EDITOR` / `$VISUAL` / compile-time default (`vi`/`nano`).
 
 ## Examples with Explanations
-### Example 1: Check Sudoers Syntax
+
+### Edit main sudoers
+
 ```bash
-visudo -c
+sudo visudo
 ```
-Parses `/etc/sudoers` and validates syntax without opening an editor.
+
+### Edit a drop-in (preferred)
+
+```bash
+sudo visudo -f /etc/sudoers.d/90-alice
+```
+
+Drop-ins should be numeric-prefixed and avoid `.` or `~` in names (sudo ignores many invalid names).
+
+### Check syntax
+
+```bash
+sudo visudo -c
+sudo visudo -cf /etc/sudoers.d/90-alice
+```
+
+### Common policy snippets (examples)
+
+```bash
+# /etc/sudoers.d/90-alice  (via visudo -f)
+alice ALL=(ALL) ALL
+# passwordless for a single command (still risky):
+alice ALL=(root) NOPASSWD: /usr/bin/systemctl restart nginx
+# group based:
+%sudo ALL=(ALL:ALL) ALL
+```
+
+Understand tag implications (`NOPASSWD`, `SETENV`, `NOEXEC`) before deploying.
+
+### Recover from broken sudoers (prevention)
+
+If you never skip `visudo`, you avoid the classic lockout. Recovery usually needs:
+
+- console/root login
+- or break-glass cloud serial console
+- then `visudo` fix
+
+### Test as user
+
+```bash
+sudo -l -U alice
+sudo -u alice sudo -l
+```
+
+## Notes / Pitfalls
+
+- Never `nano /etc/sudoers` without visudo — a typo can deny all sudo.
+- Last matching rule wins in many cases — order matters.
+- `#includedir /etc/sudoers.d` is standard; file names must meet sudo’s filters.
+- `NOPASSWD: ALL` is almost always too broad for humans.
+- Keep a root console session open while testing policy changes on remote hosts.
+
+## 2026-relevant notes
+
+- Prefer small drop-ins per role over one monolithic sudoers file.
+- Many orgs move to SSH certs + policy engines; sudoers still ubiquitous on servers.
+- Audit with `sudo -l` and central config management (Ansible `template` + validate).
 
 ## Related Commands
-- `sudo` - Execute command as another user
-- `passwd` - Change user password
+
+- `sudo` / `sudo -l`
+- `sudoedit` — edit files as another user safely
+- `pkexec` — polkit privilege (desktop/admin)
+- `su` — switch user
+- editor env: `EDITOR=vim visudo`
+
+## Additional Resources
+
+- `man visudo`, `man sudoers`

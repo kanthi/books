@@ -1,205 +1,131 @@
 # file
 
 ## Overview
-The `file` command determines file types by examining file contents rather than relying on file extensions. It uses magic numbers and patterns to identify file formats.
+
+`file` classifies files by inspecting **content magic** (and optionally the filesystem type), not just the name extension. Use it on unknown downloads, mystery binaries, compressed blobs, and scripts without a reliable extension.
+
+It reads magic patterns from a database (e.g. `/usr/share/misc/magic`). Classification is heuristic — good for ops triage, not a security sandbox.
 
 ## Syntax
+
 ```bash
 file [options] file...
+file -               # read stdin
 ```
 
 ## Common Options
+
 | Option | Description |
 |--------|-------------|
-| `-b` | Brief mode (no filename) |
-| `-i` | MIME type output |
-| `-L` | Follow symbolic links |
+| `-b`, `--brief` | Don’t prefix filename |
+| `-i`, `--mime` | MIME type output |
+| `-I` | MIME with encoding (some versions) |
 | `-z` | Look inside compressed files |
-| `-0` | Read null-separated filenames |
-| `-f list` | Read filenames from file |
-| `-m magic` | Use specific magic file |
-| `-r` | Don't stop at first match |
-| `-s` | Read block/character special files |
-
-## File Type Categories
-| Category | Examples |
-|----------|----------|
-| Text | ASCII text, UTF-8 text |
-| Binary | ELF executable, PE32 executable |
-| Archive | ZIP, TAR, GZIP |
-| Image | JPEG, PNG, GIF |
-| Audio | MP3, WAV, FLAC |
-| Video | MP4, AVI, MKV |
-| Document | PDF, MS Word, LibreOffice |
-
-## Key Use Cases
-1. Identify unknown files
-2. Verify file formats
-3. Check file integrity
-4. Security analysis
-5. Data recovery
+| `-L` | Follow symlinks |
+| `-s` | Allow special/block files |
+| `-k` | Keep going; don’t stop at first match |
+| `-f listfile` | Read filenames from listfile |
+| `-e test` | Exclude a test (e.g. `soft`, `tokens`) |
+| `-h` | Don’t follow symlinks (default often) |
 
 ## Examples with Explanations
-### Example 1: Basic File Type
-```bash
-file document.pdf
-```
-Shows file type information for the PDF
 
-### Example 2: Multiple Files
+### Basic classification
+
+```bash
+file /bin/ls
+file /etc/hosts
+file mystery.bin
+file photo.jpg note.txt archive.tar.gz
+```
+
+### Brief and MIME
+
+```bash
+file -b mystery.bin
+file -i photo.jpg
+# photo.jpg: image/jpeg; charset=binary
+file -bi photo.jpg
+```
+
+### Inside compressed data
+
+```bash
+file -z backup.tar.gz
+file -z something.xz
+```
+
+### Symlinks
+
+```bash
+file /usr/bin/python3
+file -L /usr/bin/python3
+```
+
+### Scripts and interpreters
+
+```bash
+file bootstrap.sh
+# may report: Bourne-Again shell script, ASCII text executable
+head -1 bootstrap.sh      # shebang check
+```
+
+### Stdin
+
+```bash
+head -c 256 blob | file -
+curl -fsSL https://example.com/file | file -
+```
+
+### Batch unknown directory
+
 ```bash
 file *
+find . -type f -print0 | xargs -0 file | grep -i 'executable\|ELF'
 ```
-Shows file types for all files in directory
 
-### Example 3: MIME Type
+### Guard uploads / pipelines
+
 ```bash
-file -i image.jpg
-```
-Shows MIME type instead of description
-
-## Understanding Output
-Typical output format:
-```
-filename: file type description
+mime=$(file -bi "$upload" | cut -d';' -f1)
+case $mime in
+  image/jpeg|image/png) echo ok ;;
+  *) echo "rejected: $mime" >&2; exit 1 ;;
+esac
 ```
 
-Examples:
-- `script.py: Python script, ASCII text executable`
-- `image.jpg: JPEG image data, JFIF standard`
-- `archive.tar.gz: gzip compressed data`
+### ELF deep dive (after file)
 
-## Common Usage Patterns
-1. Check executable type:
-   ```bash
-   file /bin/ls
-   ```
-2. Identify text encoding:
-   ```bash
-   file -i textfile.txt
-   ```
-3. Batch file analysis:
-   ```bash
-   find . -type f | xargs file
-   ```
+```bash
+file /usr/local/bin/app
+readelf -h /usr/local/bin/app
+ldd /usr/local/bin/app
+```
 
-## Magic Database
-The file command uses magic databases:
-- `/usr/share/misc/magic` (compiled)
-- `/usr/share/misc/magic.mgc` (binary)
-- `/etc/magic` (local additions)
-- `~/.magic` (user-specific)
+## Notes / Pitfalls
 
-## Advanced Usage
-1. Compressed file analysis:
-   ```bash
-   file -z archive.tar.gz
-   ```
-2. Follow symlinks:
-   ```bash
-   file -L symlink
-   ```
-3. Brief output:
-   ```bash
-   file -b mysterious_file
-   ```
+- Extensions lie; `file` can too — polyglots and crafted headers fool magic.
+- Text encodings may be guessed; don’t treat as authoritative Unicode detection.
+- Very large files: `file` only needs the beginning — still be careful with special devices.
+- Without `-s`, behavior on device nodes is limited.
+- Magic DB age depends on package `libmagic` / `file` updates.
 
-## Performance Analysis
-- Fast operation
-- No file modification
-- Reads only file headers
-- Efficient for large directories
-- Minimal memory usage
+## 2026-relevant notes
+
+- Container distroless images may omit `file`; copy samples to a debug image.
+- For security scanning, use dedicated malware/YARA tooling beyond `file`.
+- MIME output pairs well with web and S3 content-type checks in shell tooling.
 
 ## Related Commands
-- `stat` - File statistics
-- `ls -l` - File permissions and size
-- `hexdump` - View file in hex
-- `strings` - Extract text from binaries
-- `readelf` - ELF file analysis
+
+- `stat` — metadata, not content type
+- `hexdump` / `xxd` — raw bytes
+- `strings` — printable spans in binaries
+- `readelf` / `objdump` — ELF analysis
+- `identify` (ImageMagick) — image details
+- `ls -l` — names and modes only
 
 ## Additional Resources
-- [File Manual](https://www.darwinsys.com/file/)
-- [Magic File Format](https://www.tecmint.com/file-command-examples/)
 
-## Best Practices
-1. Use with unknown files
-2. Verify file integrity
-3. Check before processing
-4. Use MIME types for web applications
-5. Combine with other analysis tools
-
-## Security Applications
-1. Malware detection:
-   ```bash
-   file suspicious_file
-   ```
-2. Data validation:
-   ```bash
-   file uploaded_image | grep -q "JPEG"
-   ```
-3. File type verification:
-   ```bash
-   [[ $(file -b file.pdf) == *"PDF"* ]]
-   ```
-
-## Scripting Examples
-1. Process only images:
-   ```bash
-   for f in *; do
-       if file -i "$f" | grep -q "image/"; then
-           echo "Processing image: $f"
-       fi
-   done
-   ```
-2. Find executables:
-   ```bash
-   find . -type f -exec file {} \; | grep executable
-   ```
-3. Validate file types:
-   ```bash
-   validate_pdf() {
-       file -b "$1" | grep -q "PDF" || return 1
-   }
-   ```
-
-## MIME Type Examples
-Common MIME types:
-- `text/plain` - Plain text
-- `image/jpeg` - JPEG image
-- `application/pdf` - PDF document
-- `video/mp4` - MP4 video
-- `application/zip` - ZIP archive
-
-## Troubleshooting
-1. Unknown file types
-2. Corrupted files
-3. Magic database issues
-4. Encoding problems
-5. Symlink handling
-
-## Integration Examples
-1. With find:
-   ```bash
-   find /home -type f -exec file {} \; | grep "ASCII text"
-   ```
-2. With grep:
-   ```bash
-   file * | grep -i image
-   ```
-3. File sorting:
-   ```bash
-   file * | awk -F: '/JPEG/ {print $1}' | xargs ls -l
-   ```
-
-## Custom Magic Files
-Create custom magic patterns:
-```
-# ~/.magic
-0    string    MYFORMAT    My custom file format
-```
-
-Then use:
-```bash
-file -m ~/.magic custom_file
-```
+- `man file`
+- [libmagic / file(1) docs](https://www.darwinsys.com/file/)

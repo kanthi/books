@@ -1,51 +1,98 @@
 # lsusb
 
 ## Overview
-`lsusb` lists devices on the USB buses (keyboards, NICs, storage, serial adapters, phones). Provided by the `usbutils` package.
+
+`lsusb` lists USB devices connected to the system (buses, IDs, vendor/product strings). Essential for debugging docks, keys, serial adapters, and whether a device is even enumerated before loading drivers.
+
+Package: often `usbutils`.
 
 ## Syntax
+
 ```bash
 lsusb [options]
 ```
 
 ## Common Options
+
 | Option | Description |
 |--------|-------------|
-| `-v` | Verbose descriptors (noisy; pipe to `less`) |
-| `-t` | Topology tree |
-| `-s [[bus]:][devnum]` | Single device |
-| `-d vendor:product` | Filter by IDs (from `lsusb` first column) |
-| `-D /dev/bus/usb/...` | Dump a device node |
-| `-v -s 001:005` | Verbose for one device |
+| `-v`, `--verbose` | Detailed descriptors |
+| `-vv` | Even more verbose |
+| `-t` | Tree view |
+| `-s [[bus]:][devnum]` | Show only specific device |
+| `-d vendor:product` | Filter by ID |
+| `-D device` | Query device node under `/dev/bus/usb` |
+| `-k` | Kernel driver binding info (when supported) |
 
 ## Examples with Explanations
+
+### List devices
+
 ```bash
 lsusb
 lsusb -t
-lsusb -d 0781:5581
-sudo lsusb -v 2>/dev/null | less
 ```
 
-### After plugging a device
+### Filter
+
 ```bash
-dmesg | tail -40
-journalctl -k -n 40 --no-pager
+lsusb -d 0781:5567
+lsusb -s 001:005
+```
+
+### Verbose probe
+
+```bash
+sudo lsusb -v | less
+sudo lsusb -v -d 1d6b:0002 | less
+```
+
+### Correlate with kernel messages
+
+```bash
 lsusb
-lsblk -f          # if it is storage
+dmesg -w
+# plug device, watch enumeration
+journalctl -k -f
 ```
 
-### Watch for hotplug
+### Find device nodes
+
 ```bash
-watch -n 1 lsusb
+ls -l /dev/bus/usb/*/*
+ls -l /dev/ttyUSB* /dev/ttyACM* 2>/dev/null
 ```
 
-## Notes
-- IDs look like `Bus 001 Device 005: ID abcd:1234 Vendor Product`.  
-- Permissions may limit verbose descriptor detail without root.  
-- Update ID database periodically with distro packages (`usb.ids`).
+### Tree + drivers
+
+```bash
+lsusb -t
+# shows hubs and nesting; helpful for power/hub issues
+```
+
+## Notes / Pitfalls
+
+- Permission: some verbose details need root.
+- Unauthorized USB policy (USBGuard) may block devices that still appear partially.
+- VMs need USB passthrough configured; host `lsusb` ≠ guest.
+- IDs are hex vendor:product from the USB-IF database; strings can be generic.
+- Unstable enumeration often means cable/power/hub issues, not software.
+
+## 2026-relevant notes
+
+- USB-C docks create deep hub trees — use `-t`.
+- `usbguard`, `udev` rules, and secure boot policies affect usability more than `lsusb` itself.
+- For serial adapters, also check `dmesg` for `ttyUSB`/`ttyACM` assignment.
 
 ## Related Commands
-- `lspci` — PCI devices  
-- `dmesg` / `journalctl -k`  
-- `udevadm info --name=/dev/ttyUSB0`  
-- `lsblk` / `usb-devices`
+
+- `lspci` — PCI devices
+- `lshw` — hardware inventory
+- `dmesg` / `journalctl -k` — kernel enumeration logs
+- `udevadm info` — device metadata
+- `usb-devices` — alternate text dump
+- `modprobe` — load drivers
+
+## Additional Resources
+
+- `man lsusb`

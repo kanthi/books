@@ -1,102 +1,105 @@
 # pidof
 
 ## Overview
-The `pidof` command finds process IDs (PIDs) of running programs. It displays the process IDs of named programs.
+
+`pidof` prints the PIDs of running programs matched by name. It is a quick alternative to `pgrep -x` for simple lookups and remains common in init scripts and one-liners. For flexible pattern matching, prefer `pgrep`.
 
 ## Syntax
+
 ```bash
 pidof [options] program [program...]
 ```
 
 ## Common Options
+
 | Option | Description |
 |--------|-------------|
-| `-s` | Single shot - return one PID |
-| `-x` | Scripts too - return script PIDs |
-| `-o omitpid` | Omit given PID |
-| `-c` | Only return PIDs in chroot |
-| `-n` | Newest process only |
-| `-o` | Oldest process only |
-| `-z` | Skip zombies |
-| `-w` | Show PIDs with same name |
+| `-s` | Single PID only (first/one) |
+| `-c` | Only processes with same root (chroot) |
+| `-x` | Also match scripts (by script name) |
+| `-o omitpid` | Omit PID(s); often `-o %PPID` or self |
+| `-z` | Skip zombies (when supported) |
 
-## Key Use Cases
-1. Process identification
-2. Script automation
-3. Process monitoring
-4. Service management
-5. System administration
+Options vary slightly between implementations (sysvinit-utils vs others).
 
 ## Examples with Explanations
-### Example 1: Basic Usage
+
+### Basics
+
 ```bash
 pidof nginx
+pidof sshd
+pidof bash
 ```
-Find all nginx process IDs
 
-### Example 2: Single Process
+### Single PID
+
 ```bash
-pidof -s firefox
+pidof -s nginx
+kill -HUP "$(pidof -s nginx)"
 ```
-Find one firefox process ID
 
-### Example 3: Omit PID
+### Scripts
+
 ```bash
-pidof -o 1234 process_name
+pidof -x backup.sh
+pgrep -f backup.sh          # often clearer for scripts
 ```
-Find PIDs except 1234
 
-## Understanding Output
-- Space-separated list of PIDs
-- No output if process not found
-- Error messages for:
-  - Invalid options
-  - Permission issues
-  - Process not found
+### Existence gate
 
-## Common Usage Patterns
-1. Kill process:
-   ```bash
-   kill $(pidof program)
-   ```
-2. Check if running:
-   ```bash
-   if pidof program >/dev/null; then echo "Running"; fi
-   ```
-3. Monitor newest:
-   ```bash
-   pidof -n program
-   ```
+```bash
+if pidof dockerd >/dev/null; then
+  echo docker running
+fi
+```
 
-## Performance Analysis
-- Fast execution
-- Minimal system impact
-- Process table lookup
-- Name matching
-- Multiple process handling
+### Omit PIDs
+
+```bash
+pidof -o $$ bash            # other bashes, not this script’s shell if named bash
+pidof -o %PPID nginx
+```
+
+### Feed to kill
+
+```bash
+kill $(pidof myapp)
+# safer with pgrep:
+pgrep -x myapp | xargs -r kill
+```
+
+### Compare tools
+
+```bash
+pidof nginx
+pgrep -x nginx
+pgrep -a nginx
+systemctl status nginx
+```
+
+## Notes / Pitfalls
+
+- Name matching is not always exact across threads/workers — verify with `ps`.
+- Multiple PIDs print space-separated — quote carefully in scripts.
+- Race: process may exit between `pidof` and `kill`.
+- Containers: only sees processes in the same PID namespace.
+- Prefer `systemctl` for supervised services instead of raw PID kills.
+
+## 2026-relevant notes
+
+- systemd units: `systemctl show -p MainPID nginx`.
+- `pgrep`/`pkill` from procps are more expressive for modern scripts.
+- Rootless stacks may have multiple same-named processes per user — be specific.
 
 ## Related Commands
-- `pgrep` - Find processes
-- `ps` - Process status
-- `kill` - Send signals
-- `killall` - Kill by name
-- `pkill` - Kill by pattern
+
+- `pgrep` / `pkill` — pattern match / signal
+- `kill` / `killall` — signal by PID / name
+- `ps` — detailed process list
+- `systemctl` — service PIDs
+- `pidwait` / `pwait` — wait for PID exit (if installed)
 
 ## Additional Resources
-- [Pidof Manual](https://man7.org/linux/man-pages/man1/pidof.1.html)
-- [Process Management Guide](https://www.tecmint.com/linux-process-management/)
-- [System Administration](https://tldp.org/LDP/sag/html/index.html)
 
-## Best Practices
-1. Verify process names
-2. Handle multiple PIDs
-3. Error checking
-4. Script safety
-5. Regular monitoring
-
-## Use Cases
-1. Service scripts
-2. Process control
-3. System monitoring
-4. Automation tasks
-5. Dependency checking
+- `man pidof`

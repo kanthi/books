@@ -1,209 +1,111 @@
 # lscpu
 
 ## Overview
-The `lscpu` command displays detailed information about the CPU architecture, including processor type, cores, threads, cache sizes, and various CPU features.
+
+`lscpu` displays CPU architecture information from sysfs and `/proc/cpuinfo`: sockets, cores, threads, model name, caches, virtualization flags, NUMA layout, and vulnerabilities mitigations summary. Use it before tuning parallelism, interpreting load averages, or choosing binary architectures.
 
 ## Syntax
+
 ```bash
 lscpu [options]
 ```
 
 ## Common Options
+
 | Option | Description |
 |--------|-------------|
-| `-a` | Include offline CPUs |
-| `-b` | Online CPUs only |
-| `-c` | Compatible format |
-| `-e` | Extended readable format |
-| `-p` | Parsable format |
-| `-s directory` | Use specific sysfs directory |
-| `-x` | Include hex and binary flags |
-| `-y` | Show physical IDs |
-
-## Key Information Displayed
-| Field | Description |
-|-------|-------------|
-| Architecture | CPU architecture (x86_64, ARM, etc.) |
-| CPU op-mode(s) | 32-bit, 64-bit |
-| Byte Order | Little Endian, Big Endian |
-| CPU(s) | Total number of logical CPUs |
-| Thread(s) per core | Hyperthreading info |
-| Core(s) per socket | Physical cores per CPU |
-| Socket(s) | Number of CPU sockets |
-| Model name | CPU brand and model |
-| CPU MHz | Current frequency |
-| CPU max MHz | Maximum frequency |
-| CPU min MHz | Minimum frequency |
-| Cache sizes | L1, L2, L3 cache information |
-
-## Key Use Cases
-1. System inventory
-2. Performance analysis
-3. Virtualization planning
-4. Hardware compatibility checks
-5. System monitoring setup
+| `-a` / `-b` / `-c` | Online/offline CPU filtering variants |
+| `-e` | Extended parsable table of CPUs |
+| `-p` | Parseable (key,value or CSV-like) |
+| `-J` | JSON output (newer util-linux) |
+| `-x` | Hex masks |
+| `-y` | Physical instead of logical in some fields |
+| `-s` | Sysroot for inspection |
+| `-B` | Byte sizes raw |
 
 ## Examples with Explanations
-### Example 1: Basic CPU Information
+
+### Overview
+
 ```bash
 lscpu
 ```
-Shows complete CPU information in human-readable format
 
-### Example 2: Parsable Format
+### Parseable / JSON
+
 ```bash
 lscpu -p
+lscpu -J | jq .
+lscpu -e=cpu,node,socket,core,online
 ```
-Outputs CPU information in comma-separated format for scripting
 
-### Example 3: Extended Format
+### Core counts for scripts
+
 ```bash
-lscpu -e
-```
-Shows extended information including NUMA topology
-
-## Understanding CPU Topology
-Key relationships:
-- **Socket**: Physical CPU package
-- **Core**: Physical processing unit
-- **Thread**: Logical processing unit (with hyperthreading)
-- **NUMA Node**: Memory locality group
-
-Calculation:
-```
-Total CPUs = Sockets × Cores per socket × Threads per core
+nproc
+lscpu | awk -F: '/^CPU\(s\):/ {gsub(/ /,"",$2); print $2}'
+# prefer:
+nproc --all
+getconf _NPROCESSORS_ONLN
 ```
 
-## Common Usage Patterns
-1. Check CPU count:
-   ```bash
-   lscpu | grep "CPU(s):"
-   ```
-2. Get CPU model:
-   ```bash
-   lscpu | grep "Model name"
-   ```
-3. Check virtualization support:
-   ```bash
-   lscpu | grep Virtualization
-   ```
+### Virtualization and flags
 
-## Performance Analysis
-Information useful for performance:
-- Cache sizes (L1, L2, L3)
-- CPU frequency ranges
-- Thread/core ratios
-- NUMA topology
-- CPU flags and features
-
-## Scripting Examples
-1. Extract CPU count:
-   ```bash
-   CPU_COUNT=$(lscpu | grep "^CPU(s):" | awk '{print $2}')
-   ```
-2. Check architecture:
-   ```bash
-   ARCH=$(lscpu | grep "Architecture:" | awk '{print $2}')
-   ```
-3. Get CPU model:
-   ```bash
-   MODEL=$(lscpu | grep "Model name:" | cut -d':' -f2 | xargs)
-   ```
-
-## Parsable Output Format
-Using `-p` option provides CSV-like output:
+```bash
+lscpu | grep -E 'Virtualization|Hypervisor|Flags|Model name|Thread|Core|Socket'
+grep -m1 flags /proc/cpuinfo
 ```
-# CPU,Core,Socket,Node,,L1d,L1i,L2,L3
-0,0,0,0,,32K,32K,256K,8192K
-1,1,0,0,,32K,32K,256K,8192K
+
+Look for `vmx` (Intel) / `svm` (AMD) for hardware virtualization; `ht` for hyperthreading.
+
+### NUMA
+
+```bash
+lscpu | grep -i numa
+numactl -H 2>/dev/null
+ls /sys/devices/system/node
 ```
+
+### Security mitigations summary
+
+```bash
+lscpu | sed -n '/Vulnerabilities:/,$p'
+# detailed:
+grep . /sys/devices/system/cpu/vulnerabilities/*
+```
+
+### Containers
+
+```bash
+lscpu
+nproc
+# CPU affinity may be constrained by cpuset cgroup
+cat /sys/fs/cgroup/cpuset.cpus.effective 2>/dev/null
+```
+
+## Notes / Pitfalls
+
+- `CPU(s)` counts logical CPUs (hardware threads), not physical cores.
+- Hypervisors can present fake topology; verify when licensing by socket/core.
+- Offline CPUs and hotplug change counts — re-run after changes.
+- Flags strings are long; pipe to `grep` for specific features (`avx2`, `aes`, …).
+- Don’t use load average without knowing logical CPU count.
+
+## 2026-relevant notes
+
+- ARM (`aarch64`) and RISC-V hosts are common; scripts must not assume `x86_64`.
+- JSON output helps inventory agents.
+- Mitigations still affect performance; compare with workload benchmarks, not only flag presence.
 
 ## Related Commands
-- `cat /proc/cpuinfo` - Detailed CPU information
-- `nproc` - Number of processing units
-- `lshw -C cpu` - Hardware information
-- `dmidecode -t processor` - BIOS CPU information
-- `lstopo` - Hardware topology
+
+- `nproc` — online processor count
+- `lshw -class processor` — alternate inventory
+- `cat /proc/cpuinfo` — per-cpu raw
+- `numactl` — NUMA policy
+- `taskset` — CPU affinity
+- `tuned` / power profiles — CPU governors
 
 ## Additional Resources
-- [lscpu Manual](https://man7.org/linux/man-pages/man1/lscpu.1.html)
-- [CPU Information Guide](https://www.tecmint.com/lscpu-command-examples/)
 
-## Best Practices
-1. Use parsable format for scripts
-2. Check virtualization capabilities
-3. Monitor CPU frequency scaling
-4. Understand NUMA topology for optimization
-5. Verify CPU features for software requirements
-
-## Virtualization Information
-CPU virtualization features:
-- **VT-x/AMD-V**: Hardware virtualization
-- **VT-d/AMD-Vi**: I/O virtualization
-- **EPT/NPT**: Extended/Nested page tables
-
-Check support:
-```bash
-lscpu | grep -E "(vmx|svm)"
-```
-
-## NUMA Topology
-For multi-socket systems:
-```bash
-lscpu | grep NUMA
-```
-
-Shows:
-- NUMA node count
-- CPU-to-node mapping
-- Memory locality information
-
-## CPU Flags and Features
-Important flags:
-- **sse, sse2, sse3**: SIMD instructions
-- **aes**: AES encryption support
-- **avx, avx2**: Advanced vector extensions
-- **rdrand**: Hardware random number generator
-
-## Frequency Information
-Modern CPUs show:
-- Base frequency
-- Maximum turbo frequency
-- Current frequency
-- Scaling governor information
-
-## Integration Examples
-1. System monitoring:
-   ```bash
-   echo "CPU: $(lscpu | grep 'Model name' | cut -d':' -f2 | xargs)"
-   ```
-2. Performance tuning:
-   ```bash
-   CORES=$(lscpu | grep "Core(s) per socket" | awk '{print $4}')
-   make -j$CORES
-   ```
-3. Capacity planning:
-   ```bash
-   lscpu -p | grep -v "^#" | wc -l
-   ```
-
-## Troubleshooting
-1. Missing CPU information
-2. Incorrect core counts
-3. Frequency scaling issues
-4. Virtualization detection problems
-5. NUMA topology confusion
-
-## Output Filtering
-1. Get specific information:
-   ```bash
-   lscpu | grep -i cache
-   ```
-2. Extract numeric values:
-   ```bash
-   lscpu | grep "CPU(s):" | grep -o '[0-9]*'
-   ```
-3. Format for reports:
-   ```bash
-   lscpu | grep -E "(Architecture|CPU\(s\)|Model name)"
-   ```
+- `man lscpu`

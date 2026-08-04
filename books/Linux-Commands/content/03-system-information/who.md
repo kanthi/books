@@ -1,190 +1,109 @@
 # who
 
 ## Overview
-The `who` command displays information about users currently logged into the system, including login time, terminal, and remote host information.
+
+`who` shows who is logged in, with terminal, login time, and sometimes host/remote info from utmp/wtmp accounting. Related tools: `w` (richer: load + what they run), `users` (names only), `last` (historical logins).
 
 ## Syntax
+
 ```bash
-who [options] [file | arg1 arg2]
+who [options] [file]
+who am i
+whoami                 # different command: effective user
 ```
 
 ## Common Options
+
 | Option | Description |
 |--------|-------------|
-| `-a` | All information |
-| `-b` | Time of last system boot |
+| `-a` | All information (combo flags) |
+| `-b` | Boot time |
 | `-d` | Dead processes |
-| `-H` | Print column headings |
+| `-H` | Header |
 | `-l` | Login processes |
-| `-q` | Quick mode (names and count only) |
-| `-r` | Current runlevel |
-| `-t` | System clock changes |
-| `-u` | Idle time for each user |
-| `-w` | User's message status |
+| `-m` | Same as `who am i` (hostname and user for stdin) |
+| `-q` | Count and names only |
+| `-r` | Runlevel (legacy) |
+| `-s` | Short format |
+| `-t` | Last system clock change |
+| `-u` | Idle time / PID |
+| `-T` | Message status of mesg (+/−) |
 
-## Key Use Cases
-1. Monitor logged-in users
-2. System administration
-3. Security auditing
-4. Session management
-5. System status checking
+Optional `file` defaults to utmp (often `/var/run/utmp` or `/run/utmp`).
 
 ## Examples with Explanations
-### Example 1: Basic Usage
+
+### Who is on the system
+
 ```bash
 who
-```
-Shows currently logged-in users
-
-### Example 2: All Information
-```bash
-who -a
-```
-Displays comprehensive system and user information
-
-### Example 3: With Headers
-```bash
 who -H
+who -u
+who -q
 ```
-Shows output with column headers
 
-### Example 4: Boot Time
+### Boot time
+
 ```bash
 who -b
-```
-Shows when system was last booted
-
-## Understanding Output
-Default output columns:
-- **Username**: Login name
-- **Terminal**: TTY or pts device
-- **Login time**: When user logged in
-- **Remote host**: Where user connected from (if remote)
-
-Example output:
-```
-user1    pts/0    2024-01-15 09:30 (192.168.1.100)
-user2    tty1     2024-01-15 08:15
+uptime -s
 ```
 
-## Common Usage Patterns
-1. Count logged-in users:
-   ```bash
-   who | wc -l
-   ```
-2. Check specific user:
-   ```bash
-   who | grep username
-   ```
-3. Monitor remote connections:
-   ```bash
-   who | grep -E '\([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+\)'
-   ```
+### Yourself
 
-## Advanced Usage
-1. Show idle time:
-   ```bash
-   who -u
-   ```
-2. Quick user count:
-   ```bash
-   who -q
-   ```
-3. System information:
-   ```bash
-   who -r  # Runlevel
-   who -b  # Boot time
-   ```
+```bash
+who am i
+who -m
+logname
+```
 
-## System Information
-Special options for system status:
-- `-b`: Boot time
-- `-r`: Current runlevel
-- `-t`: Clock changes
-- `-d`: Dead processes
-- `-l`: Login processes
+### Compare with w
 
-## Performance Analysis
-- Fast operation
-- Reads from /var/run/utmp
-- Minimal resource usage
-- Real-time information
-- Good for monitoring scripts
+```bash
+who
+w
+users
+```
+
+`w` adds load averages and the current command line of each session.
+
+### Historical
+
+```bash
+last
+last -a
+who /var/log/wtmp          # if supported / accessible
+```
+
+### Scripting inventory
+
+```bash
+who | awk '{print $1}' | sort -u
+```
+
+## Notes / Pitfalls
+
+- utmp accuracy varies: display managers, wayland, lingering sessions, and containers may not appear as classic ttys.
+- SSH multiplexing and tmux can make “one human, many lines”.
+- Empty output on some minimal containers is normal — no utmp traffic.
+- Privacy: listing logins is normal for admins; still treat usernames carefully in logs.
+- `whoami` ≠ `who am i`.
+
+## 2026-relevant notes
+
+- Prefer `loginctl` on systemd for modern session management views.
+- Audit pipelines use `last`/`journalctl` more than live `who`.
+- Remote access gateways may hide real client IPs behind proxies — check sshd logs.
 
 ## Related Commands
-- `w` - More detailed user information
-- `users` - Simple list of usernames
-- `last` - Login history
-- `finger` - User information
-- `ps` - Process information
 
-## Best Practices
-1. Use for security monitoring
-2. Combine with other system tools
-3. Regular auditing of user sessions
-4. Monitor remote connections
-5. Check system boot time
+- `w` — richer logged-in view
+- `users` — names only
+- `last` / `lastlog` — history
+- `logname` — login name
+- `loginctl` — systemd sessions
+- `whoami` / `id` — identity of current process
 
-## Security Applications
-1. Monitor unauthorized access:
-   ```bash
-   who | grep -v "$(whoami)" | mail -s "Other users logged in" admin@domain.com
-   ```
-2. Remote connection audit:
-   ```bash
-   who | awk '$4 ~ /\(/ {print $1, $4}' > remote_logins.log
-   ```
+## Additional Resources
 
-## Scripting Examples
-1. User session monitoring:
-   ```bash
-   #!/bin/bash
-   while true; do
-       echo "$(date): $(who | wc -l) users logged in"
-       sleep 300
-   done
-   ```
-2. Alert on new logins:
-   ```bash
-   CURRENT_USERS=$(who | wc -l)
-   if [ "$CURRENT_USERS" -gt "$EXPECTED_USERS" ]; then
-       echo "Alert: More users than expected"
-   fi
-   ```
-
-## Integration Examples
-1. System status report:
-   ```bash
-   echo "System Status Report"
-   echo "Boot time: $(who -b)"
-   echo "Current users: $(who -q)"
-   echo "Runlevel: $(who -r)"
-   ```
-2. Login monitoring:
-   ```bash
-   who -H | while read user tty time rest; do
-       echo "User $user on $tty since $time"
-   done
-   ```
-
-## File Sources
-The `who` command reads from:
-- `/var/run/utmp` - Current sessions
-- `/var/log/wtmp` - Login history (with file argument)
-
-## Output Formatting
-1. Custom format with awk:
-   ```bash
-   who | awk '{print $1 ": " $3 " " $4}'
-   ```
-2. JSON-like output:
-   ```bash
-   who | awk '{printf "{\"user\":\"%s\",\"tty\":\"%s\",\"time\":\"%s %s\"}\n", $1, $2, $3, $4}'
-   ```
-
-## Troubleshooting
-1. Empty output (no users logged in)
-2. Permission issues with utmp files
-3. Stale session information
-4. Network connectivity for remote hosts
-5. Time zone display issues
+- `man who`

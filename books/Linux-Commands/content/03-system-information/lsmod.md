@@ -1,100 +1,107 @@
 # lsmod
 
 ## Overview
-The `lsmod` command shows the status of modules in the Linux kernel. It displays information about all loaded kernel modules.
+
+`lsmod` lists loaded **kernel modules** (name, size, use count, dependents). It is a thin, readable view of `/proc/modules`. Use it when debugging drivers, missing hardware support, or before `modprobe`/`rmmod` operations.
 
 ## Syntax
+
 ```bash
 lsmod
+# no significant options — see modprobe/rmmod for management
 ```
-
-## Common Options
-Note: lsmod doesn't typically take options as it simply shows the contents of `/proc/modules` in a formatted way.
-
-## Key Use Cases
-1. Kernel module inspection
-2. System troubleshooting
-3. Driver verification
-4. Module dependency checking
-5. System monitoring
 
 ## Examples with Explanations
-### Example 1: List All Modules
+
+### List modules
+
 ```bash
 lsmod
+lsmod | sort
+lsmod | head
 ```
-Show all loaded kernel modules
 
-### Example 2: Filter Output
+### Search for a driver
+
 ```bash
-lsmod | grep video
+lsmod | grep -i usb
+lsmod | grep -i nvidia
+lsmod | grep -E '^(nfs|overlay|br_netfilter)'
 ```
-Show only video-related modules
 
-### Example 3: Sort by Size
+### Dependency / use count
+
 ```bash
-lsmod | sort -k 2 -n
-```
-List modules sorted by size
-
-## Understanding Output
-Columns explained:
-- Module: Name of module
-- Size: Memory size in bytes
-- Used: Reference count
-- Used by: List of dependent modules
-
-Example output:
-```
-Module                  Size  Used by
-bluetooth             557056  23
-rfcomm                 81920  4
-bnep                   24576  2
+lsmod | awk 'NR==1 || $3>0 {print}'
+# third column: used by count; Used by column shows dependents
 ```
 
-## Common Usage Patterns
-1. Check module status:
-   ```bash
-   lsmod | grep module_name
-   ```
-2. Find dependencies:
-   ```bash
-   lsmod | grep -w 'module'
-   ```
-3. Module size analysis:
-   ```bash
-   lsmod | sort -k 2 -nr | head
-   ```
+### Correlate with hardware
 
-## Performance Analysis
-- Fast execution
-- Reads from /proc
-- Minimal system impact
-- Real-time information
-- No disk I/O required
+```bash
+lsusb
+lspci -k
+lsmod | grep -i xhci
+```
+
+`lspci -k` shows which kernel driver is bound to a PCI device.
+
+### Module details
+
+```bash
+modinfo e1000e
+modprobe -n -v e1000e          # dry-run
+cat /proc/modules | grep e1000e
+```
+
+### Unload safety check
+
+```bash
+lsmod | grep module_name
+sudo modprobe -r module_name   # preferred over raw rmmod
+# fails if in use — check dependents in lsmod
+```
+
+### Blacklist context
+
+```bash
+lsmod | grep nouveau
+# if you blacklisted a module, it should not appear after reboot
+grep -r nouveau /etc/modprobe.d/ 2>/dev/null
+```
+
+## Understanding columns
+
+| Column | Meaning |
+|--------|---------|
+| Module | Module name |
+| Size | Memory size in bytes |
+| Used by | Reference count and dependent module names |
+
+A non-zero use count means unload will fail until dependents release it.
+
+## Notes / Pitfalls
+
+- Built-in kernel features are **not** modules — absence from `lsmod` doesn’t mean “unsupported”.
+- Out-of-tree modules (ZFS, some NVIDIA) still appear when loaded.
+- Containers usually cannot load modules; operations need host privileges.
+- Secure Boot may restrict unsigned modules.
+- Don’t randomly `rmmod` storage/network drivers on remote hosts.
+
+## 2026-relevant notes
+
+- Initramfs and UKI images embed critical modules — `lsmod` after boot is not the whole story.
+- Prefer `modprobe` over `insmod` for dependency resolution.
+- For policy, use `/etc/modules-load.d/` and `/etc/modprobe.d/` rather than ad-hoc loads.
 
 ## Related Commands
-- `modinfo` - Module information
-- `insmod` - Insert module
-- `rmmod` - Remove module
-- `modprobe` - Add/remove modules
-- `depmod` - Generate dependencies
+
+- `modprobe` / `rmmod` / `insmod` — load/unload
+- `modinfo` — module metadata
+- `lspci -k` / `lsusb` — hardware binding
+- `dmesg` — load errors
+- `depmod` — rebuild module deps
 
 ## Additional Resources
-- [Linux Kernel Documentation](https://www.kernel.org/doc/html/latest/admin-guide/modules.html)
-- [Module Management Guide](https://tldp.org/LDP/lkmpg/2.6/html/x44.html)
-- [System Administration Guide](https://access.redhat.com/documentation/en-us/red_hat_enterprise_linux/7/html/system_administrators_guide/ch-working_with_kernel_modules)
 
-## Module Management
-1. Loading modules
-2. Removing modules
-3. Dependency tracking
-4. Parameter setting
-5. Blacklisting
-
-## Best Practices
-1. Regular module checks
-2. Document dependencies
-3. Monitor module size
-4. Check module parameters
-5. Maintain security
+- `man lsmod`, `man 5 modules`

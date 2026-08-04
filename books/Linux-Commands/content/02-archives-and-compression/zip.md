@@ -1,187 +1,112 @@
 # zip
 
 ## Overview
-The `zip` command creates compressed archive files in ZIP format. It's widely compatible across different operating systems and supports various compression methods.
+
+`zip` creates **ZIP** archives widely used for cross-platform interchange (Windows, macOS, Linux). Unlike `tar` + compressor pipelines, zip typically **compresses each member** and stores a central directory. Prefer `tar` + `gzip`/`zstd` for Unix-native backups with permissions/owners; use `zip` when recipients expect `.zip` or you need simple selective compression of mixed files.
 
 ## Syntax
+
 ```bash
-zip [options] archive.zip file1 file2...
-unzip [options] archive.zip
+zip [options] archive.zip file...
+zip [options] archive.zip -r dir/
 ```
 
 ## Common Options
+
 | Option | Description |
 |--------|-------------|
-| `-r` | Recursive (include subdirectories) |
-| `-u` | Update existing archive |
-| `-f` | Freshen existing entries |
-| `-d` | Delete entries from archive |
-| `-m` | Move files to archive |
-| `-j` | Junk directory paths |
-| `-e` | Encrypt archive |
-| `-x pattern` | Exclude files |
-| `-i pattern` | Include only files |
-| `-v` | Verbose output |
-| `-q` | Quiet mode |
-
-## Compression Levels
-| Level | Description |
-|-------|-------------|
-| `-0` | No compression (store only) |
-| `-1` | Fastest compression |
-| `-6` | Default compression |
-| `-9` | Best compression |
-
-## Key Use Cases
-1. Create portable archives
-2. Compress multiple files
-3. Cross-platform file sharing
-4. Backup directories
-5. Distribute software packages
+| `-r` | Recurse into directories |
+| `-q` | Quiet |
+| `-v` | Verbose |
+| `-u` | Update existing entries |
+| `-m` | Move files into zip (delete after) |
+| `-e` | Encrypt (traditional; weak by modern standards) |
+| `-P pass` | Password on CLI (visible in process list — avoid) |
+| `-x pattern` | Exclude patterns |
+| `-i pattern` | Include patterns |
+| `-y` | Store symbolic links as links (Unix) |
+| `-j` | Junk (store) path names — flatten |
+| `-0` … `-9` | Compression level (0 = store) |
+| `-s size` | Split archive into segments |
+| `-F` / `-FF` | Fix archive |
 
 ## Examples with Explanations
-### Example 1: Create Basic Archive
+
+### Create archives
+
 ```bash
-zip archive.zip file1.txt file2.txt
+zip notes.zip *.txt
+zip -r project.zip project/
+zip -r project.zip project/ -x 'project/node_modules/*' -x '*.git*'
 ```
-Creates archive containing specified files
 
-### Example 2: Recursive Directory Archive
+### Update and list
+
 ```bash
-zip -r backup.zip /home/user/documents/
+zip -u project.zip project/README.md
+zip -sf project.zip                 # show files (zipinfo-like)
+unzip -l project.zip                # often clearer listing
 ```
-Archives entire directory structure
 
-### Example 3: Extract Archive
+### Flatten paths
+
 ```bash
-unzip archive.zip
+zip -j flat.zip path/to/a.txt path/to/b.txt
 ```
-Extracts all files from archive
 
-## Archive Management
-1. Add files to existing archive:
-   ```bash
-   zip -u archive.zip newfile.txt
-   ```
-2. Delete files from archive:
-   ```bash
-   zip -d archive.zip oldfile.txt
-   ```
-3. List archive contents:
-   ```bash
-   unzip -l archive.zip
-   ```
+### Store without compression
 
-## Advanced Operations
-1. Password protection:
-   ```bash
-   zip -e secure.zip sensitive.txt
-   ```
-2. Exclude patterns:
-   ```bash
-   zip -r archive.zip directory/ -x "*.tmp"
-   ```
-3. Update only newer files:
-   ```bash
-   zip -u archive.zip *.txt
-   ```
+```bash
+zip -0 -r media.zip photos/         # already-compressed JPEGs
+```
 
-## Unzip Options
-| Option | Description |
-|--------|-------------|
-| `-l` | List contents |
-| `-t` | Test archive |
-| `-d dir` | Extract to directory |
-| `-j` | Junk paths |
-| `-o` | Overwrite without prompting |
-| `-n` | Never overwrite |
-| `-q` | Quiet mode |
-| `-v` | Verbose listing |
+### Encryption (know the limits)
 
-## Common Usage Patterns
-1. Backup with date:
-   ```bash
-   zip backup-$(date +%Y%m%d).zip *.txt
-   ```
-2. Exclude hidden files:
-   ```bash
-   zip -r archive.zip directory/ -x "*/.*"
-   ```
-3. Extract to specific directory:
-   ```bash
-   unzip archive.zip -d /target/directory/
-   ```
+```bash
+zip -e secret.zip secrets.txt
+# traditional zip crypto is weak; prefer 7z AES or age/gpg for real secrets
+```
 
-## Performance Analysis
-- Good compression ratios
-- Moderate CPU usage
-- Memory efficient
-- Fast extraction
-- Good for mixed file types
+### Split archives
 
-## File Compatibility
-- Cross-platform support
-- Windows native support
-- macOS built-in support
-- Linux standard tool
-- Mobile device support
+```bash
+zip -r -s 100m backup.zip data/
+```
+
+### Exclude junk
+
+```bash
+zip -r src.zip src/ -x '*/__pycache__/*' -x '*.pyc' -x '*/.DS_Store'
+```
+
+### Date-stamped backup
+
+```bash
+zip -r "backup-$(date +%Y%m%d).zip" documents/
+```
+
+## Notes / Pitfalls
+
+- Unix permissions, owners, and special files are a poor fit; `tar` preserves more faithfully.
+- Password on the command line (`-P`) leaks via `ps` — interactive `-e` is better but still weak crypto.
+- Large file ZIP64 support depends on zip version; very old unzip may fail.
+- Default may follow or store links differently than you expect — test with `-y`.
+- Windows/macOS clients may mishandle exotic UTF-8 names depending on flags/tools.
+
+## 2026-relevant notes
+
+- For secure sharing, prefer `age`, `gpg`, or encrypted 7z over zip’s traditional encryption.
+- CI artifacts often use zip for multi-OS consumers — keep compression level modest for speed.
+- `unzip` / `bsdunzip` / Explorer all need to open your result — avoid exotic extensions.
 
 ## Related Commands
-- `tar` - Unix archiving
-- `gzip` - GNU compression
-- `7z` - 7-Zip format
-- `rar` - RAR archives
-- `bzip2` - Alternative compression
+
+- `unzip` — extract / list
+- `zipinfo` — detailed listing
+- `7z` — stronger formats/crypto
+- `tar` — Unix-native archives
+- `zstd` / `gzip` — stream compressors
 
 ## Additional Resources
-- [Zip Manual](http://infozip.sourceforge.net/mans.html)
-- [Archive Examples](https://www.tecmint.com/zip-unzip-command-examples/)
 
-## Best Practices
-1. Use descriptive archive names
-2. Test archives after creation
-3. Consider compression vs speed trade-offs
-4. Use encryption for sensitive data
-5. Verify extraction success
-
-## Security Considerations
-1. Password protect sensitive archives
-2. Verify archive integrity
-3. Be cautious with zip bombs
-4. Check extraction paths
-5. Validate archive sources
-
-## Integration Examples
-1. With find:
-   ```bash
-   find . -name "*.log" | zip logs.zip -@
-   ```
-2. Automated backup:
-   ```bash
-   zip -r backup-$(date +%Y%m%d).zip /important/data/
-   ```
-3. Selective archiving:
-   ```bash
-   zip -r project.zip . -x "node_modules/*" "*.git/*"
-   ```
-
-## Troubleshooting
-1. Archive corruption issues
-2. Path length limitations
-3. Permission problems
-4. Disk space errors
-5. Character encoding issues
-
-## Archive Testing
-1. Test integrity:
-   ```bash
-   unzip -t archive.zip
-   ```
-2. Verbose test:
-   ```bash
-   zip -T archive.zip
-   ```
-3. Check specific files:
-   ```bash
-   unzip -t archive.zip file.txt
-   ```
+- `man zip`

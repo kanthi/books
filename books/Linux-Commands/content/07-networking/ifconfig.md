@@ -1,92 +1,107 @@
 # ifconfig
 
 ## Overview
-The `ifconfig` (interface configuration) command is used to configure, control, and query network interface parameters. While newer systems prefer the `ip` command, `ifconfig` is still widely used for network interface management.
+
+`ifconfig` configures and displays network interfaces from the legacy **net-tools** package. On modern Linux, prefer **`ip`** from iproute2 (`ip addr`, `ip link`, `ip route`). This page exists for reading old docs, recovery shells that still ship net-tools, and muscle-memory translation to `ip`.
+
+Many minimal images no longer install `ifconfig` by default.
 
 ## Syntax
+
 ```bash
-ifconfig [interface] [options]
+ifconfig [interface]
+ifconfig interface [address_family] options
 ```
 
-## Common Options
-| Option | Description |
-|--------|-------------|
-| `up` | Activate interface |
-| `down` | Deactivate interface |
-| `netmask addr` | Set netmask address |
-| `broadcast addr` | Set broadcast address |
-| `-a` | Display all interfaces |
-| `mtu N` | Set MTU size |
-| `metric N` | Set interface metric |
-| `promisc` | Set/clear promiscuous mode |
+## Common Options / forms
 
-## Key Use Cases
-1. Configure network interfaces
-2. View network interface status
-3. Enable/disable interfaces
-4. Set IP addresses
-5. Troubleshoot network issues
+| Form | Description |
+|------|-------------|
+| `ifconfig` | List up interfaces (often only “up”) |
+| `ifconfig -a` | All interfaces including down |
+| `ifconfig eth0` | Show one interface |
+| `ifconfig eth0 up` / `down` | Bring interface up/down |
+| `ifconfig eth0 192.0.2.10 netmask 255.255.255.0` | Set IPv4 |
+| `ifconfig eth0 add ...` | Additional addresses (implementation-dependent) |
+| `ifconfig eth0 hw ether AA:BB:...` | Set MAC (may need down first) |
+| `ifconfig eth0 mtu 1400` | Set MTU |
+| `ifconfig eth0:0 ...` | Alias interface style (legacy) |
 
 ## Examples with Explanations
-### Example 1: View All Interfaces
+
+### Display
+
 ```bash
+ifconfig
 ifconfig -a
+ifconfig eth0
 ```
-Shows all network interfaces, including inactive ones
 
-### Example 2: Configure IP Address
+### Preferred modern equivalents
+
 ```bash
-ifconfig eth0 192.168.1.100 netmask 255.255.255.0
+ip -br link
+ip -br addr
+ip addr show dev eth0
+ip link set eth0 up
+ip addr add 192.0.2.10/24 dev eth0
+ip route
 ```
-Sets IP address and netmask for eth0
 
-### Example 3: Enable/Disable Interface
+### Bring up/down
+
 ```bash
-ifconfig eth0 up
-ifconfig eth0 down
+sudo ifconfig eth0 up
+sudo ifconfig eth0 down
+# modern:
+sudo ip link set eth0 up
 ```
-Activates/deactivates the eth0 interface
 
-## Understanding Output
-Standard output fields:
-- Interface name
-- Link status (UP/DOWN)
-- Hardware address (MAC)
-- IP address
-- Broadcast address
-- Netmask
-- MTU size
-- RX/TX statistics
+### Set address (legacy)
 
-## Common Usage Patterns
-1. Check interface status:
-   ```bash
-   ifconfig eth0
-   ```
-2. Set temporary IP:
-   ```bash
-   ifconfig eth0 192.168.1.100
-   ```
-3. Enable promiscuous mode:
-   ```bash
-   ifconfig eth0 promisc
-   ```
+```bash
+sudo ifconfig eth0 192.0.2.10 netmask 255.255.255.0
+# modern CIDR:
+sudo ip addr add 192.0.2.10/24 dev eth0
+```
 
-## Performance Analysis
-- No real-time monitoring
-- Static configuration tool
-- Consider using `ip` command
-- Check interface statistics
-- Monitor packet errors
+### MTU
+
+```bash
+sudo ifconfig eth0 mtu 1400
+sudo ip link set eth0 mtu 1400
+```
+
+### Install on Debian/Ubuntu if missing
+
+```bash
+sudo apt install net-tools
+```
+
+Still prefer learning `ip`.
+
+## Notes / Pitfalls
+
+- Output and available flags differ across Unixes; Linux net-tools is not identical to BSD.
+- Changes are not persistent — use netplan/NetworkManager/systemd-networkd.
+- Alias interfaces (`eth0:0`) are obsolete vs multiple addresses on one device.
+- Scripts parsing `ifconfig` are fragile — use `ip -j` JSON when available.
+- Wireless details: use `iw` / NetworkManager, not only ifconfig.
+
+## 2026-relevant notes
+
+- Teaching and certification materials may still show ifconfig; translate on sight to `ip`.
+- Containers: `ip` is the standard; ifconfig often absent.
+- For persistent config, never rely on either ifconfig or ip alone — use the distro network stack.
 
 ## Related Commands
-- `ip` - Show/manipulate routing, devices, policy routing
-- `route` - Show/manipulate IP routing table
-- `netstat` - Network statistics
-- `ethtool` - Query/control network drivers
-- `iwconfig` - Configure wireless interfaces
+
+- `ip` — modern interface/address/route tool
+- `ss` — sockets (replaces netstat)
+- `nmcli` / `networkctl` — higher-level management
+- `ethtool` — NIC hardware settings
+- `ifup` / `ifdown` — distro helper scripts (legacy)
 
 ## Additional Resources
-- [Linux ifconfig manual](https://man7.org/linux/man-pages/man8/ifconfig.8.html)
-- [Network Configuration Guide](https://www.tecmint.com/ifconfig-command-examples/)
-- [IP Command vs ifconfig](https://www.tecmint.com/ip-command-vs-ifconfig/)
+
+- `man ifconfig` (if installed), `man ip`

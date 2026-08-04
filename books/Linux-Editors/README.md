@@ -14,7 +14,7 @@ Linux-Editors/
 ```
 
 Parts under `content/` (ignored dirs start with `_`):  
-00-intro,01-vi,02-vim,03-neovim,04-nano,05-emacs,06-lazyvim,07-helix,08-micro,09-kakoune,10-modern-tools,
+00-intro, 01-vi, 02-vim, 03-neovim, 04-nano, 05-emacs, 06-lazyvim, 07-helix, 08-micro, 09-kakoune, 10-modern-tools, 11-tmux, 12-herdr, 13-zed, 14-workflows
 
 ## Local commands
 

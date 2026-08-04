@@ -1,6 +1,12 @@
+---
+title: "Modern Tools"
+---
+
 # Modern Linux Development Tools
 
-This chapter covers modern command-line tools and utilities specifically designed to enhance the Linux development experience. These tools are optimized for Linux systems and integrate seamlessly with Linux workflows, providing powerful functionality that complements traditional editors.
+This chapter is the **companion CLI layer** around editors and workspaces: better search, navigation, diffs, file managers, and prompts. Pair it with a daily editor (Neovim, Helix, Micro, …) and a session tool ([tmux](../11-tmux/index.md), [Herdr](../12-herdr/index.md), or Zellij below).
+
+For end-to-end recipes, see [Workflows](../14-workflows/index.md).
 
 ## Why Modern Tools on Linux?
 
@@ -10,11 +16,52 @@ This chapter covers modern command-line tools and utilities specifically designe
 - **Resource Efficiency**: Optimized for Linux server environments and containers
 - **Open Source**: Most tools are open source and align with Linux philosophy
 
+## Suggested “editor kit” install
+
+```bash
+# Debian/Ubuntu names vary slightly (fd-find, batcat)
+sudo apt install -y ripgrep fd-find fzf bat git curl
+# Optional polish:
+# cargo install eza zoxide git-delta starship just
+# cargo install --locked lazygit   # or use distro package
+```
+
+Wire defaults:
+
+```bash
+export EDITOR=nvim          # or hx, micro, "zed --wait"
+export FZF_DEFAULT_COMMAND='fd --type f --hidden --follow --exclude .git'
+export MANPAGER="sh -c 'col -bx | bat -l man -p'"
+```
+
+## Terminal Multiplexers (map)
+
+| Tool | Role in this book |
+|------|-------------------|
+| **tmux** | Full chapter: [tmux](../11-tmux/index.md) — portable SSH sessions |
+| **Herdr** | Full chapter: [Herdr](../12-herdr/index.md) — AI agent workspaces |
+| **Zellij** | Covered below — friendly layouts and defaults |
+| **GNU screen** | Brief notes below — legacy availability |
+
+### GNU screen (legacy multiplexer)
+
+Still appears on minimal systems when tmux is missing.
+
+```bash
+sudo apt install -y screen   # or pacman/dnf equivalent
+screen -S work               # named session
+# Ctrl-a d                   # detach (prefix is Ctrl-a)
+screen -r work               # reattach
+screen -ls
+```
+
+Prefer learning **tmux** for new muscle memory; use screen when it is all you have.
+
 ## Terminal-Based Development Tools
 
 ### Zellij: Modern Terminal Multiplexer
 
-Zellij is a modern alternative to tmux with better defaults and user experience.
+Zellij is a modern alternative to tmux with better defaults and user experience. For agent-heavy workflows prefer [Herdr](../12-herdr/index.md); for maximum portability prefer [tmux](../11-tmux/index.md).
 
 #### Installation
 
@@ -360,6 +407,89 @@ rg "\d{3}-\d{2}-\d{4}"     # Phone number pattern
 rg "^function.*\{$"        # Function definitions
 ```
 
+### Fzf: Fuzzy Finder
+
+**fzf** is the interactive filter that turns huge lists into something you can pick with two keystrokes. It is the glue between `fd`/`rg` and your editor.
+
+#### Installation
+
+```bash
+sudo apt install fzf          # Debian/Ubuntu
+sudo pacman -S fzf            # Arch
+sudo dnf install fzf          # Fedora
+sudo zypper install fzf       # openSUSE
+cargo install fzf             # if needed
+```
+
+Shell keybindings (bash):
+
+```bash
+# Debian package often provides:
+# /usr/share/doc/fzf/examples/key-bindings.bash
+source /usr/share/doc/fzf/examples/key-bindings.bash 2>/dev/null || true
+# Ctrl-R → fuzzy history, Ctrl-T → fuzzy files (when configured)
+```
+
+#### Editor integration patterns
+
+```bash
+# Open file in $EDITOR
+export FZF_DEFAULT_COMMAND='fd --type f --hidden --follow --exclude .git'
+export FZF_DEFAULT_OPTS='--height 40% --layout=reverse --border --preview "bat --color=always --style=numbers --line-range=:200 {}"'
+
+fe() {
+  local file
+  file=$(fzf) || return
+  ${EDITOR:-nvim} "$file"
+}
+
+# Search file contents then open at line (requires rg)
+feg() {
+  local out file line
+  out=$(rg -n --hidden --glob '!.git' "${1:-.}" 2>/dev/null | fzf) || return
+  file=${out%%:*}
+  line=$(printf '%s\n' "$out" | cut -d: -f2)
+  ${EDITOR:-nvim} +"$line" "$file"
+}
+```
+
+Inside Neovim/LazyVim, Telescope or fzf-lua often wraps the same ideas. Inside Helix, use Space-f pickers; still keep shell `fe` for any directory.
+
+### Lazygit: Terminal Git UI
+
+**lazygit** is a keyboard-driven Git TUI. It pairs well with any editor: stage hunks here, press `e` (or your configured key) to open the file in `$EDITOR`.
+
+```bash
+# Install (one of)
+sudo pacman -S lazygit
+go install github.com/jesseduffield/lazygit@latest
+# binary releases: https://github.com/jesseduffield/lazygit/releases
+```
+
+```bash
+cd ~/src/app
+lazygit
+# Common: space=stage, c=commit, p=pull, P=push, / = search
+```
+
+LazyVim users often have `<leader>gg` bound to lazygit. In tmux/Herdr, give lazygit its own pane or window.
+
+### Yazi: Terminal File Manager (modern)
+
+**Yazi** is a fast async terminal file manager (Rust) with previews—useful beside Helix/Neovim when you want browsing without leaving the TUI.
+
+```bash
+cargo install --locked yazi-fm yazi-cli
+# or check distro packages / https://yazi-rs.github.io/
+```
+
+```bash
+ya   # or yazi
+# Open selection in $EDITOR; use as a project springboard
+```
+
+Alternatives already covered below: **nnn**, **broot**.
+
 ### Fd: Better Find
 
 Fd is a simple, fast alternative to find with better defaults.
@@ -624,7 +754,7 @@ echo 'eval "$(mise activate zsh)"' >> ~/.zshrc    # For zsh
 # Install runtimes
 mise install node@18       # Install Node.js 18
 mise install python@3.11   # Install Python 3.11
-mise install go@1.21       # Install Go 1.21
+mise install go@1.26       # Install a current stable Go (or: mise install go@latest)
 
 # Set global versions
 mise global node@18
@@ -1321,4 +1451,16 @@ RUN echo 'alias ls=eza' >> ~/.bashrc
 RUN echo 'alias cat=bat' >> ~/.bashrc
 ```
 
-These modern tools significantly enhance the Linux development experience by providing better defaults, improved performance, and more intuitive interfaces compared to traditional Unix tools. They integrate seamlessly with Linux systems and are optimized for Linux development workflows, making them essential tools for modern Linux developers and system administrators.
+## Putting it together with editors
+
+| Goal | Tooling |
+|------|---------|
+| Jump to any file | `fd` + `fzf` + `$EDITOR` |
+| Jump to content | `rg` + `fzf` + `$EDITOR +line` |
+| Review changes | `delta` + `lazygit` |
+| Long SSH session | [tmux](../11-tmux/index.md) |
+| Multiple AI agents | [Herdr](../12-herdr/index.md) |
+| Pretty shell context | `starship` + `zoxide` + `eza` |
+| Full recipes | [Workflows](../14-workflows/index.md) |
+
+These modern tools enhance the Linux development experience with better defaults and performance—especially when paired with a deliberate editor and workspace choice from the rest of this book.

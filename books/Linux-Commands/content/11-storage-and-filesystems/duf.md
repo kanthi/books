@@ -1,41 +1,105 @@
 # duf
 
 ## Overview
-`duf` (Disk Usage/Free Utility) is a modern replacement for `df`. It displays mounted filesystem storage, inode usage, and device stats in colored visual tables.
+
+`duf` is a modern, colorful **disk usage / free space** viewer — a friendlier alternative to `df -h`. It groups local, network, special, and inaccessible filesystems with readable tables. Optional install (`apt install duf`, etc.). Keep `df` for scripts and minimal systems.
 
 ## Syntax
+
 ```bash
-duf [options] [path...]
+duf [options] [device/path...]
 ```
 
 ## Common Options
+
 | Option | Description |
 |--------|-------------|
-| `--all` | Include pseudo, duplicate, and inaccessible filesystems |
-| `--only TYPE` | Show only specific filesystem types (e.g. `local`, `network`, `fuse`) |
-| `--hide TYPE` | Hide specific filesystem types |
-| `--json` | Output storage metrics as JSON |
-| `--sort KEY` | Sort output table by key (`mount`, `size`, `used`, `avail`, `usage`) |
+| `-all` | Show all filesystems including pseudo |
+| `-only local|network|fuse|special|loops|binds` | Filter types |
+| `-only-mp` / `-only-device` | Filter by mount/device strings |
+| `-hide` | Hide types |
+| `-output` | Choose columns |
+| `-sort` | Sort key (`size`, `used`, `avail`, `usage`, …) |
+| `-json` | JSON output |
+| `-style` | UI style |
+| `-theme` | Color theme |
+| `-width` | Width |
+| `-inodes` | Inode view |
+| `-avail-threshold` / `-usage-threshold` | Highlight thresholds |
 
-## Key Use Cases
-1. Checking disk usage visually with clean bar graphs.
-2. Filtering out temporary (`tmpfs`) filesystems during storage audits.
-3. Exporting storage metrics to JSON for script ingestion.
+Confirm with `duf --help` for your version.
 
 ## Examples with Explanations
-### Example 1: View Local Filesystems Only
-```bash
-duf --only local
-```
-Displays only physical local disk mounts, excluding `tmpfs` or dev mounts.
 
-### Example 2: Export Storage Data to JSON
+### Everyday
+
 ```bash
-duf --json
+duf
+duf -only local
+duf /
+duf -sort usage
 ```
-Outputs disk space usage data in JSON format for automated monitoring scripts.
+
+### Inodes
+
+```bash
+duf -inodes
+df -ih
+```
+
+### JSON
+
+```bash
+duf -json | jq .
+```
+
+### Hide noise
+
+```bash
+duf -hide special,loops,binds
+# or only local disks:
+duf -only local
+```
+
+### Compare with df
+
+```bash
+df -hT
+duf
+findmnt
+```
+
+### Threshold awareness
+
+```bash
+duf -usage-threshold 0.8
+```
+
+Highlights nearly full mounts when supported.
+
+## Notes / Pitfalls
+
+- Not portable to bare recovery images — know `df -hT`.
+- Colors/unicode need a capable terminal.
+- Bind mounts and snap loops can still clutter — filter them.
+- JSON schema may change across versions.
+- Network FS free space can be misleading (quotas, cloud buckets).
+
+## 2026-relevant notes
+
+- Excellent interactive upgrade alongside `dust`/`eza`/`bat`.
+- Monitoring systems should still scrape `node_exporter`/`df` metrics, not duf.
+- Btrfs/ZFS may need native tools for pool-level free space accuracy.
 
 ## Related Commands
-- `df` - Standard filesystem disk space utility
-- `du` - Summarize disk usage of set of files
-- `lsblk` - List block devices
+
+- `df` — portable free space
+- `findmnt` — mount tree
+- `du` / `dust` / `ncdu` — directory usage
+- `lsblk` — block devices
+- `btrfs filesystem usage` / `zpool list` — volume managers
+
+## Additional Resources
+
+- `duf --help`
+- [muesli/duf](https://github.com/muesli/duf)

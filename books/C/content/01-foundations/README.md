@@ -1,64 +1,88 @@
 # Module 1: Foundations and Environment Setup
 
 ## Overview
-This module introduces you to the C programming language and helps you set up a professional development environment. You'll learn the basic structure of C programs, how to compile and run them, and fundamental input/output operations.
 
-## Learning Objectives
-By the end of this module, you will be able to:
-- Understand the history and importance of C programming
-- Set up a complete C development environment with modern tools
-- Write, compile, and execute basic C programs
-- Use fundamental input and output functions
-- Understand the compilation process and program structure
-- Apply best practices for C programming
+This module is the **on-ramp** for the C book: what C is, how to install and drive a toolchain, the edit–compile–run loop, and console I/O. Finish it before jumping to data types and control flow unless you already ship C daily.
 
-## Chapters
-1. **Introduction to C Programming** - History, standards, and applications
-2. **Development Environment Setup** - Installing compilers, IDEs, and tools
-3. **First C Program** - Program structure, compilation, and execution
-4. **Basic Input/Output** - printf, scanf, and character I/O functions
+**Default compile line (memorize it):**
 
-## Key Concepts Covered
-- C language history and evolution through C23 standard
-- Compiler installation (GCC, Clang, MSVC)
-- IDE setup (VS Code, CLion, Code::Blocks)
-- Debugging tools (GDB, Valgrind, AddressSanitizer)
-- Build systems (Make, CMake)
-- Basic program structure with #include and main()
-- Compilation process (preprocessing, compilation, assembly, linking)
-- Input/output functions (printf, scanf, getchar, putchar)
-- Format specifiers and modifiers
-- Error handling with return values
-- Comments and code documentation
+```bash
+gcc -std=c17 -Wall -Wextra -Wpedantic -o prog prog.c
+```
+
+Clang is fine: replace `gcc` with `clang`.
+
+## Learning goals
+
+By the end of this module you should be able to:
+
+- Explain where C sits (systems language, standards C17/C23) and when it is the right tool  
+- Install **GCC** and/or **Clang**, a debugger (**GDB**/**LLDB**), and optional **CMake** / Make  
+- Write, compile, and run small programs; read common compiler diagnostics  
+- Split a program across `.c` / `.h` files and link object files  
+- Use `printf` / `scanf` / `fgets` carefully (check return values, avoid unbounded `%s`)  
+- Prefer `-g -O0` when debugging and treat warnings as signal, not noise  
+
+## Chapters (map)
+
+| # | Chapter | What you practice |
+|---|---------|-------------------|
+| 1 | [Introduction to C](01-intro-to-c.md) | History, standards, “Hello”, mini converters, mental model of compile/link |
+| 2 | [Development Environment](02-dev-environment.md) | Install compilers; **multi-file recipes**; Make; **mini CMake**; GCC vs Clang; GDB one-pager; sanitizers |
+| 3 | [First C Program](03-first-program.md) | Program structure, flags, multi-file lab, personal-info / converter labs |
+| 4 | [Basic Input/Output](04-basic-io.md) | `printf`/`scanf`, format specs, `fgets`, mixing line and token input safely |
+
+## Suggested path
+
+1. Skim **Intro** so the compile pipeline and `main` form are clear.  
+2. Do **Environment** *for real* — multi-file build + one debugger session, not only install notes.  
+3. Type every program in **First Program**.  
+4. Complete **Basic I/O** exercises before Module 2; I/O bugs dominate early frustration.
+
+## Tooling cheat sheet
+
+```bash
+# single file
+gcc -std=c17 -Wall -Wextra -Wpedantic -o hello hello.c && ./hello
+
+# multi-file
+gcc -std=c17 -Wall -Wextra -Wpedantic -c main.c util.c
+gcc -o app main.o util.o
+
+# debug
+gcc -std=c17 -Wall -Wextra -g -O0 -o app main.c util.c
+gdb ./app    # or: lldb ./app
+
+# memory / UB (Linux/macOS)
+gcc -std=c17 -Wall -Wextra -g -O1 -fsanitize=address,undefined -o app app.c
+```
 
 ## Prerequisites
-- Basic computer literacy
-- Access to a computer with internet connection
-- Willingness to install development tools
 
-## Tools and Technologies
-- GCC or Clang compiler
-- Text editor or IDE (VS Code recommended)
-- Terminal/Command Prompt
-- Git (for version control)
-- Debugging tools (GDB, Valgrind)
+- Basic computer literacy and a terminal  
+- Ability to install packages (apt, brew, MSYS2, or Xcode CLT)  
+- No prior C required for Path A (see book landing page)
 
-## Estimated Time to Complete
-- Reading: 4-6 hours
-- Exercises: 6-8 hours
-- Projects: 2-4 hours
+## Self-check before Module 2
 
-## Assessment
-- Complete all chapter exercises
-- Successfully compile and run example programs
-- Pass basic I/O programming quiz
-- Submit a personal information display program
+- [ ] `hello.c` builds with zero warnings under `-Wall -Wextra`  
+- [ ] Multi-file program links (`main.c` + `util.c`)  
+- [ ] One GDB/LLDB session: breakpoint, `print`, continue  
+- [ ] Program reads an integer and a line of text without leftover-newline confusion  
+- [ ] You know how to show the compiler’s version and the executable’s exit status (`echo $?`)
 
-## Next Module
-After completing this module, proceed to **Module 2: Data Types and Variables** to learn about C's fundamental data types, variable declarations, and type conversions.
+## Estimated time
 
-## Additional Resources
-- "The C Programming Language" by Kernighan and Ritchie
-- Online C compiler environments (repl.it, JDoodle)
-- GCC documentation
-- C standard references (ISO/IEC 9899:2024 for C23)
+- Reading: 4–6 hours  
+- Typing examples + exercises: 6–10 hours  
+- Optional: CMake mini-project and sanitizer lab from chapter 2  
+
+## Next module
+
+**Module 2: Data Types and Variables** — types, sizes, constants, conversions, operators.
+
+## Resources
+
+- K&R *The C Programming Language* (classic reference, older dialect)  
+- GCC / Clang manuals for flag details  
+- Book appendices for reference tables and solutions pointers  

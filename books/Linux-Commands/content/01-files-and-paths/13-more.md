@@ -1,105 +1,118 @@
 # more
 
 ## Overview
-The `more` command is a file perusal filter for viewing text one screen at a time. It's simpler than `less` but still useful for basic file viewing.
+
+`more` is a simple historical **pager** that displays text one screen at a time. On modern Linux, **`less` is almost always the better interactive choice** (bi-directional scroll, better search). `more` remains useful for POSIX familiarity, tiny environments, and scripts that expect the classic pager name.
 
 ## Syntax
+
 ```bash
-more [options] file...
+more [options] [file ...]
+command | more
 ```
 
 ## Common Options
+
 | Option | Description |
 |--------|-------------|
-| `-d` | Display help prompt |
-| `-f` | Count logical lines |
-| `-l` | Suppress line-break treatment |
+| `-d` | Prompt with more helpful “press space” text |
+| `-f` | Count logical lines (don’t fold long lines as multiple) |
+| `-l` | Do not treat form-feed specially |
+| `-c` / `-p` | Paint from top / clear then show (terminal-dependent) |
 | `-s` | Squeeze multiple blank lines |
 | `-u` | Suppress underlining |
-| `-5` | Screen every 5 lines |
-| `-p` | Clear screen before display |
-| `+/pattern` | Start at pattern |
 | `+num` | Start at line number |
+| `+/pattern` | Start at pattern |
+| `-n num` | Screen size (lines) |
 
-## Key Use Cases
-1. View text files
-2. Read documentation
-3. Display command output
-4. Basic file navigation
-5. Quick file inspection
+Feature sets differ between implementations (util-linux vs BSD heritage).
+
+## Common keys
+
+| Key | Action |
+|-----|--------|
+| `Space` | Next page |
+| `Enter` | Next line |
+| `q` | Quit |
+| `/pattern` | Search (implementation-dependent) |
+| `h` | Help (if supported) |
+| `b` | Back (often **not** available in classic more) |
+
+Limited backward movement is the classic reason people switch to `less`.
 
 ## Examples with Explanations
-### Example 1: Basic Usage
+
+### Basic
+
 ```bash
-more file.txt
+more /etc/os-release
+more +20 /var/log/dmesg
+more +/failed /var/log/syslog
 ```
-View file one screen at a time
 
-### Example 2: Start at Pattern
+### Pipelines
+
 ```bash
-more +/pattern file.txt
+dmesg | more
+seq 1 200 | more
+ls -l /usr/bin | more
 ```
-Start viewing at first occurrence of pattern
 
-### Example 3: Line Numbers
+### Prefer less when available
+
 ```bash
-more +5 file.txt
+# interactive systems
+less /var/log/syslog
+
+# force more only if required
+PAGER=more man ls
 ```
-Start viewing from line 5
 
-## Understanding Output
-Commands during viewing:
-- Space: Next page
-- Enter: Next line
-- b: Previous page
-- /pattern: Search pattern
-- =: Show current line number
-- q: Quit
-- h: Help
+### Start position
 
-## Common Usage Patterns
-1. View with line numbers:
-   ```bash
-   more -d file
-   ```
-2. Squeeze blank lines:
-   ```bash
-   more -s file
-   ```
-3. Pipe command output:
-   ```bash
-   command | more
-   ```
+```bash
+more +100 /var/log/kern.log
+more +/error app.log
+```
 
-## Performance Analysis
-- Simple and lightweight
-- Forward-only scrolling
-- Limited memory usage
-- Quick startup
-- Basic feature set
+### Tiny environments
+
+```bash
+# busybox / recovery shells may only have more
+more /etc/passwd
+```
+
+### Compare pagers
+
+```bash
+printf '%s\n' {1..200} | more
+printf '%s\n' {1..200} | less
+```
+
+Notice bidirectional movement and search comfort in `less`.
+
+## Notes / Pitfalls
+
+- Default `PAGER` / `MANPAGER` on desktop distros is usually `less`, not `more`.
+- Behavior of flags is **less portable** than many coreutils tools.
+- Not ideal for huge logs; still reads sequentially.
+- Some `more` versions exit automatically at EOF when not a tty — good for scripts, surprising interactively.
+- Teaching material still mentions `more`; production muscle memory should favor `less`.
+
+## 2026-relevant notes
+
+- Recovery initramfs and busybox environments may ship `more` only — know both.
+- `systemctl` / `journalctl` respect `$SYSTEMD_PAGER` / `$PAGER`; set to `less -R` for color.
+- Don’t write new tooling that requires `more`-specific keybindings.
 
 ## Related Commands
-- `less` - Enhanced pager
-- `cat` - Display file contents
-- `pg` - Another pager
-- `view` - Read-only vim
-- `most` - Another pager
+
+- `less` — preferred full-featured pager
+- `most` — alternate pager
+- `bat` — highlighting viewer
+- `pg` — historical pager (rare)
+- `cat` — dump entire file
 
 ## Additional Resources
-- [More Manual](https://man7.org/linux/man-pages/man1/more.1.html)
-- [Text Processing Guide](https://tldp.org/LDP/abs/html/textproc.html)
-- [File Viewing Tools](https://www.tecmint.com/linux-more-command-and-less-command-examples/)
 
-## Limitations
-1. No backward scrolling
-2. Limited search capabilities
-3. Basic feature set
-4. No file editing
-5. Single file viewing
-
-## Best Practices
-1. Use for quick views
-2. Consider less for large files
-3. Use with pipes
-4. Learn key commands
-5. Know when to switch to less
+- `man more`

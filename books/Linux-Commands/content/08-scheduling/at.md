@@ -1,55 +1,121 @@
-# at / atq / atrm
+# at
 
 ## Overview
-`at` schedules **one-shot** jobs for a later time. Recurring work belongs in `cron` or systemd timers. Requires the `atd` daemon.
+
+`at` schedules a **one-shot** command to run once at a future time. Unlike `cron` (recurring) or systemd timers (rich units), `at` is ideal for “run this once tonight” admin tasks. Companion tools: `atq` (queue), `atrm` (remove), `batch` (run when load is low).
+
+Requires `atd` service running and permission via `/etc/at.allow` / `/etc/at.deny`.
 
 ## Syntax
+
 ```bash
-at [options] TIME
-at -f script TIME
+at [-q queue] [-f file] [-m] TIME
 atq
-atrm id...
+atrm JOB...
 batch
 ```
 
-## Time expressions
-Examples: `now + 5 minutes`, `23:30`, `midnight`, `noon tomorrow`, `4pm + 2 days`, `teatime`.
+## Common Options
 
-## Examples with Explanations
-### Interactive
-```bash
-at now + 10 minutes
-# type commands, finish with Ctrl-D
+| Option | Description |
+|--------|-------------|
+| `-f file` | Read job from file |
+| `-m` | Mail when done (even if no output) |
+| `-M` | Never mail |
+| `-q queue` | Queue letter (`a` default; higher letters later) |
+| `-t time` | Time as `[[CC]YY]MMDDhhmm[.ss]` |
+| `-v` | Show time job will run |
+| `-c job` | Cat job contents |
+| `-l` | Alias for `atq` on some systems |
+| `-d` | Alias for `atrm` on some systems |
+
+## Time expressions
+
+```text
+now + 30 minutes
+now + 2 hours
+teatime          # 16:00
+noon
+midnight
+23:30
+10am tomorrow
+4pm + 3 days
 ```
 
-### From pipe / file
+## Examples with Explanations
+
+### Interactive job
+
 ```bash
-echo '/usr/local/bin/backup.sh >> /var/log/backup.at.log 2>&1' | at 02:30
-at -f ./job.sh midnight
+at now + 1 hour
+# then type commands, finish with Ctrl-D
+echo "hello from at" >> /tmp/at.out
+systemctl restart demo
+^D
+```
+
+### One-liner from pipe
+
+```bash
+echo 'systemctl restart nginx' | sudo at now + 5 minutes
+echo 'wall "maintenance over"' | at 22:00
+```
+
+### From file
+
+```bash
+cat > /tmp/job.sh <<'EOF'
+#!/bin/bash
+/usr/local/bin/backup.sh
+EOF
+at -f /tmp/job.sh 2am tomorrow
 ```
 
 ### Queue management
+
 ```bash
 atq
-at -c 3          # show job body
-atrm 3
+at -c 7                 # show job 7 script
+atrm 7
 ```
 
-### Low-load batch queue
+### batch
+
 ```bash
-echo './heavy.sh' | batch
+echo '/usr/local/bin/heavy-index' | batch
 ```
 
-## Permissions & service
+Runs when system load allows (implementation-defined).
+
+### Ensure service
+
 ```bash
 systemctl status atd
-# /etc/at.allow  /etc/at.deny
+sudo systemctl enable --now atd
 ```
 
-## Output
-Job stdout/stderr is mailed to the user if a local MTA exists; otherwise redirect inside the job.
+## Notes / Pitfalls
+
+- Environment is a snapshot — don’t assume your interactive aliases; use absolute paths.
+- Output mailed to user if local mail works; on servers mail may be undelivered — redirect to files.
+- Permissions: not all users may use `at` (allow/deny files).
+- Timezone is system timezone (`timedatectl`).
+- Not a substitute for durable job queues in multi-host apps.
+
+## 2026-relevant notes
+
+- Prefer `systemd-run --on-calendar=` / `--on-active=` for modern one-shots with cgroups/logging.
+- `at` remains handy on classic servers for quick deferred restarts.
+- Containers often lack `atd` — use external schedulers.
 
 ## Related Commands
-- `crontab` / `anacron`  
-- `systemd-run --on-calendar=` / `.timer` units  
-- `sleep`
+
+- `atq` / `atrm` / `batch`
+- `cron` / `crontab`
+- `systemd-run` / timers
+- `sleep` — simple delay in a live shell
+- `wall` — broadcast messages
+
+## Additional Resources
+
+- `man at`, `man atd`

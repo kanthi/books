@@ -1,54 +1,98 @@
 # paste
 
 ## Overview
-`paste` merges lines of files side-by-side (parallel) or serially, using a delimiter (default TAB). Ideal for building TSV columns from separate lists.
+
+`paste` merges lines of files **side by side**, writing corresponding lines separated by tabs (or another delimiter). The counterpart mindset to `cut` (split columns) — paste builds columns from separate files or serializes lines with `-s`.
 
 ## Syntax
+
 ```bash
 paste [options] [file...]
 ```
 
 ## Common Options
+
 | Option | Description |
 |--------|-------------|
-| `-d LIST` | Delimiter characters (cycle through LIST) |
-| `-s` | Serial: paste one file at a time |
-| `-` | Read stdin as a file |
+| `-d LIST`, `--delimiters=LIST` | Cycle delimiter characters instead of tab |
+| `-s`, `--serial` | Paste one file at a time (serialize lines of each file) |
+| `-z`, `--zero-terminated` | NUL-terminated lines |
 
-## Key Use Cases
-1. Combine columns from two files
-2. Build CSV/TSV quickly
-3. Pair names with IDs
-4. Join command outputs
+Use `-` for stdin.
 
 ## Examples with Explanations
-### Side-by-side merge
-```bash
-paste names.txt emails.txt
-```
-Line 1 of each file joined by TAB.
 
-### Comma-separated
-```bash
-paste -d, names.txt emails.txt > contacts.csv
-```
-Simple CSV without a spreadsheet.
+### Side by side
 
-### Number lines with nl + paste
 ```bash
-nl -ba file.txt | head
+paste names.txt ages.txt
+paste <(echo -e 'a\nb') <(echo -e '1\n2')
 ```
-Often combined with other column tools; `paste -d: <(seq 3) <(echo -e "a\nb\nc")` for bash process substitution.
 
-### Serial mode
+### Custom delimiter
+
 ```bash
-paste -s -d, file.txt
+paste -d, names.txt ages.txt
+paste -d'|' a.txt b.txt c.txt
+paste -d '\t|' a.txt b.txt     # cycle delimiters
 ```
-Joins all lines of one file onto one line with commas.
+
+### Serialize lines of one file
+
+```bash
+# join all lines with comma
+paste -sd, file.txt
+# words to CSV row
+paste -sd' ' words.txt
+```
+
+### Combine with cut/seq
+
+```bash
+paste <(seq 1 3) <(seq 10 12)
+cut -d: -f1 /etc/passwd | head | paste - - -    # 3 columns
+```
+
+### Join data columns from commands
+
+```bash
+paste <(nproc; echo cores) <(free -h | awk '/Mem:/{print $2}')
+```
+
+### NUL-safe
+
+```bash
+paste -z -d '' file1 file2
+```
+
+### Classic: make CSV from columns
+
+```bash
+paste -d, col1.txt col2.txt col3.txt > out.csv
+```
+
+## Notes / Pitfalls
+
+- Unequal line counts: shorter files yield empty fields for missing lines.
+- Default tab delimiter can be hard to see — use `-d,` or `cat -A`.
+- `-s` changes semantics dramatically (horizontal merge of each file’s own lines).
+- Not a full CSV writer (no quoting of embedded commas) — use proper CSV tools when needed.
+- Large files stream line-by-line; keep inputs aligned intentionally.
+
+## 2026-relevant notes
+
+- Still great for quick ops glue between two tool outputs.
+- For structured data, prefer `jq -s` / `python` when quoting/escaping matters.
+- Pair with `column -t` after paste for display.
 
 ## Related Commands
-- `cut` — select columns
-- `column` — pretty align tables
-- `join` — merge on a key field
-- `awk` — richer field logic
-- `pr -m` — side-by-side pages
+
+- `cut` — extract columns
+- `join` — merge sorted files on a key
+- `awk` — general field processing
+- `column` — pretty alignment
+- `pr -m` — merge files in columns (different tool)
+
+## Additional Resources
+
+- `man paste`

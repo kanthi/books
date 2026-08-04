@@ -1,261 +1,125 @@
 # bg
 
 ## Overview
-The `bg` command resumes suspended jobs in the background. It's part of shell job control, allowing you to continue stopped processes without bringing them to the foreground.
+
+`bg` resumes a **stopped** job in the **background** so it continues running without occupying the terminal. It is part of interactive shell **job control** (bash/zsh), together with `fg`, `jobs`, `Ctrl-Z`, and `&`.
+
+Job control is per-shell: background jobs are not the same as systemd services or `nohup` daemons.
 
 ## Syntax
+
 ```bash
-bg [job_spec...]
+bg [job_spec ...]
 ```
 
-## Job Specification
-| Format | Description |
-|--------|-------------|
+With no argument, resumes the current job (`%+`).
+
+## Job specification
+
+| Spec | Meaning |
+|------|---------|
 | `%n` | Job number n |
 | `%string` | Job whose command begins with string |
 | `%?string` | Job whose command contains string |
-| `%%` or `%+` | Current job (default) |
+| `%%` or `%+` | Current job |
 | `%-` | Previous job |
 
-## Key Use Cases
-1. Resume suspended processes
-2. Multitasking in terminal
-3. Job control management
-4. Process workflow optimization
-5. Shell session efficiency
+## Common Options
+
+None significant — `bg` is a shell builtin. See `help bg`.
 
 ## Examples with Explanations
-### Example 1: Resume Current Job
+
+### Suspend then background
+
 ```bash
+# start a long command in foreground
+find / -xdev -name '*.log' 2>/dev/null
+# press Ctrl-Z  → Stopped
 bg
+# continues in background
+jobs -l
 ```
-Resumes the most recently suspended job in background
 
-### Example 2: Resume Specific Job
+### Start in background directly
+
 ```bash
+make -j$(nproc) &
+jobs
+```
+
+`&` starts background immediately; `bg` is for jobs already stopped.
+
+### Specific job
+
+```bash
+jobs
 bg %1
+bg %find
 ```
-Resumes job number 1 in background
 
-### Example 3: Resume Multiple Jobs
+### Multiple jobs
+
 ```bash
-bg %1 %2 %3
+bg %1 %2
 ```
-Resumes multiple jobs in background
 
-## Common Workflow
-1. Start a command:
-   ```bash
-   long_running_command
-   ```
-2. Suspend it (Ctrl+Z):
-   ```bash
-   ^Z
-   [1]+  Stopped    long_running_command
-   ```
-3. Resume in background:
-   ```bash
-   bg %1
-   [1]+ long_running_command &
-   ```
+### Typical workflow
 
-## Job Control Sequence
-| Action | Command | Result |
-|--------|---------|--------|
-| Start job | `command` | Runs in foreground |
-| Suspend | `Ctrl+Z` | Job stopped |
-| Background | `bg` | Job runs in background |
-| Foreground | `fg` | Job returns to foreground |
-| List jobs | `jobs` | Show all jobs |
+```bash
+gzip -k huge.img
+# Ctrl-Z
+bg
+# continue using the shell
+jobs -l
+fg %1          # bring back if needed
+```
 
-## Common Usage Patterns
-1. Quick background resume:
-   ```bash
-   # Suspend current job
-   ^Z
-   # Resume in background
-   bg
-   ```
-2. Manage multiple jobs:
-   ```bash
-   jobs  # List jobs
-   bg %2  # Resume job 2
-   ```
-3. Resume by command name:
-   ```bash
-   bg %vim  # Resume vim job
-   ```
+### Disown / survive hangup
 
-## Advanced Usage
-1. Resume all stopped jobs:
-   ```bash
-   for job in $(jobs -s | awk '{print $1}' | tr -d '[]+-'); do
-       bg %$job
-   done
-   ```
-2. Conditional resume:
-   ```bash
-   if jobs -s | grep -q "backup"; then
-       bg %backup
-   fi
-   ```
+```bash
+# after bg:
+disown %1
+# or start with:
+nohup longcmd &
+# or use tmux/systemd for real persistence
+```
 
-## Performance Analysis
-- Instant operation
-- No resource overhead
-- Shell built-in command
-- Efficient job management
-- Real-time process control
+### Not for scripts by default
+
+```bash
+# non-interactive shells often have job control off
+set -m              # monitor mode (enable job control) if needed
+sleep 30 &
+jobs
+```
+
+Prefer explicit background with `&` and `wait` in scripts rather than `bg`.
+
+## Notes / Pitfalls
+
+- Only works with **job control enabled** and jobs owned by this shell.
+- Background jobs writing to the terminal can interleave messily — redirect stdout/stderr.
+- `bg` on an already running background job is a no-op / error depending on shell.
+- Closing the terminal may SIGHUP jobs unless `disown`/`nohup`/tmux/systemd.
+- Don’t confuse with `systemd` `bg` — there is none; use units for services.
+
+## 2026-relevant notes
+
+- For anything important, prefer `tmux`/`systemd-run`/`nohup` over bare `bg`.
+- Desktop environments may use their own session management; servers still rely on classic job control daily.
+- Pipeline job control can be surprising — know whether the whole pipeline is one job.
 
 ## Related Commands
-- `fg` - Bring job to foreground
-- `jobs` - List active jobs
-- `kill` - Terminate jobs
-- `nohup` - Run immune to hangups
-- `disown` - Remove from job table
 
-## Best Practices
-1. Check job status before using bg
-2. Use specific job numbers for clarity
-3. Monitor background jobs regularly
-4. Combine with job listing commands
-5. Understand job control implications
+- `fg` — resume in foreground
+- `jobs` — list jobs
+- `Ctrl-Z` / `kill -STOP` — stop
+- `disown` — detach from shell job table
+- `nohup` — ignore hangup
+- `tmux` / `screen` — persistent sessions
+- `wait` — wait for background PIDs/jobs
 
-## Error Handling
-1. Job not found:
-   ```bash
-   bg %99  # Error if job doesn't exist
-   ```
-2. Job already running:
-   ```bash
-   bg %1  # No effect if already running
-   ```
-3. No current job:
-   ```bash
-   bg  # Error if no current job
-   ```
+## Additional Resources
 
-## Scripting Applications
-1. Automated job management:
-   ```bash
-   #!/bin/bash
-   # Start job
-   long_process &
-   JOB_PID=$!
-
-   # Later, if needed to suspend and resume
-   kill -STOP $JOB_PID
-   kill -CONT $JOB_PID
-   ```
-2. Interactive job control:
-   ```bash
-   manage_jobs() {
-       echo "Stopped jobs:"
-       jobs -s
-       read -p "Resume which job? " job_num
-       bg %$job_num
-   }
-   ```
-
-## Integration Examples
-1. With job monitoring:
-   ```bash
-   # Check and resume stopped jobs
-   if jobs -s | grep -q .; then
-       echo "Resuming stopped jobs..."
-       jobs -s | while read line; do
-           job_num=$(echo "$line" | awk '{print $1}' | tr -d '[]+-')
-           bg %$job_num
-       done
-   fi
-   ```
-2. Workflow automation:
-   ```bash
-   # Start multiple tasks
-   task1 &
-   task2 &
-   task3 &
-
-   # If any get suspended, resume them
-   for job in $(jobs -s | awk '{print $1}' | tr -d '[]+-'); do
-       bg %$job
-   done
-   ```
-
-## Shell Compatibility
-Different shells support bg:
-- **Bash**: Full support
-- **Zsh**: Enhanced features
-- **Fish**: Modern syntax
-- **Dash**: Basic support
-- **Tcsh**: C-shell style
-
-## Troubleshooting
-1. Job control not enabled
-2. No jobs to resume
-3. Job already running
-4. Shell doesn't support job control
-5. Process has exited
-
-## Security Considerations
-1. Monitor background processes
-2. Check process ownership
-3. Verify job legitimacy
-4. Resource usage monitoring
-5. Process privilege levels
-
-## Alternative Methods
-1. Start directly in background:
-   ```bash
-   command &
-   ```
-2. Use nohup for persistence:
-   ```bash
-   nohup command &
-   ```
-3. Use screen/tmux for session management:
-   ```bash
-   screen -S session_name
-   command
-   # Ctrl+A, D to detach
-   ```
-
-## Real-world Examples
-1. Development workflow:
-   ```bash
-   # Start editor
-   vim file.txt
-   # Suspend to test
-   ^Z
-   # Resume editor in background
-   bg
-   # Run tests in foreground
-   make test
-   ```
-2. System administration:
-   ```bash
-   # Start backup
-   backup_script
-   # Suspend if needed
-   ^Z
-   # Resume in background
-   bg
-   # Continue other tasks
-   ```
-
-## Monitoring Background Jobs
-1. Regular status check:
-   ```bash
-   watch -n 5 jobs
-   ```
-2. Job completion notification:
-   ```bash
-   (sleep 100; echo "Job completed") &
-   ```
-3. Resource monitoring:
-   ```bash
-   jobs -l | while read job; do
-       pid=$(echo "$job" | awk '{print $2}')
-       ps -p $pid -o pid,pcpu,pmem,cmd
-   done
-   ```
+- `help bg`, `man bash` (JOB CONTROL)

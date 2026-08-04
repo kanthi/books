@@ -1,74 +1,116 @@
 # zstd
 
 ## Overview
-`zstd` (Zstandard) is a fast lossless compressor with excellent ratio/speed tradeoffs. It is often preferable to `gzip` for logs, backups, and package artifacts.
+
+`zstd` (Zstandard) is a modern compression tool offering an excellent **speed vs ratio** curve, levels from very fast to extremely dense, optional multithreading, and framing with checksums. It is the preferred default for many new local pipelines, package systems, and container layers. Extension: `.zst`.
 
 ## Syntax
+
 ```bash
 zstd [options] [file...]
 zstd -d [options] [file...]
-zstdmt [options] [file...]   # multi-threaded alias/common packaging
+zstdcat [file...]
+unzstd [file...]
 ```
 
 ## Common Options
+
 | Option | Description |
 |--------|-------------|
-| `-#` | Compression level 1–19 (default 3); ultra up to 22 with --ultra |
-| `-d / --decompress` | Decompress |
-| `-c / --stdout` | Write to stdout |
-| `-f` | Overwrite output |
+| `-d`, `--decompress` | Decompress |
+| `-c`, `--stdout` | Write to stdout |
+| `-f`, `--force` | Overwrite / compress links |
+| `-o file` | Output file name |
+| `-k` / `--rm` | Keep sources (default keep) / remove sources after success |
 | `-t` | Test integrity |
-| `-T#` | Threads (0 = all CPUs) |
-| `-o file` | Output path |
-| `--rm` | Remove source after success |
+| `-T#` | Threads (`-T0` = all cores) |
+| `-#` | Level 1–19 (default 3); ultra with `--ultra -20`…`-22` |
 | `-v` | Verbose |
+| `-q` | Quiet |
+| `-l` / `--list` | Show frame info |
+| `--train` | Build a dictionary (advanced) |
+| `-D dict` | Compress/decompress with dictionary |
+| `--long` | Long distance matching mode |
 
-## Key Use Cases
-1. Compress backups and tarballs
-2. Replace gzip for large log archives
-3. Stream compress in pipelines
-4. Multi-threaded bulk compression
+Unlike classic gzip defaults, **zstd keeps the original file** unless you pass `--rm`.
 
 ## Examples with Explanations
-### Compress a file
-```bash
-zstd big.log
-# creates big.log.zst, keeps original unless --rm
-```
-Default level balances speed and size.
 
-### Decompress
-```bash
-zstd -d big.log.zst
-```
-Restores `big.log` beside the archive.
+### Basic
 
-### Tar + zstd (modern tar)
 ```bash
-tar --zstd -cf project.tar.zst project/
-tar --zstd -tf project.tar.zst
-tar --zstd -xf project.tar.zst
+zstd file.tar
+zstd -d file.tar.zst
+zstd -o out.zst file
+unzstd file.tar.zst
 ```
-GNU tar 1.31+ supports `--zstd` natively.
 
-### Pipeline
+### Levels and threads
+
 ```bash
-tar -cf - mydir | zstd -T0 -19 -o mydir.tar.zst
+zstd -1 -T0 fast.log
+zstd -19 -T0 cold.img
+zstd --ultra -22 -T0 deepest.img   # very slow/heavy
+for l in 1 3 6 9 15 19; do
+  zstd -$l -f -o /tmp/t.zst sample.bin && ls -lh /tmp/t.zst
+done
 ```
-High ratio with all cores; stream avoids temp tar.
 
-### Decompress to stdout
+### Pipelines with tar
+
 ```bash
-zstd -dc data.json.zst | jq .
+tar -I 'zstd -T0' -cf backup.tar.zst dir/
+tar --zstd -cf backup.tar.zst dir/          # GNU tar 1.31+
+zstd -dc backup.tar.zst | tar xf -
+tar -I zstd -xf backup.tar.zst
 ```
-Chain into JSON tools without unpacking to disk.
 
-## Notes & Pitfalls
-- Prefer `.zst` extension; tools recognize it widely now.
-- Level 19 is slow but dense; level 3 is a good default for logs.
-- Package: `sudo apt install zstd`.
+### Integrity
+
+```bash
+zstd -t backup.tar.zst
+zstd -l backup.tar.zst
+```
+
+### Remove source when desired
+
+```bash
+zstd --rm big.img
+```
+
+### Dictionaries (small similar files)
+
+```bash
+zstd --train -o dict samples/*
+zstd -D dict small1 small2
+zstd -d -D dict small1.zst
+```
+
+Useful for massive numbers of similar tiny JSON/logs.
+
+## Notes / Pitfalls
+
+- Confirm consumers understand `.zst` before replacing gzip in public APIs.
+- Ultra levels need large memory windows — watch small VMs.
+- Default **keeps** inputs; scripts ported from gzip may leave duplicates if they assume deletion.
+- `tar --zstd` requires sufficiently new GNU tar; `-I 'zstd -T0'` is explicit and flexible.
+- Older enterprise appliances may still demand `.gz`.
+
+## 2026-relevant notes
+
+- Default choice for many new internal artifacts, caches, and log archives.
+- Kernel squashfs, package managers, and container tooling increasingly support zstd natively.
+- Compare: **gzip** (universal), **xz** (max ratio, slow), **zstd** (best general default).
 
 ## Related Commands
-- `tar` — archive then compress
-- `gzip` / `xz` — older alternatives
-- `zip` — multi-file archives with different ecosystem
+
+- `gzip` / `xz` / `bzip2` — alternatives
+- `tar` — archive integration
+- `zstdcat` / `zstdgrep` (if packaged)
+- `pzstd` — parallel client in some packages
+- `lz4` — even faster, lower ratio
+
+## Additional Resources
+
+- `man zstd`
+- [facebook/zstd](https://github.com/facebook/zstd)

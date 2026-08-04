@@ -1,104 +1,151 @@
 # touch
 
 ## Overview
-The `touch` command changes file timestamps. It's commonly used to create empty files or update access and modification times of existing files.
+
+`touch` updates file timestamps and, by default, **creates** empty files that do not exist. Operators use it to create placeholders, nudge `make` rebuilds, normalize mtimes in tests, and clone timestamps from a reference file.
+
+Linux files typically track at least **atime** (access), **mtime** (content modification), and **ctime** (metadata change). `touch` adjusts atime/mtime; ctime updates as a side effect of the metadata change.
 
 ## Syntax
+
 ```bash
 touch [options] file...
 ```
 
 ## Common Options
+
 | Option | Description |
 |--------|-------------|
 | `-a` | Change access time only |
 | `-m` | Change modification time only |
-| `-c` | Don't create new files |
-| `-d time` | Use specified time |
-| `-r ref_file` | Use ref_file's times |
-| `-t time` | Use specified time [[CC]YY]MMDDhhmm[.ss] |
-| `--time=WORD` | Change specified time: access, modify, change |
-| `--date=STRING` | Parse STRING and use it for time |
-| `--no-create` | Don't create new files |
+| `-c`, `--no-create` | Do not create missing files |
+| `-d STRING`, `--date=STRING` | Parse human-friendly time string |
+| `-t [[CC]YY]MMDDhhmm[.ss]` | Set time in compact form |
+| `-r REF`, `--reference=REF` | Copy timestamps from REF |
+| `--time=WORD` | `access`/`atime`/`use` or `modify`/`mtime` |
+| `-h` | Affect symlink itself (when supported) |
 
 ## Key Use Cases
-1. Create empty files
-2. Update timestamps
-3. Batch file creation
-4. File time synchronization
-5. File existence checking
+
+1. Create empty files / placeholders
+2. Update mtime to trigger build systems
+3. Set explicit timestamps for tests and packages
+4. Copy times from a reference file
+5. Batch-create names (`touch file{1..5}`)
 
 ## Examples with Explanations
-### Example 1: Create File
+
+### Create or refresh
+
 ```bash
 touch newfile
+touch file1 file2 file3
+touch file{1..5}
+touch logs/.gitkeep
 ```
-Create empty file or update timestamp
 
-### Example 2: Specific Time
+### Do not create
+
+```bash
+touch -c missing_file     # no-op if absent; exit 0 typically
+ls missing_file
+```
+
+### atime / mtime only
+
+```bash
+touch -a file             # access time
+touch -m file             # modification time
+stat file
+```
+
+### Date strings
+
+```bash
+touch -d '2020-01-01' file
+touch -d '2 days ago' file
+touch -d '2024-06-15 14:30:00' file
+touch -d 'next Monday' file
+```
+
+GNU `touch` accepts many `date`-style strings.
+
+### Compact `-t` form
+
 ```bash
 touch -t 202312201200 file
+touch -t 202312201200.30 file
+# [[CC]YY]MMDDhhmm[.ss]
 ```
-Set timestamp to specified date/time
 
-### Example 3: Reference File
+### Reference file
+
 ```bash
-touch -r ref_file target_file
+touch -r /etc/hosts mycopy
+stat -c '%y %n' /etc/hosts mycopy
 ```
-Copy timestamps from ref_file
 
-## Understanding Output
-- No output by default
-- Error messages for:
-  - Permission denied
-  - Invalid date format
-  - Directory not writable
-  - Invalid option
+### Make and empty targets
 
-## Common Usage Patterns
-1. Create multiple files:
-   ```bash
-   touch file1 file2 file3
-   ```
-2. Update access time:
-   ```bash
-   touch -a file
-   ```
-3. Set specific date:
-   ```bash
-   touch -d "2 days ago" file
-   ```
+```bash
+touch src/main.c          # force rebuild consumers of main.c
+make
+```
 
-## Performance Analysis
-- Fast operation
-- Minimal system impact
-- Inode updates only
-- No data modification
-- Multiple file efficiency
+### Scripts: ensure path exists as empty file
+
+```bash
+mkdir -p "$(dirname "$out")"
+touch "$out"
+```
+
+### Clear mtime into the past for cleanup tests
+
+```bash
+touch -d '30 days ago' /tmp/old.log
+find /tmp -name 'old.log' -mtime +7
+```
+
+## Understanding timestamps
+
+```bash
+stat file
+stat -c 'mtime=%y atime=%x ctime=%z' file
+```
+
+| Field | Meaning |
+|-------|---------|
+| atime | Last access (often lazy/relatime on modern mounts) |
+| mtime | Last content modification |
+| ctime | Last inode/metadata change (not “creation”) |
+| birth | Creation time on some filesystems (`stat` `%w`) |
+
+**relatime** / **noatime** mount options mean `touch -a` may not behave as you expect for real reads; the explicit `touch -a` still sets atime.
+
+## Notes / Pitfalls
+
+- Creating files requires write permission on the parent directory.
+- `touch` on a directory updates the directory’s timestamps, not children.
+- Timestamp precision and timezone depend on filesystem and locale settings.
+- NFS root_squash and permission quirks can make `touch` fail with EACCES.
+- `touch` is not a substitute for writing content — use redirection or editors.
+
+## 2026-relevant notes
+
+- Build caches (Bazel, Nix, container layer caches) care deeply about mtime vs content hashes; know which model your toolchain uses.
+- `touch -r` is handy when replaying reproducible package layouts.
+- For pure “ensure file exists” in bash, ` : >>file ` or `umask` + redirect may be clearer than `touch` when you also write content.
 
 ## Related Commands
-- `stat` - Display file status
-- `ls` - List directory contents
-- `find` - Search files
-- `date` - Display/set date
-- `mkdir` - Create directories
+
+- `stat` — display timestamps and inode data
+- `date` — print/set system time; format strings
+- `find -mtime/-mmin` — select by age
+- `mkdir` — create directories
+- `install` — install files with mode/owner
+- `make` — rebuild based on mtimes
 
 ## Additional Resources
-- [GNU Coreutils - touch](https://www.gnu.org/software/coreutils/manual/html_node/touch-invocation.html)
-- [Linux File Times](https://www.usenix.org/legacy/publications/library/proceedings/usenix99/full_papers/zadok/zadok_html/node11.html)
-- [File Management Guide](https://www.tecmint.com/8-pratical-examples-of-linux-touch-command/)
 
-## Best Practices
-1. Use -c to prevent accidental creation
-2. Verify timestamp format
-3. Check file permissions
-4. Consider timezone impact
-5. Use with find for batch operations
-## Additional Examples
-```bash
-touch newfile
-touch -a file          # atime only
-touch -m file          # mtime only
-touch -d '2020-01-01' file
-touch file{1..5}
-```
+- `man touch`
+- [GNU coreutils — touch](https://www.gnu.org/software/coreutils/manual/html_node/touch-invocation.html)

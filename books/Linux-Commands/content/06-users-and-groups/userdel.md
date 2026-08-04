@@ -1,115 +1,100 @@
 # userdel
 
 ## Overview
-The `userdel` command deletes a user account and related files. It removes the user from the system, optionally including their home directory and mail spool.
+
+`userdel` deletes a user account from the system. By default it removes the account entry but may leave the home directory and mail spool unless you pass `-r`. Always confirm you have backups and that no critical processes still run as that user.
 
 ## Syntax
+
 ```bash
-userdel [options] login
+userdel [options] LOGIN
 ```
 
 ## Common Options
+
 | Option | Description |
 |--------|-------------|
-| `-f` | Force removal |
-| `-r` | Remove home dir |
-| `-Z` | Remove SELinux |
-| `--help` | Show help |
-| `--version` | Show version |
-
-## Affected Files
-| File | Description |
-|------|-------------|
-| /etc/passwd | User accounts |
-| /etc/shadow | Secure accounts |
-| /etc/group | Group accounts |
-| /home/user | Home directory |
-| /var/mail/user | Mail spool |
-| /var/spool/mail/user | Mail directory |
-
-## Key Use Cases
-1. Account removal
-2. System cleanup
-3. Security management
-4. Directory cleanup
-5. User management
+| `-r`, `--remove` | Remove home directory and mail spool |
+| `-f`, `--force` | Force removal even if logged in / files busy (dangerous) |
+| `-Z` | Remove SELinux user mapping (when applicable) |
+| `-R CHROOT` | Chroot |
+| `-P PREFIX` | Prefix |
 
 ## Examples with Explanations
-### Example 1: Basic Remove
+
+### Delete account, keep home
+
 ```bash
-userdel username
+id bob
+sudo userdel bob
+ls /home/bob                 # may still exist
 ```
-Remove user account
 
-### Example 2: Full Remove
+### Delete account and home
+
 ```bash
-userdel -r username
+sudo userdel -r bob
 ```
-Remove with home directory
 
-### Example 3: Force Remove
+### Refuse when logged in
+
 ```bash
-userdel -f username
+who | grep bob
+loginctl user-status bob
+sudo userdel bob             # may fail if logged in
+# terminate sessions first:
+sudo loginctl terminate-user bob
+sudo userdel -r bob
 ```
-Force user removal
 
-## Common Usage Patterns
-1. Simple delete:
-   ```bash
-   userdel user
-   ```
-2. Complete removal:
-   ```bash
-   userdel -r user
-   ```
-3. Force cleanup:
-   ```bash
-   userdel -f -r user
-   ```
+### Processes still running
 
-## Security Considerations
-1. Data removal
-2. File ownership
-3. Group access
-4. System security
-5. Backup importance
+```bash
+ps -u bob
+sudo pkill -u bob
+sudo userdel -r bob
+```
+
+### Orphan files outside home
+
+```bash
+# after delete, numeric UID may remain on files:
+sudo find /var /srv -nouser 2>/dev/null | head
+```
+
+Reassign or delete intentionally.
+
+### System users
+
+```bash
+# prefer package uninstall / systemd DynamicUser cleanup
+# only manually remove custom system accounts you created
+sudo userdel -r appuser
+```
+
+## Notes / Pitfalls
+
+- Without `-r`, homes accumulate on disk — disk bloat and privacy residue.
+- Force-deleting logged-in users can confuse running jobs; terminate cleanly first.
+- Crontabs, systemd user units, and mail spools may need manual cleanup.
+- UID reuse: deleting then creating a new user with same UID exposes old files — wipe or reown.
+- LDAP users: use directory tools, not local `userdel`, for network accounts.
+
+## 2026-relevant notes
+
+- Prefer lifecycle via configuration management and IdP offboarding playbooks.
+- Containers: removing users in a container image layer doesn’t rewrite earlier layers’ files.
+- Check `loginctl`, `crontab -u`, and `/var/lib/systemd/` leftovers for interactive users.
 
 ## Related Commands
-- `useradd` - Add user
-- `usermod` - Modify user
-- `groupdel` - Delete group
-- `passwd` - Password
-- `chage` - Account aging
+
+- `useradd` / `usermod`
+- `passwd` / `chage`
+- `groupdel`
+- `find -nouser`
+- `loginctl`
+- `vipw` — manual editor (last resort)
 
 ## Additional Resources
-- [Userdel Manual](https://man7.org/linux/man-pages/man8/userdel.8.html)
-- [User Guide](https://www.cyberciti.biz/faq/linux-userdel-command-examples-syntax-usage/)
-- [System Administration](https://www.tecmint.com/linux-userdel-command-examples/)
 
-## Best Practices
-1. Backup data
-2. Check processes
-3. Verify ownership
-4. Document removal
-5. Test completion
-
-## User Management
-1. Account removal
-2. Data cleanup
-3. Group handling
-4. Security update
-5. System cleanup
-
-## Troubleshooting
-1. Permission denied
-2. Process running
-3. File ownership
-4. Group membership
-5. Directory issues
-
-## Common Issues
-1. Active processes
-2. File permissions
-3. Group ownership
-4. System files
-5. Mail spools
+- `man userdel`

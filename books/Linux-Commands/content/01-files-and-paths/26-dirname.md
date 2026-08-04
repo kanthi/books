@@ -1,82 +1,127 @@
 # dirname
 
 ## Overview
-The `dirname` command strips the last component from file names, returning the directory path portion. It's the complement to `basename` for path manipulation.
+
+`dirname` removes the last path component, returning the directory portion of a path. Together with `basename` it covers most shell path-splitting needs: locating a script’s directory, ensuring parent dirs exist, and computing sibling paths.
 
 ## Syntax
+
 ```bash
-dirname name...
+dirname [OPTION] NAME...
 ```
 
 ## Common Options
+
 | Option | Description |
 |--------|-------------|
-| `-z` | End output with NUL character |
+| `-z`, `--zero` | NUL-terminated output |
+
+GNU coreutils accepts multiple NAME arguments and prints one line each.
 
 ## Key Use Cases
-1. Extract directory path
-2. Script directory detection
-3. Relative path calculation
-4. File organization
-5. Path validation
+
+1. Find a script’s directory
+2. `mkdir -p` parents before writing a file
+3. Compute sibling paths
+4. Normalize path structure in scripts
+5. Logging / display of parent locations
 
 ## Examples with Explanations
-### Example 1: Basic Usage
+
+### Basics
+
 ```bash
 dirname /path/to/file.txt
-```
-Returns: `/path/to`
-
-### Example 2: Current Directory
-```bash
+# /path/to
 dirname file.txt
+# .
+dirname /usr/local/bin/
+# /usr/local
+dirname /usr
+# /
+dirname /
+# /
 ```
-Returns: `.`
 
-### Example 3: Script Directory
+### Multiple arguments
+
 ```bash
-SCRIPT_DIR=$(dirname "$0")
+dirname /a/b /c/d/e
 ```
-Gets the directory containing the script
 
-## Common Usage Patterns
-1. Change to script directory:
-   ```bash
-   cd "$(dirname "$0")"
-   ```
-2. Create parent directories:
-   ```bash
-   mkdir -p "$(dirname "$target_file")"
-   ```
-3. Relative path operations:
-   ```bash
-   parent_dir=$(dirname "$PWD")
-   ```
+### Script directory pattern
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
+# better when $0 is a symlink:
+SCRIPT_DIR=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
+cd "$SCRIPT_DIR"
+```
+
+### Ensure parent exists
+
+```bash
+out=/var/lib/myapp/data/file.db
+mkdir -p "$(dirname "$out")"
+touch "$out"
+```
+
+### Sibling paths
+
+```bash
+conf=/etc/myapp/app.conf
+dir=$(dirname "$conf")
+cp "$conf" "$dir/app.conf.bak"
+```
+
+### Combine with realpath
+
+```bash
+abs=$(realpath -m "$1")
+parent=$(dirname "$abs")
+```
+
+### Parameter expansion alternative (bash)
+
+```bash
+f=/path/to/file.txt
+echo "${f%/*}"            # /path/to  (careful with no-slash cases)
+# dirname is safer for edge cases like no slash → "."
+```
+
+### NUL-safe
+
+```bash
+find /etc -name '*.conf' -print0 |
+  xargs -0 -n1 dirname |
+  sort -u
+```
+
+## Notes / Pitfalls
+
+- `dirname file` (no slash) → `.` not empty string — important for `cd`.
+- Trailing slashes are normalized by GNU dirname.
+- Don’t implement security checks with string dirname alone; canonicalize first.
+- Hot loops: bash `${f%/*}` is faster but handle “no slash” yourself.
+- `dirname` does not require the path to exist.
+
+## 2026-relevant notes
+
+- Still the readable choice in installer and devops shell scripts.
+- For complex path logic, consider Python/`pathlib` in larger tools.
+- Pair with `realpath -m` when creating outputs under computed absolute parents.
 
 ## Related Commands
-- `basename` - Extract filename
-- `realpath` - Get absolute path
-- `readlink` - Read symbolic links
 
-## Best Practices
-1. Quote paths to handle spaces
-2. Use with basename for complete path parsing
-3. Consider absolute vs relative paths
-4. Handle edge cases (root directory, current directory)
+- `basename` — final component
+- `realpath` — canonicalize
+- `readlink -f` — resolve script path
+- `mkdir -p` — create parents
+- `cd` / `pwd` — navigate and display
+- bash expansions — `${f%/*}`
 
-## Integration Examples
-1. Backup to parent directory:
-   ```bash
-   backup_dir="$(dirname "$PWD")/backups"
-   ```
-2. Config file location:
-   ```bash
-   config_dir="$(dirname "$0")/config"
-   ```
-## Additional Examples
-```bash
-dirname /usr/local/bin/tool
-dirname /usr/local/bin/
-# compose with basename for path surgery
-echo "$(dirname "$0")/../lib"
-```
+## Additional Resources
+
+- `man dirname`

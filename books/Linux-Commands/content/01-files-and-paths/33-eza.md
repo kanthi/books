@@ -1,40 +1,135 @@
 # eza
 
 ## Overview
-`eza` is a modern, actively maintained replacement for `ls`. It provides color-coded output, file type icons, Git file status, tree views, and extended attribute visualization.
+
+`eza` is a modern replacement for `ls` (community successor to `exa`) with colors, git status, icons (optional), tree view, and friendlier defaults. Install separately (`apt install eza`, `cargo install eza`, etc.). Keep knowing classic `ls` for minimal systems and scripts.
 
 ## Syntax
+
 ```bash
 eza [options] [path...]
 ```
 
 ## Common Options
+
 | Option | Description |
 |--------|-------------|
-| `-l`, `--long` | Display extended file attributes and metadata |
-| `-a`, `--all` | Show hidden dotfiles |
-| `-T`, `--tree` | Recurse into directories as a visual tree |
-| `--git` | Show Git status for tracked files |
-| `--icons` | Render contextual file/directory icons |
+| `-l`, `--long` | Long format |
+| `-a`, `--all` | Show hidden (not `.` / `..`) |
+| `-A` | Show hidden including `.` / `..` variants per version |
+| `-h`, `--header` | Header row in long mode |
+| `-g`, `--group` | Show group |
+| `-b`, `--binary` | Binary (power-of-two) sizes |
+| `-B`, `--bytes` | Exact bytes |
+| `--git` | Git status column |
+| `--git-ignore` | Ignore gitignored entries |
+| `-T`, `--tree` | Tree view |
+| `-L`, `--level` | Tree depth |
+| `-s`, `--sort` | Sort field (`name`, `size`, `modified`, …) |
+| `-r`, `--reverse` | Reverse sort |
+| `-t`, `--time` / `--time-style` | Time field / format |
+| `-i`, `--inode` | Inodes |
+| `-u` / `-U` | User / don’t show user |
+| `--icons` | Icon glyphs (needs font) |
+| `-1` | One per line |
+| `-d` | List directories as dirs, not contents |
+| `-R` | Recurse without tree graphics |
 
-## Key Use Cases
-1. Inspecting file metadata with Git integration in local repos.
-2. Generating quick file tree diagrams directly in the terminal.
-3. Colorized directory browsing with human-readable sizes.
+Flags evolve quickly — `eza --help` is authoritative for your version.
 
 ## Examples with Explanations
-### Example 1: Detailed File Listing with Git Status
-```bash
-eza -la --git --icons
-```
-Lists all files (including hidden ones) with metadata, file icons, and Git modification flags.
 
-### Example 2: Tree View
+### Everyday aliases
+
+```bash
+eza
+eza -la
+eza -lah --git
+eza -lah --group --header
+```
+
+Suggested aliases:
+
+```bash
+alias ls='eza'
+alias ll='eza -lah --git'
+alias lt='eza -T -L 2'
+```
+
+### Sorting
+
+```bash
+eza -l --sort=modified
+eza -l --sort=size -r
+eza -l --sort=ext
+```
+
+### Tree view
+
 ```bash
 eza -T -L 2
+eza -T -L 3 --git-ignore
+eza -T -L 2 -a
 ```
-Displays directory structure down to 2 levels deep as a tree.
+
+### Git-aware listing
+
+```bash
+eza -l --git
+eza -l --git --git-ignore
+```
+
+Shows modified/untracked markers when inside a repository.
+
+### Headers and metadata
+
+```bash
+eza -lbh --header --group
+eza -l --inode --links
+```
+
+### Compare with ls / tree
+
+```bash
+ls -lah
+eza -lah --git
+tree -L 2
+eza -T -L 2
+```
+
+### Scripts: prefer classic ls
+
+```bash
+# portable scripts
+ls -1
+# interactive human shell
+eza -lah --git
+```
+
+## Notes / Pitfalls
+
+- Not installed everywhere; don’t hard-depend in production automation.
+- Icons need a Nerd Font / patched font or they look like tofu boxes.
+- Color/git features add cost on huge directories and network FS — fall back to `ls -U`/`find` when needed.
+- Option names differ from `ls`; muscle memory transfer is incomplete.
+- Output is still human-oriented; don’t parse it in scripts.
+
+## 2026-relevant notes
+
+- `eza` is the maintained path for many who used `exa`.
+- Fits a modern toolkit with `bat`, `fd`, `rg`, `delta`, `zoxide`.
+- Remote SSH to Alpine/BusyBox hosts: expect plain `ls` only.
 
 ## Related Commands
-- `ls` - Standard POSIX directory listing tool
-- `tree` - Recursive directory tree visualizer
+
+- `ls` — portable listing
+- `tree` — classic tree
+- `lsd` — another modern ls
+- `fd` / `find` — selection
+- `stat` — precise metadata
+- `git status` — full git detail
+
+## Additional Resources
+
+- `eza --help`, `man eza` (if packaged)
+- [eza-community/eza](https://github.com/eza-community/eza)

@@ -6,6 +6,14 @@ System-level programming in C involves interacting directly with the operating s
 
 Understanding system-level programming concepts is essential for developing robust applications that can adapt to different environments, handle errors gracefully, and interact with system resources effectively.
 
+**Environment:** Linux/POSIX (macOS mostly fine). Compile with:
+
+```bash
+gcc -std=c17 -Wall -Wextra -o program program.c
+```
+
+Some examples use POSIX APIs (`sigaction`, `fork`, `unistd.h`).
+
 ## Command-Line Arguments
 
 Command-line arguments allow programs to receive input directly from the command line when they are executed. This is a fundamental way for programs to be configurable and flexible.
@@ -641,6 +649,380 @@ int main(int argc, char *argv[]) {
 }
 ```
 
+## Full Programs: CLI, Env, Signals, Processes
+
+### Program 1 — Robust argument parser (`opts.c`)
+
+```c
+/* file: opts.c */
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+struct Options {
+    const char *input;
+    const char *output;
+    int verbose;
+    int count;
+};
+
+static void usage(const char *prog) {
+    fprintf(stderr,
+            "Usage: %s [-v] [-n N] -i input -o output\n"
+            "  -v        verbose\n"
+            "  -n N      count (default 1)\n"
+            "  -i path   input file\n"
+            "  -o path   output file\n",
+            prog);
+}
+
+int main(int argc, char *argv[]) {
+    struct Options opt = {NULL, NULL, 0, 1};
+    int i;
+
+    for (i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "-v") == 0) {
+            opt.verbose = 1;
+        } else if (strcmp(argv[i], "-n") == 0) {
+            if (i + 1 >= argc) {
+                usage(argv[0]);
+                return EXIT_FAILURE;
+            }
+            opt.count = atoi(argv[++i]);
+            if (opt.count <= 0) {
+                fprintf(stderr, "-n must be positive\n");
+                return EXIT_FAILURE;
+            }
+        } else if (strcmp(argv[i], "-i") == 0) {
+            if (i + 1 >= argc) {
+                usage(argv[0]);
+                return EXIT_FAILURE;
+            }
+            opt.input = argv[++i];
+        } else if (strcmp(argv[i], "-o") == 0) {
+            if (i + 1 >= argc) {
+                usage(argv[0]);
+                return EXIT_FAILURE;
+            }
+            opt.output = argv[++i];
+        } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
+            usage(argv[0]);
+            return EXIT_SUCCESS;
+        } else {
+            fprintf(stderr, "unknown option: %s\n", argv[i]);
+            usage(argv[0]);
+            return EXIT_FAILURE;
+        }
+    }
+
+    if (opt.input == NULL || opt.output == NULL) {
+        usage(argv[0]);
+        return EXIT_FAILURE;
+    }
+
+    if (opt.verbose) {
+        fprintf(stderr, "in=%s out=%s count=%d\n",
+                opt.input, opt.output, opt.count);
+    }
+    printf("would process %s -> %s (%d times)\n",
+           opt.input, opt.output, opt.count);
+    return EXIT_SUCCESS;
+}
+```
+
+```bash
+gcc -std=c17 -Wall -Wextra -o opts opts.c
+./opts -v -n 3 -i a.txt -o b.txt
+./opts -h
+./opts -i a.txt          # should fail with usage
+```
+
+### Program 2 — Environment-driven config (`envcfg.c`)
+
+```c
+/* file: envcfg.c */
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+struct Config {
+    const char *home;
+    const char *log_level;
+    int max_items;
+};
+
+static int parse_positive_int(const char *s, int *out) {
+    char *end;
+    long v;
+
+    if (s == NULL || out == NULL) {
+        return -1;
+    }
+    v = strtol(s, &end, 10);
+    if (end == s || *end != '\0' || v <= 0 || v > 1000000L) {
+        return -1;
+    }
+    *out = (int)v;
+    return 0;
+}
+
+int main(void) {
+    struct Config cfg;
+    const char *max_s;
+
+    cfg.home = getenv("HOME");
+    if (cfg.home == NULL) {
+        cfg.home = ".";
+    }
+
+    cfg.log_level = getenv("APP_LOG_LEVEL");
+    if (cfg.log_level == NULL) {
+        cfg.log_level = "INFO";
+    }
+
+    max_s = getenv("APP_MAX_ITEMS");
+    if (max_s == NULL) {
+        cfg.max_items = 100;
+    } else if (parse_positive_int(max_s, &cfg.max_items) != 0) {
+        fprintf(stderr, "invalid APP_MAX_ITEMS=%s\n", max_s);
+        return EXIT_FAILURE;
+    }
+
+    printf("home=%s\n", cfg.home);
+    printf("log_level=%s\n", cfg.log_level);
+    printf("max_items=%d\n", cfg.max_items);
+    return EXIT_SUCCESS;
+}
+```
+
+```bash
+gcc -std=c17 -Wall -Wextra -o envcfg envcfg.c
+./envcfg
+APP_LOG_LEVEL=DEBUG APP_MAX_ITEMS=50 ./envcfg
+APP_MAX_ITEMS=nope ./envcfg   # should fail
+```
+
+### Program 3 — `atexit` cleanup and `exit` status (`cleanup_demo.c`)
+
+```c
+/* file: cleanup_demo.c */
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+static FILE *g_log;
+
+static void close_log(void) {
+    if (g_log != NULL) {
+        fprintf(g_log, "shutdown\n");
+        fclose(g_log);
+        g_log = NULL;
+        fprintf(stderr, "atexit: log closed\n");
+    }
+}
+
+int main(int argc, char *argv[]) {
+    int fail = (argc > 1 && strcmp(argv[1], "fail") == 0);
+
+    g_log = fopen("app_runtime.log", "w");
+    if (g_log == NULL) {
+        perror("fopen");
+        return EXIT_FAILURE;
+    }
+    if (atexit(close_log) != 0) {
+        fprintf(stderr, "atexit registration failed\n");
+        fclose(g_log);
+        return EXIT_FAILURE;
+    }
+
+    fprintf(g_log, "started\n");
+    printf("working...\n");
+
+    if (fail) {
+        fprintf(stderr, "failing with exit code 2\n");
+        exit(2);  /* still runs atexit handlers */
+    }
+    return EXIT_SUCCESS;
+}
+```
+
+```bash
+gcc -std=c17 -Wall -Wextra -o cleanup_demo cleanup_demo.c
+./cleanup_demo
+cat app_runtime.log
+./cleanup_demo fail; echo exit=$?
+```
+
+Note: `#include <string.h>` is required for `strcmp` — add it if your compiler rejects the program under pedantic modes.
+
+### Program 4 — Graceful SIGINT shutdown (`sigint_loop.c`)
+
+```c
+/* file: sigint_loop.c */
+#include <stdio.h>
+#include <stdlib.h>
+#include <signal.h>
+#include <unistd.h>
+#include <string.h>
+
+static volatile sig_atomic_t g_stop = 0;
+
+static void on_sigint(int signo) {
+    (void)signo;
+    g_stop = 1;
+}
+
+int main(void) {
+    struct sigaction sa;
+    unsigned long ticks = 0;
+
+    memset(&sa, 0, sizeof sa);
+    sa.sa_handler = on_sigint;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;  /* no SA_RESTART: sleep may return early */
+
+    if (sigaction(SIGINT, &sa, NULL) != 0) {
+        perror("sigaction");
+        return EXIT_FAILURE;
+    }
+
+    printf("pid=%d — press Ctrl+C to stop\n", (int)getpid());
+    while (!g_stop) {
+        printf("tick %lu\n", ticks++);
+        sleep(1);
+    }
+    printf("clean shutdown after %lu ticks\n", ticks);
+    return EXIT_SUCCESS;
+}
+```
+
+```bash
+gcc -std=c17 -Wall -Wextra -o sigint_loop sigint_loop.c
+./sigint_loop
+# Ctrl+C → clean message
+```
+
+### Program 5 — `fork` + `exec` + `wait` mini runner (`run_cmd.c`)
+
+```c
+/* file: run_cmd.c */
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <sys/wait.h>
+#include <errno.h>
+
+int main(int argc, char *argv[]) {
+    pid_t pid;
+    int status;
+
+    if (argc < 2) {
+        fprintf(stderr, "Usage: %s <command> [args...]\n", argv[0]);
+        return EXIT_FAILURE;
+    }
+
+    pid = fork();
+    if (pid < 0) {
+        perror("fork");
+        return EXIT_FAILURE;
+    }
+
+    if (pid == 0) {
+        /* child */
+        execvp(argv[1], &argv[1]);
+        fprintf(stderr, "execvp %s: %s\n", argv[1], strerror(errno));
+        _exit(127);
+    }
+
+    /* parent */
+    if (waitpid(pid, &status, 0) < 0) {
+        perror("waitpid");
+        return EXIT_FAILURE;
+    }
+
+    if (WIFEXITED(status)) {
+        printf("child exited %d\n", WEXITSTATUS(status));
+        return WEXITSTATUS(status);
+    }
+    if (WIFSIGNALED(status)) {
+        printf("child killed by signal %d\n", WTERMSIG(status));
+        return 128 + WTERMSIG(status);
+    }
+    return EXIT_FAILURE;
+}
+```
+
+```bash
+gcc -std=c17 -Wall -Wextra -o run_cmd run_cmd.c
+./run_cmd echo hello from child
+./run_cmd false; echo status=$?
+./run_cmd /no/such/cmd; echo status=$?
+```
+
+### Program 6 — Echo lines with PID and env prefix (`line_echo.c`)
+
+```c
+/* file: line_echo.c */
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+
+int main(void) {
+    char line[256];
+    const char *prefix = getenv("LINE_PREFIX");
+    pid_t pid = getpid();
+
+    if (prefix == NULL) {
+        prefix = "";
+    }
+
+    while (fgets(line, sizeof line, stdin) != NULL) {
+        /* strip newline for formatting */
+        line[strcspn(line, "\n")] = '\0';
+        printf("%s[pid=%d] %s\n", prefix, (int)pid, line);
+        fflush(stdout);
+    }
+    if (ferror(stdin)) {
+        perror("stdin");
+        return EXIT_FAILURE;
+    }
+    return EXIT_SUCCESS;
+}
+```
+
+```bash
+gcc -std=c17 -Wall -Wextra -o line_echo line_echo.c
+printf 'a\nb\n' | LINE_PREFIX='>>' ./line_echo
+```
+
+---
+
+## Exercises
+
+```bash
+gcc -std=c17 -Wall -Wextra -o exN exN.c
+```
+
+1. **`opts` long form** — Accept `--input=path` and `--verbose` in addition to short flags.
+
+2. **Required env** — Fail startup if `APP_TOKEN` is unset or empty; print a clear error to stderr.
+
+3. **Double atexit** — Register two `atexit` handlers; show they run in reverse order of registration.
+
+4. **SIGTERM too** — Extend `sigint_loop` to stop on `SIGTERM` as well as `SIGINT` (one handler, two `sigaction` calls).
+
+5. **Pipeline** — Use `run_cmd` to run `ls` and then `true`/`false`; document exit codes in a comment.
+
+6. **Avoid `system()`** — Replace a `system("ls -l")` sketch with `fork`/`execvp`/`waitpid` for fixed argv `{"ls","-l",NULL}`.
+
+7. **Argv0 banner** — Print only the basename of `argv[0]` (after last `/`) as the program name in usage errors.
+
+8. **Timeout sketch** — After `fork`, parent uses `alarm(2)` or a timed wait strategy (research `sigtimedwait` or poll loop) to kill a hanging child — advanced stretch.
+
+---
+
 ## Summary
 
 System-level programming in C provides powerful capabilities for interacting with the operating system:
@@ -648,7 +1030,8 @@ System-level programming in C provides powerful capabilities for interacting wit
 1. **Command-Line Arguments**: Processing `argc` and `argv` for flexible program configuration
 2. **Environment Variables**: Accessing system configuration through `getenv()`, `setenv()`, and `unsetenv()`
 3. **Process Management**: Controlling program termination with `exit()` and cleanup with `atexit()`
-4. **Signal Handling**: Responding to system events and interrupts gracefully
-5. **System Calls**: Executing shell commands and interacting with the operating system
+4. **Signal Handling**: Responding to system events and interrupts gracefully (`sig_atomic_t`, `sigaction`)
+5. **Process control**: `fork`, `exec*`, `waitpid` for running and supervising programs
+6. **System Calls**: Executing shell commands carefully (`system` is convenient but shells inject risk)
 
 These system-level programming concepts are essential for developing robust, production-ready C applications that can adapt to different environments and handle various runtime conditions effectively.

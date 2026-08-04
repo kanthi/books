@@ -1,121 +1,104 @@
 # passwd
 
 ## Overview
-The `passwd` command changes user account passwords. It's used to change passwords, update password expiry information, and manage account locking.
+
+`passwd` sets or changes user passwords and can lock/unlock accounts or expire passwords. Ordinary users change their own password; root can set any user’s password and manage lock state. Aging policy is refined with `chage`.
 
 ## Syntax
+
 ```bash
 passwd [options] [LOGIN]
 ```
 
 ## Common Options
+
 | Option | Description |
 |--------|-------------|
-| `-d, --delete` | Delete password |
-| `-e, --expire` | Force password expiration |
-| `-i, --inactive DAYS` | Set password inactive days |
-| `-l, --lock` | Lock password |
-| `-n, --minimum DAYS` | Set minimum days |
-| `-S, --status` | Password status report |
-| `-u, --unlock` | Unlock password |
-| `-w, --warning DAYS` | Set expiry warning |
-| `-x, --maximum DAYS` | Set maximum days |
-| `-h, --help` | Display help |
-
-## Key Use Cases
-1. Password management
-2. Account security
-3. Access control
-4. Security maintenance
-5. User administration
+| `-S`, `--status` | Account password status |
+| `-l`, `--lock` | Lock password (prefix `!` in shadow) |
+| `-u`, `--unlock` | Unlock password |
+| `-d`, `--delete` | Delete password (careful: may allow passwordless login depending on PAM) |
+| `-e`, `--expire` | Expire password; force change on next login |
+| `-n MIN` / `-x MAX` / `-w WARN` / `-i INACT` | Aging shortcuts (often prefer `chage`) |
+| `-a`, `--all` | Status for all users (root) |
+| `--stdin` | Read password from stdin (root; scripts — prefer chpasswd carefully) |
 
 ## Examples with Explanations
-### Example 1: Change Password
+
+### Change passwords
+
 ```bash
-passwd
+passwd                     # own password
+sudo passwd alice          # set alice’s password as root
 ```
-Change own password
 
-### Example 2: User Password
+### Status
+
 ```bash
-sudo passwd username
+passwd -S alice
+sudo passwd -Sa | head
 ```
-Change specific user's password
 
-### Example 3: Account Status
+Typical status letters: `P` (usable password), `L` (locked), `NP` (no password) — confirm with `man passwd` on your distro.
+
+### Lock / unlock
+
 ```bash
-passwd -S username
+sudo passwd -l alice
+sudo passwd -u alice
+sudo usermod -L alice      # related
+sudo usermod -U alice
 ```
-Show password status
 
-## Understanding Output
-Password status format:
+Locking disables password auth; SSH keys may still work depending on config.
+
+### Force change next login
+
+```bash
+sudo passwd -e alice
+# or
+sudo chage -d 0 alice
 ```
-username Status Last_Change Min_Days Max_Days Warn_Days Inactive Lock_Date
+
+### Scripted set (controlled environments)
+
+```bash
+echo 'alice:NewSecurePass' | sudo chpasswd
+# passwd --stdin is not portable across all distros
 ```
-Status codes:
-- P: usable password
-- L: locked password
-- NP: no password
 
-## Common Usage Patterns
-1. Force password change:
-   ```bash
-   passwd -e username
-   ```
-2. Lock account:
-   ```bash
-   passwd -l username
-   ```
-3. Set expiry:
-   ```bash
-   passwd -x 90 -w 7 username
-   ```
+Prefer configuration management vaults over shell history for secrets.
 
-## Security Considerations
-1. Password complexity
-2. Expiry policies
-3. Account locking
-4. Access control
-5. Audit logging
+### Service accounts
+
+```bash
+sudo passwd -l svc_backup
+# or lock shell:
+sudo usermod -s /usr/sbin/nologin svc_backup
+```
+
+## Notes / Pitfalls
+
+- PAM policy enforces complexity/retries — errors may be vague.
+- Root bypasses most complexity checks — still use strong secrets.
+- Deleting passwords (`-d`) can be dangerous with certain PAM stacks.
+- LDAP/sssd users: password changes may need `passwd` via SSSD or IdP self-service.
+- Shadow file integrity: never edit `/etc/shadow` by hand if tools exist.
+
+## 2026-relevant notes
+
+- Prefer SSO/IdP for humans; local `passwd` for break-glass and system accounts.
+- SSH certificate / key-only logins reduce password surface.
+- Pair with `chage` for compliance aging on local accounts.
 
 ## Related Commands
-- `chage` - Change age info
-- `usermod` - Modify users
-- `shadow` - Shadow passwords
-- `gpasswd` - Group passwords
-- `pwck` - Password checks
+
+- `chage` — aging policy
+- `chpasswd` — batch updates
+- `usermod -L/-U` — lock flags
+- `vipw -s` — edit shadow carefully
+- `pam-auth-update` — PAM stacks (Debian family)
 
 ## Additional Resources
-- [Passwd Manual](https://man7.org/linux/man-pages/man1/passwd.1.html)
-- [Password Security Guide](https://www.cyberciti.biz/tips/linux-security.html)
-- [User Management](https://www.tecmint.com/usermod-command-examples/)
 
-## Best Practices
-1. Regular changes
-2. Strong policies
-3. Expiry management
-4. Access monitoring
-5. Security audits
-
-## Password Policies
-1. Minimum length
-2. Complexity rules
-3. History control
-4. Expiry periods
-5. Failed attempts
-
-## Troubleshooting
-1. Password errors
-2. Account lockouts
-3. Expiry issues
-4. Permission problems
-5. Policy conflicts
-## Additional Examples
-```bash
-passwd                    # change own password
-sudo passwd alice
-sudo passwd -l alice      # lock
-sudo passwd -u alice      # unlock
-sudo passwd -S alice      # status
-```
+- `man passwd`, `man shadow`, `man chage`

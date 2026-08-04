@@ -898,3 +898,9 @@ Helix is inspired by Kakoune:
 - Different keybindings and features
 
 Helix offers a modern, efficient editing experience with powerful features built-in. Its selection-first approach and multiple selections make it particularly effective for complex text manipulation tasks, while the zero-configuration philosophy means you can be productive immediately.
+## Next steps
+
+- [tmux](../11-tmux/index.md) for splits and SSH detach
+- [Herdr](../12-herdr/index.md) when running AI agent CLIs beside Helix
+- [Modern Tools](../10-modern-tools/index.md) — rg, fd, fzf, bat
+- [Workflows](../14-workflows/index.md)

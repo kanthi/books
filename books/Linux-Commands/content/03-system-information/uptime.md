@@ -1,118 +1,115 @@
 # uptime
 
 ## Overview
-The `uptime` command shows how long the system has been running. It displays the current time, system uptime, number of users, and load averages.
+
+`uptime` shows how long the system has been running, how many users are logged in, and the **load average** (1, 5, and 15 minutes). It is a quick health snapshot before diving into `top`/`htop`/`vmstat`.
+
+Load average is the average number of runnable **plus** uninterruptible (disk sleep) tasks — not a pure “CPU %” meter.
 
 ## Syntax
+
 ```bash
 uptime [options]
 ```
 
 ## Common Options
+
 | Option | Description |
 |--------|-------------|
-| `-p` | Pretty format |
-| `-s` | Since date |
-| `-h` | Show help |
-| `-V` | Show version |
-| `--pretty` | Pretty output |
-| `--since` | Boot time |
-| `--help` | Show help |
-| `--version` | Show version |
-
-## Output Fields
-| Field | Description |
-|-------|-------------|
-| Time | Current time |
-| Uptime | Running time |
-| Users | Connected users |
-| Load1 | 1 minute load |
-| Load5 | 5 minute load |
-| Load15 | 15 minute load |
-
-## Key Use Cases
-1. System monitoring
-2. Load analysis
-3. Uptime tracking
-4. User activity
-5. Performance checking
+| `-p`, `--pretty` | Pretty duration only |
+| `-s`, `--since` | System up since timestamp |
+| `-h`, `--help` | Help |
+| `-V` | Version |
 
 ## Examples with Explanations
-### Example 1: Basic Usage
+
+### Default
+
 ```bash
 uptime
+# 10:15:02 up 21 days,  4:03,  3 users,  load average: 0.08, 0.12, 0.09
 ```
-Show all information
 
-### Example 2: Pretty Format
+### Pretty / since
+
 ```bash
 uptime -p
-```
-Human readable time
-
-### Example 3: Boot Time
-```bash
 uptime -s
 ```
-System start time
 
-## Common Usage Patterns
-1. Quick check:
-   ```bash
-   uptime
-   ```
-2. Simple format:
-   ```bash
-   uptime -p
-   ```
-3. Boot time:
-   ```bash
-   uptime -s
-   ```
+### Interpret load vs CPUs
 
-## System Information
-1. Running time
-2. System load
-3. User count
-4. Current time
-5. Load trends
+```bash
+uptime
+nproc
+lscpu | grep '^CPU(s):'
+# rough rule of thumb: load near nproc ≈ busy; much higher may mean saturation
+```
+
+### Watch over time
+
+```bash
+watch -n1 uptime
+```
+
+### Scripts
+
+```bash
+load=$(awk '{print $1}' /proc/loadavg)
+echo "1-minute load: $load"
+# /proc/loadavg is the source of truth
+cat /proc/loadavg
+```
+
+### Correlate with other tools
+
+```bash
+uptime
+who
+w
+top -bn1 | head
+```
+
+### Containers
+
+```bash
+uptime
+# may reflect host uptime depending on visibility of /proc
+```
+
+## Understanding load average
+
+| Observation | Possible meaning |
+|-------------|------------------|
+| Low load, high latency | Network/app issues, not CPU |
+| Load ≫ nproc, CPU idle% high | I/O wait / uninterruptible tasks |
+| Load ≈ runnable tasks | CPU contention |
+| Sudden load spikes | Cron storms, backups, build jobs |
+
+Use `vmstat 1`, `iostat -xz 1`, `ps`, `pidstat` for root cause.
+
+## Notes / Pitfalls
+
+- Load is not “percent CPU”; a 64-core host can show load 20 and still be fine.
+- Suspend-to-RAM / cloud live migration can make “up” time less intuitive.
+- User count is from utmp; containers/ssh multiplexing may look odd.
+- Don’t alert only on load without CPU, memory, and I/O context.
+
+## 2026-relevant notes
+
+- For long-term trends use Prometheus node exporter / `sar` rather than one-off `uptime`.
+- Latency-sensitive systems care more about p99 and steal time (VMs) than raw load.
+- `systemd-analyze` helps boot time; `uptime -s` shows when the current boot began.
 
 ## Related Commands
-- `w` - Who is logged in
-- `top` - System monitor
-- `who` - Show users
-- `last` - Login history
-- `procinfo` - System stats
+
+- `w` / `who` — who is logged in
+- `top` / `htop` / `btop` — live process view
+- `vmstat` / `iostat` — run queue vs block I/O
+- `nproc` / `lscpu` — CPU count
+- `cat /proc/loadavg` — raw values
+- `sar` — historical load
 
 ## Additional Resources
-- [Uptime Manual](https://man7.org/linux/man-pages/man1/uptime.1.html)
-- [System Guide](https://www.cyberciti.biz/faq/linux-uptime-command-examples-usage-syntax/)
-- [System Administration](https://www.tecmint.com/linux-uptime-command-examples/)
 
-## Best Practices
-1. Regular checking
-2. Load monitoring
-3. User tracking
-4. Documentation
-5. Trend analysis
-
-## Performance Analysis
-1. Load averages
-2. User activity
-3. System stability
-4. Uptime goals
-5. Resource usage
-
-## Troubleshooting
-1. High load
-2. User issues
-3. System stability
-4. Resource problems
-5. Performance degradation
-
-## Common Uses
-1. System monitoring
-2. Performance checks
-3. Availability tracking
-4. Load analysis
-5. User activity
+- `man uptime`, `man 5 proc` (`/proc/loadavg`)

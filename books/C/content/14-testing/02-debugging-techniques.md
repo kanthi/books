@@ -1,308 +1,614 @@
 # Debugging Techniques
 
-Debugging is the process of identifying, isolating, and fixing bugs or defects in software. Effective debugging requires a systematic approach and the right tools. This chapter covers various debugging techniques and tools available for C programming.
+Debugging is the systematic process of finding and fixing defects. On Linux, the core toolkit is **GDB**, **printf/logging macros**, **Valgrind Memcheck**, **strace/ltrace**, **core dumps**, and compiler sanitizers (see the testing chapter for ASan/UBSan).
 
-## Introduction to Debugging
-
-Debugging is an essential skill for every programmer. It involves finding and resolving defects or problems within a computer program that prevent correct operation. Debugging is a complex process that requires patience, logical thinking, and the right tools.
-
-### The Debugging Process
-
-1. **Problem Identification**: Recognize that a problem exists
-2. **Problem Isolation**: Narrow down the location of the problem
-3. **Root Cause Analysis**: Determine why the problem occurs
-4. **Solution Implementation**: Fix the underlying cause
-5. **Verification**: Confirm that the fix works and doesn't introduce new problems
-
-## Debugging Tools
-
-### GDB (GNU Debugger)
-
-GDB is the most widely used debugger for C programs on Unix-like systems. It allows you to examine the internal state of a program as it executes.
-
-#### Basic GDB Commands
+**Always compile with symbols when debugging:**
 
 ```bash
-# Compile with debug information
-gcc -g -o program program.c
-
-# Start GDB
-gdb ./program
-
-# GDB commands
-(gdb) break main          # Set breakpoint at main function
-(gdb) run                 # Run the program
-(gdb) step                # Step through code line by line
-(gdb) next                # Step over functions
-(gdb) continue            # Continue execution
-(gdb) print variable      # Print value of variable
-(gdb) backtrace           # Show function call stack
-(gdb) quit                # Exit GDB
+gcc -std=c17 -Wall -Wextra -g -O0 -o program program.c
 ```
 
-#### Advanced GDB Features
+`-O0` keeps the mapping between source lines and machine code straightforward. Optimized builds (`-O2`) can reorder code and eliminate variables, which confuses stepping.
 
-- **Conditional Breakpoints**: `break 10 if x > 5`
-- **Watchpoints**: `watch variable` to stop when variable changes
-- **Core Dumps**: Analyze program state after crashes
-- **Remote Debugging**: Debug programs running on different machines
+## The Debugging Process
 
-### Valgrind
+1. **Reproduce** — reliable steps beat intermittent luck  
+2. **Isolate** — smallest input / fewest modules that fail  
+3. **Hypothesize** — what would make the observed symptoms true?  
+4. **Observe** — debugger, logs, sanitizers, traces  
+5. **Fix** — change the root cause, not the symptom  
+6. **Verify** — re-run failing case + nearby regression tests  
 
-Valgrind is an instrumentation framework for building dynamic analysis tools. It's particularly useful for detecting memory-related errors.
+---
 
-#### Memory Error Detection
+## GDB: Session-Style Walkthroughs
 
-```bash
-# Compile with debug info
-gcc -g -o program program.c
+GDB (GNU Debugger) inspects a running or crashed process: breakpoints, stepping, printing, stack traces, and watchpoints.
 
-# Run with Valgrind
-valgrind --tool=memcheck --leak-check=full ./program
-```
-
-#### Common Issues Detected by Valgrind
-
-- **Memory Leaks**: Allocated memory that is never freed
-- **Invalid Memory Access**: Reading/writing outside allocated memory
-- **Use of Uninitialized Memory**: Using variables before initialization
-- **Double Free**: Freeing the same memory block twice
-
-### Static Analysis Tools
-
-Static analysis tools examine source code without executing it to find potential issues.
-
-#### GCC with Warnings
-
-```bash
-gcc -Wall -Wextra -Werror -pedantic program.c
-```
-
-#### Cppcheck
-
-Cppcheck is a static analysis tool that detects bugs that compilers normally don't detect.
-
-```bash
-cppcheck --enable=all program.c
-```
-
-#### Splint
-
-Splint is a tool for statically checking C programs for security vulnerabilities and coding mistakes.
-
-```bash
-splint program.c
-```
-
-## Debugging Techniques
-
-### Print Debugging
-
-Print debugging is the simplest form of debugging, involving adding print statements to track program execution and variable values.
+### Program under study
 
 ```c
+/* file: buggy_sum.c */
 #include <stdio.h>
 
-int calculate_sum(int arr[], int size) {
-    int sum = 0;
-    printf("DEBUG: calculate_sum called with size=%d\n", size);
-    
-    for (int i = 0; i < size; i++) {
-        printf("DEBUG: arr[%d] = %d\n", i, arr[i]);
-        sum += arr[i];
-        printf("DEBUG: sum after adding arr[%d] = %d\n", i, sum);
+int sum_range(int n) {
+    int total = 0;
+    int i;
+    /* Off-by-one: should be i <= n for inclusive sum 1..n */
+    for (i = 1; i < n; i++) {
+        total += i;
     }
-    
-    printf("DEBUG: calculate_sum returning %d\n", sum);
-    return sum;
+    return total;
 }
-```
 
-### Rubber Duck Debugging
-
-Rubber duck debugging involves explaining your code line by line to an inanimate object (like a rubber duck). This technique helps identify logical errors by forcing you to articulate your thought process.
-
-### Binary Search Debugging
-
-When dealing with large codebases, binary search debugging can help narrow down the location of a bug by systematically eliminating sections of code.
-
-### Delta Debugging
-
-Delta debugging involves making minimal changes to isolate the cause of a bug. This technique is particularly useful for identifying the specific change that introduced a regression.
-
-## Common Debugging Scenarios
-
-### Segmentation Faults
-
-Segmentation faults occur when a program tries to access memory that it's not allowed to access.
-
-#### Common Causes
-
-- **Dereferencing Null Pointers**: `int *ptr = NULL; *ptr = 5;`
-- **Buffer Overflows**: Writing beyond array boundaries
-- **Dangling Pointers**: Using pointers after freeing memory
-- **Stack Overflow**: Exceeding stack space limits
-
-#### Debugging Segmentation Faults
-
-```c
-#include <stdio.h>
-#include <stdlib.h>
-
-int main() {
-    int *ptr = NULL;
-    
-    // This will cause a segmentation fault
-    // printf("%d\n", *ptr);
-    
-    // Safe approach
-    if (ptr != NULL) {
-        printf("%d\n", *ptr);
-    } else {
-        printf("Error: Null pointer dereference\n");
-    }
-    
+int main(void) {
+    int n = 5;
+    int s = sum_range(n);
+    printf("sum 1..%d = %d (expected 15)\n", n, s);
     return 0;
 }
 ```
 
-### Memory Leaks
+```bash
+gcc -std=c17 -Wall -Wextra -g -O0 -o buggy_sum buggy_sum.c
+gdb ./buggy_sum
+```
 
-Memory leaks occur when allocated memory is not properly freed, leading to gradual memory consumption.
+### Transcript 1 — break, run, print, next, continue
 
-#### Detection and Prevention
+```text
+$ gdb ./buggy_sum
+(gdb) break main
+Breakpoint 1 at 0x11a9: file buggy_sum.c, line 14.
+(gdb) run
+Starting program: .../buggy_sum
+
+Breakpoint 1, main () at buggy_sum.c:14
+14          int n = 5;
+(gdb) next
+15          int s = sum_range(n);
+(gdb) print n
+$1 = 5
+(gdb) step
+sum_range (n=5) at buggy_sum.c:5
+5           int total = 0;
+(gdb) next
+7           for (i = 1; i < n; i++) {
+(gdb) print i
+$2 = 0
+(gdb) next
+8               total += i;
+(gdb) print i
+$3 = 1
+(gdb) print total
+$4 = 0
+(gdb) next
+7           for (i = 1; i < n; i++) {
+(gdb) print total
+$5 = 1
+(gdb) break buggy_sum.c:9
+Breakpoint 2 at 0x1178: file buggy_sum.c, line 9.
+(gdb) continue
+Continuing.
+
+Breakpoint 2, sum_range (n=5) at buggy_sum.c:9
+9           return total;
+(gdb) print total
+$6 = 10
+(gdb) print n
+$7 = 5
+(gdb) quit
+```
+
+Observation: for `n = 5`, loop runs `i = 1..4` so total is 10, not 15. Fix: `i <= n`.
+
+### Transcript 2 — backtrace on a crash
 
 ```c
+/* file: crash_null.c */
+#include <stdio.h>
+
+void boom(int *p) {
+    *p = 42; /* segfault if p is NULL */
+}
+
+void middle(void) {
+    int *p = NULL;
+    boom(p);
+}
+
+int main(void) {
+    middle();
+    return 0;
+}
+```
+
+```bash
+gcc -std=c17 -Wall -Wextra -g -O0 -o crash_null crash_null.c
+gdb ./crash_null
+```
+
+```text
+(gdb) run
+Program received signal SIGSEGV, Segmentation fault.
+0x0000555555555155 in boom (p=0x0) at crash_null.c:5
+5           *p = 42;
+(gdb) backtrace
+#0  boom (p=0x0) at crash_null.c:5
+#1  0x0000555555555170 in middle () at crash_null.c:10
+#2  0x0000555555555185 in main () at crash_null.c:14
+(gdb) frame 1
+#1  middle () at crash_null.c:10
+10          boom(p);
+(gdb) print p
+$1 = (int *) 0x0
+(gdb) info locals
+p = 0x0
+(gdb) list
+```
+
+**Commands to memorize**
+
+| Command | Purpose |
+|---------|---------|
+| `break main` / `b file.c:42` | Set breakpoint |
+| `break foo if x > 5` | Conditional breakpoint |
+| `run` / `r` | Start program (args: `run arg1 arg2`) |
+| `next` / `n` | Step over |
+| `step` / `s` | Step into |
+| `continue` / `c` | Resume |
+| `print expr` / `p` | Evaluate expression |
+| `backtrace` / `bt` | Call stack |
+| `frame N` | Select stack frame |
+| `info locals` | Locals in current frame |
+| `list` | Show source |
+| `quit` | Exit |
+
+### Transcript 3 — watchpoints
+
+```c
+/* file: watch_demo.c */
+#include <stdio.h>
+
+int main(void) {
+    int counter = 0;
+    int i;
+    for (i = 0; i < 5; i++) {
+        counter += i;
+    }
+    printf("%d\n", counter);
+    return 0;
+}
+```
+
+```text
+(gdb) break main
+(gdb) run
+(gdb) next
+(gdb) watch counter
+Hardware watchpoint 2: counter
+(gdb) continue
+Hardware watchpoint 2: counter
+
+Old value = 0
+New value = 1
+main () at watch_demo.c:8
+(gdb) continue
+...
+(gdb) delete 2
+```
+
+Use `watch *pointer` for heap locations after they are allocated. Software watchpoints are slower; hardware watchpoints are limited in count but efficient.
+
+### Handy GDB extras
+
+```text
+(gdb) break 10 if x > 5
+(gdb) info breakpoints
+(gdb) delete 1
+(gdb) set var i = 99
+(gdb) finish          # run until current function returns
+(gdb) until 40        # continue until line 40 in this frame
+(gdb) disassemble main
+(gdb) info registers
+```
+
+TUI mode (source + assembly panes): start with `gdb -tui ./program` or press `C-x a` inside GDB.
+
+---
+
+## `printf` Debugging and `DEBUG_LOG` Macros
+
+Print debugging is fast for I/O-heavy paths and remote systems without an interactive debugger. Make it **toggleable** and **location-aware**.
+
+```c
+/* file: debug_log.h */
+#ifndef DEBUG_LOG_H
+#define DEBUG_LOG_H
+
+#include <stdio.h>
+
+/* Compile with -DDEBUG=1 to enable, or #define DEBUG 1 before include */
+#ifndef DEBUG
+#define DEBUG 0
+#endif
+
+#if DEBUG
+#define DEBUG_LOG(fmt, ...)                                                   \
+    do {                                                                      \
+        fprintf(stderr, "[DEBUG] %s:%d:%s(): " fmt "\n",                      \
+                __FILE__, __LINE__, __func__, ##__VA_ARGS__);                 \
+    } while (0)
+#else
+#define DEBUG_LOG(fmt, ...)                                                   \
+    do { /* no-op */ } while (0)
+#endif
+
+/* Always-on diagnostic (errors, rare paths) */
+#define ERROR_LOG(fmt, ...)                                                   \
+    do {                                                                      \
+        fprintf(stderr, "[ERROR] %s:%d:%s(): " fmt "\n",                      \
+                __FILE__, __LINE__, __func__, ##__VA_ARGS__);                 \
+    } while (0)
+
+#endif
+```
+
+```c
+/* file: sum_debug.c */
+#include "debug_log.h"
+
+int sum_range(int n) {
+    int total = 0;
+    int i;
+    DEBUG_LOG("enter n=%d", n);
+    for (i = 1; i <= n; i++) {
+        total += i;
+        DEBUG_LOG("i=%d total=%d", i, total);
+    }
+    DEBUG_LOG("leave total=%d", total);
+    return total;
+}
+
+int main(void) {
+    int s = sum_range(5);
+    printf("sum=%d\n", s);
+    return 0;
+}
+```
+
+```bash
+# Logs on
+gcc -std=c17 -Wall -Wextra -DDEBUG=1 -o sum_debug sum_debug.c
+./sum_debug
+
+# Logs compiled out
+gcc -std=c17 -Wall -Wextra -o sum_debug sum_debug.c
+./sum_debug
+```
+
+**Patterns**
+
+- Log **entry/exit** of suspect functions with key arguments  
+- Log **loop indices** only for small `n` or every Nth iteration  
+- Prefer `stderr` so stdout can still be piped/compared  
+- Never leave secrets (passwords, tokens) in permanent logs  
+- For binary data, log lengths and a few hex bytes, not megabytes  
+
+```c
+/* Hex dump snippet */
+static void dump_bytes(const unsigned char *p, size_t n) {
+    size_t i;
+    for (i = 0; i < n; i++) {
+        fprintf(stderr, "%02x%s", p[i], ((i + 1) % 16 == 0) ? "\n" : " ");
+    }
+    if (n % 16) {
+        fputc('\n', stderr);
+    }
+}
+```
+
+### Rubber duck and binary-search debugging
+
+- **Rubber duck**: explain each line aloud; contradictions surface quickly.  
+- **Binary search**: comment out half the work (or `git bisect`) until the bad change is isolated.  
+
+```bash
+git bisect start
+git bisect bad                # current broken revision
+git bisect good v1.0          # known good tag
+# build + test each checkout, then:
+git bisect good   # or: git bisect bad
+git bisect reset
+```
+
+---
+
+## Valgrind Memcheck: Intentional Leak and Reading the Report
+
+[Valgrind](https://valgrind.org/) Memcheck detects invalid reads/writes, use of uninitialized values, double-free, and leaks.
+
+### Example program with a real leak and a bad read
+
+```c
+/* file: leaky.c */
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
-void memory_leak_example() {
-    int *arr = malloc(10 * sizeof(int));
-    
-    // Forgot to free(arr) - memory leak!
-    
-    // Correct approach:
-    // free(arr);
-    // arr = NULL;
+char *make_greeting(const char *name) {
+    size_t n = strlen(name);
+    char *buf = malloc(n + 8); /* enough for "Hello, " + name + NUL roughly */
+    if (buf == NULL) {
+        return NULL;
+    }
+    /* Intentionally wrong size path for demo: we allocated n+8, use carefully */
+    sprintf(buf, "Hello, %s", name);
+    return buf; /* caller must free — we will "forget" */
 }
 
-void proper_memory_management() {
-    int *arr = malloc(10 * sizeof(int));
-    
-    if (arr == NULL) {
-        fprintf(stderr, "Memory allocation failed\n");
-        return;
+int main(void) {
+    char *msg = make_greeting("Ada");
+    if (msg == NULL) {
+        return 1;
     }
-    
-    // Use the allocated memory
-    for (int i = 0; i < 10; i++) {
-        arr[i] = i * i;
-    }
-    
-    // Always free allocated memory
-    free(arr);
-    arr = NULL; // Prevent dangling pointer
-}
-```
+    printf("%s\n", msg);
 
-### Race Conditions
+    /* Invalid read demo (optional): read one past strlen */
+    /* printf("past end byte maybe junk: %d\n", msg[strlen(msg) + 1]); */
 
-Race conditions occur in multi-threaded programs when multiple threads access shared data concurrently.
-
-#### Debugging Race Conditions
-
-- Use thread sanitizers: `gcc -fsanitize=thread program.c`
-- Implement proper synchronization mechanisms
-- Use mutexes, semaphores, or other synchronization primitives
-
-### Logic Errors
-
-Logic errors occur when the program runs but produces incorrect results due to flawed algorithms or conditions.
-
-#### Debugging Logic Errors
-
-```c
-#include <stdio.h>
-
-// Incorrect implementation
-int factorial_wrong(int n) {
-    int result = 1;
-    for (int i = 0; i <= n; i++) {  // Bug: should be i = 1
-        result *= i;  // Bug: result becomes 0 when i = 0
-    }
-    return result;
-}
-
-// Correct implementation
-int factorial_correct(int n) {
-    if (n < 0) return -1;  // Error case
-    if (n == 0 || n == 1) return 1;
-    
-    int result = 1;
-    for (int i = 2; i <= n; i++) {  // Start from 2
-        result *= i;
-    }
-    return result;
+    /* BUG: forgot free(msg) — definite leak */
+    /* free(msg); */
+    return 0;
 }
 ```
+
+```bash
+gcc -std=c17 -Wall -Wextra -g -O0 -o leaky leaky.c
+valgrind --tool=memcheck --leak-check=full --show-leak-kinds=all \
+  --track-origins=yes ./leaky
+```
+
+### How to read typical output
+
+```text
+==12345== HEAP SUMMARY:
+==12345==     in use at exit: 11 bytes in 1 blocks
+==12345==   total heap usage: 1 allocs, 0 frees, 11 bytes allocated
+==12345==
+==12345== 11 bytes in 1 blocks are definitely lost in loss record 1 of 1
+==12345==    at 0x...: malloc (vg_replace_malloc.c:...)
+==12345==    by 0x...: make_greeting (leaky.c:8)
+==12345==    by 0x...: main (leaky.c:18)
+```
+
+| Phrase | Meaning |
+|--------|---------|
+| **definitely lost** | No pointer to the block remains — real leak |
+| **indirectly lost** | Lost because a root pointer was lost (e.g. list head) |
+| **possibly lost** | Interior pointer only (suspicious) |
+| **still reachable** | Pointers exist at exit (globals, caches) — may be intentional |
+| **Invalid read/write** | Access outside allocated region or after free |
+| **Conditional jump depends on uninitialised value** | Branch on garbage |
+| **Invalid free** / **Mismatched free** | Double free or `free` vs `delete` style issues |
+
+Fix for the demo: `free(msg);` before `return 0`.
+
+### Common Memcheck flags
+
+```bash
+valgrind --leak-check=full --show-leak-kinds=all \
+  --track-origins=yes --errors-for-leak-kinds=all \
+  ./program args...
+```
+
+Run under the same `-g` build you use for GDB. Suppressions (`.supp` files) hide known third-party noise — use sparingly.
+
+---
+
+## `strace` and `ltrace` (brief)
+
+### `strace` — system calls
+
+Shows what the kernel sees: open, read, write, connect, etc.
+
+```bash
+# Trace a simple program
+strace -o strace.log ./buggy_sum
+# Follow forks (servers, shells)
+strace -f -o strace.log ./server
+# Only file-related calls
+strace -e trace=file ./myprog
+# Network-related
+strace -e trace=network ./client
+```
+
+Example snippet when a file is missing:
+
+```text
+openat(AT_FDCWD, "config.txt", O_RDONLY) = -1 ENOENT (No such file or directory)
+```
+
+That single line often beats minutes of guessing about path logic.
+
+### `ltrace` — library calls
+
+```bash
+ltrace -o ltrace.log ./leaky
+# Focus on malloc family
+ltrace -e malloc+free+realloc ./leaky
+```
+
+Useful when you care about libc (`malloc`, `printf`, `connect`) rather than raw syscalls. Availability varies by distro/package.
+
+---
+
+## Core Dumps: Capture and Analyze
+
+When a process dies with a fatal signal (e.g. `SIGSEGV`), the kernel can write a **core** image of memory for post-mortem GDB.
+
+### Enable dumps
+
+```bash
+# Current shell only
+ulimit -c unlimited
+
+# Check limit
+ulimit -c
+
+# On many systems, core pattern is controlled by:
+cat /proc/sys/kernel/core_pattern
+# Example patterns: core, core.%p, or systemd-coredump pipes
+```
+
+If `core_pattern` pipes to `systemd-coredump`, use:
+
+```bash
+coredumpctl list
+coredumpctl gdb ./crash_null
+# or: coredumpctl dump -o core.crash
+```
+
+### Produce a core
+
+```bash
+gcc -std=c17 -Wall -Wextra -g -O0 -o crash_null crash_null.c
+ulimit -c unlimited
+./crash_null
+# may create file "core" or "core.<pid>" depending on system
+ls -l core*
+```
+
+### Analyze with GDB
+
+```bash
+gdb ./crash_null core
+# or: gdb ./crash_null core.12345
+```
+
+```text
+(gdb) bt
+#0  boom (p=0x0) at crash_null.c:5
+#1  middle () at crash_null.c:10
+#2  main () at crash_null.c:14
+(gdb) print p
+$1 = (int *) 0x0
+(gdb) list
+```
+
+Same skills as live debugging: `bt`, `frame`, `print`, `info locals`.
+
+**Tips**
+
+- The binary path and **build ID** should match the one that crashed  
+- Keep `-g` builds (or separate debug packages) for production post-mortems  
+- Never ship secrets in cores; cores can contain full memory  
+
+---
+
+## Common Failure Modes
+
+### Segmentation faults
+
+Typical causes:
+
+- Null or wild pointer dereference  
+- Buffer overflow past array/heap end  
+- Use after free  
+- Stack overflow (deep recursion)  
+
+Workflow: GDB `bt` → inspect pointer → Valgrind or ASan if memory corruption is subtle.
+
+### Logic errors
+
+Program runs, wrong answer. Prefer:
+
+- Unit tests with known golden values  
+- GDB watchpoints on intermediate results  
+- Temporary `DEBUG_LOG` of invariants  
+
+### Memory leaks and corruption
+
+Valgrind / ASan first; then fix ownership (who allocates, who frees).
+
+### Race conditions (threads)
+
+```bash
+gcc -std=c17 -Wall -Wextra -g -fsanitize=thread -o races races.c -pthread
+./races
+```
+
+Combine with careful locking; races are hard to reproduce with `printf` alone.
+
+---
+
+## Static Analysis (quick)
+
+```bash
+gcc -std=c17 -Wall -Wextra -Wpedantic -Wshadow -Wconversion -c file.c
+cppcheck --enable=all --inconclusive --std=c17 file.c
+```
+
+Static tools do not replace runtime debugging; they reduce the number of bugs that reach GDB.
+
+---
 
 ## Debugging Best Practices
 
-### Develop a Systematic Approach
+1. **Reproduce first** — write a failing test or a minimal input file.  
+2. **One change at a time** — random edits hide the real fix.  
+3. **Trust tools more than memory** — print the actual value of `errno`, sizes, indices.  
+4. **Keep a short log** — hypothesis, experiment, result.  
+5. **Prefer `-g -O0` while hunting**, then re-test optimized builds.  
+6. **Use version control** — `git bisect` for regressions.  
+7. **Take breaks** — fatigue creates new bugs.  
 
-1. **Reproduce the Issue**: Ensure you can consistently reproduce the problem
-2. **Understand the Problem**: Clearly define what is happening vs. what should happen
-3. **Form Hypotheses**: Develop theories about the cause
-4. **Test Hypotheses**: Design experiments to validate or invalidate theories
-5. **Fix and Verify**: Implement the fix and verify it solves the problem
+---
 
-### Use Version Control
+## Exercises
 
-Version control systems like Git can help identify when bugs were introduced:
+### Exercise 1 — GDB fix of `sum_range`
 
-```bash
-# Find when a bug was introduced
-git bisect start
-git bisect bad                 # Current version is bad
-git bisect good v1.0           # Known good version
-# Git will checkout intermediate versions for testing
-```
+Use the buggy `sum_range` that uses `i < n`. Under GDB, break in the loop, print `i` and `total` for `n = 5`, confirm the off-by-one, fix the loop, and re-run outside GDB so the program prints `15`.
 
-### Keep a Debugging Log
+### Exercise 2 — `DEBUG_LOG` toggle
 
-Maintain a log of debugging sessions, including:
-- Problem description
-- Steps taken to isolate the issue
-- Root cause analysis
-- Solution implemented
-- Lessons learned
+Add `debug_log.h` to a small multi-function program. Build once with `-DDEBUG=1` and once without. Confirm the non-debug binary produces no debug lines and is smaller / quieter.
 
-### Prevent Debugging Fatigue
+### Exercise 3 — Valgrind leak
 
-Debugging can be mentally exhausting. Take breaks, get fresh perspectives, and avoid debugging for extended periods without rest.
+Write a program that allocates a linked list of 10 nodes and “forgets” to free them. Run Memcheck with `--leak-check=full`. Then free the list correctly and show a clean report (`All heap blocks were freed -- no leaks are possible`).
 
-## Advanced Debugging Techniques
+### Exercise 4 — Invalid write
 
-### Core Dump Analysis
+Allocate `malloc(4)` and write 8 bytes. Compare:
 
-Core dumps capture the state of a program when it crashes, allowing post-mortem analysis.
+1. Normal run (may appear to work — UB)  
+2. `valgrind ./prog`  
+3. `gcc -fsanitize=address`  
 
-```bash
-# Enable core dumps
-ulimit -c unlimited
+Describe which tool gave the clearest diagnosis.
 
-# Analyze core dump with GDB
-gdb ./program core
-```
+### Exercise 5 — Core dump
 
-### Profiling and Performance Debugging
+Enable `ulimit -c unlimited`, run `crash_null`, open the core in GDB, and paste (or retype) the `bt` output. Identify the null pointer in which frame.
 
-Tools like `gprof`, `perf`, and `Valgrind` can help identify performance bottlenecks.
+### Exercise 6 — `strace` detective
 
-### Remote Debugging
+Write a program that tries to open three paths in order until one succeeds. Hide the working path among missing ones. Use `strace -e openat` (or `trace=file`) to determine which path was used without reading the source.
 
-For embedded systems or remote servers, remote debugging tools allow debugging programs running on different machines.
+---
 
-## Conclusion
+## Summary
 
-Debugging is a critical skill that improves with practice. By mastering various debugging tools and techniques, developers can quickly identify and resolve issues in their C programs. The key is to approach debugging systematically, use the right tools for the job, and learn from each debugging experience to prevent similar issues in the future.
+| Tool | Best for |
+|------|----------|
+| **GDB** | Breakpoints, stack traces, watchpoints, live state |
+| **DEBUG_LOG** | Fast insight, remote/headless runs |
+| **Valgrind Memcheck** | Leaks, invalid access, uninit values |
+| **ASan/UBSan** | Fast memory/UB checks (see testing chapter) |
+| **strace** | “Why did open/connect fail?” |
+| **ltrace** | Library call sequences |
+| **Core + GDB** | Post-crash forensics |
+
+Debugging is a skill of **observation under control**. Master GDB and Memcheck early; use logs and traces when interactivity is limited; always finish with a regression test so the same bug stays fixed.

@@ -1,98 +1,117 @@
 # logger
 
 ## Overview
-The `logger` command makes entries in the system log. It provides a shell command interface to the syslog system log module, allowing you to create log entries from the command line or scripts.
+
+`logger` writes messages to the system log from the shell or scripts. It is the command-line interface to the syslog/journal stack — useful for marking deploy steps, cron output, and ad-hoc audit notes that should land next to service logs.
+
+On systemd systems, messages typically appear in the **journal** (`journalctl`) and may also be forwarded to classic syslog daemons.
 
 ## Syntax
+
 ```bash
 logger [options] [message]
+echo message | logger [options]
 ```
 
 ## Common Options
+
 | Option | Description |
 |--------|-------------|
-| `-f file` | Log contents of file |
-| `-i` | Log process ID |
-| `-p priority` | Specify message priority |
-| `-t tag` | Mark every line with specified tag |
-| `-n server` | Write to remote syslog server |
-| `-s` | Output to standard error as well |
-| `-u socket` | Write to specified socket |
-| `--id=[id]` | Enter log entry with specified ID |
-
-## Key Use Cases
-1. Script logging
-2. System monitoring
-3. Application debugging
-4. Security auditing
-5. Event tracking
+| `-p priority` | Facility.level e.g. `user.notice`, `local0.warning` |
+| `-t tag` | Tag (defaults often to user name) |
+| `-i` | Include PID in the tag |
+| `-s` | Also write to stderr |
+| `-f file` | Log each line of file |
+| `-n host` | Remote syslog host (when supported) |
+| `-P port` | Remote port |
+| `-u socket` | Log socket path |
+| `--journald` | Send via journal fields (newer util-linux) |
+| `-e` | Skip empty lines |
 
 ## Examples with Explanations
-### Example 1: Basic Logging
+
+### Simple messages
+
 ```bash
-logger "System backup completed successfully"
+logger "deploy started"
+logger -t deploy -i "step 1 complete"
+logger -p local0.info "backup ok"
 ```
-Logs a simple message to syslog
 
-### Example 2: Tagged Message
+### From scripts
+
 ```bash
-logger -t BACKUP -p local0.info "Backup process started"
+#!/bin/bash
+tag=mybackup
+log() { logger -t "$tag" -p user.notice "$*"; }
+log "starting"
+# ...
+log "finished"
 ```
-Logs a tagged message with priority
 
-### Example 3: Log File Contents
+### Pipe multi-line output
+
 ```bash
-logger -f /var/log/myapp.log
+df -h | logger -t diskcheck
+mycommand 2>&1 | logger -t mycommand -i
 ```
-Sends file contents to syslog
 
-## Understanding Output
-Priority Levels:
-- emerg (0): System is unusable
-- alert (1): Action must be taken immediately
-- crit (2): Critical conditions
-- err (3): Error conditions
-- warning (4): Warning conditions
-- notice (5): Normal but significant
-- info (6): Informational
-- debug (7): Debug-level messages
+### Priority levels
 
-## Common Usage Patterns
-1. Script logging:
-   ```bash
-   logger -t myscript -p local0.info "Script started"
-   ```
-2. Error logging:
-   ```bash
-   logger -i -t myapp -p local0.err "Error: Database connection failed"
-   ```
-3. Remote logging:
-   ```bash
-   logger -n logserver.example.com -P 514 "Remote log entry"
-   ```
+```bash
+logger -p user.debug "debug detail"
+logger -p user.warning "watch this"
+logger -p user.err "failed to mount backup"
+```
 
-## Performance Analysis
-- Minimal system impact
-- Asynchronous operation
-- Consider log rotation
-- Monitor disk usage
-- Check syslog configuration
+Facility.level pairs control routing in rsyslog/syslog-ng; journal stores priority as well.
+
+### View on systemd
+
+```bash
+logger -t demo "hello journal"
+journalctl -t demo -n 5
+journalctl -t demo -f
+```
+
+### stderr mirror
+
+```bash
+logger -s -t demo "visible in console and log"
+```
+
+### Structured-ish with journald (when supported)
+
+```bash
+logger --journald <<EOF
+MESSAGE=deployment finished
+PRIORITY=5
+DEPLOY_ID=42
+EOF
+```
+
+## Notes / Pitfalls
+
+- Rate limiting may drop floods of messages (rsyslog/journald).
+- Remote logging needs network syslog config; `-n` alone may be insufficient on hardened hosts.
+- Don’t log secrets (tokens, passwords).
+- Cron: prefer logging explicitly; cron mails can be unreliable.
+- Priorities only help if collectors honor them.
+
+## 2026-relevant notes
+
+- Prefer `journalctl` for local investigation; ship logs with vector/fluent-bit/alloy for fleets.
+- `systemd-cat` is an alternative that attaches stdout to the journal with unit-like metadata.
+- For apps, native journal/syslog libraries beat wrapping everything in `logger`.
 
 ## Related Commands
-- `syslogd` - System log daemon
-- `klogd` - Kernel log daemon
-- `dmesg` - Print kernel messages
-- `tail` - Monitor log files
-- `journalctl` - Query systemd journal
+
+- `journalctl` — query journal
+- `systemd-cat` — pipe to journal
+- `rsyslogd` / `syslog-ng` — classic daemons
+- `dmesg` — kernel ring buffer
+- `wall` — broadcast to ttys (not syslog)
 
 ## Additional Resources
-- [Linux logger manual](https://man7.org/linux/man-pages/man1/logger.1.html)
-- [Syslog Protocol RFC](https://tools.ietf.org/html/rfc5424)
-- [System Logging Guide](https://www.rsyslog.com/doc/master/)
-## Additional Examples
-```bash
-logger "backup finished"
-logger -p local0.info -t myapp "started"
-logger -s "also to stderr"
-journalctl -t myapp -n 5
-```
+
+- `man logger`

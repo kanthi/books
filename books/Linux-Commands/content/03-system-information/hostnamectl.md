@@ -1,105 +1,105 @@
 # hostnamectl
 
 ## Overview
-The `hostnamectl` command is used to query and change the system hostname and related settings. It provides a unified interface for hostname management in systemd-based systems.
+
+`hostnamectl` queries and changes the system hostname and related machine identity fields on **systemd** systems. It is the preferred way to set a **persistent** hostname (vs classic `hostname` alone, which may only change the transient name until reboot).
 
 ## Syntax
+
 ```bash
-hostnamectl [options] {status|set-hostname|set-icon-name|set-chassis|set-deployment|set-location} [value]
+hostnamectl [options] [command]
 ```
 
-## Common Options
-| Option | Description |
-|--------|-------------|
-| `--no-ask-password` | Don't prompt for password |
-| `--static` | Change static hostname |
-| `--transient` | Change transient hostname |
-| `--pretty` | Change pretty hostname |
-| `-H, --host` | Operate on remote host |
-| `-M, --machine` | Operate on local container |
-| `--json=` | Generate JSON output |
-| `--help` | Show help message |
+## Common Commands / Options
 
-## Key Use Cases
-1. System identification
-2. Hostname management
-3. System information display
-4. Remote host configuration
-5. Container management
+| Command / option | Description |
+|------------------|-------------|
+| `status` | Show current hostnames and OS info (default) |
+| `set-hostname NAME` | Set hostname |
+| `set-hostname NAME --static` | Static hostname |
+| `set-hostname NAME --transient` | Transient only |
+| `set-hostname NAME --pretty` | Pretty (presentation) name |
+| `set-icon-name` / `set-chassis` / `set-deployment` / `set-location` | Machine metadata |
+| `set-hostname "" --pretty` | Clear pretty name |
+| `-H host` / `--machine=` | Operate on remote/container via systemd |
+| `--no-ask-password` | Non-interactive privilege |
 
 ## Examples with Explanations
-### Example 1: Show Status
+
+### Status
+
 ```bash
+hostnamectl
 hostnamectl status
 ```
-Display system and hostname information
 
-### Example 2: Set Hostname
+Shows static/transient/pretty hostnames, machine ID icons, chassis, OS pretty name, kernel, architecture.
+
+### Set hostname
+
 ```bash
-hostnamectl set-hostname newname
+sudo hostnamectl set-hostname app-01
+hostnamectl
+hostname
 ```
-Change system hostname
 
-### Example 3: Set Pretty Name
+### Pretty name
+
 ```bash
-hostnamectl set-hostname "My Server" --pretty
+sudo hostnamectl set-hostname "App Server 01" --pretty
+sudo hostnamectl set-hostname app-01 --static
 ```
-Set descriptive hostname
 
-## Understanding Output
-Status output includes:
-- Static hostname
-- Pretty hostname
-- Machine ID
-- Boot ID
-- Virtualization
-- Operating System
-- Architecture
-- Kernel
+### Transient (temporary)
 
-## Common Usage Patterns
-1. Check system info:
-   ```bash
-   hostnamectl
-   ```
-2. Change hostname:
-   ```bash
-   hostnamectl set-hostname server1
-   ```
-3. Set location:
-   ```bash
-   hostnamectl set-location "Data Center 1"
-   ```
+```bash
+sudo hostnamectl set-hostname temp-probe --transient
+```
 
-## Performance Analysis
-- Systemd integration
-- Configuration persistence
-- Multiple hostname types
-- Network impact
-- Service notifications
+### Chassis / location metadata
+
+```bash
+sudo hostnamectl set-chassis server
+sudo hostnamectl set-location "rack-3-u12"
+```
+
+### Remote / container
+
+```bash
+hostnamectl -H alice@host.example
+hostnamectl --machine=mycontainer
+```
+
+### Verify files
+
+```bash
+cat /etc/hostname
+ls -l /etc/machine-id
+hostname
+```
+
+## Notes / Pitfalls
+
+- Requires systemd; classic SysV-only systems won’t have it.
+- cloud-init may overwrite hostnames on next boot if configured to manage them.
+- DNS is separate: setting hostname does not create DNS records.
+- Valid hostname labels: prefer RFC-ish DNS labels for static names; pretty names can be freer.
+- Containers may restrict hostname changes.
+
+## 2026-relevant notes
+
+- Standard admin path on almost all mainstream server distros.
+- Inventory tools should read `hostnamectl` status or `/etc/hostname` + `/etc/os-release`.
+- Pair with `timedatectl` for complete first-boot identity setup.
 
 ## Related Commands
-- `hostname` - Show/set hostname
-- `systemctl` - Control systemd
-- `uname` - System information
-- `dnsdomainname` - Show domain
-- `domainname` - NIS domain name
+
+- `hostname` — classic get/set
+- `timedatectl` — time/timezone
+- `localectl` — locale/keymap
+- `resolvectl` — DNS
+- `cat /etc/os-release` — distro identity
 
 ## Additional Resources
-- [Systemd Documentation](https://www.freedesktop.org/software/systemd/man/hostnamectl.html)
-- [System Administration Guide](https://access.redhat.com/documentation/en-us/red_hat_enterprise_linux/7/html/system_administrators_guide/ch-configuring_basic_system_settings#sect-Configuring_Basic_System_Settings-Configuring_the_System_Hostname)
-- [Hostname Management](https://www.tecmint.com/set-hostname-permanently-in-linux/)
 
-## Configuration
-1. Static vs Transient
-2. Pretty hostname
-3. Deployment environment
-4. Chassis type
-5. System location
-
-## Best Practices
-1. Use meaningful names
-2. Document changes
-3. Consider DNS impact
-4. Update related services
-5. Verify changes properly
+- `man hostnamectl`

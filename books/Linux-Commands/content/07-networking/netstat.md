@@ -1,119 +1,108 @@
 # netstat
 
 ## Overview
-The `netstat` command displays network connections, routing tables, interface statistics, masquerade connections, and multicast memberships.
+
+`netstat` displays network connections, listening sockets, routing tables, and interface statistics from the legacy **net-tools** suite. On modern Linux, prefer **`ss`** (sockets) and **`ip`** (routes/links). `netstat` remains useful when reading older documentation or working on systems that still ship it.
 
 ## Syntax
+
 ```bash
 netstat [options]
 ```
 
 ## Common Options
+
 | Option | Description |
 |--------|-------------|
-| `-a` | All connections |
-| `-n` | Numeric addresses |
-| `-p` | Show PID/Program |
-| `-t` | TCP connections |
-| `-u` | UDP connections |
+| `-t` / `-u` | TCP / UDP |
 | `-l` | Listening sockets |
-| `-i` | Interface stats |
+| `-a` | All sockets |
+| `-n` | Numeric addresses (no DNS) |
+| `-p` | Process PID/name (may need root) |
 | `-r` | Routing table |
-| `-s` | Protocol stats |
-| `-c` | Continuous output |
-| `-e` | Extended info |
-| `-v` | Verbose mode |
+| `-i` | Interfaces |
+| `-s` | Statistics |
+| `-c` | Continuous refresh |
+| `-w` | RAW sockets |
+| `-x` | Unix sockets |
+| `-e` | Extended |
+| `-4` / `-6` | Address family |
 
-## Connection States
-| State | Description |
-|-------|-------------|
-| LISTEN | Waiting for connection |
-| SYN_SENT | Active open |
-| SYN_RECV | Passive open |
-| ESTABLISHED | Connection ok |
-| FIN_WAIT1 | Closing |
-| FIN_WAIT2 | Closing |
-| TIME_WAIT | 2MSL wait |
-| CLOSED | Socket is free |
-| CLOSE_WAIT | Remote closed |
-| LAST_ACK | Closing |
-
-## Key Use Cases
-1. Connection monitoring
-2. Port scanning
-3. Process tracking
-4. Network debugging
-5. Security auditing
+Classic combo: `netstat -tulpn` for listening TCP/UDP with PIDs.
 
 ## Examples with Explanations
-### Example 1: Active Connections
-```bash
-netstat -tuln
-```
-Show TCP/UDP listeners
 
-### Example 2: Process Info
+### Listening services
+
 ```bash
+netstat -tulpn
+netstat -tlnp
+# modern:
+ss -tulpn
+```
+
+### Established connections
+
+```bash
+netstat -tn
 netstat -tp
+ss -tp
 ```
-Show with program names
 
-### Example 3: Route Table
+### Routing
+
 ```bash
-netstat -r
+netstat -rn
+ip route
 ```
-Show routing table
 
-## Common Usage Patterns
-1. Check listeners:
-   ```bash
-   netstat -an | grep LISTEN
-   ```
-2. Process ports:
-   ```bash
-   netstat -tulpn
-   ```
-3. Interface stats:
-   ```bash
-   netstat -i
-   ```
+### Interfaces / stats
+
+```bash
+netstat -i
+netstat -s | less
+ip -s link
+```
+
+### Continuous
+
+```bash
+netstat -ct
+watch -n1 'ss -tnp'
+```
+
+### Translate old → new
+
+| Old | New |
+|-----|-----|
+| `netstat -tulpn` | `ss -tulpn` |
+| `netstat -tn` | `ss -tn` |
+| `netstat -rn` | `ip route` |
+| `netstat -i` | `ip -s link` / `ip -br link` |
+| `netstat -s` | `nstat` / `ss -s` / `/proc/net` |
+
+## Notes / Pitfalls
+
+- Not installed by default on many minimal distros (`net-tools` package).
+- DNS reverse lookups without `-n` make output slow — prefer `-n`.
+- `-p` requires privileges for others’ processes.
+- Output format is for humans; parse carefully or use `ss -H`/`ip -j`.
+- Namespace-aware debugging needs `ip netns exec` + `ss`.
+
+## 2026-relevant notes
+
+- Muscle memory migration to `ss`/`ip` is complete for most ops teams; learn netstat only for translation.
+- eBPF-based tools (`bpftool`, Pixie, etc.) go deeper than either for advanced tracing.
+- Containers: check sockets **inside** the correct network namespace.
 
 ## Related Commands
-- `ss` - Socket statistics
-- `lsof` - List open files
-- `ip` - IP utilities
-- `route` - Routing table
-- `iptables` - Firewall rules
+
+- `ss` — modern socket statistics
+- `ip` — routes and links
+- `lsof -i` — files/sockets by process
+- `nstat` — network counters
+- `nmap` — external port scans (authorized)
 
 ## Additional Resources
-- [Netstat Manual](https://linux.die.net/man/8/netstat)
-- [Network Guide](https://www.cyberciti.biz/faq/linux-netstat-command-examples/)
-- [System Administration](https://www.tecmint.com/linux-netstat-command-examples/)
 
-## Best Practices
-1. Use specific filters
-2. Check permissions
-3. Regular monitoring
-4. Document findings
-5. Compare states
-
-## Security Considerations
-1. Port exposure
-2. Connection states
-3. Process verification
-4. Network mapping
-5. Information leakage
-
-## Troubleshooting
-1. Connection issues
-2. Port conflicts
-3. Process problems
-4. Routing errors
-5. Interface status
-
-## Common Output Fields
-1. Protocol
-2. Local address
-3. Foreign address
-4. State
-5. PID/Program name
+- `man netstat` (if installed), `man ss`, `man ip`

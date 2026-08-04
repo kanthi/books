@@ -860,7 +860,7 @@ A clear and concise description of what you expected to happen.
 A clear and concise description of what actually happened.
 
 ### Environment
-- OS: [e.g. Ubuntu 20.04]
+- OS: [e.g. Ubuntu 24.04]
 - Browser: [e.g. Chrome 91]
 - Version: [e.g. 1.2.3]
 

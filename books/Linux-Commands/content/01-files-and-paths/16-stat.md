@@ -1,177 +1,138 @@
 # stat
 
 ## Overview
-The `stat` command displays detailed information about files and filesystems, including permissions, timestamps, size, and inode details.
+
+`stat` displays detailed **inode metadata**: size, ownership, mode, timestamps, device/inode numbers, links, and filesystem identity. It is more precise than `ls -l` for scripting and debugging (“why can’t I write this?”, “is this the same file?”, “when was mtime?”).
+
+GNU `stat` supports custom output formats with `-c` (files) and `-f` (filesystems).
 
 ## Syntax
+
 ```bash
 stat [options] file...
+stat -c FORMAT file...
+stat -f -c FORMAT file...     # filesystem (GNU)
 ```
 
 ## Common Options
+
 | Option | Description |
 |--------|-------------|
-| `-c format` | Custom format |
-| `-f` | Display filesystem status |
-| `-L` | Follow symbolic links |
-| `-t` | Terse format |
-| `--printf=format` | Printf-style format |
+| `-c FORMAT`, `--format=FORMAT` | Custom file format string |
+| `-f` | Filesystem status instead of file |
+| `-L` | Follow symlinks |
+| `-t` | Terse form |
+| `--printf=FORMAT` | Like `-c` with escape sequences; no forced newline |
+| `-x` | BSD-style verbose (some systems) |
 
-## File Information Fields
-| Field | Description |
-|-------|-------------|
-| File | Filename |
-| Size | File size in bytes |
-| Blocks | Number of blocks allocated |
-| IO Block | Filesystem block size |
-| Device | Device ID |
-| Inode | Inode number |
-| Links | Number of hard links |
-| Access | File permissions |
-| Uid/Gid | User and group IDs |
-| Access time | Last access time |
-| Modify time | Last modification time |
-| Change time | Last status change time |
-| Birth time | File creation time (if supported) |
+## Useful format sequences (GNU file)
 
-## Key Use Cases
-1. View detailed file information
-2. Check file permissions and ownership
-3. Analyze timestamps
-4. Filesystem analysis
-5. Debugging file issues
+| Seq | Meaning |
+|-----|---------|
+| `%n` | File name |
+| `%s` | Size in bytes |
+| `%a` / `%A` | Octal / human access rights |
+| `%u` / `%U` | UID / user name |
+| `%g` / `%G` | GID / group name |
+| `%i` | Inode number |
+| `%d` / `%D` | Device (decimal / hex) |
+| `%h` | Hard link count |
+| `%F` | File type string |
+| `%x` / `%X` | atime human / epoch |
+| `%y` / `%Y` | mtime human / epoch |
+| `%z` / `%Z` | ctime human / epoch |
+| `%w` / `%W` | birth time human / epoch (if supported) |
+| `%N` | Quoted name with symlink target |
 
 ## Examples with Explanations
-### Example 1: Basic File Information
+
+### Default view
+
 ```bash
-stat file.txt
+stat /etc/hosts
+stat -L /usr/bin/python3
 ```
-Shows complete file information
 
-### Example 2: Filesystem Information
+### Script-friendly fields
+
 ```bash
-stat -f /home
+stat -c '%a %n' file
+stat -c '%U:%G %a %n' file
+stat -c '%s bytes  mtime=%y  %n' file
+stat -c '%d:%i %n' file          # device:inode identity
 ```
-Displays filesystem statistics
 
-### Example 3: Custom Format
+### Compare identities (same file?)
+
 ```bash
-stat -c "%n %s %y" file.txt
+stat -c '%d:%i' a b
+# equal device+inode → hard-linked or same path
 ```
-Shows filename, size, and modification time
 
-## Format Specifiers
-| Specifier | Description |
-|-----------|-------------|
-| `%n` | Filename |
-| `%s` | Total size in bytes |
-| `%b` | Number of blocks |
-| `%f` | Raw mode in hex |
-| `%F` | File type |
-| `%a` | Access rights in octal |
-| `%A` | Access rights in human readable form |
-| `%u` | User ID |
-| `%g` | Group ID |
-| `%U` | User name |
-| `%G` | Group name |
-| `%x` | Time of last access |
-| `%y` | Time of last modification |
-| `%z` | Time of last change |
+### Timestamps
 
-## Common Usage Patterns
-1. Check permissions:
-   ```bash
-   stat -c "%a %n" file.txt
-   ```
-2. Compare timestamps:
-   ```bash
-   stat -c "%y %n" file1 file2
-   ```
-3. Find inode number:
-   ```bash
-   stat -c "%i" file.txt
-   ```
+```bash
+stat -c 'atime=%x' file
+stat -c 'mtime=%y' file
+stat -c 'ctime=%z' file
+stat -c 'birth=%w' file          # may show '-' if unsupported
+stat -c '%Y' file                # mtime epoch for sorting
+```
 
-## Timestamp Analysis
-Understanding timestamps:
-- Access time (atime): Last read
-- Modify time (mtime): Last content change
-- Change time (ctime): Last metadata change
-- Birth time (btime): Creation time (ext4, btrfs)
+### Filesystem info
 
-## Performance Analysis
-- Fast operation
-- No file content reading
-- Minimal system resources
-- Good for scripting
-- Efficient metadata access
+```bash
+stat -f /var
+stat -f -c '%T %b %f %S' /       # type, blocks, free, block size (see man)
+df -T /var
+```
+
+### Batch
+
+```bash
+stat -c '%08a %s %n' /etc/*.conf
+find . -type f -printf '' -exec stat -c '%Y %n' {} + | sort -n | tail
+```
+
+### Permissions debugging
+
+```bash
+namei -l /var/lib/myapp/data.db
+stat -c '%A %U %G %n' /var/lib/myapp /var/lib/myapp/data.db
+```
+
+### Terse / portable caution
+
+```bash
+stat -t file                     # compact; format not for portable scripts
+```
+
+Prefer explicit `-c` formats in automation.
+
+## Notes / Pitfalls
+
+- **ctime** is metadata change time, not “creation time”. Birth/creation is `%w` where supported (ext4, btrfs, …).
+- atime may be unreliable under `relatime`/`noatime` mounts.
+- Following symlinks (`-L`) vs not changes which inode you inspect.
+- BSD `stat` format flags differ completely — GNU examples are Linux-oriented.
+- Parsing default multi-line output is fragile; always use `-c`/`--printf` in scripts.
+
+## 2026-relevant notes
+
+- Still the best quick metadata tool before reaching for Python `os.stat`.
+- Network FS may fake or delay some timestamps; verify on the server.
+- Combine with `find -printf` for bulk metadata without one `stat` exec per file when possible.
 
 ## Related Commands
-- `ls -l` - Basic file listing
-- `file` - File type detection
-- `du` - Disk usage
-- `find` - File searching
-- `lsattr` - Extended attributes
+
+- `ls -l` — human listing
+- `file` — content type guess
+- `stat` filesystem vs `df` / `findmnt`
+- `readlink` / `realpath` — path resolution
+- `getfacl` — ACLs beyond mode bits
+- `lsattr` / `chattr` — ext attributes
 
 ## Additional Resources
-- [GNU stat manual](https://www.gnu.org/software/coreutils/manual/html_node/stat-invocation.html)
-- [Stat Command Examples](https://www.tecmint.com/stat-command-examples/)
 
-## Best Practices
-1. Use custom formats for scripting
-2. Check filesystem support for features
-3. Understand timestamp meanings
-4. Use with other tools for analysis
-5. Consider timezone effects
-
-## Scripting Examples
-1. Find files modified today:
-   ```bash
-   stat -c "%y %n" * | grep $(date +%Y-%m-%d)
-   ```
-2. Check if file is executable:
-   ```bash
-   [[ $(stat -c "%a" file) -ge 100 ]] && echo "Executable"
-   ```
-3. Compare file ages:
-   ```bash
-   stat -c "%Y" file1 file2 | sort -n
-   ```
-
-## Filesystem Information
-Using `-f` option shows:
-- Filesystem type
-- Block size
-- Total blocks
-- Free blocks
-- Available blocks
-- Total inodes
-- Free inodes
-
-## Troubleshooting
-1. Permission denied errors
-2. Symbolic link handling
-3. Filesystem compatibility
-4. Timestamp interpretation
-5. Format string errors
-
-## Integration Examples
-1. With find:
-   ```bash
-   find . -name "*.txt" -exec stat -c "%n %s" {} \;
-   ```
-2. With awk:
-   ```bash
-   stat -c "%s %n" * | awk '$1 > 1000000'
-   ```
-3. Monitoring script:
-   ```bash
-   stat -c "%y" important.txt > timestamp.log
-   ```
-## Additional Examples
-```bash
-stat file.txt
-stat -c '%n %s %U:%G %a' file.txt
-stat -f /                 # filesystem status (Linux: -f different on BSD)
-stat -c '%y' file.txt     # mtime
-```
+- `man stat`
+- [GNU coreutils — stat](https://www.gnu.org/software/coreutils/manual/html_node/stat-invocation.html)
