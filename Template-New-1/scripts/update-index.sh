@@ -96,6 +96,7 @@ book:
   sidebar:
     style: docked
     collapse-level: 1
+  reader-mode: true
   chapters:
     - index.qmd
 EOL
@@ -195,6 +196,8 @@ format:
     toc: true
     number-sections: false
     page-navigation: true
+    include-after-body:
+      - styles/reader-mode-body.html
 
   pdf:
     pdf-engine-max-runs: 4
