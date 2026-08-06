@@ -8,6 +8,8 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TINYTEX_HOME="${TINYTEX_HOME:-$HOME/.TinyTeX}"
+# Vendored fontawesome and any personal sty files live here (not only TinyTeX tree).
+export TEXMFHOME="${TEXMFHOME:-$HOME/texmf}"
 
 ensure_tinytex_path() {
   if command -v kpsewhich >/dev/null 2>&1 && command -v tlmgr >/dev/null 2>&1; then
@@ -27,7 +29,15 @@ ensure_tinytex_path() {
   return 1
 }
 
-# Install / verify TinyTeX (writes GITHUB_PATH; also needs PATH in *this* process)
+persist_env_for_later_steps() {
+  # GITHUB_ENV / GITHUB_PATH apply to subsequent workflow steps (Render, etc.).
+  if [ -n "${GITHUB_ENV:-}" ]; then
+    echo "TEXMFHOME=$TEXMFHOME" >> "$GITHUB_ENV"
+    echo "TINYTEX_HOME=$TINYTEX_HOME" >> "$GITHUB_ENV"
+  fi
+}
+
+# Install / verify TinyTeX
 bash "$SCRIPT_DIR/setup-ci-tinytex.sh"
 ensure_tinytex_path || {
   echo "ERROR: TinyTeX not on PATH after setup-ci-tinytex.sh" >&2
@@ -35,9 +45,12 @@ ensure_tinytex_path || {
   exit 1
 }
 
+# Child bash process — pass TEXMFHOME explicitly via environment (exported above)
 bash "$SCRIPT_DIR/install-ci-tex-extras.sh"
 
-# Required for Networking-style ~~strikethrough~~ and callout icons
+persist_env_for_later_steps
+
+# Sanity checks in *this* process (must use same TEXMFHOME)
 if ! kpsewhich soul.sty >/dev/null 2>&1; then
   echo "soul.sty missing — trying tlmgr install soul..."
   tlmgr install soul || true
@@ -47,9 +60,12 @@ if ! kpsewhich soul.sty >/dev/null 2>&1; then
   exit 1
 fi
 if ! kpsewhich fontawesome5.sty >/dev/null 2>&1; then
-  echo "ERROR: fontawesome5.sty not found" >&2
+  echo "ERROR: fontawesome5.sty not found (TEXMFHOME=$TEXMFHOME)" >&2
+  echo "  kpsewhich -var-value=TEXMFHOME => $(kpsewhich -var-value=TEXMFHOME 2>/dev/null || true)" >&2
+  find "$TEXMFHOME" -name 'fontawesome5.sty' 2>/dev/null || true
   exit 1
 fi
 
 echo "ci-tex-setup: soul -> $(kpsewhich soul.sty)"
 echo "ci-tex-setup: fontawesome5 -> $(kpsewhich fontawesome5.sty)"
+echo "ci-tex-setup: TEXMFHOME=$TEXMFHOME"
