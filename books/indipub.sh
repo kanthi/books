@@ -1,4 +1,5 @@
 #!/bin/bash
+set -euo pipefail
 export PATH="/opt/homebrew/bin:$PATH"
 
 # Check if book name is provided
@@ -21,13 +22,13 @@ echo "📚 Processing book: $BOOK_NAME"
 # Update book index
 if [ -f "$BOOKS_DIR/$BOOK_NAME/scripts/update-index.sh" ]; then
     echo "🔄 Updating book index..."
-    cd "$BOOKS_DIR/$BOOK_NAME/scripts" && ./update-index.sh
-    cd "$BOOKS_DIR"
+    (cd "$BOOKS_DIR/$BOOK_NAME/scripts" && ./update-index.sh)
 else
     echo "⚠️  No update-index.sh script found in $BOOK_NAME/scripts/"
 fi
 
-# Render book
+# Render book (must fail the job if any format fails — previously PDF
+# errors were ignored, so CI "succeeded" with HTML-only artifacts).
 echo "🌐 Rendering book..."
 quarto render "$BOOKS_DIR/$BOOK_NAME"
 

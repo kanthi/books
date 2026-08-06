@@ -58,10 +58,10 @@ Dense layer $d\to h$: $dh + h$ parameters (weights + biases).
 ### Worked example 1 — MLP $10\to 32\to 32\to 1$
 
 $$
-\begin{align*}
+\begin{aligned}
 &10\cdot 32+32 + 32\cdot 32+32 + 32\cdot 1+1\\
 &=320+32+1024+32+32+1=1441.
-\end{align*}
+\end{aligned}
 $$
 
 (If you saw $1473$ elsewhere, recount with the same bias convention — always state whether biases are included.)
