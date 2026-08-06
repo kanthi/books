@@ -448,13 +448,27 @@ process_book() {
 
   log "Rendering book with Quarto (html → pdf → epub; Deno heap via QUARTO_DENO_V8_OPTIONS)"
   export QUARTO_DENO_V8_OPTIONS="${QUARTO_DENO_V8_OPTIONS:---max-old-space-size=8192}"
-  # Sequential formats reduce peak Deno memory vs one multi-format render.
-  if ! quarto render --to html || ! quarto render --to pdf || ! quarto render --to epub; then
-    log "Render failed for $book_name"
-    COUNT_FAIL=$((COUNT_FAIL + 1))
-    cd "$BOOKS_DIR"
-    return
-  fi
+  # Sequential formats reduce peak Deno memory, but each --to can wipe prior
+  # artifacts from _book/. Stage PDF/EPUB after each pass and restore.
+  local stage
+  stage="$(mktemp -d "${TMPDIR:-/tmp}/renderpub-stage.XXXXXX")"
+  for fmt in html pdf epub; do
+    if ! quarto render --to "$fmt"; then
+      log "Render failed for $book_name (format=$fmt)"
+      rm -rf "$stage"
+      COUNT_FAIL=$((COUNT_FAIL + 1))
+      cd "$BOOKS_DIR"
+      return
+    fi
+    if [ -d "_book" ]; then
+      find "_book" -maxdepth 1 -type f \( -iname '*.pdf' -o -iname '*.epub' \) \
+        -exec cp -f {} "$stage/" \; 2>/dev/null || true
+    fi
+  done
+  mkdir -p "_book"
+  find "$stage" -maxdepth 1 -type f \( -iname '*.pdf' -o -iname '*.epub' \) \
+    -exec cp -f {} "_book/" \; 2>/dev/null || true
+  rm -rf "$stage"
 
   generate_book_cover "$book_name"
 
