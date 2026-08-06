@@ -134,7 +134,7 @@ $\hat p=0.52$, $n=1000$:
 $$
 \mathrm{SE}\approx\sqrt{0.52\cdot 0.48/1000}\approx 0.0158,
 \quad
-\text{95% ME}\approx 0.031.
+\text{95\% ME}\approx 0.031.
 $$
 
 Report $52\%\pm 3.1\%$ (approx), not $52.173\%$.
