@@ -446,8 +446,10 @@ process_book() {
     fi
   fi
 
-  log "Rendering book with Quarto"
-  if ! quarto render; then
+  log "Rendering book with Quarto (html → pdf → epub; Deno heap via QUARTO_DENO_V8_OPTIONS)"
+  export QUARTO_DENO_V8_OPTIONS="${QUARTO_DENO_V8_OPTIONS:---max-old-space-size=8192}"
+  # Sequential formats reduce peak Deno memory vs one multi-format render.
+  if ! quarto render --to html || ! quarto render --to pdf || ! quarto render --to epub; then
     log "Render failed for $book_name"
     COUNT_FAIL=$((COUNT_FAIL + 1))
     cd "$BOOKS_DIR"
