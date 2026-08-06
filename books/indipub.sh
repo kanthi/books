@@ -113,8 +113,12 @@ build_epub_pandoc() {
 }
 
 # Sequential formats: lower peak Deno memory than one multi-format render.
-echo "🌐 Rendering book (sequential formats)..."
-for fmt in html pdf epub; do
+#
+# Order matters: each `quarto render --to X` often rebuilds _book/ and drops
+# other formats. Do **html last** so the site (index.html + chapters) remains.
+# PDF/EPUB are harvested after their passes and restored onto the final HTML tree.
+echo "🌐 Rendering book (sequential: pdf → epub → html)..."
+for fmt in pdf epub html; do
   echo "   → format: $fmt"
   if [ "$fmt" = epub ]; then
     if ! quarto render "$BOOK_PATH" --to epub; then
@@ -128,5 +132,11 @@ for fmt in html pdf epub; do
 done
 
 restore_artifacts
+
+if [ ! -f "$OUT_DIR/index.html" ]; then
+  echo "ERROR: _book/index.html missing after render (HTML site not produced)" >&2
+  ls -la "$OUT_DIR" 2>/dev/null || true
+  exit 1
+fi
 
 echo "✅ Book rendering complete!"
