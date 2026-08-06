@@ -2,9 +2,21 @@
 set -euo pipefail
 export PATH="/opt/homebrew/bin:$PATH"
 
-# Quarto runs on Deno (not Node). NODE_OPTIONS does NOT raise the heap.
-# See https://quarto.org/docs/troubleshooting/ — Out-of-memory issues.
-export QUARTO_DENO_V8_OPTIONS="${QUARTO_DENO_V8_OPTIONS:---max-old-space-size=8192}"
+# ---------------------------------------------------------------------------
+# Quarto 1.3.x (CI) runs on Deno and only forwards QUARTO_DENO_EXTRA_OPTIONS
+# to the deno binary. QUARTO_DENO_V8_OPTIONS is ignored on 1.3.450 (no support
+# in bin/quarto). Without --v8-flags, Deno sits at ~1.4GB and large books
+# (Go EPUB) die with: Fatal javascript OOM / exit 133.
+#
+# Newer Quarto also honors QUARTO_DENO_V8_OPTIONS; set both for compatibility.
+# Heap sizes are MB. GHA ubuntu-latest has ~7GB RAM — stay under that.
+# ---------------------------------------------------------------------------
+_V8_HEAP="${QUARTO_DENO_HEAP_MB:-6144}"
+export QUARTO_DENO_V8_OPTIONS="${QUARTO_DENO_V8_OPTIONS:---max-old-space-size=${_V8_HEAP},--max-heap-size=${_V8_HEAP}}"
+# Critical for Quarto 1.3.450:
+if [[ "${QUARTO_DENO_EXTRA_OPTIONS:-}" != *v8-flags* ]]; then
+  export QUARTO_DENO_EXTRA_OPTIONS="--v8-flags=--max-old-space-size=${_V8_HEAP},--max-heap-size=${_V8_HEAP}${QUARTO_DENO_EXTRA_OPTIONS:+ ${QUARTO_DENO_EXTRA_OPTIONS}}"
+fi
 
 # Check if book name is provided
 if [ $# -ne 1 ]; then
@@ -22,7 +34,8 @@ if [ ! -d "$BOOKS_DIR/$BOOK_NAME" ]; then
 fi
 
 echo "📚 Processing book: $BOOK_NAME"
-echo "   QUARTO_DENO_V8_OPTIONS=$QUARTO_DENO_V8_OPTIONS"
+echo "   quarto: $(quarto --version 2>/dev/null || echo unknown)"
+echo "   QUARTO_DENO_EXTRA_OPTIONS=$QUARTO_DENO_EXTRA_OPTIONS"
 
 # Update book index
 if [ -f "$BOOKS_DIR/$BOOK_NAME/scripts/update-index.sh" ]; then
@@ -62,12 +75,55 @@ restore_artifacts() {
   done
 }
 
-# Sequential formats: lower peak Deno memory than one multi-format render
-# (large books e.g. Go EPUB OOMed in a single multi-format pass).
+# Pandoc EPUB fallback when Quarto/Deno still OOMs (uses Quarto-bundled pandoc).
+build_epub_pandoc() {
+  local list css_args resource
+  local -a sources
+  list="$(mktemp)"
+  if [ -f "$BOOK_PATH/index.qmd" ]; then
+    echo "$BOOK_PATH/index.qmd" >> "$list"
+  elif [ -f "$BOOK_PATH/index.md" ]; then
+    echo "$BOOK_PATH/index.md" >> "$list"
+  fi
+  if [ -d "$BOOK_PATH/content" ]; then
+    find "$BOOK_PATH/content" -type f \( -name '*.qmd' -o -name '*.md' \) | LC_ALL=C sort >> "$list"
+  fi
+  if [ ! -s "$list" ]; then
+    echo "   pandoc epub: no source files" >&2
+    rm -f "$list"
+    return 1
+  fi
+  mapfile -t sources < "$list"
+  rm -f "$list"
+  mkdir -p "$OUT_DIR"
+  css_args=()
+  if [ -f "$BOOK_PATH/styles/epub.css" ]; then
+    css_args=(--css="$BOOK_PATH/styles/epub.css")
+  fi
+  resource="$BOOK_PATH"
+  if [ -d "$BOOK_PATH/images" ]; then
+    resource="$BOOK_PATH:$BOOK_PATH/images"
+  fi
+  echo "   pandoc epub: ${#sources[@]} source files → _book/${BOOK_NAME}.epub"
+  quarto pandoc "${sources[@]}" \
+    -o "$OUT_DIR/${BOOK_NAME}.epub" \
+    --toc \
+    --resource-path="$resource" \
+    "${css_args[@]+"${css_args[@]}"}"
+}
+
+# Sequential formats: lower peak Deno memory than one multi-format render.
 echo "🌐 Rendering book (sequential formats)..."
 for fmt in html pdf epub; do
   echo "   → format: $fmt"
-  quarto render "$BOOK_PATH" --to "$fmt"
+  if [ "$fmt" = epub ]; then
+    if ! quarto render "$BOOK_PATH" --to epub; then
+      echo "   ⚠️  quarto epub failed (often Deno OOM on huge books) — trying pandoc fallback..."
+      build_epub_pandoc
+    fi
+  else
+    quarto render "$BOOK_PATH" --to "$fmt"
+  fi
   harvest_artifacts
 done
 
