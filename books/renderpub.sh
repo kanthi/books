@@ -1,4 +1,34 @@
 #!/usr/bin/env bash
+# =============================================================================
+# renderpub.sh — full multi-book library build + published_books portal
+# =============================================================================
+#
+# Version history
+# ---------------
+# v3 (current)  — Renamed from renderpub-codex-v2.sh → renderpub.sh (canonical
+#                 name for the full-library build). Behavior unchanged from v2;
+#                 this is the CI and local full-build path of record.
+#
+# v2            — Formerly books/renderpub-codex-v2.sh
+#                 Sequential per-book update-index + quarto render; harvest into
+#                 published_books/{html,pdf,epub,assets}; dynamic SVG covers;
+#                 portal index.html. Replaced older codex / indi-codex variants.
+#
+# v1 (legacy)   — Earlier scripts now under _archive/scripts/:
+#                   renderpub.sh, renderpub-codex.sh, renderpub-indi-codex.sh,
+#                   renderpub_backup.sh, renderpub_backup_20250726_114326.sh,
+#                   renderpub.sh.bak, renderpub.sh.backup
+#                 Superseded; keep for reference only.
+#
+# Related tools (not this file)
+#   indipub.sh              — single-book render
+#   indiprev.sh             — local preview
+#   scripts/gen-portal.sh   — portal HTML only (no book render)
+#
+# Usage (from the books/ directory):
+#   ./renderpub.sh
+#
+# =============================================================================
 set -euo pipefail
 export PATH="/opt/homebrew/bin:$PATH"
 
@@ -497,7 +527,7 @@ process_book() {
 }
 
 main() {
-  log "Starting renderpub-codex-v2"
+  log "Starting renderpub.sh (v3)"
   log "Working directory: $BOOKS_DIR"
 
   prepare_publish_dir

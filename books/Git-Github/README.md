@@ -29,7 +29,7 @@ From `books/`:
 
 ```bash
 ./indipub.sh Git-Github      # update-index + quarto render (this book only)
-# ./renderpub-codex-v2.sh      # full library portal (what CI runs)
+# ./renderpub.sh      # full library portal (what CI runs)
 ```
 
 ## Content rules

@@ -8,7 +8,7 @@ This file is kept as a short pointer so older tooling that looks for `Gemini.md`
 ## Quick rules
 
 - Do **not** hand-edit `_quarto.yml`; regenerate with `scripts/update-index.sh`.
-- Full library build / portal: `books/renderpub-codex-v2.sh` (what CI runs).
+- Full library build / portal: `books/renderpub.sh` (what CI runs).
 - Single book: `books/indipub.sh <BookName>`.
 - Content lives under `books/<BookName>/content/` with numeric prefixes for order.
 - `published_books/` and `_book/` are gitignored build artifacts.

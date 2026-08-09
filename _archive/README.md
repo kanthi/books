@@ -4,7 +4,7 @@ Historical monorepo material kept for reference. **Not used by CI or day-to-day 
 
 | Path | Contents |
 |------|----------|
-| `scripts/` | Older full-library render scripts superseded by `books/renderpub-codex-v2.sh` |
+| `scripts/` | Older full-library render scripts superseded by `books/renderpub.sh` |
 | `templates/Template.backup/` | Oldest book scaffold (pre–Template-New-1 era) |
 | `templates/Template-New-1/` | Snapshot of `Template-New-1` before rename to root `Template/` |
 | `docs/` | Retired agent notes (e.g. short `Gemini.md`) |

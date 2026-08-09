@@ -22,7 +22,7 @@ cd ..
 ./indipub.sh My-New-Book
 
 # 4. Full library portal (HTML + PDF + EPUB + index cards)
-# ./renderpub-codex-v2.sh
+# ./renderpub.sh
 ```
 
 Preview while writing (from the book directory):
@@ -31,7 +31,7 @@ Preview while writing (from the book directory):
 quarto preview
 ```
 
-Pushing to `main` runs CI, which builds all books via `renderpub-codex-v2.sh`
+Pushing to `main` runs CI, which builds all books via `renderpub.sh`
 and deploys `books/published_books` to GitHub Pages.
 
 ## Layout
@@ -93,6 +93,6 @@ title: "Getting Started"
 ## What this template does *not* include
 
 - Per-book GitHub Actions (deployment is monorepo-wide under `.github/`)
-- Multi-book render scripts (use `books/renderpub-codex-v2.sh` or `indipub.sh`)
+- Multi-book render scripts (use `books/renderpub.sh` or `indipub.sh`)
 
 See the repository root **`AGENTS.md`** for the full monorepo workflow.

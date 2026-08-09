@@ -25,7 +25,7 @@ trap 'rm -f "$ENTRIES_FILE"' EXIT
 
 log() { printf '%s\n' "$*"; }
 
-# ── Helper functions (mirrored from renderpub-codex-v2.sh) ────
+# ── Helper functions (mirrored from renderpub.sh) ────
 
 display_name() {
   printf '%s' "$1" | sed 's/[-_]/ /g'

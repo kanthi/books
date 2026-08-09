@@ -32,7 +32,7 @@ Run these from the **`books/`** directory.
     - Used by the incremental CI pipeline (`incremental.yml`) after overlaying changed books.
     - Can also be run locally: `bash scripts/gen-portal.sh` (from `books/`).
 
-1.  **`renderpub-codex-v2.sh` (Master Build / CI path of record)**:
+1.  **`renderpub.sh` (Master Build / CI path of record)**:
     - **Iterates** through all subdirectories in `books/` looking for `_quarto.yml`.
     - **Updates Index**: Calls `scripts/update-index.sh` for each book to ensure the navigation reflects the latest content.
     - **Renders**: Runs `quarto render` to build HTML, PDF, and EPUB formats.
@@ -118,7 +118,7 @@ The **primary** CI path. Triggers on push to `main` (only for changes under `boo
 - **Concurrency control** — a new push cancels any in-flight run for the same branch.
 - **Prunes deleted books** — if a book directory is removed from the repo, it's cleaned from the deployed site.
 - **Force rebuild** — use `workflow_dispatch` with the `force_all` checkbox to rebuild everything.
-- **Infrastructure changes** (workflow file, `renderpub-codex-v2.sh`, `gen-portal.sh`, `Template/`) trigger a full rebuild of all books automatically.
+- **Infrastructure changes** (workflow file, `renderpub.sh`, `gen-portal.sh`, `Template/`) trigger a full rebuild of all books automatically.
 
 ### Full Rebuild (`main.yml`) — **manual only**
 
@@ -126,7 +126,7 @@ Legacy workflow, retained for manual full rebuilds of all books via `workflow_di
 
 1.  **Trigger**: Manual (`workflow_dispatch`) only — push trigger is disabled.
 2.  **Setup**: Installs Quarto 1.3.450 and LaTeX (texlive) for PDF generation.
-3.  **Build**: Executes `books/renderpub-codex-v2.sh` (renders **all** books sequentially).
+3.  **Build**: Executes `books/renderpub.sh` (renders **all** books sequentially).
 4.  **Deploy**: Pushes `books/published_books` to `gh-pages` (`force_orphan: true`).
 
 ## Summary of Logic
@@ -161,5 +161,5 @@ Use **`Template`** (preferred). The older scaffold is preserved under **`_archiv
     cd books
     ./indiprev.sh My-New-Book         # live preview + open browser
     ./indipub.sh My-New-Book          # one-shot render (no portal)
-    # ./renderpub-codex-v2.sh         # full library portal (what CI runs)
+    # ./renderpub.sh         # full library portal (what CI runs)
     ```

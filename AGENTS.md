@@ -72,7 +72,7 @@ A **multi-book Quarto monorepo**. Each book is a self-contained Quarto project u
 1. **Never hand-edit `_quarto.yml`** inside a book. It is overwritten by `scripts/update-index.sh`.
 2. After adding/removing/renaming content files or folders, run that book's `update-index.sh` (or a full render script that calls it).
 3. **Primary CI** is `incremental.yml` (push-triggered, per-book). Full-rebuild fallback is `main.yml` (manual only).
-4. **Full-build script** is `books/renderpub-codex-v2.sh`. Single-book: `indipub.sh`. Preview: `indiprev.sh`. Portal-only: `scripts/gen-portal.sh`.
+4. **Full-build script** is `books/renderpub.sh`. Single-book: `indipub.sh`. Preview: `indiprev.sh`. Portal-only: `scripts/gen-portal.sh`.
 5. `published_books/` and `_book/` are build artifacts — do not commit them.
 6. Older full-library scripts live under **`_archive/scripts/`** (not used by CI). Do not restore them to `books/` without a reason.
 7. Live books under `books/` share the **Template shell**: `scripts/update-index.sh` (GitHub link, `date-modified` + “Updated” label, `epub.css`), monorepo README, no per-book `.github/`.
@@ -117,7 +117,7 @@ push to main
 ```
 
 Change detection: compares `github.event.before..HEAD` via `git diff`.
-Infrastructure changes (workflow, `renderpub-codex-v2.sh`, `gen-portal.sh`, `Template/`) trigger a full rebuild of all books.
+Infrastructure changes (workflow, `renderpub.sh`, `gen-portal.sh`, `Template/`) trigger a full rebuild of all books.
 `workflow_dispatch` with `force_all` checkbox also triggers full rebuild.
 
 ### Full-rebuild pipeline (manual — `main.yml`)
@@ -127,20 +127,20 @@ content/**  →  update-index.sh  →  _quarto.yml
                                     ↓
                               quarto render  →  _book/
                                     ↓
-                         renderpub-codex-v2.sh
+                         renderpub.sh
                                     ↓
               published_books/{html,pdf,epub,assets,index.html}
                                     ↓
                     GitHub Actions → gh-pages branch
 ```
 
-### Master script (`books/renderpub-codex-v2.sh`)
+### Master script (`books/renderpub.sh`)
 
 Run from `books/`:
 
 ```bash
 cd books
-./renderpub-codex-v2.sh
+./renderpub.sh
 ```
 
 For each subdirectory that contains `_quarto.yml`:
@@ -199,7 +199,7 @@ bash scripts/update-index.sh
 - **Triggers:** `workflow_dispatch` only (push trigger **disabled**)
 - **Quarto version:** `1.3.450`
 - **Deps:** pandoc + texlive packages (for PDF) + librsvg2-bin
-- **Build:** `cd books && ./renderpub-codex-v2.sh` (all books sequentially)
+- **Build:** `cd books && ./renderpub.sh` (all books sequentially)
 - **Deploy:** `peaceiris/actions-gh-pages` to `gh-pages` (`force_orphan: true`)
 
 ## Creating a new book
@@ -214,7 +214,7 @@ cd books/My-New-Book && bash scripts/update-index.sh
 cd ../ && ./indipub.sh My-New-Book   # optional local test
 ```
 
-On the next full CI run (or local `renderpub-codex-v2.sh`), the new book appears on the portal automatically if it has `_quarto.yml`.
+On the next full CI run (or local `renderpub.sh`), the new book appears on the portal automatically if it has `_quarto.yml`.
 
 ## Common agent tasks
 
@@ -225,7 +225,7 @@ On the next full CI run (or local `renderpub-codex-v2.sh`), the new book appears
 | Add a part | New `content/NN-name/` directory; run `update-index.sh` |
 | Fix sidebar title | Edit chapter YAML `title:` or first `#` heading; re-run `update-index.sh` |
 | Style changes | Edit `styles/light.scss` / `styles/dark.scss` (or shared patterns); not `_quarto.yml` by hand |
-| Portal / cover / aggregate bugs | Edit `books/scripts/gen-portal.sh` (incremental) or `books/renderpub-codex-v2.sh` (full) |
+| Portal / cover / aggregate bugs | Edit `books/scripts/gen-portal.sh` (incremental) or `books/renderpub.sh` (full) |
 | CI changes (incremental) | Edit `.github/workflows/incremental.yml` |
 | CI changes (full rebuild) | Edit `.github/workflows/main.yml` |
 | Regenerate portal only (no render) | `cd books && bash scripts/gen-portal.sh` |
@@ -241,7 +241,7 @@ On the next full CI run (or local `renderpub-codex-v2.sh`), the new book appears
 ## Defaults for future sessions
 
 - **CI** is handled by two workflows: `incremental.yml` (push-triggered, per-book) is the default; `main.yml` (manual full rebuild) is the fallback.
-- Prefer **`renderpub-codex-v2.sh`** for local full library builds.
+- Prefer **`renderpub.sh`** for local full library builds.
 - Prefer **`indipub.sh <Book>`** for single-book one-shot render.
 - Prefer **`indiprev.sh <Book>`** for local Safari preview (static `_book/`; use `--live` for Quarto reload).
 - Prefer **`scripts/gen-portal.sh`** to regenerate just the portal `index.html` without rendering any books.
