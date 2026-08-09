@@ -1,3 +1,5 @@
+# Archived snapshot of Template-New-1 (pre-rename to Template)
+
 # Book template (Template-New-1)
 
 Scaffold for a **new book inside this monorepo**. Copy it into `books/`, add

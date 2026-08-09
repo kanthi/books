@@ -22,7 +22,7 @@ A **multi-book Quarto monorepo**. Each book is a self-contained Quarto project u
 | `books/<BookName>/index.qmd` | Book landing page (always first chapter) |
 | `books/<BookName>/_book/` | Local Quarto output (**gitignored**) |
 | `books/published_books/` | Aggregated site artifact (**gitignored**; CI deploy source) |
-| `Template-New-1/` | **Preferred** scaffold for a new book |
+| `Template/` | **Preferred** scaffold for a new book |
 | `_archive/` | Legacy scripts, old template, retired docs (reference only; not used by CI) |
 | `.github/workflows/incremental.yml` | **Primary CI**: incremental build + deploy on push to `main` |
 | `.github/workflows/main.yml` | Full-rebuild workflow (manual `workflow_dispatch` only) |
@@ -75,7 +75,7 @@ A **multi-book Quarto monorepo**. Each book is a self-contained Quarto project u
 4. **Full-build script** is `books/renderpub-codex-v2.sh`. Single-book: `indipub.sh`. Preview: `indiprev.sh`. Portal-only: `scripts/gen-portal.sh`.
 5. `published_books/` and `_book/` are build artifacts — do not commit them.
 6. Older full-library scripts live under **`_archive/scripts/`** (not used by CI). Do not restore them to `books/` without a reason.
-7. Live books under `books/` share the **Template-New-1 shell**: `scripts/update-index.sh` (GitHub link, `date-modified` + “Updated” label, `epub.css`), monorepo README, no per-book `.github/`.
+7. Live books under `books/` share the **Template shell**: `scripts/update-index.sh` (GitHub link, `date-modified` + “Updated” label, `epub.css`), monorepo README, no per-book `.github/`.
 
 ## Content conventions
 
@@ -117,7 +117,7 @@ push to main
 ```
 
 Change detection: compares `github.event.before..HEAD` via `git diff`.
-Infrastructure changes (workflow, `renderpub-codex-v2.sh`, `gen-portal.sh`, `Template-New-1/`) trigger a full rebuild of all books.
+Infrastructure changes (workflow, `renderpub-codex-v2.sh`, `gen-portal.sh`, `Template/`) trigger a full rebuild of all books.
 `workflow_dispatch` with `force_all` checkbox also triggers full rebuild.
 
 ### Full-rebuild pipeline (manual — `main.yml`)
@@ -204,11 +204,11 @@ bash scripts/update-index.sh
 
 ## Creating a new book
 
-Prefer **`Template-New-1/`** (sample `content/`, accurate monorepo README, no per-book CI).
+Prefer **`Template/`** (sample `content/`, accurate monorepo README, no per-book CI).
 Legacy scaffold is under **`_archive/templates/Template.backup/`** — do not use it for new books.
 
 ```bash
-cp -r Template-New-1 books/My-New-Book
+cp -r Template books/My-New-Book
 # Edit index.qmd; add/replace content under content/<NN-part>/...
 cd books/My-New-Book && bash scripts/update-index.sh
 cd ../ && ./indipub.sh My-New-Book   # optional local test

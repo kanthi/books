@@ -6,7 +6,7 @@ The project is designed to host and publish multiple technical books (or documen
 
 ### Key Directories
 - **`/books`**: The core directory containing all book projects. Each subdirectory (e.g., `Git-Github`, `Linux-Commands`) represents a separate book.
-- **`/Template-New-1`**: Preferred scaffold for creating new books.
+- **`/Template`**: Preferred scaffold for creating new books.
 - **`/_archive`**: Legacy render scripts, old template, and retired docs (reference only).
 - **`/.github`**: Contains GitHub Actions workflows for automated deployment.
 
@@ -118,7 +118,7 @@ The **primary** CI path. Triggers on push to `main` (only for changes under `boo
 - **Concurrency control** — a new push cancels any in-flight run for the same branch.
 - **Prunes deleted books** — if a book directory is removed from the repo, it's cleaned from the deployed site.
 - **Force rebuild** — use `workflow_dispatch` with the `force_all` checkbox to rebuild everything.
-- **Infrastructure changes** (workflow file, `renderpub-codex-v2.sh`, `gen-portal.sh`, `Template-New-1/`) trigger a full rebuild of all books automatically.
+- **Infrastructure changes** (workflow file, `renderpub-codex-v2.sh`, `gen-portal.sh`, `Template/`) trigger a full rebuild of all books automatically.
 
 ### Full Rebuild (`main.yml`) — **manual only**
 
@@ -137,11 +137,11 @@ Legacy workflow, retained for manual full rebuilds of all books via `workflow_di
 
 ## 4. How to Create a New Book
 
-Use **`Template-New-1`** (preferred). The older scaffold is preserved under **`_archive/templates/Template.backup/`**.
+Use **`Template`** (preferred). The older scaffold is preserved under **`_archive/templates/Template.backup/`**.
 
 1.  **Copy the template** into `books/` and name the folder for the book:
     ```bash
-    cp -r Template-New-1 books/My-New-Book
+    cp -r Template books/My-New-Book
     ```
     The folder name becomes the Quarto book title when you regenerate `_quarto.yml`.
 
