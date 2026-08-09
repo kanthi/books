@@ -23,14 +23,15 @@ For books using `scripts/update-index.sh` in this repo:
 7. Directories starting with `_` are ignored by part discovery.
 8. Root-level files directly under `content/` are not included as chapters.
 
-## 90DaysOfX (multi-volume series)
+## 90DaysOfX / 30DaysOfX (multi-volume series)
 
-- Portal book: `books/90DaysOfX/`
+- Portal books: `books/90DaysOfX/`, `books/30DaysOfX/`
 - **Volumes** = independent parts: `content/01-go/`, `content/02-nixos/`, `content/03-maths/`, future `content/04-…/`
 - Readers take one volume at a time by default; no morning/evening dual-track in published prose
-- Each volume: `00-sub-book-overview.qmd` + `01-syllabus.qmd` first; chapters later
-- Series-wide docs: `content/00-program/`
+- Each volume: `00-sub-book-overview.qmd` + syllabus early; day chapters later
+- Series-wide docs: `content/00-program/` where present
 - Standalone `Go` / `NixOS` / `Maths` stay as deep libraries; do not auto-merge chapter bodies
+- Prefer root **`AGENTS.md`** for full naming rules (`@lib` / `@90` / `30X`)
 
 ### Naming (same as root AGENTS.md — do not confuse with standalone books)
 

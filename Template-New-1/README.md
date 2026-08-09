@@ -3,7 +3,7 @@
 Scaffold for a **new book inside this monorepo**. Copy it into `books/`, add
 chapters under `content/`, regenerate `_quarto.yml`, then render.
 
-The older scaffold is kept as root **`Template.backup/`** for reference only. Prefer this folder for all new books.
+The older scaffold is kept under root **`_archive/templates/Template.backup/`** for reference only. Prefer this folder for all new books.
 
 ## Quick start
 

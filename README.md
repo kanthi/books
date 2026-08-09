@@ -7,7 +7,7 @@ The project is designed to host and publish multiple technical books (or documen
 ### Key Directories
 - **`/books`**: The core directory containing all book projects. Each subdirectory (e.g., `Git-Github`, `Linux-Commands`) represents a separate book.
 - **`/Template-New-1`**: Preferred scaffold for creating new books.
-- **`/Template.backup`**: Legacy scaffold (kept for reference only).
+- **`/_archive`**: Legacy render scripts, old template, and retired docs (reference only).
 - **`/.github`**: Contains GitHub Actions workflows for automated deployment.
 
 ### Book Structure (e.g., inside `/books/Linux-Commands`)
@@ -40,7 +40,7 @@ Run these from the **`books/`** directory.
         - Copies output to `books/published_books/`.
         - Generates a **custom SVG book cover** for each book dynamically.
         - Updates the main `index.html` portal to list all rendered books.
-    - Older scripts (`renderpub.sh`, `renderpub-codex.sh`, …) may still exist; prefer **`renderpub-codex-v2.sh`** unless you have a reason not to.
+    - Older full-library scripts live under **`_archive/scripts/`**; do not use them for normal builds.
 
 2.  **`indipub.sh` (Single Book Build)**:
     - Usage: `./indipub.sh <book_name>`
@@ -137,7 +137,7 @@ Legacy workflow, retained for manual full rebuilds of all books via `workflow_di
 
 ## 4. How to Create a New Book
 
-Use **`Template-New-1`** (preferred). The older scaffold is preserved as **`Template.backup`**.
+Use **`Template-New-1`** (preferred). The older scaffold is preserved under **`_archive/templates/Template.backup/`**.
 
 1.  **Copy the template** into `books/` and name the folder for the book:
     ```bash

@@ -23,16 +23,17 @@ A **multi-book Quarto monorepo**. Each book is a self-contained Quarto project u
 | `books/<BookName>/_book/` | Local Quarto output (**gitignored**) |
 | `books/published_books/` | Aggregated site artifact (**gitignored**; CI deploy source) |
 | `Template-New-1/` | **Preferred** scaffold for a new book |
-| `Template.backup/` | Legacy book scaffold (kept for reference only) |
+| `_archive/` | Legacy scripts, old template, retired docs (reference only; not used by CI) |
 | `.github/workflows/incremental.yml` | **Primary CI**: incremental build + deploy on push to `main` |
-| `.github/workflows/main.yml` | Legacy full-rebuild workflow (manual `workflow_dispatch` only) |
+| `.github/workflows/main.yml` | Full-rebuild workflow (manual `workflow_dispatch` only) |
 | `books/scripts/gen-portal.sh` | Standalone portal regenerator (no book rendering) |
 
 ### Current books (as of last inventory)
 
-`90DaysOfX`, `C`, `ContainerLabs`, `Git-Github`, `Go`, `Linux-Commands`, `Linux-Editors`, `Linux-ShellScripting-Bash`, `Maths`, `myHomelab`, `Networking`, `NixOS`, `Rust`
+`30DaysOfX`, `90DaysOfX`, `C`, `ContainerLabs`, `Git-Github`, `Go`, `Linux-Commands`, `Linux-Editors`, `Linux-ShellScripting-Bash`, `Maths`, `myHomelab`, `Networking`, `NixOS`, `Rust`
 
 - **`90DaysOfX`**: multi-volume series container. Volumes are **independent** parts under `content/` (`01-go`, `02-nixos`, `03-maths`, …)—no required joint schedule. Standalone `Go` / `NixOS` / `Maths` books remain deeper libraries.
+- **`30DaysOfX`**: shorter multi-volume series (same topic family as 90-day / libraries). Independent of the 90-day calendar; do not merge bodies unless the user asks.
 
 ## Book vs volume naming (user language → path)
 
@@ -45,7 +46,8 @@ A **multi-book Quarto monorepo**. Each book is a self-contained Quarto project u
 | **`Go book`**, **`standalone Go`**, **`Go@lib`** | Standalone library | `books/Go/` |
 | **`NixOS book`**, **`standalone NixOS`**, **`NixOS@lib`** | Standalone library | `books/NixOS/` |
 | **`Maths book`**, **`standalone Maths`**, **`Maths@lib`** | Standalone library | `books/Maths/` |
-| **`90DaysOfX`**, **`series`** | Series container only | `books/90DaysOfX/` |
+| **`90DaysOfX`**, **`series`**, **`90X`** | 90-day series container | `books/90DaysOfX/` |
+| **`30DaysOfX`**, **`30X`** | 30-day series container | `books/30DaysOfX/` |
 | **`Go volume`**, **`90X Go`**, **`Volume 1`**, **`Go@90`** | Day-paced Go spine | `books/90DaysOfX/content/01-go/` |
 | **`NixOS volume`**, **`90X NixOS`**, **`Volume 2`**, **`NixOS@90`** | Day-paced NixOS spine | `books/90DaysOfX/content/02-nixos/` |
 | **`Maths volume`**, **`90X Maths`**, **`Volume 3`**, **`Maths@90`** | Day-paced Maths spine | `books/90DaysOfX/content/03-maths/` |
@@ -70,10 +72,10 @@ A **multi-book Quarto monorepo**. Each book is a self-contained Quarto project u
 1. **Never hand-edit `_quarto.yml`** inside a book. It is overwritten by `scripts/update-index.sh`.
 2. After adding/removing/renaming content files or folders, run that book's `update-index.sh` (or a full render script that calls it).
 3. **Primary CI** is `incremental.yml` (push-triggered, per-book). Full-rebuild fallback is `main.yml` (manual only).
-4. **Full-build script** is `books/renderpub-codex-v2.sh` (not the older `renderpub.sh`).
+4. **Full-build script** is `books/renderpub-codex-v2.sh`. Single-book: `indipub.sh`. Preview: `indiprev.sh`. Portal-only: `scripts/gen-portal.sh`.
 5. `published_books/` and `_book/` are build artifacts — do not commit them.
-6. Older scripts (`renderpub.sh`, `renderpub-codex.sh`, `renderpub-indi-codex.sh`, `renderpub_backup*.sh`) may still be in the tree; treat them as legacy unless the user says otherwise.
-7. Live books under `books/` share the **Template-New-1 shell**: `scripts/update-index.sh` (GitHub link, `date-modified` + “Updated” label, `epub.css`), monorepo README, no per-book `.github/`, no `render_all_books.sh`.
+6. Older full-library scripts live under **`_archive/scripts/`** (not used by CI). Do not restore them to `books/` without a reason.
+7. Live books under `books/` share the **Template-New-1 shell**: `scripts/update-index.sh` (GitHub link, `date-modified` + “Updated” label, `epub.css`), monorepo README, no per-book `.github/`.
 
 ## Content conventions
 
@@ -203,7 +205,7 @@ bash scripts/update-index.sh
 ## Creating a new book
 
 Prefer **`Template-New-1/`** (sample `content/`, accurate monorepo README, no per-book CI).
-Legacy scaffold is kept as **`Template.backup/`** — do not use it for new books.
+Legacy scaffold is under **`_archive/templates/Template.backup/`** — do not use it for new books.
 
 ```bash
 cp -r Template-New-1 books/My-New-Book
@@ -234,7 +236,7 @@ On the next full CI run (or local `renderpub-codex-v2.sh`), the new book appears
 |------|---------|
 | `README.md` | Human project overview (may lag slightly vs CI script name) |
 | `books/AGENTS.md` | Quarto generation + ordering rules; myHomelab notes |
-| `Gemini.md` | Shorter legacy agent memory — prefer **this** file as canonical |
+| `_archive/` | Historical scripts/templates/docs — reference only |
 
 ## Defaults for future sessions
 
