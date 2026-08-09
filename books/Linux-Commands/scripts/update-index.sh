@@ -115,6 +115,7 @@ process_directory() {
 
   local ext doc doc_name file_title subdir subdir_name relative_path
 
+  # Prefer index.qmd over index.md when both exist
   for ext in qmd md; do
     if [ -f "$dir/index.$ext" ]; then
       file_title="$(extract_qmd_title "$dir/index.$ext")"
@@ -122,19 +123,20 @@ process_directory() {
         echo "        - text: \"$file_title\""
         echo "          file: content/$(basename "$dir")/index.$ext"
       } >> "$TMP_FILE"
+      break
     fi
-
-    # Lexicographic order via sorted null-safe listing
-    while IFS= read -r -d '' doc; do
-      doc_name="$(basename "$doc")"
-      [ "$doc_name" = "index.$ext" ] && continue
-      file_title="$(extract_qmd_title "$doc")"
-      {
-        echo "        - text: \"$file_title\""
-        echo "          file: content/$(basename "$dir")/${doc_name}"
-      } >> "$TMP_FILE"
-    done < <(find "$dir" -maxdepth 1 -type f -name "*.$ext" -print0 2>/dev/null | sort -z)
   done
+
+  # Chapters: sort .md and .qmd together by basename (NN- prefixes)
+  while IFS= read -r -d '' doc; do
+    doc_name="$(basename "$doc")"
+    [[ "$doc_name" == index.* ]] && continue
+    file_title="$(extract_qmd_title "$doc")"
+    {
+      echo "        - text: \"$file_title\""
+      echo "          file: content/$(basename "$dir")/${doc_name}"
+    } >> "$TMP_FILE"
+  done < <(find "$dir" -maxdepth 1 -type f \( -name "*.qmd" -o -name "*.md" \) -print0 2>/dev/null | sort -z)
 
   for subdir in "$dir"/*; do
     if [ -d "$subdir" ] && [[ ! $(basename "$subdir") == _* ]]; then
@@ -144,17 +146,15 @@ process_directory() {
         echo "          contents:"
       } >> "$TMP_FILE"
 
-      for ext in qmd md; do
-        while IFS= read -r -d '' doc; do
-          doc_name="$(basename "$doc")"
-          file_title="$(extract_qmd_title "$doc")"
-          relative_path="content/$(basename "$dir")/$(basename "$subdir")"
-          {
-            echo "            - text: \"$file_title\""
-            echo "              file: ${relative_path}/${doc_name}"
-          } >> "$TMP_FILE"
-        done < <(find "$subdir" -maxdepth 1 -type f -name "*.$ext" -print0 2>/dev/null | sort -z)
-      done
+      while IFS= read -r -d '' doc; do
+        doc_name="$(basename "$doc")"
+        file_title="$(extract_qmd_title "$doc")"
+        relative_path="content/$(basename "$dir")/$(basename "$subdir")"
+        {
+          echo "            - text: \"$file_title\""
+          echo "              file: ${relative_path}/${doc_name}"
+        } >> "$TMP_FILE"
+      done < <(find "$subdir" -maxdepth 1 -type f \( -name "*.qmd" -o -name "*.md" \) -print0 2>/dev/null | sort -z)
     fi
   done
 }
