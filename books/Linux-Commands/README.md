@@ -2,6 +2,8 @@
 
 Quarto book in the multi-book monorepo. Prefer the repository root **`AGENTS.md`** for the full publish workflow.
 
+**Scope:** general Linux CLI + **server-side** administration (SSH/headless). No desktop/GUI apps, CUPS printing, or Flatpak-style app stores.
+
 ## Layout
 
 ```text
@@ -14,7 +16,7 @@ Linux-Commands/
 ```
 
 Parts under `content/` (ignored dirs start with `_`):  
-00-help-and-docs, 01-files-and-paths, 02-archives-and-compression, 03-system-information, 04-processes-and-jobs, 05-system-monitoring, 06-users-and-groups, 07-networking, 08-scheduling, 09-logging, 10-hardware, 11-storage-and-filesystems, 12-terminals-and-mux, 13-text-and-pipes, 14-packages, 15-services-and-runtime, 16-printing, 17-shell-commands, 99-appendices
+00-help-and-docs, 01-files-and-paths, 02-archives-and-compression, 03-system-information, 04-processes-and-jobs, 05-system-monitoring, 06-users-and-groups, 07-networking, 08-scheduling, 09-logging, 10-hardware, 11-storage-and-filesystems, 12-terminals-and-mux, 13-text-and-pipes, 14-packages, 15-services-and-runtime, 17-shell-commands, 18-security, 99-appendices
 
 
 

@@ -37,7 +37,7 @@ install -d [options] DIRECTORY...
 2. Drop configs with correct mode/owner
 3. Create system directory trees with known permissions
 4. Reproducible Makefile `make install` steps
-5. User-local desktop/application files
+5. Install unit files and server config snippets with correct modes
 
 ## Examples with Explanations
 
@@ -61,13 +61,13 @@ sudo install -d -m 750 -o myapp -g myapp /var/lib/myapp
 sudo install -m 640 -o root -g adm myapp.conf /etc/myapp/myapp.conf
 ```
 
-### Leading path creation
+### Leading path creation (systemd unit)
 
 ```bash
-install -D -m 644 share/app.desktop \
-  ~/.local/share/applications/app.desktop
 sudo install -D -m 644 myapp.service \
   /etc/systemd/system/myapp.service
+sudo install -D -m 644 myapp.conf \
+  /etc/myapp/myapp.conf
 ```
 
 `-D` creates parent directories of the final DEST file.

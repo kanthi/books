@@ -141,7 +141,7 @@ Always inventory before mass signaling when the blast radius is unclear.
 - `pkill` / `pgrep` — pattern-based select/signal
 - `pidof` — simple name → PID list
 - `systemctl` — supervised stop/reload
-- `xkill` — GUI click-to-kill (desktop only)
+- `kill` / `pkill` — more controlled signaling on servers
 
 ## Additional Resources
 

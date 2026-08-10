@@ -1,91 +1,159 @@
 # mount
 
 ## Overview
-`mount` attaches a filesystem (device, network share, bind path, tmpfs, …) onto a directory in the single directory tree. Persistent mounts belong in `/etc/fstab` or systemd `.mount` units; `mount` itself is the live operation.
+
+`mount` attaches a filesystem (block device, network share, bind path, tmpfs, …) onto a directory in the single Linux directory tree. Persistent mounts belong in `/etc/fstab` or systemd `.mount` units; interactive `mount` is for live operations and troubleshooting.
 
 ## Syntax
+
 ```bash
 mount [-t type] [-o options] device dir
-mount                    # list mounts
-mount -a                 # all fstab entries
+mount                         # list mounts
+mount -a                      # all fstab entries due at boot
+mount -o remount,opts dir
 ```
 
 ## Common Options
+
 | Option | Description |
 |--------|-------------|
-| `-t type` | Filesystem type (`ext4`, `xfs`, `nfs`, `tmpfs`, `cifs`, …) |
-| `-o opts` | Comma options (`ro`, `noexec`, `nosuid`, `defaults`, …) |
-| `-a` | Mount all fstab filesystems |
-| `-r` | Read-only |
-| `--bind` | Bind mount a directory |
+| `-t type` | Filesystem type (`ext4`, `xfs`, `nfs4`, `cifs`, `tmpfs`, `overlay`, …) |
+| `-o opts` | Mount options (`ro`, `noexec`, `nosuid`, `nodev`, `defaults`, …) |
+| `-a` | Mount all appropriate fstab entries |
+| `-r` / `-w` | Read-only / read-write |
+| `--bind` / `--rbind` | Bind mount (recursive) |
 | `-v` | Verbose |
+| `--source` / `--target` | Explicit long options |
 
 ## Key Use Cases
+
 1. Attach disks and USB volumes  
 2. Mount NFS/CIFS shares  
-3. Bind mounts for chroots/containers  
+3. Bind mounts for chroots, containers, and rebuilds  
 4. Temporary tmpfs workspaces  
+5. Remount root or data with new options  
 
 ## Safety
-Wrong device on `mkfs`/`mount` can expose or overwrite data. Always verify with `lsblk -f` and `blkid` first. Unmount cleanly with `umount` before disconnecting storage.
+
+- Wrong device → wrong data exposure. Verify with `lsblk -f` and `blkid` **before** mounting.  
+- Prefer `UUID=` / `LABEL=` in fstab over volatile `/dev/sdX` names.  
+- Network mounts can hang the shell on outage — consider `soft`/`timeo` options and separate automount units.  
+- Unmount cleanly (`umount`) before yanking USB or unplugging SAN LUNs.
 
 ## Examples with Explanations
-### List
+
+### Inventory
+
 ```bash
-mount | column -t
 findmnt
-findmnt -t ext4
+findmnt -t ext4,xfs
+mount | column -t
+findmnt -J | jq .          # if jq installed
 ```
 
-### Mount a partition
+Prefer `findmnt` for tree and JSON views.
+
+### Mount a partition by UUID
+
 ```bash
+lsblk -f
 sudo mkdir -p /mnt/data
-sudo mount /dev/sdb1 /mnt/data
-# or by UUID (stable):
 sudo mount UUID=xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx /mnt/data
+df -h /mnt/data
 ```
 
-### Read-only
+### Read-only mount (forensics / recovery)
+
 ```bash
 sudo mount -o ro /dev/sdb1 /mnt/data
 ```
 
 ### NFS
+
 ```bash
-sudo mount -t nfs server:/export/path /mnt/nfs
+sudo mount -t nfs4 -o rw,hard,timeo=600 server.example:/export/path /mnt/nfs
 ```
 
-### Bind mount
+Options trade durability vs hang behavior — know your storage SLA.
+
+### CIFS / SMB
+
+```bash
+sudo mount -t cifs //server/share /mnt/share \
+  -o credentials=/root/.smbcred,uid=1000,gid=1000,iocharset=utf8
+```
+
+Keep credentials files mode `600`.
+
+### Bind mounts
+
 ```bash
 sudo mount --bind /var/www /mnt/www-view
+sudo mount --rbind /home /mnt/chroot/home
 ```
+
+Bind mounts share the same filesystem; `rbind` includes submounts.
 
 ### tmpfs
+
 ```bash
-sudo mount -t tmpfs -o size=1G tmpfs /mnt/scratch
+sudo mount -t tmpfs -o size=1G,mode=0755 tmpfs /mnt/scratch
 ```
 
-### From fstab
+RAM-backed; contents vanish on unmount/reboot.
+
+### Remount
+
 ```bash
-sudo mount -a
-sudo mount /mnt/data    # if listed in fstab
+sudo mount -o remount,ro /
+sudo mount -o remount,rw /
 ```
+
+Common in recovery environments.
+
+### fstab-driven
+
+```bash
+# /etc/fstab example:
+# UUID=…  /mnt/data  ext4  defaults,nofail  0  2
+sudo mount -a
+sudo mount /mnt/data
+findmnt /mnt/data
+```
+
+`nofail` avoids boot hangs if the disk is absent (laptops/USB).
+
+### Overlay (container-style)
+
+```bash
+sudo mount -t overlay overlay -o lowerdir=/base,upperdir=/upper,workdir=/work /merged
+```
+
+Used heavily by container engines; easy to get wrong — read `overlay` docs before production use.
 
 ## Understanding Output
-`mount` with no args lists source, target, type, and options. Prefer `findmnt` for tree views and JSON (`findmnt -J`).
+
+With no arguments, `mount` lists source, target, type, and options. Exit status non-zero means the mount failed (busy target, bad superblock, missing helper binary for NFS/CIFS, permission denied).
 
 ## Notes & Pitfalls
-- Prefer **UUID=** or **LABEL=** in fstab over `/dev/sdX` names.  
-- “Target is busy” on umount → `lsof`/`fuser`/`findmnt`.  
-- Systemd may auto-manage mounts; check `systemctl status mnt-data.mount`.  
+
+- Helpers live as `mount.nfs`, `mount.cifs` — missing packages cause cryptic errors.  
+- “Target is busy” on umount → `lsof +f -- /mnt/data`, `fuser -vm /mnt/data`.  
+- Systemd may own the mount: `systemctl status mnt-data.mount`.  
+- `user`/`users` fstab options allow non-root mount/umount with restrictions.  
+- Mount namespaces (containers) mean `findmnt` inside a pod is not the host’s view.
 
 ## Related Commands
+
 - `umount` — detach  
 - `lsblk` / `blkid` — identify devices  
 - `findmnt` — rich listing  
-- `df` — space on mounted filesystems  
+- `df` / `du` — space usage  
+- `losetup` — loop devices for images  
 - `fstab(5)` — persistence  
 
 ## Additional Resources
+
 - `man mount`  
-- `man fstab`
+- `man fstab`  
+- `man systemd.mount`

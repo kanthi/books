@@ -134,7 +134,7 @@ fi
 
 - Systemd, iproute2, and Podman pages are high quality; prefer `man systemctl`, `man ip-link`, `man podman-run` over outdated blog posts for flag accuracy.
 - Many modern tools also ship `--help` that is good enough for flags; use `man` when you need semantics, exit codes, and file formats.
-- Flatpak / snap sandboxes may not see host man pages; document tools where they are installed.
+- Container and snap sandboxes may not see host man pages; read docs in the environment where the tool is installed.
 
 ## Related Commands
 

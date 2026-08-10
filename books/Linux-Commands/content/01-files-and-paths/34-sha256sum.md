@@ -34,8 +34,8 @@ With no files (or `-`), reads stdin. Default output: `<hash>  <filename>` (two s
 ### Hash a file
 
 ```bash
-sha256sum ubuntu-24.04-desktop-amd64.iso
-# e3b0c442…  ubuntu-24.04-desktop-amd64.iso
+sha256sum ubuntu-24.04.1-live-server-amd64.iso
+# e3b0c442…  ubuntu-24.04.1-live-server-amd64.iso
 ```
 
 Compare the printed digest to the publisher’s checksum page (preferably over HTTPS / signed).
