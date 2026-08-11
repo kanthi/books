@@ -8,7 +8,12 @@ See Front Matter: Syllabus (A) + Syllabus 1–7 + comparison index.
 
 ## Diagrams
 
-`images/diagram-*.svg` — transparent SVG, `currentColor` for light/dark Quarto themes.
+Hand-written SVGs under `images/`. See **`images/README.md`** for the illustrated topology style (canvas, grid, IP chips, racks) and inventory.
+
+| Kind | Style |
+|------|--------|
+| **Topology** | Illustrated light-card SVG (dist-switch, MAC, VLAN, triangle, leaf-spine) |
+| **Conceptual** | Monochrome `#7a8fa6` on transparent (planes, encapsulation, verify loop, …) |
 
 ## Commands
 

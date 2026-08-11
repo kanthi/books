@@ -27,10 +27,15 @@ A **multi-book Quarto monorepo**. Each book is a self-contained Quarto project u
 | `.github/workflows/incremental.yml` | **Primary CI**: incremental build + deploy on push to `main` |
 | `.github/workflows/main.yml` | Full-rebuild workflow (manual `workflow_dispatch` only) |
 | `books/scripts/gen-portal.sh` | Standalone portal regenerator (no book rendering) |
+| `ci/` | **CI TeX assets** (TinyTeX pin, packages list, fontawesome zip) — not a book |
+| `includes/` | **Shared monorepo assets** (diagram standard, GA snippet, highlight themes) — not a book |
+| `includes/diagrams/` | Illustrated SVG standard + reference art + theme-swap fragment |
 
 ### Current books (as of last inventory)
 
-`30DaysOfX`, `90DaysOfX`, `C`, `ContainerLabs`, `Git-Github`, `Go`, `Linux-Commands`, `Linux-Editors`, `Linux-ShellScripting-Bash`, `Maths`, `myHomelab`, `Networking`, `NixOS`, `Rust`
+`30DaysOfX`, `90DaysOfX`, `C`, `Git-Github`, `Go`, `Linux`, `Maths`, `Networking`, `NixOS`, `Rust`
+
+- **`Linux`**: merged former `Linux-Commands` + `Linux-Editors` + `Linux-ShellScripting-Bash` (parts `cmd-*`, `editors-*`, `shell-*`).
 
 - **`90DaysOfX`**: multi-volume series container. Volumes are **independent** parts under `content/` (`01-go`, `02-nixos`, `03-maths`, …)—no required joint schedule. Standalone `Go` / `NixOS` / `Maths` books remain deeper libraries.
 - **`30DaysOfX`**: shorter multi-volume series (same topic family as 90-day / libraries). Independent of the 90-day calendar; do not merge bodies unless the user asks.
@@ -89,6 +94,29 @@ Documented in detail in `books/AGENTS.md`. Summary:
 6. Directories starting with `_` are ignored by part discovery (e.g. planning folders).
 7. Root-level files directly under `content/` are **not** auto-included as chapters.
 8. Titles for sidebar entries come from YAML frontmatter `title:`, else first `#` heading, else the path name.
+
+## Illustrated diagrams (all books)
+
+**Single monorepo style** for topology / lab figures. Do not invent per-book palettes.
+
+| Item | Path |
+|------|------|
+| **Standard (agents must read)** | `includes/diagrams/STANDARD.md` |
+| **Visual reference (light)** | `includes/diagrams/reference/diagram-reference-topology.svg` |
+| **Visual reference (dark)** | `includes/diagrams/reference/diagram-reference-topology-dark.svg` |
+| **Theme-swap fragment** | `includes/diagrams/theme-swap.fragment.html` |
+| **Template copies** | `Template/images/diagram-reference-topology*.svg` + `Template/images/README.md` |
+| **First production exemplar** | `books/Networking/images/diagram-dist-switch-multihome.svg` (+ `-dark`) |
+
+### Rules agents must follow
+
+1. **Illustrated topology** (racks, switches, fabrics, addressing): self-contained dual-theme **card** SVGs using the reference CSS tokens; ship **`diagram-<topic>.svg`** + **`diagram-<topic>-dark.svg`**.
+2. **Conceptual mono** (planes, loops, abstract models): transparent background, `#7a8fa6` strokes only; prefer `diagram-concept-<topic>.svg`; **no** dark sibling.
+3. Markdown embeds **always** use the **light** path. HTML dark mode is handled by the theme-swap script in `styles/reader-mode-body.html`.
+4. Ensure the book’s `scripts/update-index.sh` includes `project.resources: [images/*-dark.svg]` so dark files reach `_book/`.
+5. Before drawing a new figure: open the light **reference** SVG and match card, grid, bubbles, links, and type.
+
+Prefer illustrated topology over Mermaid for devices, links, or CIDRs.
 
 ## Build & publish pipeline
 
@@ -224,6 +252,7 @@ On the next full CI run (or local `renderpub.sh`), the new book appears on the p
 | Reorder chapters | Rename with numeric prefixes; run `update-index.sh` |
 | Add a part | New `content/NN-name/` directory; run `update-index.sh` |
 | Fix sidebar title | Edit chapter YAML `title:` or first `#` heading; re-run `update-index.sh` |
+| **Add a topology diagram** | Follow `includes/diagrams/STANDARD.md`; copy reference SVG light+dark; place under book `images/`; embed light path; ensure theme-swap + `images/*-dark.svg` resources |
 | Style changes | Edit `styles/light.scss` / `styles/dark.scss` (or shared patterns); not `_quarto.yml` by hand |
 | Portal / cover / aggregate bugs | Edit `books/scripts/gen-portal.sh` (incremental) or `books/renderpub.sh` (full) |
 | CI changes (incremental) | Edit `.github/workflows/incremental.yml` |
@@ -235,7 +264,8 @@ On the next full CI run (or local `renderpub.sh`), the new book appears on the p
 | File | Purpose |
 |------|---------|
 | `README.md` | Human project overview (may lag slightly vs CI script name) |
-| `books/AGENTS.md` | Quarto generation + ordering rules; myHomelab notes |
+| `books/AGENTS.md` | Quarto generation + ordering rules |
+| `includes/diagrams/STANDARD.md` | **Illustrated SVG style** (dual-theme tokens, dual files, theme swap) |
 | `_archive/` | Historical scripts/templates/docs — reference only |
 
 ## Defaults for future sessions
@@ -246,6 +276,7 @@ On the next full CI run (or local `renderpub.sh`), the new book appears on the p
 - Prefer **`indiprev.sh <Book>`** for local Safari preview (static `_book/`; use `--live` for Quarto reload).
 - Prefer **`scripts/gen-portal.sh`** to regenerate just the portal `index.html` without rendering any books.
 - Resolve **book vs volume** using **Book vs volume naming** above; ask if "Go" / "NixOS" / "Maths" is ambiguous.
+- **Diagrams:** follow `includes/diagrams/STANDARD.md` and the reference topology SVGs; dual light/dark files for illustrated figures.
 - Do not re-explain this pipeline unless the user asks; assume it is known.
 - Do not invent hand-maintained chapter lists in `_quarto.yml`.
 - When unsure whether `_quarto.yml` is stale after content moves, regenerate it.

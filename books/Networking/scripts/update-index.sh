@@ -82,6 +82,9 @@ cat > "$TMP_FILE" <<EOL
 project:
   type: book
   output-dir: _book
+  # Dual-theme topology SVGs (dark siblings swapped in HTML by reader-mode-body.html)
+  resources:
+    - images/*-dark.svg
 
 book:
   title: "$BOOK_NAME"

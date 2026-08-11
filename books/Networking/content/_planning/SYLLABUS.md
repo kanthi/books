@@ -8,7 +8,9 @@ No vendor certification branding. No proprietary exam blueprints. Competence is 
 
 **Lab platform:** Containerlab + free/open network OS and endpoint images (e.g. FRR, Linux, Nokia SR Linux community images, SONiC, VyOS, and other kinds that do not require paid licenses).  
 
-**Diagrams:** under `images/diagram-*.svg` — transparent SVG using `currentColor` so they work in Quarto light and dark themes.
+**Published spine (2026-08-11):** lab platform → networking foundations → L2…fabrics. Models/mental-models archived under `content/_planning/archive/`.
+
+**Diagrams:** under `images/diagram-*.svg` — illustrated topology SVGs (light canvas) + monochrome conceptual figures. Style guide: `images/README.md`.
 
 ---
 
@@ -16,8 +18,8 @@ No vendor certification branding. No proprietary exam blueprints. Competence is 
 
 ### 0.1 Pedagogy
 
-1. **Models before features** — planes, encapsulation, state machines  
-2. **Predict → observe → fix → harden** — every lab  
+1. **Lab platform first** — macOS/Linux host + Containerlab before deep protocols  
+2. **Foundations before features** — TCP/IP, packets, addressing intro, then L2/L3 depth  
 3. **Lab-as-code** — topologies in git; rebuild from nothing  
 4. **Failure is curriculum** — shut links, poison routes, break MTU  
 5. **Vendor-agnostic language** — concepts first; CLI is a dialect  
@@ -51,8 +53,8 @@ You can:
 ## Journey map
 
 ```
-Models + lab craft
-  → Host networking for labs
+Lab platform (macOS / Linux + Containerlab)
+  → Networking foundations (TCP/IP, packets, addressing intro)
   → Bridging domains (L2)
   → Addressing & forwarding (L3)
   → Interior routing

@@ -4,11 +4,11 @@
 # Avoids apt's texlive-fonts-extra (~629 MB, often stalls). Installs only:
 #   - fontawesome5 (Quarto callout icons) into $TEXMFHOME (default ~/texmf)
 #
-# Source: vendored zip at books/ci/fontawesome5.zip (no CTAN/network at CI time).
+# Source: vendored zip at ci/fontawesome5.zip (no CTAN/network at CI time).
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-VENDOR_ZIP="${SCRIPT_DIR}/../ci/fontawesome5.zip"
+VENDOR_ZIP="${SCRIPT_DIR}/../../ci/fontawesome5.zip"
 TINYTEX_HOME="${TINYTEX_HOME:-$HOME/.TinyTeX}"
 export TEXMFHOME="${TEXMFHOME:-$HOME/texmf}"
 

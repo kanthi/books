@@ -1,16 +1,289 @@
 # Quarto Publishing Project Overview
 
+Multi-book [Quarto](https://quarto.org/) monorepo. Each book under `books/` builds to HTML, PDF, and EPUB; a library portal is assembled under `books/published_books/` and deployed to GitHub Pages.
+
+**Agent / maintainer notes:** root `AGENTS.md` (pipeline, naming). Illustrated SVG style: `includes/diagrams/STANDARD.md`.
+
+## Prerequisites
+
+Install these **before** rendering or previewing locally. CI installs its own toolchain on **Ubuntu** (see `.github/workflows/incremental.yml`).
+
+**Primary authoring platforms:** macOS and Linux (bash scripts). **Windows:** use **WSL2 (Ubuntu)** for full parity, or Git Bash with limitations (below).
+
+### What you need (all OSes)
+
+| Tool | Why |
+|------|-----|
+| **Quarto** | Renders HTML / PDF / EPUB. **CI pins `1.3.450`**; local **1.4+ / 1.10.x** usually fine. |
+| **Bash** | `books/indipub.sh`, `indiprev.sh`, `renderpub.sh`, each book’s `scripts/update-index.sh`. |
+| **Python 3** | Preview server (`indiprev.sh`) and helpers (`python3` on `PATH`). |
+| **Git** | Clone and CI change detection. |
+| **TeX (TinyTeX or TeX Live)** | PDF via LuaLaTeX / related engines. Put `lualatex` + `tlmgr` on `PATH`. |
+| **`rsvg-convert` (librsvg)** | Quarto converts SVG figures → PDF. Without it, topology diagrams fail or look wrong in PDF. |
+
+HTML-only can skip TeX:
+
+```bash
+cd books/<BookName>
+quarto render --to html
+```
+
+Pandoc is **bundled with Quarto** — no separate install. Node/Deno are managed by Quarto.
+
+**TeX packages:** first PDF render may pull packages via `tlmgr` (network). Match `tlmgr`’s repository to your TeX Live **year** (frozen historic mirror if needed). CI package list: `ci/tinytex-packages.txt`; setup: `books/scripts/setup-ci-tinytex.sh`.
+
+---
+
+### macOS
+
+**Recommended:** Homebrew + TinyTeX (or MacTeX if you already use it).
+
+#### Install
+
+```bash
+# Package manager
+# https://brew.sh
+/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+
+# Quarto
+brew install --cask quarto
+
+# SVG → PDF (rsvg-convert)
+brew install librsvg
+
+# Python 3 (if missing)
+brew install python
+
+# Git (if missing)
+brew install git
+
+# TinyTeX — minimal TeX for PDF (pick one approach)
+# A) Official TinyTeX: https://yihui.org/tinytex/
+# B) Or full MacTeX: https://www.tug.org/mactex/  (large download)
+```
+
+#### PATH (required for TinyTeX)
+
+After TinyTeX install, engines are often **not** on the default PATH:
+
+```bash
+# Apple Silicon / universal TinyTeX (common layout)
+export PATH="$HOME/Library/TinyTeX/bin/universal-darwin:$PATH"
+
+# Persist (zsh):
+echo 'export PATH="$HOME/Library/TinyTeX/bin/universal-darwin:$PATH"' >> ~/.zshrc
+# Also ensure Homebrew is on PATH (Apple Silicon):
+# echo 'eval "$(/opt/homebrew/bin/brew shellenv)"' >> ~/.zshrc
+```
+
+Repo scripts prepend `/opt/homebrew/bin` automatically when present.
+
+#### Verify & build
+
+```bash
+quarto --version
+python3 --version
+which rsvg-convert lualatex tlmgr
+quarto check
+
+cd books
+./indipub.sh Networking          # HTML + PDF + EPUB
+./indiprev.sh Networking         # HTTPS preview (Safari default)
+./indiprev.sh Networking --browser "Google Chrome"
+```
+
+#### Preview notes (macOS)
+
+- `indiprev.sh` defaults to **HTTPS** on localhost (Safari-friendly) and **Safari**.
+- First visit may need to trust the local self-signed cert under `books/.preview-certs/`.
+- OpenSSL/LibreSSL is usually already available.
+
+---
+
+### Linux
+
+**Recommended:** same shape as CI (Ubuntu/Debian). Other distros: use equivalent packages.
+
+#### Ubuntu / Debian
+
+```bash
+sudo apt-get update
+sudo apt-get install -y --no-install-recommends \
+  curl ca-certificates git python3 \
+  librsvg2-bin unzip xz-utils
+
+# Quarto: install the .deb from https://quarto.org/docs/get-started/
+# Example (check site for current version/arch):
+# curl -LO https://github.com/quarto-dev/quarto-cli/releases/download/v1.3.450/quarto-1.3.450-linux-amd64.deb
+# sudo dpkg -i quarto-1.3.450-linux-amd64.deb
+
+# TinyTeX (user-local; matches CI idea) — https://yihui.org/tinytex/
+# or system TeX Live:
+# sudo apt-get install -y texlive-xetex texlive-luatex texlive-latex-recommended texlive-fonts-recommended
+```
+
+Fedora/RHEL-style (approximate):
+
+```bash
+sudo dnf install -y git python3 librsvg2 curl
+# Quarto: .tar.gz or package from quarto.org
+# TeX: sudo dnf install -y texlive-scheme-basic   # or TinyTeX
+```
+
+Arch-style (approximate):
+
+```bash
+sudo pacman -S git python librsvg
+# yay/paru or manual: quarto-bin; texlive-basic or TinyTeX
+```
+
+#### PATH (TinyTeX on Linux)
+
+```bash
+# After TinyTeX install, bin is typically:
+export PATH="$HOME/.TinyTeX/bin/x86_64-linux:$PATH"
+# arm64:
+# export PATH="$HOME/.TinyTeX/bin/aarch64-linux:$PATH"
+
+# Persist:
+echo 'export PATH="$HOME/.TinyTeX/bin/x86_64-linux:$PATH"' >> ~/.bashrc
+```
+
+#### Verify & build
+
+```bash
+quarto --version
+python3 --version
+which rsvg-convert lualatex tlmgr
+quarto check
+
+cd books
+./indipub.sh Networking
+./indiprev.sh Networking --browser "firefox"   # or chromium
+# or plain HTTP if preferred:
+./indiprev.sh Networking --http --browser "firefox"
+```
+
+#### Preview notes (Linux)
+
+- `indiprev.sh` still works; pass `--browser` (no Safari).
+- OpenSSL is usually present via `openssl` package if cert generation is needed.
+
+#### CI parity
+
+GitHub Actions (Ubuntu) roughly: Quarto **1.3.450**, TinyTeX + `ci/tinytex-packages.txt`, `librsvg2-bin`. Local Ubuntu with the same stack is the closest match to production builds.
+
+---
+
+### Windows
+
+**Recommended path: WSL2 + Ubuntu.** The monorepo’s build/preview scripts are **bash**. Native PowerShell is not a first-class path for `indipub.sh` / `renderpub.sh`.
+
+#### Option A — WSL2 (recommended)
+
+1. Install **WSL2** and an Ubuntu distro (Microsoft Store or `wsl --install`).
+2. Open the Ubuntu shell and follow the **Linux (Ubuntu / Debian)** section above.
+3. Clone or open the repo **inside the Linux filesystem** (e.g. `~/src/books`) for best I/O performance — avoid building only from `/mnt/c/...` if possible.
+4. Run builds from the WSL shell:
+
+```bash
+cd /path/to/repo/books
+./indipub.sh Networking
+./indiprev.sh Networking --http --browser ""   # open the printed URL from Windows browser if needed
+# or: quarto preview books/Networking
+```
+
+Quarto and TeX should be installed **inside WSL**, not only on Windows, so `PATH` is consistent.
+
+#### Option B — Native Windows (limited)
+
+| Piece | How |
+|-------|-----|
+| **Git for Windows** | Provides **Git Bash** so you can run `./indipub.sh` / `update-index.sh`. |
+| **Quarto** | [Windows installer](https://quarto.org/docs/get-started/) — ensure “Add to PATH”. |
+| **Python 3** | [python.org](https://www.python.org/downloads/) or `winget install Python.Python.3.12` — enable “Add to PATH”; use `python` / `py` if `python3` is missing. |
+| **TinyTeX / TeX Live** | [TinyTeX](https://yihui.org/tinytex/) or [TeX Live for Windows](https://tug.org/texlive/). Add the TinyTeX `bin/windows` directory to the **User PATH**. |
+| **rsvg-convert** | Easiest via **MSYS2** (`pacman -S mingw-w64-x86_64-librsvg`) or a Scoop/Chocolatey package that ships `rsvg-convert`. Must be on PATH for PDF figures. |
+
+Example Git Bash session:
+
+```bash
+# Git Bash
+cd /c/Users/you/src/books/books
+export PATH="/c/Program Files/Quarto/bin:$PATH"
+# Add TinyTeX and rsvg bins as installed:
+# export PATH="$HOME/AppData/Roaming/TinyTeX/bin/windows:$PATH"
+
+quarto --version
+./indipub.sh Networking
+```
+
+#### Windows preview caveats
+
+- `indiprev.sh` is oriented toward macOS Safari/HTTPS; on Windows prefer:
+  - `quarto preview` from the book directory, or
+  - WSL + `--http` and open the URL in Edge/Chrome.
+- Line endings: keep shell scripts as LF (`git config core.autocrlf input` recommended for this repo).
+
+#### Not supported as a first-class path
+
+- Running `indipub.sh` from **cmd.exe** / pure PowerShell without Bash.
+- Expecting CI’s exact Ubuntu TinyTeX layout under native Windows without adjusting PATH.
+
+---
+
+### Environment variables (all platforms)
+
+| Variable | Purpose |
+|----------|---------|
+| `PATH` | Must include Quarto, TeX (`lualatex`/`tlmgr`), and `rsvg-convert`. |
+| `QUARTO_DENO_HEAP_MB` | Raise Deno heap for large books (e.g. `6144`); `indipub.sh` sets a high default. |
+| `QUARTO_DENO_V8_OPTIONS` / `QUARTO_DENO_EXTRA_OPTIONS` | Advanced V8 flags; see comments in `books/indipub.sh` (differs Quarto 1.3 vs 1.4+). |
+
+### What you do *not* need
+
+- Per-book Node projects.
+- Hand-edited `_quarto.yml` chapter lists — run each book’s `scripts/update-index.sh`.
+- Committing `_book/` or `published_books/` (gitignored build artifacts).
+
+### Sanity checklist (macOS / Linux / WSL)
+
+```bash
+cd books
+quarto --version && python3 --version
+which rsvg-convert
+which lualatex && lualatex --version | head -1
+
+./indipub.sh Networking    # single book: HTML + PDF + EPUB
+./indiprev.sh Networking   # preview (adjust --browser on Linux/Windows)
+```
+
+### Troubleshooting (common)
+
+| Symptom | Likely fix |
+|---------|------------|
+| PDF hangs on “updating existing packages” | `tlmgr` cannot reach its repo — fix network/mirror (historic TL year if frozen). |
+| PDF figures solid black | SVG used CSS `var()` — use literal hex (`includes/diagrams/STANDARD.md`). |
+| PDF figures blurry | SVG used filters (`feDropShadow`) — remove filters for pure vector PDF. |
+| `lualatex: command not found` | TeX bin not on `PATH` (see OS section). |
+| `rsvg-convert: command not found` | Install librsvg (`brew install librsvg` / `librsvg2-bin` / MSYS2). |
+| Scripts fail on Windows | Use WSL2 or Git Bash; ensure LF line endings. |
+
+---
+
 ## 1. Project Structure
 
 The project is designed to host and publish multiple technical books (or documentation sets) using [Quarto](https://quarto.org/).
 
 ### Key Directories
-- **`/books`**: The core directory containing all book projects. Each subdirectory (e.g., `Git-Github`, `Linux-Commands`) represents a separate book.
+- **`/books`**: Book projects only (e.g. `Networking`, `Go`). Each subdir with `_quarto.yml` is a book — not shared tooling.
+- **`/ci`**: CI / PDF TeX assets (TinyTeX version, package list, Font Awesome zip). **Not a book.**
+- **`/includes`**: Shared monorepo assets (diagram standard, analytics snippet, highlight themes). **Not a book.**
 - **`/Template`**: Preferred scaffold for creating new books.
 - **`/_archive`**: Legacy render scripts, old template, and retired docs (reference only).
 - **`/.github`**: Contains GitHub Actions workflows for automated deployment.
 
-### Book Structure (e.g., inside `/books/Linux-Commands`)
+### Book Structure (e.g., inside `/books/Linux`)
 Each book generally follows this pattern:
 - **`content/`**: (Expected) Contains the actual Markdown (`.md`) or Quarto (`.qmd`) source files, organized by folders (chapters/parts).
 - **`scripts/`**:

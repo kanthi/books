@@ -119,7 +119,7 @@ find_html_entry() {
 
 write_index_header() {
   # Shared GA snippet (same file books inject via Quarto include-in-header)
-  local ga_file="$BOOKS_DIR/includes/google-analytics.inc"
+  local ga_file="$BOOKS_DIR/../includes/google-analytics.inc"
 
   {
     cat <<'HTML'

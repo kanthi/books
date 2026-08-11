@@ -34,6 +34,16 @@ quarto preview
 Pushing to `main` runs CI, which builds all books via `renderpub.sh`
 and deploys `books/published_books` to GitHub Pages.
 
+## Diagrams
+
+Illustrated topology figures use the **monorepo dual-theme SVG standard**:
+
+- Spec: `includes/diagrams/STANDARD.md`
+- Reference art in `images/diagram-reference-topology.svg` (+ `-dark`)
+- Theme swap: `styles/reader-mode-body.html` (from `includes/diagrams/theme-swap.fragment.html`)
+
+See `images/README.md` in this Template.
+
 ## Layout
 
 ```text

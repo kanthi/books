@@ -7,11 +7,12 @@
 #
 # After this script:
 #   - xelatex / tlmgr on PATH
-#   - packages from books/ci/tinytex-packages.txt installed (unless skipped)
+#   - packages from ci/tinytex-packages.txt installed (unless skipped)
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CI_DIR="$(cd "$SCRIPT_DIR/../ci" && pwd)"
+# Monorepo root is two levels up from books/scripts (…/books/scripts → …/ci)
+CI_DIR="$(cd "$SCRIPT_DIR/../../ci" && pwd)"
 VERSION_FILE="$CI_DIR/tinytex-version.txt"
 PKG_FILE="$CI_DIR/tinytex-packages.txt"
 
