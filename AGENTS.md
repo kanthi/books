@@ -33,7 +33,7 @@ A **multi-book Quarto monorepo**. Each book is a self-contained Quarto project u
 
 ### Current books (as of last inventory)
 
-`30DaysOfX`, `90DaysOfX`, `C`, `Git-Github`, `Go`, `Linux`, `Maths`, `Networking`, `NixOS`, `Rust`
+`30DaysOfX`, `90DaysOfX`, `C`, `Git-Github`, `Go`, `Linux`, `Maths`, `Networking`, `NixOS`
 
 - **`Linux`**: merged former `Linux-Commands` + `Linux-Editors` + `Linux-ShellScripting-Bash` (parts `cmd-*`, `editors-*`, `shell-*`).
 
