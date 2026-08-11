@@ -100,7 +100,7 @@ void cache_performance_comparison(void) {
 
 ## Memory Allocation Optimization
 
-Standard memory allocation functions like [malloc](file:///Users/king/Workspace/Repos/books/books/C/content/08-file-io/04-system-programming.md?search=malloc)() and [free](file:///Users/king/Workspace/Repos/books/books/C/content/10-data-structures/01-linear-structures.md?search=free)() can be significant performance bottlenecks in performance-critical applications.
+Standard memory allocation functions like `malloc()` (see [system programming](../08-file-io/04-system-programming.md)) and `free()` (see [linear structures](../10-data-structures/01-linear-structures.md)) can be significant performance bottlenecks in performance-critical applications.
 
 ### Custom Memory Allocators
 

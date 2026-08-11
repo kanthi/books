@@ -477,7 +477,7 @@ The C book under `books/C/` is a modular library, not a 90-day calendar:
 | 14 Testing | `content/14-testing/` | Debug, test, harden |
 | 15 Advanced | `content/15-advanced/` | Threads, systems topics, capstone |
 | Workbook | `content/99-workbook/` | Extra demos, exercises, projects |
-| Appendices | `content/appendices/` | Resources, reference, solution notes |
+| Appendices | `content/100-appendices/` | Resources, reference, solution notes |
 
 ### What to practice first
 

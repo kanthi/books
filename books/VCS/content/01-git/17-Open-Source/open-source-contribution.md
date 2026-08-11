@@ -472,13 +472,13 @@ console.log(result);
 
 ## Documentation
 
-- [API Reference](docs/api.md)
-- [Contributing Guide](CONTRIBUTING.md)
-- [Installation Guide](docs/installation.md)
+- `docs/api.md` (API Reference)
+- `CONTRIBUTING.md`
+- `docs/installation.md` (Installation)
 
 ## Contributing
 
-We welcome contributions! Please see our [Contributing Guide](CONTRIBUTING.md) for details.
+We welcome contributions! Please see our `CONTRIBUTING.md` for details.
 
 ## License
 

@@ -48,12 +48,20 @@ Rules (short):
 
 Root **`AGENTS.md`** also links this standard for session defaults.
 
+## `update-index.sh` (all books)
+
+Every live book (and `Template/`) uses the same generator: **nested sections**, **`humanize_dir_title`** for sidebar labels (including special cases like File I/O, GitHub, NixOS, CLI, SRE), dual-theme `images/*-dark.svg` resources, and `date-modified` / “Updated”. Re-run after any content tree rename.
+
 ## Linux book (combined)
 
 - Path: `Linux/`
 - Merged from former `Linux-Commands`, `Linux-Editors`, `Linux-ShellScripting-Bash`
-- **Sidebar tree** (supported by `scripts/update-index.sh`, nested sections allowed):
+- **Sidebar tree** (nested sections allowed):
   - Part: `content/01-commands/`, `02-editors/`, `03-scripting/`
   - Section: e.g. `01-commands/01-files-and-paths/`, `03-scripting/01-bash/`
   - Nested section (optional): e.g. `03-scripting/01-bash/04-variables/`
   - Chapter: files inside the leaf section
+
+## VCS book
+
+- Path: `VCS/`; Git curriculum under `content/01-git/` (future parts may add `02-…`).

@@ -1,6 +1,6 @@
 # C
 
-Quarto book in the multi-book monorepo. Prefer the repository root **`AGENTS.md`** for the full publish workflow.
+Modular **C17** library: foundations through systems topics, plus workbook and appendices. Prefer root **`AGENTS.md`** for the publish workflow.
 
 ## Layout
 
@@ -14,7 +14,7 @@ C/
 ```
 
 Parts under `content/` (ignored dirs start with `_`):  
-00-intro,01-foundations,02-data-types,03-control-flow,04-functions,05-arrays-strings,06-pointers,07-structures,08-file-io,09-modern-c,10-data-structures,11-network,12-embedded,13-performance,14-testing,15-advanced,99-workbook,appendices,
+00-intro … 15-advanced, 99-workbook (examples/exercises/projects), 100-appendices.
 
 ## Local commands
 

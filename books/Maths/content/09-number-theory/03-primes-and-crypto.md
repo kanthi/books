@@ -95,6 +95,28 @@ Message `m=88`:
 4. Build toy RSA using `p=13, q=19`, choose valid `e`, compute `d`.
 5. Explain why tiny RSA is insecure even if mathematically correct.
 
+## Extended practice: Chinese Remainder Theorem (CRT)
+
+If $n = n_1 n_2$ with $\gcd(n_1,n_2)=1$, and you know $x \bmod n_1$ and $x \bmod n_2$, you can recover $x \bmod n$.
+
+**Toy:** $x \equiv 2 \pmod{3}$, $x \equiv 3 \pmod{5}$. Then $x \equiv 8 \pmod{15}$ (check: $8=2+3\cdot2$, $8=3+5\cdot1$).
+
+CRT speeds RSA private ops when $p$ and $q$ are known (compute mod $p$ and mod $q$, recombine). Same math as “two congruences → one modulus.”
+
+## Discrete log (why Diffie–Hellman is hard)
+
+Given prime $p$, generator $g$, and $y = g^a \bmod p$, recovering $a$ is the **discrete log** problem. Easy direction: exponentiate. Hard direction: invert. DH key exchange relies on that asymmetry—not on secrecy of $p$ or $g$.
+
+## Map to CS
+
+| Idea | Where it shows up |
+|------|-------------------|
+| GCD / Euclid | Fraction reduce, calendar math, RSA setup |
+| Modular inverse | RSA $d$, affine ciphers, some hash constructions |
+| $\varphi(n)$ | Order of multiplicative group mod $n$ |
+| Primality | Key generation; Miller–Rabin in libraries |
+| CRT | Fast RSA, calendar/concurrent scheduling puzzles |
+
 ## Summary
 
-Primes, totients, modular inverses, and fast exponentiation combine into real cryptographic systems. This chapter links pure number theory to practical security engineering.
+Primes, totients, modular inverses, and fast exponentiation combine into real cryptographic systems. This chapter links pure number theory to practical security engineering. For algorithms that *use* number theory at scale, continue to **Algorithms and Complexity** and **Complexity Theory** parts later in this book.

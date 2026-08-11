@@ -49,7 +49,11 @@ All titles are **standalone library books** under `books/<Name>/` (topic-organiz
 | **`Linux`**, **`Linux book`** | `books/Linux/` |
 | **`Networking`**, **`C`**, **`VCS`**, **`Git`** | `books/<Name>/` (`Git` → `books/VCS/`) |
 
-For **NixOS** especially: normal chapters under `01-concepts/` … `08-capstone/` + `99-projects/` — not day-calendar filenames.
+For **NixOS** especially: normal chapters under `01-concepts/` … `02-nix-on-linux/` … `09-capstone/` + `99-projects/` — not day-calendar filenames.
+
+### `update-index.sh` (all books)
+
+Shared behaviour (Template + every live book): nested sections, `humanize_dir_title` for sidebar labels, `project.resources` for dual-theme SVGs, `date-modified` / “Updated” label. Re-run after any content tree rename.
 
 ## Critical rules
 

@@ -1,4 +1,4 @@
-# Git and GitHub Comprehensive Syllabus
+# VCS — Git Syllabus
 
 ## Course Overview
 This comprehensive guide covers Git version control system and GitHub platform from beginner to advanced levels, including practical workflows, collaboration techniques, and best practices.

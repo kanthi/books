@@ -4,7 +4,7 @@
 
 `pushd`, `popd`, and `dirs` maintain a **directory stack** in bash. `pushd` changes directory and pushes the previous location; `popd` returns; `dirs` lists the stack. Handy when hopping between build trees, config dirs, and logs without losing your place. For a single previous directory, `cd -` is enough.
 
-Light operator page — stack gymnastics in large scripts belong in ShellScripting practices.
+Light operator page — stack gymnastics in large scripts belong in **Scripting → Bash** in this book.
 
 ## Syntax
 

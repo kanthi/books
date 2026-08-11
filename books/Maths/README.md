@@ -13,8 +13,10 @@ Maths/
 └── _quarto.yml               # GENERATED — do not hand-edit
 ```
 
-Parts under `content/` (ignored dirs start with `_`):  
-00-Intro,01-Arithmetic,02-Geometry,03-Pre-Algebra,04-Algebra,05-LinearAlgebra,06-DiscreteMathematics,07-Statistics,08-Calculus,09-Number-Theory,10-Information-Theory,11-Optimization,12-Machine-Learning-Math,13-Algorithms-Complexity,14-Graph-Theory,15-Numerical-Methods,16-Data-Science-Math,17-Probability-Advanced,18-Linear-Algebra-Advanced,19-Complexity-Theory,
+Parts under `content/` (ignored dirs start with `_`; kebab-case):  
+00-intro, 01-arithmetic … 05-linear-algebra, 06-discrete-mathematics, … 12-machine-learning-math, 13-algorithms-complexity, … 19-complexity-theory.
+
+Learning paths (CS spine, ML, refresh-from-zero) are on `index.qmd`.
 
 ## Local commands
 

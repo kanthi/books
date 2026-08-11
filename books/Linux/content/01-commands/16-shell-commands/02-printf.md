@@ -4,7 +4,7 @@
 
 `printf` formats and prints arguments using a format string, like C’s `printf`. Prefer it over `echo` when you need reliable escapes, fixed columns, no unexpected options parsing, or portable scripts. Available as a bash builtin and `/usr/bin/printf` (usually identical enough for ops use).
 
-Keep complex format logic in the ShellScripting book; here are the operator essentials.
+Keep complex format logic in **Scripting → Bash** in this book; here are the operator essentials.
 
 ## Syntax
 

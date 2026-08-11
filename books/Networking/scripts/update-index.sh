@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Generate _quarto.yml from content/ directory layout.
 # Do not hand-edit _quarto.yml; re-run this script after structural changes.
+# Supports nested sections (part → section → nested section → chapters).
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -9,7 +10,6 @@ CONTENT_DIR="$BOOK_DIR/content"
 QUARTO_YML="$BOOK_DIR/_quarto.yml"
 BOOK_NAME="$(basename "$BOOK_DIR")"
 
-# Repo homepage used in the book navbar (monorepo).
 REPO_URL="${BOOK_REPO_URL:-https://github.com/kanthi/books}"
 BOOK_AUTHOR="${BOOK_AUTHOR:-K19G}"
 
@@ -24,7 +24,6 @@ extract_qmd_title() {
   local title=""
 
   if [ -f "$file" ]; then
-    # YAML frontmatter title: (first --- block only)
     title="$(awk '
       BEGIN { in_fm=0 }
       /^---[[:space:]]*$/ {
@@ -43,7 +42,6 @@ extract_qmd_title() {
       return
     fi
 
-    # First markdown H1; strip optional Pandoc attrs like {.unnumbered}
     title="$(head -n 20 "$file" | grep -E '^#[[:space:]]+' | head -n 1 | sed -E 's/^#[[:space:]]+//')"
     title="${title%% \{*}"
     title="$(printf '%s' "$title" | sed -E 's/[[:space:]]+$//')"
@@ -55,23 +53,127 @@ extract_qmd_title() {
 
   local dirname
   dirname="$(basename "$(dirname "$file")")"
-  printf '%s\n' "$dirname" | sed -E 's/^[0-9]+-?//' | sed 's/-/ /g' | awk '{for(i=1;i<=NF;i++)sub(/./,toupper(substr($i,1,1)),$i)}1'
+  humanize_dir_title "$dirname"
+}
+
+# Title-case a directory basename with special cases and small-word rules.
+humanize_dir_title() {
+  local slug title
+  slug="$(echo "$1" | sed -E 's/^[0-9]+-?//')"
+  # Split CamelCase leftovers: LinearAlgebra → Linear Algebra
+  slug="$(echo "$slug" | sed -E 's/([a-z])([A-Z])/\1-\2/g' | tr '[:upper:]' '[:lower:]')"
+
+  case "$slug" in
+    # Linux
+    terminals-and-mux)          printf '%s\n' "Terminals and Multiplexers"; return ;;
+    help-and-docs)              printf '%s\n' "Help and Docs"; return ;;
+    services-and-runtime)       printf '%s\n' "Services and Runtime"; return ;;
+    text-and-pipes)             printf '%s\n' "Text and Pipes"; return ;;
+    files-and-paths)            printf '%s\n' "Files and Paths"; return ;;
+    archives-and-compression)   printf '%s\n' "Archives and Compression"; return ;;
+    processes-and-jobs)         printf '%s\n' "Processes and Jobs"; return ;;
+    users-and-groups)           printf '%s\n' "Users and Groups"; return ;;
+    storage-and-filesystems)    printf '%s\n' "Storage and Filesystems"; return ;;
+    system-information)         printf '%s\n' "System Information"; return ;;
+    system-monitoring)          printf '%s\n' "System Monitoring"; return ;;
+    shell-commands)             printf '%s\n' "Shell Commands"; return ;;
+    intro-to-shells)            printf '%s\n' "Intro to Shells"; return ;;
+    bash-features)              printf '%s\n' "Bash Features"; return ;;
+    lazyvim)                    printf '%s\n' "LazyVim"; return ;;
+    modern-tools)               printf '%s\n' "Modern Tools"; return ;;
+    # C
+    file-io)                    printf '%s\n' "File I/O"; return ;;
+    arrays-strings)             printf '%s\n' "Arrays and Strings"; return ;;
+    data-types)                 printf '%s\n' "Data Types"; return ;;
+    control-flow)               printf '%s\n' "Control Flow"; return ;;
+    data-structures)            printf '%s\n' "Data Structures"; return ;;
+    modern-c)                   printf '%s\n' "Modern C"; return ;;
+    # Go
+    concurrency-parallelism)    printf '%s\n' "Concurrency and Parallelism"; return ;;
+    performance-tooling)        printf '%s\n' "Performance and Tooling"; return ;;
+    network-systems)            printf '%s\n' "Network Systems"; return ;;
+    systems-programming)        printf '%s\n' "Systems Programming"; return ;;
+    distributed-infra)          printf '%s\n' "Distributed Infrastructure"; return ;;
+    observability-sre)          printf '%s\n' "Observability and SRE"; return ;;
+    security-hardening)         printf '%s\n' "Security Hardening"; return ;;
+    performance-engineering)    printf '%s\n' "Performance Engineering"; return ;;
+    modern-go-book-synthesis)   printf '%s\n' "Modern Go Synthesis"; return ;;
+    go-deep-dives)              printf '%s\n' "Go Deep Dives"; return ;;
+    concurrency-ground-up)      printf '%s\n' "Concurrency Ground Up"; return ;;
+    web-development-in-go)      printf '%s\n' "Web Development in Go"; return ;;
+    cli-tools-in-go)            printf '%s\n' "CLI Tools in Go"; return ;;
+    # NixOS
+    front-matter)               printf '%s\n' "Front Matter"; return ;;
+    nix-on-linux)               printf '%s\n' "Nix on Linux"; return ;;
+    nixos-host)                 printf '%s\n' "NixOS Host"; return ;;
+    home-and-flake-layout)      printf '%s\n' "Home and Flake Layout"; return ;;
+    services-and-security)      printf '%s\n' "Services and Security"; return ;;
+    ops-and-fleet)              printf '%s\n' "Ops and Fleet"; return ;;
+    # Maths
+    pre-algebra)                printf '%s\n' "Pre-Algebra"; return ;;
+    linear-algebra)             printf '%s\n' "Linear Algebra"; return ;;
+    discrete-mathematics)       printf '%s\n' "Discrete Mathematics"; return ;;
+    number-theory)              printf '%s\n' "Number Theory"; return ;;
+    information-theory)         printf '%s\n' "Information Theory"; return ;;
+    machine-learning-math)      printf '%s\n' "Machine Learning Math"; return ;;
+    algorithms-complexity)      printf '%s\n' "Algorithms and Complexity"; return ;;
+    graph-theory)               printf '%s\n' "Graph Theory"; return ;;
+    numerical-methods)          printf '%s\n' "Numerical Methods"; return ;;
+    data-science-math)          printf '%s\n' "Data Science Math"; return ;;
+    probability-advanced)       printf '%s\n' "Probability (Advanced)"; return ;;
+    linear-algebra-advanced)    printf '%s\n' "Linear Algebra (Advanced)"; return ;;
+    complexity-theory)          printf '%s\n' "Complexity Theory"; return ;;
+    # Networking
+    lab-platform)               printf '%s\n' "Lab Platform"; return ;;
+    networking-foundations)     printf '%s\n' "Networking Foundations"; return ;;
+    layer-2)                    printf '%s\n' "Layer 2"; return ;;
+    layer-3)                    printf '%s\n' "Layer 3"; return ;;
+    interior-routing)           printf '%s\n' "Interior Routing"; return ;;
+    ops-automation)             printf '%s\n' "Ops and Automation"; return ;;
+    edge-and-services)          printf '%s\n' "Edge and Services"; return ;;
+    policy-qos-hardening)       printf '%s\n' "Policy, QoS, and Hardening"; return ;;
+    overlays-tunnels)           printf '%s\n' "Overlays and Tunnels"; return ;;
+    fabrics-multi-area)         printf '%s\n' "Fabrics and Multi-Area"; return ;;
+    # VCS (before generic CamelCase split effects: GitHub → git-hub)
+    git-fundamentals)           printf '%s\n' "Git Fundamentals"; return ;;
+    core-operations)            printf '%s\n' "Core Operations"; return ;;
+    git-internals)              printf '%s\n' "Git Internals"; return ;;
+    advanced-branching)         printf '%s\n' "Advanced Branching"; return ;;
+    github-intro|git-hub-intro) printf '%s\n' "GitHub Intro"; return ;;
+    rewriting-history)          printf '%s\n' "Rewriting History"; return ;;
+    advanced-commands)          printf '%s\n' "Advanced Commands"; return ;;
+    hooks-automation)           printf '%s\n' "Hooks and Automation"; return ;;
+    github-actions|git-hub-actions) printf '%s\n' "GitHub Actions"; return ;;
+    github-advanced|git-hub-advanced) printf '%s\n' "GitHub Advanced"; return ;;
+    open-source)                printf '%s\n' "Open Source"; return ;;
+    team-collaboration)         printf '%s\n' "Team Collaboration"; return ;;
+    advanced-topics)            printf '%s\n' "Advanced Topics"; return ;;
+  esac
+
+  title="$(echo "$slug" | sed 's/-/ /g' | awk '{
+    small["and"]=1; small["or"]=1; small["to"]=1; small["of"]=1;
+    small["for"]=1; small["in"]=1; small["on"]=1; small["the"]=1; small["a"]=1;
+    for (i=1;i<=NF;i++) {
+      w=tolower($i)
+      if (i>1 && (w in small)) $i=w
+      else $i=toupper(substr(w,1,1)) substr(w,2)
+    }
+    print
+  }')"
+  printf '%s\n' "$title"
 }
 
 get_metadata() {
   local dir="$1"
-  local dirname
+  local dirname order title
   dirname="$(basename "$dir")"
-  local order title
 
   if [[ $dirname =~ ^[0-9]+ ]]; then
     order="${BASH_REMATCH[0]}"
-    title="$(echo "$dirname" | sed -E 's/^[0-9]+-?//' | sed 's/-/ /g' | awk '{for(i=1;i<=NF;i++)sub(/./,toupper(substr($i,1,1)),$i)}1')"
   else
     order="99"
-    title="$(echo "$dirname" | sed 's/-/ /g' | awk '{for(i=1;i<=NF;i++)sub(/./,toupper(substr($i,1,1)),$i)}1')"
   fi
-
+  title="$(humanize_dir_title "$dirname")"
   printf '%s|%s\n' "$order" "$title"
 }
 
@@ -82,7 +184,7 @@ cat > "$TMP_FILE" <<EOL
 project:
   type: book
   output-dir: _book
-  # Dual-theme topology SVGs (dark siblings swapped in HTML by reader-mode-body.html)
+  # Dual-theme illustrated SVGs (dark siblings swapped in HTML — see includes/diagrams/STANDARD.md)
   resources:
     - images/*-dark.svg
 
@@ -104,6 +206,63 @@ book:
     - index.qmd
 EOL
 
+emit_chapter_files() {
+  local folder="$1"
+  local rel="$2"
+  local ind="$3"
+  local ext doc doc_name file_title
+
+  for ext in qmd md; do
+    if [ -f "$folder/index.$ext" ]; then
+      file_title="$(extract_qmd_title "$folder/index.$ext")"
+      {
+        echo "${ind}- text: \"$file_title\""
+        echo "${ind}  file: ${rel}/index.$ext"
+      } >> "$TMP_FILE"
+      break
+    fi
+  done
+
+  while IFS= read -r -d '' doc; do
+    doc_name="$(basename "$doc")"
+    [[ "$doc_name" == index.* ]] && continue
+    file_title="$(extract_qmd_title "$doc")"
+    {
+      echo "${ind}- text: \"$file_title\""
+      echo "${ind}  file: ${rel}/${doc_name}"
+    } >> "$TMP_FILE"
+  done < <(find "$folder" -maxdepth 1 -type f \( -name "*.qmd" -o -name "*.md" \) -print0 2>/dev/null | sort -z)
+}
+
+emit_section() {
+  local folder="$1"
+  local rel="$2"
+  local ind="$3"
+  local nested_ind="${ind}  "
+  local item_ind="${nested_ind}  "
+  local name title sub sub_name sub_rel
+  local has_nested=0
+
+  name="$(basename "$folder")"
+  title="$(humanize_dir_title "$name")"
+
+  {
+    echo "${ind}- section: \"$title\""
+    echo "${ind}  contents:"
+  } >> "$TMP_FILE"
+
+  for sub in "$folder"/*; do
+    if [ -d "$sub" ] && [[ ! $(basename "$sub") == _* ]]; then
+      has_nested=1
+      sub_name="$(basename "$sub")"
+      sub_rel="${rel}/${sub_name}"
+      emit_section "$sub" "$sub_rel" "$item_ind"
+    fi
+  done
+
+  emit_chapter_files "$folder" "$rel" "$item_ind"
+}
+
 process_directory() {
   local dir="$1"
   local metadata order title
@@ -116,7 +275,7 @@ process_directory() {
     echo "      contents:"
   } >> "$TMP_FILE"
 
-  local ext doc doc_name file_title subdir subdir_name relative_path
+  local ext doc doc_name file_title subdir
 
   for ext in qmd md; do
     if [ -f "$dir/index.$ext" ]; then
@@ -125,39 +284,23 @@ process_directory() {
         echo "        - text: \"$file_title\""
         echo "          file: content/$(basename "$dir")/index.$ext"
       } >> "$TMP_FILE"
+      break
     fi
-
-    # Lexicographic order via sorted null-safe listing
-    while IFS= read -r -d '' doc; do
-      doc_name="$(basename "$doc")"
-      [ "$doc_name" = "index.$ext" ] && continue
-      file_title="$(extract_qmd_title "$doc")"
-      {
-        echo "        - text: \"$file_title\""
-        echo "          file: content/$(basename "$dir")/${doc_name}"
-      } >> "$TMP_FILE"
-    done < <(find "$dir" -maxdepth 1 -type f -name "*.$ext" -print0 2>/dev/null | sort -z)
   done
+
+  while IFS= read -r -d '' doc; do
+    doc_name="$(basename "$doc")"
+    [[ "$doc_name" == index.* ]] && continue
+    file_title="$(extract_qmd_title "$doc")"
+    {
+      echo "        - text: \"$file_title\""
+      echo "          file: content/$(basename "$dir")/${doc_name}"
+    } >> "$TMP_FILE"
+  done < <(find "$dir" -maxdepth 1 -type f \( -name "*.qmd" -o -name "*.md" \) -print0 2>/dev/null | sort -z)
 
   for subdir in "$dir"/*; do
     if [ -d "$subdir" ] && [[ ! $(basename "$subdir") == _* ]]; then
-      subdir_name="$(basename "$subdir")"
-      {
-        echo "        - section: \"$subdir_name\""
-        echo "          contents:"
-      } >> "$TMP_FILE"
-
-      for ext in qmd md; do
-        while IFS= read -r -d '' doc; do
-          doc_name="$(basename "$doc")"
-          file_title="$(extract_qmd_title "$doc")"
-          relative_path="content/$(basename "$dir")/$(basename "$subdir")"
-          {
-            echo "            - text: \"$file_title\""
-            echo "              file: ${relative_path}/${doc_name}"
-          } >> "$TMP_FILE"
-        done < <(find "$subdir" -maxdepth 1 -type f -name "*.$ext" -print0 2>/dev/null | sort -z)
-      done
+      emit_section "$subdir" "content/$(basename "$dir")/$(basename "$subdir")" "        "
     fi
   done
 }
@@ -203,6 +346,7 @@ format:
       - styles/reader-mode-body.html
 
   pdf:
+    pdf-engine-max-runs: 4
     documentclass: scrreprt
     classoption: ["oneside"]
     number-sections: false

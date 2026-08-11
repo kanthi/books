@@ -14,7 +14,9 @@ Go/
 ```
 
 Parts under `content/` (ignored dirs start with `_`):  
-01-foundations,02-core,03-memory,04-generics,05-errors,06-testing,07-concurrency-parallelism,08-web,09-performance-tooling,10-infrastructure,11-security,12-specialized,13-network-systems,14-systems-programming,15-distributed-infra,16-observability-sre,17-security-hardening,18-performance-engineering,19-modern-go-book-synthesis,20-go-deep-dives,21-concurrency-ground-up,98-stdlib,99-projects,
+01-foundations … 11-security, 12-specialized … 18-performance-engineering, 19-modern-go-book-synthesis, 20-go-deep-dives, **21-concurrency-ground-up**, **22-web-development-in-go**, **23-cli-tools-in-go**, 98-stdlib, 99-projects.
+
+Overlapping “twin” parts (survey vs deep track) are explained on `index.qmd` — prefer one path, not both end-to-end.
 
 ## Local commands
 

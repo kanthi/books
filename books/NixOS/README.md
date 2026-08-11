@@ -1,9 +1,10 @@
 # NixOS
 
-Personal **journey notes** on Nix & NixOS as a **topic-oriented book** (parts and chapters), not a day calendar.
+Personal **journey notes** on Nix & NixOS as a **topic-oriented book** (parts and chapters), not a day calendar or certification track.
 
-**Baseline:** NixOS **26.05 “Yarara”** (as of mid-2026).  
-Not a certification course. Day-paced curriculum, if you want one, is a separate monorepo track—not this book’s structure.
+**Baseline:** NixOS **26.05 “Yarara”** (as of mid-2026).
+
+Parts are numbered uniquely (`01-concepts`, `02-nix-on-linux`, `03-nixos-host`, … `09-capstone`, `99-projects`). Fedora dual-stack learners start with Concepts → Nix on Linux.
 
 
 

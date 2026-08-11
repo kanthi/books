@@ -1,24 +1,15 @@
-# Chapter 21: Miscellaneous Git Tools and Alternatives
+---
+title: "Misc: Other forges and tools"
+---
 
-This chapter covers additional Git-related tools and modern alternatives that can enhance your version control workflow:
+# Misc: Other forges and tools
 
-## What You'll Learn
+Git is the common core; forges and next-generation CLIs change the day-to-day surface.
 
-- **Gitea**: Self-hosted Git service with web interface
-- **GitLab**: Comprehensive DevOps platform with Git hosting
-- **Jujutsu (jj)**: Modern version control system built on Git
+| Chapter | Focus |
+|---------|--------|
+| **GitLab** | Groups, MRs, CI YAML, self-host notes |
+| **Gitea** | Lightweight self-hosted forge |
+| **Jujutsu (`jj`)** | Compatible VCS UX on Git repos |
 
-## Chapter Contents
-
-1. [Gitea Setup and Configuration](gitea.md)
-2. [GitLab Installation and Management](gitlab.md)
-3. [Jujutsu: Next-Generation Version Control](jujutsu.md)
-
-## Why These Tools Matter
-
-While Git is the de facto standard for version control, the ecosystem around it continues to evolve. Self-hosted solutions like Gitea and GitLab provide alternatives to GitHub for organizations wanting more control, while tools like Jujutsu represent the next evolution in version control user experience.
-
-Each tool serves different needs:
-- **Gitea**: Lightweight, fast, and easy to deploy
-- **GitLab**: Full-featured DevOps platform with CI/CD
-- **Jujutsu**: Modern UX with powerful conflict resolution
+Read these after you are solid on remotes, branching, and GitHub workflows—or jump here if your workplace already uses one of these tools.

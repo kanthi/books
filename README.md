@@ -4,6 +4,20 @@ Multi-book [Quarto](https://quarto.org/) monorepo. Each book under `books/` buil
 
 **Agent / maintainer notes:** root `AGENTS.md` (pipeline, naming). Illustrated SVG style: `includes/diagrams/STANDARD.md`.
 
+## Current books
+
+| Book | Path | Focus |
+|------|------|--------|
+| **C** | `books/C/` | C17 modular library + workbook |
+| **Go** | `books/Go/` | Deep Go library (paths A–G, projects) |
+| **Linux** | `books/Linux/` | Commands + Editors + Bash |
+| **Maths** | `books/Maths/` | CS / ML mathematics library |
+| **Networking** | `books/Networking/` | First principles → NetOps + Containerlab |
+| **NixOS** | `books/NixOS/` | Nix & NixOS (Fedora bridge → fleet) |
+| **VCS** | `books/VCS/` | Version control; Git under `content/01-git/` |
+
+Single-book build from `books/`: `./indipub.sh <Name>` (e.g. `./indipub.sh VCS`).
+
 ## Prerequisites
 
 Install these **before** rendering or previewing locally. CI installs its own toolchain on **Ubuntu** (see `.github/workflows/incremental.yml`).
