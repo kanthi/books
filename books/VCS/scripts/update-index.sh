@@ -139,8 +139,10 @@ process_directory() {
   for subdir in "$dir"/*; do
     if [ -d "$subdir" ] && [[ ! $(basename "$subdir") == _* ]]; then
       subdir_name="$(basename "$subdir")"
+      # Humanize: 02-Git-Fundamentals → Git Fundamentals
+      section_title="$(echo "$subdir_name" | sed -E 's/^[0-9]+-?//' | sed 's/-/ /g' | awk '{for(i=1;i<=NF;i++)sub(/./,toupper(substr($i,1,1)),$i)}1')"
       {
-        echo "        - section: \"$subdir_name\""
+        echo "        - section: \"$section_title\""
         echo "          contents:"
       } >> "$TMP_FILE"
 

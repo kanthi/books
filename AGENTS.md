@@ -33,7 +33,7 @@ A **multi-book Quarto monorepo**. Each book is a self-contained Quarto project u
 
 ### Current books (as of last inventory)
 
-`C`, `Git-Github`, `Go`, `Linux`, `Maths`, `Networking`, `NixOS`
+`C`, `Go`, `Linux`, `Maths`, `Networking`, `NixOS`, `VCS`
 
 - **`Linux`**: merged former `Linux-Commands` + `Linux-Editors` + `Linux-ShellScripting-Bash` (parts Commands / Editors / Scripting→Bash).
 
@@ -47,7 +47,7 @@ All titles are **standalone library books** under `books/<Name>/` (topic-organiz
 | **`NixOS`**, **`NixOS book`** | `books/NixOS/` |
 | **`Maths`**, **`Maths book`** | `books/Maths/` |
 | **`Linux`**, **`Linux book`** | `books/Linux/` |
-| **`Networking`**, **`C`**, **`Git-Github`** | `books/<Name>/` |
+| **`Networking`**, **`C`**, **`VCS`**, **`Git`** | `books/<Name>/` (`Git` → `books/VCS/`) |
 
 For **NixOS** especially: normal chapters under `01-concepts/` … `08-capstone/` + `99-projects/` — not day-calendar filenames.
 

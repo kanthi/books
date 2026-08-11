@@ -25,7 +25,7 @@ For books using `scripts/update-index.sh` in this repo:
 
 ## Book naming
 
-All titles under `books/` are **standalone libraries**. Paths: `books/Go/`, `books/NixOS/`, `books/Maths/`, `books/Linux/`, `books/Networking/`, `books/C/`, `books/Git-Github/`. Prefer root **`AGENTS.md`** for inventory and workflow.
+All titles under `books/` are **standalone libraries**. Paths: `books/Go/`, `books/NixOS/`, `books/Maths/`, `books/Linux/`, `books/Networking/`, `books/C/`, `books/VCS/` (Git content under `content/01-git/`). Prefer root **`AGENTS.md`** for inventory and workflow.
 
 ## Illustrated diagrams (all books)
 
