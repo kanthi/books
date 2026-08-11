@@ -102,7 +102,7 @@ cd books
 
 ### Linux
 
-**Recommended:** same shape as CI (Ubuntu/Debian). Other distros: use equivalent packages.
+CI runs on **Ubuntu**. Local authoring is fully supported on **Fedora** and other distros with the packages below. The critical PDF dependency that differs by distro name is **`rsvg-convert`**.
 
 #### Ubuntu / Debian
 
@@ -110,34 +110,172 @@ cd books
 sudo apt-get update
 sudo apt-get install -y --no-install-recommends \
   curl ca-certificates git python3 \
-  librsvg2-bin unzip xz-utils
+  librsvg2-bin unzip xz-utils openssl
 
 # Quarto: install the .deb from https://quarto.org/docs/get-started/
-# Example (check site for current version/arch):
+# Example (check site for current version/arch; CI pins 1.3.450):
 # curl -LO https://github.com/quarto-dev/quarto-cli/releases/download/v1.3.450/quarto-1.3.450-linux-amd64.deb
 # sudo dpkg -i quarto-1.3.450-linux-amd64.deb
 
-# TinyTeX (user-local; matches CI idea) — https://yihui.org/tinytex/
+# TinyTeX (user-local; matches CI) — https://yihui.org/tinytex/
 # or system TeX Live:
 # sudo apt-get install -y texlive-xetex texlive-luatex texlive-latex-recommended texlive-fonts-recommended
 ```
 
-Fedora/RHEL-style (approximate):
+`rsvg-convert` package name on Debian/Ubuntu: **`librsvg2-bin`**.
+
+#### Fedora / RHEL / CentOS Stream / Alma / Rocky
+
+Tested shape: **Fedora 40+** (including Fedora 44) with user-local Quarto + TinyTeX. Same commands work on RHEL-family clones via `dnf` / `yum`.
+
+##### 1. System packages
 
 ```bash
-sudo dnf install -y git python3 librsvg2 curl
-# Quarto: .tar.gz or package from quarto.org
-# TeX: sudo dnf install -y texlive-scheme-basic   # or TinyTeX
+sudo dnf install -y \
+  git curl ca-certificates python3 \
+  unzip xz openssl \
+  librsvg2-tools
 ```
 
-Arch-style (approximate):
+| Package | Provides | Notes |
+|---------|----------|--------|
+| **`librsvg2-tools`** | `/usr/bin/rsvg-convert` | **Required for PDF.** Name is **not** `librsvg2` alone — the tools subpackage ships the CLI. |
+| `git`, `python3`, `curl`, `openssl` | clone, `indiprev.sh`, HTTPS | Usually already present on desktop Fedora. |
+
+Without `rsvg-convert`, Quarto aborts PDF when a book embeds SVG (e.g. **30DaysOfX**, **90DaysOfX**, **Networking** diagrams):
+
+```text
+ERROR: Failed when attempting to convert a SVG to a PDF for output.
+Please ensure that rsvg-convert is available on the path.
+```
+
+`indipub.sh` uses `set -e`, so a PDF failure **stops** that book’s EPUB/HTML passes too. Fix PATH / install `librsvg2-tools`, then re-run.
+
+##### 2. Quarto (user-local tarball — no root)
+
+Official releases: <https://quarto.org/docs/get-started/> and
+<https://github.com/quarto-dev/quarto-cli/releases>.
 
 ```bash
-sudo pacman -S git python librsvg
+# Example for amd64; bump version as needed (CI pins 1.3.450)
+VER=1.3.450
+mkdir -p "$HOME/.local/opt" "$HOME/.local/bin"
+cd /tmp
+curl -fL -o "quarto-${VER}-linux-amd64.tar.gz" \
+  "https://github.com/quarto-dev/quarto-cli/releases/download/v${VER}/quarto-${VER}-linux-amd64.tar.gz"
+tar -xzf "quarto-${VER}-linux-amd64.tar.gz" -C "$HOME/.local/opt"
+# tarball expands to a versioned directory; symlink a stable name:
+ln -sfn "$HOME/.local/opt/quarto-${VER}" "$HOME/.local/opt/quarto"
+ln -sfn "$HOME/.local/opt/quarto/bin/quarto" "$HOME/.local/bin/quarto"
+
+# Ensure ~/.local/bin is on PATH (bash):
+grep -q '.local/bin' ~/.bashrc || \
+  echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc
+# fish:
+# fish_add_path $HOME/.local/bin
+```
+
+##### 3. TinyTeX (recommended PDF stack)
+
+Matches CI idea (user-local engines + `tlmgr`):
+
+```bash
+# https://yihui.org/tinytex/
+curl -sL "https://yihui.org/tinytex/install-bin-unix.sh" | sh
+
+# PATH — engines live under ~/.TinyTeX (not system texlive)
+export PATH="$HOME/.TinyTeX/bin/x86_64-linux:$PATH"
+# aarch64:
+# export PATH="$HOME/.TinyTeX/bin/aarch64-linux:$PATH"
+
+# Persist (bash):
+echo 'export PATH="$HOME/.TinyTeX/bin/x86_64-linux:$PATH"' >> ~/.bashrc
+# fish:
+# fish_add_path $HOME/.TinyTeX/bin/x86_64-linux
+
+# Optional: install monorepo TeX extras the way CI does (from repo root):
+# bash books/scripts/setup-ci-tinytex.sh   # or follow ci/README.md + ci/tinytex-packages.txt
+```
+
+Books in this monorepo often use **XeLaTeX** (`xelatex`) as well as LuaLaTeX. After TinyTeX is on `PATH`:
+
+```bash
+which xelatex lualatex tlmgr
+```
+
+##### 4. Optional: system TeX Live (Fedora)
+
+If you prefer distro packages instead of TinyTeX (larger download, different upgrade path):
+
+```bash
+sudo dnf install -y \
+  texlive-scheme-basic \
+  texlive-xetex \
+  texlive-luatex \
+  texlive-collection-latexrecommended \
+  texlive-collection-fontsrecommended
+# Extra packages may still be needed for some books; tlmgr is TinyTeX-oriented.
+```
+
+Prefer **one** TeX install on `PATH` to avoid mixed-year `tlmgr` confusion.
+
+##### 5. No root? Install `rsvg-convert` from the RPM only
+
+If you cannot `sudo dnf install` but can download packages:
+
+```bash
+mkdir -p /tmp/rsvg-extract "$HOME/.local/bin"
+cd /tmp/rsvg-extract
+dnf download librsvg2-tools
+rpm2cpio librsvg2-tools-*.rpm | cpio -idmv
+cp -a ./usr/bin/rsvg-convert "$HOME/.local/bin/"
+export PATH="$HOME/.local/bin:$PATH"
+rsvg-convert --version
+# Shared libs usually already exist via other GUI packages; check:
+# ldd "$HOME/.local/bin/rsvg-convert" | grep 'not found'
+```
+
+##### 6. Verify & build (Fedora)
+
+```bash
+export PATH="$HOME/.local/bin:$HOME/.TinyTeX/bin/x86_64-linux:$PATH"
+
+quarto --version          # expect 1.3.x or newer
+python3 --version
+which rsvg-convert xelatex lualatex tlmgr
+rsvg-convert --version
+quarto check
+
+cd books
+./indipub.sh Networking          # single book: HTML + PDF + EPUB
+./indipub.sh Linux               # merged Commands / Editors / Bash book
+./renderpub.sh                   # full library + published_books portal
+./indiprev.sh Networking --browser "firefox"
+# or:
+./indiprev.sh Networking --http --browser "firefox"
+```
+
+Portal output: `books/published_books/index.html` (gitignored; regenerate with `bash scripts/gen-portal.sh` after harvesting).
+
+##### Fedora package cheat sheet
+
+| Need | Fedora (`dnf`) | Debian/Ubuntu (`apt`) |
+|------|----------------|------------------------|
+| SVG → PDF CLI | **`librsvg2-tools`** | **`librsvg2-bin`** |
+| Python 3 | `python3` | `python3` |
+| Git / curl | `git` `curl` | `git` `curl` |
+| Quarto | tarball → `~/.local` (or COPR if you prefer) | `.deb` from releases |
+| TeX | TinyTeX **or** `texlive-xetex` / schemes | TinyTeX **or** `texlive-*` |
+
+#### Arch (approximate)
+
+```bash
+sudo pacman -S git python librsvg curl openssl unzip
 # yay/paru or manual: quarto-bin; texlive-basic or TinyTeX
+# rsvg-convert: package name is librsvg
 ```
 
-#### PATH (TinyTeX on Linux)
+#### PATH (TinyTeX on Linux — all distros)
 
 ```bash
 # After TinyTeX install, bin is typically:
@@ -145,11 +283,15 @@ export PATH="$HOME/.TinyTeX/bin/x86_64-linux:$PATH"
 # arm64:
 # export PATH="$HOME/.TinyTeX/bin/aarch64-linux:$PATH"
 
-# Persist:
+# Persist (bash):
 echo 'export PATH="$HOME/.TinyTeX/bin/x86_64-linux:$PATH"' >> ~/.bashrc
+# fish:
+# fish_add_path $HOME/.TinyTeX/bin/x86_64-linux
 ```
 
-#### Verify & build
+Also keep `~/.local/bin` on `PATH` if Quarto or a user-local `rsvg-convert` lives there.
+
+#### Verify & build (generic Linux)
 
 ```bash
 quarto --version
@@ -166,13 +308,14 @@ cd books
 
 #### Preview notes (Linux)
 
-- `indiprev.sh` still works; pass `--browser` (no Safari).
-- OpenSSL is usually present via `openssl` package if cert generation is needed.
+- `indiprev.sh` still works; pass `--browser` (no Safari). Common: `firefox`, `chromium-browser`, `google-chrome`.
+- OpenSSL is usually present via the `openssl` package if cert generation is needed.
+- On **fish**, export PATH with `fish_add_path` (see Fedora section) rather than `export` in `~/.bashrc` only.
 
 #### CI parity
 
-GitHub Actions (Ubuntu) roughly: Quarto **1.3.450**, TinyTeX + `ci/tinytex-packages.txt`, `librsvg2-bin`. Local Ubuntu with the same stack is the closest match to production builds.
-
+GitHub Actions (Ubuntu) roughly: Quarto **1.3.450**, TinyTeX + `ci/tinytex-packages.txt`, **`librsvg2-bin`**.  
+Local **Fedora** with TinyTeX + **`librsvg2-tools`** + the same Quarto pin is a supported authoring setup; PDF/HTML/EPUB should match CI for content (engine package sets can still differ slightly from apt TeX).
 ---
 
 ### Windows
