@@ -142,7 +142,7 @@ sudo dnf install -y \
 | **`librsvg2-tools`** | `/usr/bin/rsvg-convert` | **Required for PDF.** Name is **not** `librsvg2` alone — the tools subpackage ships the CLI. |
 | `git`, `python3`, `curl`, `openssl` | clone, `indiprev.sh`, HTTPS | Usually already present on desktop Fedora. |
 
-Without `rsvg-convert`, Quarto aborts PDF when a book embeds SVG (e.g. **30DaysOfX**, **90DaysOfX**, **Networking** diagrams):
+Without `rsvg-convert`, Quarto aborts PDF when a book embeds SVG (e.g. **Networking** topology diagrams):
 
 ```text
 ERROR: Failed when attempting to convert a SVG to a PDF for output.

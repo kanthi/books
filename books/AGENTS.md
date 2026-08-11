@@ -23,28 +23,9 @@ For books using `scripts/update-index.sh` in this repo:
 7. Directories starting with `_` are ignored by part discovery.
 8. Root-level files directly under `content/` are not included as chapters.
 
-## 90DaysOfX / 30DaysOfX (multi-volume series)
+## Book naming
 
-- Portal books: `books/90DaysOfX/`, `books/30DaysOfX/`
-- **Volumes** = independent parts: `content/01-go/`, `content/02-nixos/`, `content/03-maths/`, future `content/04-…/`
-- Readers take one volume at a time by default; no morning/evening dual-track in published prose
-- Each volume: `00-sub-book-overview.qmd` + syllabus early; day chapters later
-- Series-wide docs: `content/00-program/` where present
-- Standalone `Go` / `NixOS` / `Maths` stay as deep libraries; do not auto-merge chapter bodies
-- Prefer root **`AGENTS.md`** for full naming rules (`@lib` / `@90` / `30X`)
-
-### Naming (same as root AGENTS.md — do not confuse with standalone books)
-
-| Say / assume | Path |
-|--------------|------|
-| **standalone Go / Go book / Go@lib** | `books/Go/` |
-| **standalone NixOS / NixOS book / NixOS@lib** | `books/NixOS/` |
-| **standalone Maths / Maths book / Maths@lib** | `books/Maths/` |
-| **Go volume / 90X Go / Volume 1 / Go@90** | `books/90DaysOfX/content/01-go/` |
-| **NixOS volume / 90X NixOS / Volume 2 / NixOS@90** | `books/90DaysOfX/content/02-nixos/` |
-| **Maths volume / 90X Maths / Volume 3 / Maths@90** | `books/90DaysOfX/content/03-maths/` |
-
-**book** = standalone library · **volume / 90X / @90** = series day path. Ask if the user only says “Go” / “NixOS” / “Maths” without a qualifier.
+All titles under `books/` are **standalone libraries**. Paths: `books/Go/`, `books/NixOS/`, `books/Maths/`, `books/Linux/`, `books/Networking/`, `books/C/`, `books/Git-Github/`. Prefer root **`AGENTS.md`** for inventory and workflow.
 
 ## Illustrated diagrams (all books)
 

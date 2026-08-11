@@ -33,44 +33,23 @@ A **multi-book Quarto monorepo**. Each book is a self-contained Quarto project u
 
 ### Current books (as of last inventory)
 
-`30DaysOfX`, `90DaysOfX`, `C`, `Git-Github`, `Go`, `Linux`, `Maths`, `Networking`, `NixOS`
+`C`, `Git-Github`, `Go`, `Linux`, `Maths`, `Networking`, `NixOS`
 
-- **`Linux`**: merged former `Linux-Commands` + `Linux-Editors` + `Linux-ShellScripting-Bash` (parts `cmd-*`, `editors-*`, `shell-*`).
+- **`Linux`**: merged former `Linux-Commands` + `Linux-Editors` + `Linux-ShellScripting-Bash` (parts Commands / Editors / Scripting→Bash).
 
-- **`90DaysOfX`**: multi-volume series container. Volumes are **independent** parts under `content/` (`01-go`, `02-nixos`, `03-maths`, …)—no required joint schedule. Standalone `Go` / `NixOS` / `Maths` books remain deeper libraries.
-- **`30DaysOfX`**: shorter multi-volume series (same topic family as 90-day / libraries). Independent of the 90-day calendar; do not merge bodies unless the user asks.
+### Book paths (user language → path)
 
-## Book vs volume naming (user language → path)
+All titles are **standalone library books** under `books/<Name>/` (topic-organized parts, not a day calendar).
 
-**Same topic names appear twice:** as a **standalone library book** and as a **volume inside `90DaysOfX`**. Agents **must** resolve the user’s wording to the correct path and **must ask** if ambiguous (e.g. bare “fix Go” / “NixOS chapter”).
+| User says… | Path |
+|------------|------|
+| **`Go`**, **`Go book`** | `books/Go/` |
+| **`NixOS`**, **`NixOS book`** | `books/NixOS/` |
+| **`Maths`**, **`Maths book`** | `books/Maths/` |
+| **`Linux`**, **`Linux book`** | `books/Linux/` |
+| **`Networking`**, **`C`**, **`Git-Github`** | `books/<Name>/` |
 
-### Rule of thumb
-
-| User says… | Means… | Path |
-|------------|--------|------|
-| **`Go book`**, **`standalone Go`**, **`Go@lib`** | Standalone library | `books/Go/` |
-| **`NixOS book`**, **`standalone NixOS`**, **`NixOS@lib`** | Standalone library | `books/NixOS/` |
-| **`Maths book`**, **`standalone Maths`**, **`Maths@lib`** | Standalone library | `books/Maths/` |
-| **`90DaysOfX`**, **`series`**, **`90X`** | 90-day series container | `books/90DaysOfX/` |
-| **`30DaysOfX`**, **`30X`** | 30-day series container | `books/30DaysOfX/` |
-| **`Go volume`**, **`90X Go`**, **`Volume 1`**, **`Go@90`** | Day-paced Go spine | `books/90DaysOfX/content/01-go/` |
-| **`NixOS volume`**, **`90X NixOS`**, **`Volume 2`**, **`NixOS@90`** | Day-paced NixOS spine | `books/90DaysOfX/content/02-nixos/` |
-| **`Maths volume`**, **`90X Maths`**, **`Volume 3`**, **`Maths@90`** | Day-paced Maths spine | `books/90DaysOfX/content/03-maths/` |
-
-### Defaults when the user is ambiguous
-
-1. Prefer **asking** which target (`@lib` vs `@90`) over guessing.
-2. If they say **“Day N”**, **gate**, **Lab 0**, or **90-day path** → treat as a **volume** under `90DaysOfX`.
-3. If they say **library**, **projects part**, **long-form**, or name advanced parts only in the standalone tree (e.g. Go `13-network-systems`, NixOS `99-projects`) → **standalone book**.
-4. **Do not** silently edit both trees unless the user asks to sync or mirror.
-5. **Do not** add cross-links between standalone `Go` / `NixOS` / `Maths` and `90DaysOfX` unless the user explicitly requests them (standalone books currently have **no** series links by policy).
-
-### Roles (content shape)
-
-| Kind | Role |
-|------|------|
-| **Standalone book** | Deep library / reference / large project set; **topic-organized** parts (not a day calendar). For **NixOS book** especially: normal chapters under `01-concepts/` … `08-capstone/` + `99-projects/` — **not** `day-01`…`day-90` filenames. |
-| **Volume (`@90`)** | ~90-day-shaped curriculum: overview, syllabus, **day chapters**, gates, capstone under `90DaysOfX/content/0N-*/` |
+For **NixOS** especially: normal chapters under `01-concepts/` … `08-capstone/` + `99-projects/` — not day-calendar filenames.
 
 ## Critical rules
 
