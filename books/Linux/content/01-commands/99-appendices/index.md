@@ -10,7 +10,7 @@ Long-form extras and cheatsheets that do not fit the one-command page model. Use
 
 | Command | Role |
 |---------|------|
-| `ubuntucheatsheat` | Ubuntu Cheatsheat |
+| Ubuntu Cheatsheet | Quick Ubuntu-oriented CLI reference |
 
 
 ## Suggested starting points

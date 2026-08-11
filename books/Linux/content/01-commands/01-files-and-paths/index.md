@@ -50,7 +50,6 @@ Navigate the filesystem, create and move data, inspect metadata, search by name 
 | chattr / lsattr | chattr sets ext file attributes (immutable, append-only, no-dump, etc.); lsattr lists them. |
 | `xxd` | xxd creates a hex dump of a file (or stdin) and can reverse a dump back to binary. |
 | `strings` | strings extracts printable character sequences from binary files. |
-| `lsattr` | lsattr lists ext file attributes set with chattr (immutable, append-only, no-dump, and others). |
 | `namei` | namei walks a path component by component, showing whether each element is a file, directory, or symlink — and… |
 | `umask` | umask sets the file mode creation mask for the current shell: bits that are turned *off* when new files and… |
 

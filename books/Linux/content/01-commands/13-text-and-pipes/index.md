@@ -42,6 +42,6 @@ Filter, reshape, and measure text streams — the core of shell pipelines. Line 
 
 - Files and paths — sources of text
 - Shell commands — quoting and `printf`
-- Linux-ShellScripting-Bash book — programming beyond one-liners
+- Scripting → Bash (this book) — programming beyond one-liners
 
 Continue with the individual command pages in this part.

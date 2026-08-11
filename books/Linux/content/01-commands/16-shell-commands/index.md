@@ -4,7 +4,7 @@ title: Intro
 
 # Intro
 
-Everyday shell built-ins and small utilities for output, history, name resolution, environment, timing, and the directory stack. Deeper programming belongs in the ShellScripting book.
+Everyday shell built-ins and small utilities for output, history, name resolution, environment, timing, and the directory stack. Deeper programming belongs in **Scripting → Bash** (this book).
 
 ## Commands in this part
 
@@ -31,6 +31,6 @@ Everyday shell built-ins and small utilities for output, history, name resolutio
 
 - Help and documentation tools — `help` for builtins
 - Text and pipes — consume what you print
-- Linux-ShellScripting-Bash — functions, arrays, strict mode
+- Scripting → Bash (this book) — functions, arrays, strict mode
 
 Continue with the individual command pages in this part.

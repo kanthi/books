@@ -44,7 +44,7 @@ Re-applied after accidental `git restore` / `git clean` wiped uncommitted work.
 ### Networking
 `openssl`, `nft`
 
-### Shell commands (part `17-shell-commands`)
+### Shell commands (part `16-shell-commands`)
 `echo`, `printf`, `history`, `type`, `export`, `time`, `pushd`
 
 ## Numeric prefixes

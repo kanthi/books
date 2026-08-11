@@ -101,9 +101,42 @@ book:
     - index.qmd
 EOL
 
-# Title-case a directory basename: 01-files-and-paths → Files And Paths
+# Title-case a directory basename: 01-files-and-paths → Files and Paths
+# Small words stay lowercase (except first word). Special cases for awkward slugs.
 humanize_dir_title() {
-  echo "$1" | sed -E 's/^[0-9]+-?//' | sed 's/-/ /g' | awk '{for(i=1;i<=NF;i++)sub(/./,toupper(substr($i,1,1)),$i)}1'
+  local slug title
+  slug="$(echo "$1" | sed -E 's/^[0-9]+-?//')"
+
+  case "$slug" in
+    terminals-and-mux)       printf '%s\n' "Terminals and Multiplexers"; return ;;
+    help-and-docs)           printf '%s\n' "Help and Docs"; return ;;
+    services-and-runtime)    printf '%s\n' "Services and Runtime"; return ;;
+    text-and-pipes)          printf '%s\n' "Text and Pipes"; return ;;
+    files-and-paths)         printf '%s\n' "Files and Paths"; return ;;
+    archives-and-compression) printf '%s\n' "Archives and Compression"; return ;;
+    processes-and-jobs)      printf '%s\n' "Processes and Jobs"; return ;;
+    users-and-groups)        printf '%s\n' "Users and Groups"; return ;;
+    storage-and-filesystems) printf '%s\n' "Storage and Filesystems"; return ;;
+    system-information)     printf '%s\n' "System Information"; return ;;
+    system-monitoring)      printf '%s\n' "System Monitoring"; return ;;
+    shell-commands)          printf '%s\n' "Shell Commands"; return ;;
+    intro-to-shells)         printf '%s\n' "Intro to Shells"; return ;;
+    bash-features)           printf '%s\n' "Bash Features"; return ;;
+    lazyvim)                 printf '%s\n' "LazyVim"; return ;;
+    modern-tools)            printf '%s\n' "Modern Tools"; return ;;
+  esac
+
+  title="$(echo "$slug" | sed 's/-/ /g' | awk '{
+    small["and"]=1; small["or"]=1; small["to"]=1; small["of"]=1;
+    small["for"]=1; small["in"]=1; small["on"]=1; small["the"]=1; small["a"]=1;
+    for (i=1;i<=NF;i++) {
+      w=tolower($i)
+      if (i>1 && (w in small)) $i=w
+      else $i=toupper(substr(w,1,1)) substr(w,2)
+    }
+    print
+  }')"
+  printf '%s\n' "$title"
 }
 
 # Emit chapter entries for files directly in $1 (dir path).

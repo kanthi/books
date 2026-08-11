@@ -1,4 +1,8 @@
-# Ubuntu Cheatsheat
+---
+title: "Ubuntu Cheatsheet"
+---
+
+# Ubuntu Cheatsheet
 
 ## System
 

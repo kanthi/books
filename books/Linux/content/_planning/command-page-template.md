@@ -99,20 +99,11 @@ Optional:
 
 ## Style rules
 
-<<<<<<< HEAD:books/Linux-Commands/content/_planning/command-page-template.md
 1. **Scope:** general Linux CLI + **server-side** administration. No desktop/GUI apps, display servers, CUPS printing queues, Flatpak/GUI stores, or end-user desktop workflows.
 2. Ubuntu 22.04/24.04 **Server**-compatible GNU userland unless noted (Fedora/RHEL noted when relevant).
 3. Prefer `ip`/`ss`/`systemctl` over legacy equivalents.
 4. Destructive ops: always show verify/dry-run first.
-5. Shell *programming* (functions, arrays, `set -euo pipefail`) belongs in **Linux-ShellScripting-Bash**; keep one-liners only.
+5. Shell *programming* (functions, arrays, `set -euo pipefail`) belongs in **Scripting → Bash** (this book); keep one-liners only in Commands pages.
 6. Filename = command basename with numeric prefix (`15-rsync.md`); run `bash scripts/update-index.sh` after add/rename.
 7. Do not hand-edit `_quarto.yml`.
 8. TUI tools (`top`, `less`, `tmux`) are fine; GUI tools are not.
-=======
-1. Ubuntu 22.04/24.04-compatible GNU userland unless noted.
-2. Prefer `ip`/`ss`/`systemctl` over legacy equivalents.
-3. Destructive ops: always show verify/dry-run first.
-4. Shell *programming* (functions, arrays, `set -euo pipefail`) belongs in **Shell scripting** parts (later in this book); keep one-liners only.
-5. Filename = command basename with numeric prefix after renumber (`15-rsync.md`); run `bash scripts/update-index.sh` after add/rename.
-6. Do not hand-edit `_quarto.yml`.
->>>>>>> 894fa479 (Restructure monorepo books, Networking curriculum, and shared assets.):books/Linux/content/_planning/command-page-template.md

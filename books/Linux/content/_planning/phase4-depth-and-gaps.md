@@ -64,7 +64,7 @@
 
 - Full LVM tutorial unit beyond command pages
 - AppArmor deep dive (pointer only from SELinux pages)
-- Shell programming (stays in Linux-ShellScripting-Bash)
+- Shell programming (stays in Scripting → Bash (this book))
 - Kubernetes / cloud CLIs
 
 ## Follow-ups (optional)
