@@ -25,7 +25,11 @@ For books using `scripts/update-index.sh` in this repo:
 
 ## Book naming
 
-All titles under `books/` are **standalone libraries**. Paths: `books/Go/`, `books/NixOS/`, `books/Maths/`, `books/Linux/`, `books/Networking/`, `books/C/`, `books/VCS/` (Git content under `content/01-git/`). Prefer root **`AGENTS.md`** for inventory and workflow.
+All titles under `books/` are **standalone libraries**. Paths: `books/Go/`, `books/NixOS/`, `books/Maths/`, `books/Linux/`, `books/Networking/`, `books/C/`, `books/Python/`, `books/VCS/` (Git content under `content/01-git/`). Prefer root **`AGENTS.md`** for inventory and workflow.
+
+## Book independence
+
+Each title is a complete book. Do not assume the reader has opened any other title. Do not cross-link into Linux, Maths, Networking, Go, C, NixOS, or VCS for a concept this page needs. If a host-OS or maths fact is required, give the minimum here.
 
 ## Illustrated diagrams (all books)
 
@@ -65,3 +69,12 @@ Every live book (and `Template/`) uses the same generator: **nested sections**, 
 ## VCS book
 
 - Path: `VCS/`; Git curriculum under `content/01-git/` (future parts may add `02-…`).
+
+## Python book
+
+- Path: `Python/`
+- **Published sidebar (for now):** `01-language/` (nested, Internals inside Language), `98-stdlib/`, `99-projects/`
+- Other domains parked in `content/_planning/later-parts.md`
+- **Independent** of other titles. A Python reader never needs Maths, Linux, Networking, or any sibling book. Do not reteach those subjects; do not require them.
+- Path A chapters assume **no prior Python**. Prefer beginner-friendly prose, named worked examples (input / output / why), and a term defined on first use. Deepen existing leaves before adding new parts.
+- Getting started covers a self-contained **editor / font / CLI-only** setup (macOS + Linux first). Do not send the reader to the Linux book.

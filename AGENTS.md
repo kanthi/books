@@ -33,7 +33,7 @@ A **multi-book Quarto monorepo**. Each book is a self-contained Quarto project u
 
 ### Current books (as of last inventory)
 
-`C`, `Go`, `Linux`, `Maths`, `Networking`, `NixOS`, `VCS`
+`C`, `Go`, `Linux`, `Maths`, `Networking`, `NixOS`, `Python`, `VCS`
 
 - **`Linux`**: merged former `Linux-Commands` + `Linux-Editors` + `Linux-ShellScripting-Bash` (parts Commands / Editors / Scripting→Bash).
 
@@ -41,12 +41,21 @@ A **multi-book Quarto monorepo**. Each book is a self-contained Quarto project u
 
 All titles are **standalone library books** under `books/<Name>/` (topic-organized parts, not a day calendar).
 
+### Book independence (all titles)
+
+Every book is meant to be read **on its own**. A reader of Python should never need Linux, Maths, Networking, Go, or any other title in this library, and the reverse is also true.
+
+- Do **not** send the reader to another book (“see the Linux book”, “as in Maths”).
+- Do **not** reteach another book’s subject. A one-paragraph host fact (what a terminal is, what `PATH` means, what a file path looks like) is fine when the page cannot work without it.
+- Domain asides stay **this language + that idea** (a small experiment in *this* book), never a second textbook.
+
 | User says… | Path |
 |------------|------|
 | **`Go`**, **`Go book`** | `books/Go/` |
 | **`NixOS`**, **`NixOS book`** | `books/NixOS/` |
 | **`Maths`**, **`Maths book`** | `books/Maths/` |
 | **`Linux`**, **`Linux book`** | `books/Linux/` |
+| **`Python`**, **`Python book`** | `books/Python/` |
 | **`Networking`**, **`C`**, **`VCS`**, **`Git`** | `books/<Name>/` (`Git` → `books/VCS/`) |
 
 For **NixOS** especially: normal chapters under `01-concepts/` … `02-nix-on-linux/` … `09-capstone/` + `99-projects/` — not day-calendar filenames.
