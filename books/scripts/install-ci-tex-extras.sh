@@ -10,7 +10,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VENDOR_ZIP="${SCRIPT_DIR}/../../ci/fontawesome5.zip"
 TINYTEX_HOME="${TINYTEX_HOME:-$HOME/.TinyTeX}"
-export TEXMFHOME="${TEXMFHOME:-$HOME/texmf}"
+export TEXMFHOME="${TEXMFHOME:-$HOME/.texmf}"
 
 # Nested bash may not inherit PATH; re-attach TinyTeX bin if needed.
 if ! command -v kpsewhich >/dev/null 2>&1; then

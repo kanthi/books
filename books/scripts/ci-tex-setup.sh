@@ -9,7 +9,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TINYTEX_HOME="${TINYTEX_HOME:-$HOME/.TinyTeX}"
 # Vendored fontawesome and any personal sty files live here (not only TinyTeX tree).
-export TEXMFHOME="${TEXMFHOME:-$HOME/texmf}"
+export TEXMFHOME="${TEXMFHOME:-$HOME/.texmf}"
 
 ensure_tinytex_path() {
   if command -v kpsewhich >/dev/null 2>&1 && command -v tlmgr >/dev/null 2>&1; then

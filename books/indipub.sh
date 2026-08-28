@@ -49,14 +49,9 @@ if [[ -n "$_QUARTO_BIN" ]]; then
   fi
 fi
 
-if [[ -n "$_QUARTO_WRAP" ]] && grep -q 'QUARTO_DENO_V8_OPTIONS' "$_QUARTO_WRAP" 2>/dev/null; then
+if [[ -n "$_QUARTO_BIN" ]]; then
   # Modern Quarto injects --v8-flags from QUARTO_DENO_V8_OPTIONS.
   _strip_v8_flags_from_extra
-else
-  # Legacy Quarto 1.3.x: EXTRA is the only path to raise the heap.
-  if [[ "${QUARTO_DENO_EXTRA_OPTIONS:-}" != *v8-flags* ]]; then
-    export QUARTO_DENO_EXTRA_OPTIONS="--v8-flags=--max-old-space-size=${_V8_HEAP},--max-heap-size=${_V8_HEAP}${QUARTO_DENO_EXTRA_OPTIONS:+ ${QUARTO_DENO_EXTRA_OPTIONS}}"
-  fi
 fi
 
 # Check if book name is provided
