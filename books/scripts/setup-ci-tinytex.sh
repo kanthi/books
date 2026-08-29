@@ -117,6 +117,7 @@ install_packages() {
   fi
 
   echo "tlmgr install (${#pkgs[@]} packages from tinytex-packages.txt)..."
+  tlmgr update --self || true
   if ! tlmgr install "${pkgs[@]}"; then
     echo "WARN: batch tlmgr install reported errors; installing one-by-one..."
     local p

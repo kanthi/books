@@ -53,6 +53,7 @@ persist_env_for_later_steps
 # Sanity checks in *this* process (must use same TEXMFHOME)
 if ! kpsewhich soul.sty >/dev/null 2>&1; then
   echo "soul.sty missing — trying tlmgr install soul..."
+  tlmgr update --self || true
   tlmgr install soul || true
 fi
 if ! kpsewhich soul.sty >/dev/null 2>&1; then
