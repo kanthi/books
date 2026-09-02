@@ -41,6 +41,6 @@ From `books/`:
 3. Chapter order inside a part = lexicographic filename order.
 4. Dirs starting with `_` are ignored by the index script.
 5. Sidebar titles come from YAML `title:`, else the first `#` heading.
-6. HTML title block shows **Published** (`book.date`) and **Updated** (`date-modified`).
+6. HTML title  block shows **Published** (`book.date`) and **Updated** (`date-modified`).
 
 New books should start from root **`Template/`**, not `_archive/templates/Template.backup/`.
