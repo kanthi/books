@@ -34,6 +34,40 @@ _strip_v8_flags_from_extra() {
   fi
 }
 
+_quarto_version() {
+  quarto --version 2>/dev/null | head -1 | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' | head -1
+}
+
+# True for Quarto 1.4+ (wrapper injects --v8-flags from QUARTO_DENO_V8_OPTIONS).
+_quarto_ge_1_4() {
+  local ver major rest minor
+  ver="$(_quarto_version)"
+  [[ -z "$ver" ]] && return 1
+  major="${ver%%.*}"
+  rest="${ver#*.}"
+  minor="${rest%%.*}"
+  if [ "${major:-0}" -gt 1 ] 2>/dev/null; then
+    return 0
+  fi
+  if [ "${major:-0}" -eq 1 ] && [ "${minor:-0}" -ge 4 ] 2>/dev/null; then
+    return 0
+  fi
+  return 1
+}
+
+_ensure_v8_flags_in_extra() {
+  # Quarto 1.3: Deno only sees QUARTO_DENO_EXTRA_OPTIONS.
+  if [[ "${QUARTO_DENO_EXTRA_OPTIONS:-}" == *"--v8-flags="* ]]; then
+    return 0
+  fi
+  local flags="--v8-flags=${QUARTO_DENO_V8_OPTIONS}"
+  if [[ -n "${QUARTO_DENO_EXTRA_OPTIONS:-}" ]]; then
+    export QUARTO_DENO_EXTRA_OPTIONS="${flags} ${QUARTO_DENO_EXTRA_OPTIONS}"
+  else
+    export QUARTO_DENO_EXTRA_OPTIONS="${flags}"
+  fi
+}
+
 _QUARTO_BIN="$(command -v quarto 2>/dev/null || true)"
 _QUARTO_WRAP=""
 if [[ -n "$_QUARTO_BIN" ]]; then
@@ -50,8 +84,13 @@ if [[ -n "$_QUARTO_BIN" ]]; then
 fi
 
 if [[ -n "$_QUARTO_BIN" ]]; then
-  # Modern Quarto injects --v8-flags from QUARTO_DENO_V8_OPTIONS.
-  _strip_v8_flags_from_extra
+  if _quarto_ge_1_4; then
+    # 1.4+ prepends --v8-flags from V8_OPTIONS; a second copy in EXTRA is an error.
+    _strip_v8_flags_from_extra
+  else
+    # 1.3.x (CI 1.3.450) ignores V8_OPTIONS — flags must live in EXTRA.
+    _ensure_v8_flags_in_extra
+  fi
 fi
 
 # Check if book name is provided
