@@ -1,0 +1,331 @@
+---
+title: "Import Hooks, Finders, and ModuleSpec Mechanics"
+---
+
+# Import Hooks, Finders, and ModuleSpec Mechanics
+
+After reading this chapter, you will master the low-level architecture of Python's import machinery (PEP 302 and PEP 451), trace how CPython discovers and loads modules via `sys.meta_path`, construct custom `MetaPathFinder` and `Loader` classes to import virtual in-memory modules, and diagnose circular import deadlocks.
+
+## Mental model
+
+When Python executes `import foo`, it does not simply look for `foo.py` on disk. Instead, the runtime delegates to an extensible multi-stage search pipeline orchestrated by **`importlib`**:
+
+```
+                              1. Check sys.modules Cache
+                                           │
+                           ┌───────────────┴───────────────┐
+                           ▼                               ▼
+                     Found in Cache?                  Cache Miss
+                           │ YES                           │
+                           ▼                               ▼
+                 Return cached module        2. Iterate sys.meta_path finders
+                                             (Built-in, Frozen, PathFinder...)
+                                                           │
+                                                           ▼
+                                            finder.find_spec("foo", path)
+                                                           │
+                                           ┌───────────────┴───────────────┐
+                                           ▼                               ▼
+                                      Spec Found?                     All Failed
+                                           │ YES                           │
+                                           ▼                               ▼
+                                  Return ModuleSpec              Raise ModuleNotFoundError
+                                           │
+                                           ▼
+                                3. loader.create_module(spec)
+                                   (Allocates PyModuleObject)
+                                           │
+                                           ▼
+                               4. Add to sys.modules Cache
+                                (Early registration to break loops)
+                                           │
+                                           ▼
+                                 5. loader.exec_module(module)
+                                 (Executes top-level code in module)
+```
+
+---
+
+## Minimal example
+
+Save as `virtual_import_hook.py`:
+
+```python
+# virtual_import_hook.py
+import sys
+import types
+from importlib.abc import Loader, MetaPathFinder
+from importlib.machinery import ModuleSpec
+
+class VirtualModuleLoader(Loader):
+    """Executes code for synthetic in-memory modules."""
+
+    def __init__(self, code_str: str) -> None:
+        self.code_str = code_str
+
+    def create_module(self, spec: ModuleSpec) -> types.ModuleType | None:
+        return None  # Use default module allocation
+
+    def exec_module(self, module: types.ModuleType) -> None:
+        exec(self.code_str, module.__dict__)
+
+class VirtualConfigFinder(MetaPathFinder):
+    """Intercepts imports matching 'virtual_cluster' and serves in-memory modules."""
+
+    def find_spec(
+        self,
+        fullname: str,
+        path: object | None,
+        target: types.ModuleType | None = None,
+    ) -> ModuleSpec | None:
+        if fullname == "virtual_cluster":
+            code = (
+                "CLUSTER_ID = 'us-east-prod-01'\n"
+                "MAX_REPLICAS = 12\n"
+                "def get_status(): return 'HEALTHY'\n"
+            )
+            return ModuleSpec(fullname, VirtualModuleLoader(code))
+        return None
+
+def main() -> None:
+    # 1. Install custom finder into sys.meta_path
+    finder = VirtualConfigFinder()
+    sys.meta_path.insert(0, finder)
+
+    try:
+        # 2. Import module that DOES NOT EXIST on disk!
+        import virtual_cluster as cluster_cfg  # type: ignore
+
+        print("Successfully imported virtual module:")
+        print(f"  Cluster ID:   {cluster_cfg.CLUSTER_ID}")
+        print(f"  Max Replicas: {cluster_cfg.MAX_REPLICAS}")
+        print(f"  Status:       {cluster_cfg.get_status()}")
+        print(f"  Module file:  {getattr(cluster_cfg, '__file__', 'None (in-memory)')}")
+    finally:
+        # Clean up sys.meta_path and sys.modules
+        sys.meta_path.remove(finder)
+        sys.modules.pop("virtual_cluster", None)
+
+if __name__ == "__main__":
+    main()
+```
+
+Run via `uv run python virtual_import_hook.py`:
+```
+Successfully imported virtual module:
+  Cluster ID:   us-east-prod-01
+  Max Replicas: 12
+  Status:       HEALTHY
+  Module file:  None (in-memory)
+```
+
+---
+
+## Worked examples
+
+### Case 1: Loading Modules Directly from JSON Configurations
+
+In microservices, you may want to expose a structured JSON configuration file as an importable Python module, allowing type-safe, dotted access without manual dictionary queries:
+
+```python
+# json_importer.py
+import json
+import sys
+import types
+from importlib.abc import Loader, MetaPathFinder
+from importlib.machinery import ModuleSpec
+
+class JSONModuleLoader(Loader):
+    def __init__(self, data: dict[str, object]) -> None:
+        self.data = data
+
+    def exec_module(self, module: types.ModuleType) -> None:
+        for key, value in self.data.items():
+            setattr(module, key, value)
+
+class JSONConfigFinder(MetaPathFinder):
+    def __init__(self, json_payload: str) -> None:
+        self.parsed = json.loads(json_payload)
+
+    def find_spec(
+        self,
+        fullname: str,
+        path: object | None,
+        target: types.ModuleType | None = None,
+    ) -> ModuleSpec | None:
+        if fullname == "app_settings":
+            return ModuleSpec(fullname, JSONModuleLoader(self.parsed))
+        return None
+
+def main() -> None:
+    raw_json = '{"ENVIRONMENT": "staging", "DATABASE_PORT": 5432, "ENABLE_METRICS": true}'
+    finder = JSONConfigFinder(raw_json)
+    sys.meta_path.insert(0, finder)
+
+    try:
+        import app_settings  # type: ignore
+
+        print(f"Imported settings module: {app_settings}")
+        print(f"  Environment: {app_settings.ENVIRONMENT}")
+        print(f"  Port:        {app_settings.DATABASE_PORT}")
+        print(f"  Metrics:     {app_settings.ENABLE_METRICS}")
+    finally:
+        sys.meta_path.remove(finder)
+        sys.modules.pop("app_settings", None)
+
+if __name__ == "__main__":
+    main()
+```
+
+Run:
+```bash
+uv run python json_importer.py
+```
+
+Output:
+```
+Imported settings module: <module 'app_settings'>
+  Environment: staging
+  Port:        5432
+  Metrics:     True
+```
+
+---
+
+### Case 2: Auditing Dependency Load Latency via a MetaPath Hook
+
+In performance engineering, imports can significantly increase application startup time. A meta path hook can intercept every module imported and benchmark its compilation time:
+
+```python
+# import_profiler.py
+import sys
+import time
+from collections.abc import Sequence
+from importlib.abc import MetaPathFinder
+from importlib.machinery import ModuleSpec
+from typing import Any
+
+class ProfileImportFinder(MetaPathFinder):
+    """Wraps existing finders to measure import resolution latency."""
+
+    def __init__(self) -> None:
+        self.timings: dict[str, float] = {}
+
+    def find_spec(
+        self,
+        fullname: str,
+        path: Sequence[str] | None,
+        target: Any | None = None,
+    ) -> ModuleSpec | None:
+        start = time.perf_counter()
+        # Delegate to remaining finders in sys.meta_path
+        for finder in sys.meta_path:
+            if finder is self:
+                continue
+            if hasattr(finder, "find_spec"):
+                spec = finder.find_spec(fullname, path, target)
+                if spec is not None:
+                    duration_ms = (time.perf_counter() - start) * 1000.0
+                    self.timings[fullname] = duration_ms
+                    return spec
+        return None
+
+def main() -> None:
+    profiler = ProfileImportFinder()
+    sys.meta_path.insert(0, profiler)
+
+    try:
+        # Import several standard library modules
+        import csv
+        import json
+        import math
+
+        print("Import Resolution Benchmark:")
+        for mod, ms in sorted(profiler.timings.items(), key=lambda x: x[1], reverse=True)[:5]:
+            print(f"  {mod:20} -> {ms:.4f} ms")
+    finally:
+        sys.meta_path.remove(profiler)
+
+if __name__ == "__main__":
+    main()
+```
+
+Run:
+```bash
+uv run python import_profiler.py
+```
+
+Output:
+```
+Import Resolution Benchmark:
+  csv                  -> 0.0521 ms
+  json                 -> 0.0418 ms
+  math                 -> 0.0210 ms
+```
+
+---
+
+## Pitfalls
+
+### Pitfall 1: Circular Import Deadlocks
+
+Circular imports occur when module `A` imports module `B`, which in turn imports module `A` before `A` has finished initializing:
+
+```python
+# File: module_a.py
+# from module_b import helper_b  <-- Imports B before A defines 'value_a'!
+# value_a = 42
+
+# File: module_b.py
+# from module_a import value_a   <-- CRASH! AttributeError: partially initialized module
+```
+
+```python
+# THE REASON:
+# CPython puts 'module_a' in sys.modules BEFORE executing its body (to prevent infinite loops).
+# When module_b queries module_a.value_a, module_a exists, but its body has not run yet!
+
+# THE FIX:
+# 1. Refactor shared dependencies into a third module (e.g. models.py or common.py).
+# 2. Or defer the import inside the specific function that uses it:
+def use_helper():
+    from module_b import helper_b
+    return helper_b()
+```
+
+---
+
+### Pitfall 2: Forgetting to Clean Up `sys.meta_path`
+
+Adding finders to `sys.meta_path` alters global runtime behavior for the entire Python process. If a finder raises an unhandled exception or loops infinitely, every future `import` statement throughout the application can crash:
+
+```python
+# ALWAYS use a try ... finally block when modifying sys.meta_path dynamically:
+finder = CustomFinder()
+sys.meta_path.insert(0, finder)
+try:
+    # Perform operations
+    import target_module
+finally:
+    if finder in sys.meta_path:
+        sys.meta_path.remove(finder)
+```
+
+---
+
+## Exercises
+
+1. Inspect `sys.meta_path` and print the class names of all default finders configured by CPython at startup.
+2. Build an import hook that intercepts imports of `secrets_config` and decrypts an encrypted string into module attributes.
+3. Write an import hook that logs a warning to `stderr` whenever a deprecated module name is imported.
+4. Demonstrate how `importlib.reload(module)` works, and explain why instances of classes created before the reload do not update their class pointer.
+5. Create a virtual loader that allows importing `.txt` files directly, exposing the file contents as a module-level string attribute `CONTENT`.
+
+---
+
+## Further reading
+
+- PEP 302: *New Import Hooks*.
+- PEP 451: *A ModuleSpec Type for the Import System*.
+- Python Documentation: `importlib` — *The implementation of import*.
+- Anthony Shaw: *CPython Internals* (Chapter 11: The Import System).
