@@ -153,11 +153,31 @@ humanize_dir_title() {
     systems-and-ops)            printf '%s\n' "Systems and Ops"; return ;;
     computer-science)           printf '%s\n' "Computer Science"; return ;;
     stdlib)                     printf '%s\n' "Standard Library"; return ;;
+    standard-library)           printf '%s\n' "Standard Library"; return ;;
     stdlib-essentials)          printf '%s\n' "Stdlib Essentials"; return ;;
+    typing-and-testing)         printf '%s\n' "Typing and Testing"; return ;;
+    concurrency-and-internals)  printf '%s\n' "Concurrency and Internals"; return ;;
     getting-started)            printf '%s\n' "Getting Started"; return ;;
+    advanced-oop)               printf '%s\n' "Advanced OOP"; return ;;
+    programming-foundations)    printf '%s\n' "Programming Foundations"; return ;;
+    files-and-env)              printf '%s\n' "Files and Environment"; return ;;
+    testing-and-opt)            printf '%s\n' "Testing and Optimization"; return ;;
+    testing-qa)                 printf '%s\n' "Testing and QA"; return ;;
+    web-and-apis)               printf '%s\n' "Web and APIs"; return ;;
+    systems-python)             printf '%s\n' "Systems Python"; return ;;
+    artificial-intelligence)    printf '%s\n' "Artificial Intelligence"; return ;;
+    network-clients)            printf '%s\n' "Network Clients"; return ;;
+    network-tooling)            printf '%s\n' "Network Tooling"; return ;;
+    network-automation)         printf '%s\n' "Network Automation"; return ;;
+    task-automation)            printf '%s\n' "Task Automation"; return ;;
+    data-science)               printf '%s\n' "Data Science"; return ;;
+    design-patterns)            printf '%s\n' "Design Patterns"; return ;;
+    code-quality)               printf '%s\n' "Code Quality"; return ;;
+    gui)                        printf '%s\n' "GUI"; return ;;
     syntax-and-types)           printf '%s\n' "Syntax and Types"; return ;;
     modules-and-packages)       printf '%s\n' "Modules and Packages"; return ;;
     objects-and-classes)        printf '%s\n' "Objects and Classes"; return ;;
+    error-handling)             printf '%s\n' "Error Handling"; return ;;
     errors-and-io)              printf '%s\n' "Errors and I/O"; return ;;
     names-namespaces-frames)    printf '%s\n' "Names, Namespaces, and Frames"; return ;;
     bytecode-and-eval)          printf '%s\n' "Bytecode and Eval"; return ;;
@@ -173,6 +193,19 @@ humanize_dir_title() {
     mlops)                      printf '%s\n' "MLOps"; return ;;
     sre)                        printf '%s\n' "SRE"; return ;;
     devops)                     printf '%s\n' "DevOps"; return ;;
+    devops-and-cloud-engineering) printf '%s\n' "DevOps and Cloud Engineering"; return ;;
+    devops-foundations)         printf '%s\n' "DevOps Foundations"; return ;;
+    applied-devops-and-cloud)   printf '%s\n' "Applied DevOps and Cloud"; return ;;
+    applied-netdevops)          printf '%s\n' "Applied NetDevOps"; return ;;
+    netdevops)                  printf '%s\n' "NetDevOps"; return ;;
+    cloud-native-sre-and-k8s)   printf '%s\n' "Cloud Native SRE and K8s"; return ;;
+    ros2-robotics-and-autonomy) printf '%s\n' "ROS 2 Robotics and Autonomy"; return ;;
+    python-foundations)         printf '%s\n' "Python Foundations"; return ;;
+    data-science-and-analytics) printf '%s\n' "Data Science and Analytics"; return ;;
+    robotics-and-simulation)    printf '%s\n' "Robotics and Simulation"; return ;;
+    cybersecurity-and-automation) printf '%s\n' "Cybersecurity and Automation"; return ;;
+    web-and-distributed-systems) printf '%s\n' "Web and Distributed Systems"; return ;;
+    capstone-systems)           printf '%s\n' "Capstone Systems"; return ;;
   esac
 
   title="$(echo "$slug" | sed 's/-/ /g' | awk '{

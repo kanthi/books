@@ -73,8 +73,7 @@ Every live book (and `Template/`) uses the same generator: **nested sections**, 
 ## Python book
 
 - Path: `Python/`
-- **Published sidebar (for now):** `01-language/` (nested, Internals inside Language), `98-stdlib/`, `99-projects/`
-- Other domains parked in `content/_planning/later-parts.md`
-- **Independent** of other titles. A Python reader never needs Maths, Linux, Networking, or any sibling book. Do not reteach those subjects; do not require them.
-- Path A chapters assume **no prior Python**. Prefer beginner-friendly prose, named worked examples (input / output / why), and a term defined on first use. Deepen existing leaves before adding new parts.
-- Getting started covers a self-contained **editor / font / CLI-only** setup (macOS + Linux first). Do not send the reader to the Linux book.
+- **Published sidebar:** `01-basics/` only. Later parts are syllabus text (`index.qmd`, `content/_planning/syllabus.md`) — do not add empty part directories until a writing pass starts on that part.
+- **Independent** of other titles. A Python reader never needs Maths, Linux, Networking, or any sibling book.
+- Basics assume **no prior Python**. Named worked examples (input / output / why). Term defined on first use. No type hints in Basics. Python **3.14**, toolchain **`uv`**.
+- Getting started is self-contained (install with `uv`, editor you already like). Do not send the reader to the Linux book.
