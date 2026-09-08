@@ -25,7 +25,7 @@ For books using `scripts/update-index.sh` in this repo:
 
 ## Book naming
 
-All titles under `books/` are **standalone libraries**. Paths: `books/Go/`, `books/NixOS/`, `books/Maths/`, `books/Linux/`, `books/Networking/`, `books/C/`, `books/Python/`, `books/VCS/` (Git content under `content/01-git/`). Prefer root **`AGENTS.md`** for inventory and workflow.
+All titles under `books/` are **standalone libraries**. Paths: `books/Go/`, `books/Boring-Go/`, `books/Boring-Python/`, `books/NixOS/`, `books/Maths/`, `books/Linux/`, `books/Networking/`, `books/C/`, `books/Python/`, `books/VCS/` (Git content under `content/01-git/`). Prefer root **`AGENTS.md`** for inventory and workflow.
 
 ## Book independence
 
@@ -69,6 +69,22 @@ Every live book (and `Template/`) uses the same generator: **nested sections**, 
 ## VCS book
 
 - Path: `VCS/`; Git curriculum under `content/01-git/` (future parts may add `02-…`).
+
+## Boring-Go book
+
+- Path: `Boring-Go/`
+- Linear, example-heavy Go (clarity over cleverness). **Go 1.27**. Toolchain **`go`**.
+- **Independent** of `Go/` and every other title. Do not cross-link.
+- Every listing is a complete runnable program **inline in the chapter** — do not add a sibling `.go` tree.
+- Recurring domain: a small desk (orders, tickets, shifts).
+
+## Boring-Python book
+
+- Path: `Boring-Python/`
+- Linear, example-heavy Python (clarity over cleverness). **Python 3.14**. Toolchain **`uv`**, **`ruff`**, **`pytest`**.
+- **Independent** of `Python/`, `Boring-Go/`, and every other title. Do not cross-link.
+- Every listing is a complete runnable program **inline in the chapter** — do not add a sibling `.py` tree.
+- Recurring domain: a small desk (orders, tickets, shifts). No type hints until the typing part.
 
 ## Python book
 

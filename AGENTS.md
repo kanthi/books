@@ -33,7 +33,7 @@ A **multi-book Quarto monorepo**. Each book is a self-contained Quarto project u
 
 ### Current books (as of last inventory)
 
-`C`, `Go`, `Linux`, `Maths`, `Networking`, `NixOS`, `Python`, `VCS`
+`C`, `Go`, `Boring-Go`, `Boring-Python`, `Linux`, `Maths`, `Networking`, `NixOS`, `Python`, `VCS`
 
 - **`Linux`**: merged former `Linux-Commands` + `Linux-Editors` + `Linux-ShellScripting-Bash` (parts Commands / Editors / Scripting→Bash).
 
@@ -52,10 +52,12 @@ Every book is meant to be read **on its own**. A reader of Python should never n
 | User says… | Path |
 |------------|------|
 | **`Go`**, **`Go book`** | `books/Go/` |
+| **`Boring-Go`**, **`Boring Go`** | `books/Boring-Go/` |
 | **`NixOS`**, **`NixOS book`** | `books/NixOS/` |
 | **`Maths`**, **`Maths book`** | `books/Maths/` |
 | **`Linux`**, **`Linux book`** | `books/Linux/` |
 | **`Python`**, **`Python book`** | `books/Python/` |
+| **`Boring-Python`**, **`Boring Python`** | `books/Boring-Python/` |
 | **`Networking`**, **`C`**, **`VCS`**, **`Git`** | `books/<Name>/` (`Git` → `books/VCS/`) |
 
 For **NixOS** especially: normal chapters under `01-concepts/` … `02-nix-on-linux/` … `09-capstone/` + `99-projects/` — not day-calendar filenames.
