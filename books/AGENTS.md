@@ -86,6 +86,14 @@ Every live book (and `Template/`) uses the same generator: **nested sections**, 
 - Every listing is a complete runnable program **inline in the chapter** — do not add a sibling `.py` tree.
 - Recurring domain: a small desk (orders, tickets, shifts). No type hints until the typing part.
 
+## Boring-NixOS book
+
+- Path: `Boring-NixOS/`
+- Deterministic, immutable infrastructure and developer environments.
+- **Independent** of `NixOS/` and every other title. Do not cross-link.
+- Every listing is a complete runnable expression/file **inline in the chapter** (`default.nix`, `flake.nix`, `shell.nix`, `configuration.nix`).
+- Recurring domain: an infrastructure desk (workstations, devShells, services).
+
 ## Python book
 
 - Path: `Python/`

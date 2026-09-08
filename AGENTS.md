@@ -33,7 +33,7 @@ A **multi-book Quarto monorepo**. Each book is a self-contained Quarto project u
 
 ### Current books (as of last inventory)
 
-`C`, `Go`, `Boring-Go`, `Boring-Python`, `Linux`, `Maths`, `Networking`, `NixOS`, `Python`, `VCS`
+`C`, `Go`, `Boring-Go`, `Boring-NixOS`, `Boring-Python`, `Linux`, `Maths`, `Networking`, `NixOS`, `Python`, `VCS`
 
 - **`Linux`**: merged former `Linux-Commands` + `Linux-Editors` + `Linux-ShellScripting-Bash` (parts Commands / Editors / Scripting→Bash).
 
@@ -54,6 +54,7 @@ Every book is meant to be read **on its own**. A reader of Python should never n
 | **`Go`**, **`Go book`** | `books/Go/` |
 | **`Boring-Go`**, **`Boring Go`** | `books/Boring-Go/` |
 | **`NixOS`**, **`NixOS book`** | `books/NixOS/` |
+| **`Boring-NixOS`**, **`Boring NixOS`** | `books/Boring-NixOS/` |
 | **`Maths`**, **`Maths book`** | `books/Maths/` |
 | **`Linux`**, **`Linux book`** | `books/Linux/` |
 | **`Python`**, **`Python book`** | `books/Python/` |
