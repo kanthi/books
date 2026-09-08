@@ -109,6 +109,13 @@ humanize_dir_title() {
     home-and-flake-layout)      printf '%s\n' "Home and Flake Layout"; return ;;
     services-and-security)      printf '%s\n' "Services and Security"; return ;;
     ops-and-fleet)              printf '%s\n' "Ops and Fleet"; return ;;
+    # Boring-NixOS
+    nixos-system)               printf '%s\n' "NixOS System"; return ;;
+    cicd)                       printf '%s\n' "CI/CD with Nix"; return ;;
+    containers-k8s)             printf '%s\n' "Containers and Kubernetes"; return ;;
+    iac)                        printf '%s\n' "Infrastructure as Code"; return ;;
+    secrets-security)           printf '%s\n' "Secrets and Security"; return ;;
+    production-capstone)        printf '%s\n' "Production Capstone Lab"; return ;;
     # Maths
     pre-algebra)                printf '%s\n' "Pre-Algebra"; return ;;
     linear-algebra)             printf '%s\n' "Linear Algebra"; return ;;

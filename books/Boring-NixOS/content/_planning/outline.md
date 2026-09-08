@@ -43,28 +43,36 @@
 
 ## Part 02: The Nix Language — From Basics to Advanced Patterns
 
-- **`02-nix-language/01-expressions-values-types.qmd`**: *Expressions, Values, and Types*
-  - Primitives: integers, floats, booleans, strings, and paths
-  - String interpolation, multiline strings (`'' ... ''`), and indentation stripping
-  - Truthiness, null values, and the absence of mutable variables
-- **`02-nix-language/02-let-in-bindings.qmd`**: *Let-In Blocks and Local Bindings*
+- **`02-nix-language/01-expressions-and-evaluation.qmd`**: *Nix Expressions and Evaluation*
+  - Pure expression tree model vs imperative scripting
+  - Evaluating expressions with `nix eval --expr`
+  - Laziness in practice: why unqueried branches never evaluate
+- **`02-nix-language/02-values-and-immutability.qmd`**: *Values and Immutability*
+  - Deep immutability of data structures
+  - Transformations yield new values (`//`, `++`)
+  - Deterministic evaluation and thread-safe memoization
+- **`02-nix-language/03-data-types-and-strings.qmd`**: *Data Types and String Interpolation*
+  - Primitive types: int, float, bool, string, path, null
+  - Single-line (`"..."`) and multi-line (`''...''`) strings with indentation stripping
+  - String interpolation with `${...}` and path importing into `/nix/store`
+- **`02-nix-language/04-let-in-bindings.qmd`**: *Let-In Blocks and Local Bindings*
   - Defining local variables with `let ... in ...`
   - Scope rules and lexical shadowing
   - Pure evaluation: order of bindings does not matter
-- **`02-nix-language/03-functions-and-defaults.qmd`**: *Functions and Argument Defaults*
+- **`02-nix-language/05-functions-and-defaults.qmd`**: *Functions and Argument Defaults*
   - Single-argument functions, currying, and lambda syntax (`x: y: ...`)
   - Attribute set pattern matching and destructuring (`{ x, y, ... }`)
   - Default arguments (`{ port ? 3000, debug ? false }`) and `@args` capture
-- **`02-nix-language/04-attribute-sets-and-rec.qmd`**: *Attribute Sets and Recursive Definitions*
+- **`02-nix-language/06-attribute-sets-and-rec.qmd`**: *Attribute Sets and Recursive Definitions*
   - Attribute set syntax, nesting (`a.b.c = 1;`), and merging (`//`)
   - The `rec` keyword and sibling references
   - Avoiding infinite recursion traps and circular definitions
-- **`02-nix-language/05-conditionals-and-lists.qmd`**: *Conditionals, Lists, and Built-in Operations*
+- **`02-nix-language/07-conditionals-and-lists.qmd`**: *Conditionals, Lists, and Built-in Operations*
   - `if ... then ... else ...` expressions
   - Lists, indexing, and concatenation (`++`)
   - Built-in functions: `builtins.map`, `builtins.filter`, `builtins.elem`
   - Writing pure data transformations
-- **`02-nix-language/06-imports-and-abstractions.qmd`**: *Importing Files and Building Abstractions*
+- **`02-nix-language/08-imports-and-abstractions.qmd`**: *Importing Files and Building Abstractions*
   - The `import` operator and passing arguments (`import ./config.nix { inherit pkgs; }`)
   - Organizing modular Nix codebases across files
   - Standard library (`pkgs.lib`) utility functions (`lib.mkDefault`, `lib.mkIf`, `lib.optional`)
