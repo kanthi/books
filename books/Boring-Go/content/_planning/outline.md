@@ -89,6 +89,9 @@ See `index.qmd` for the reader-facing map.
 - 09-regexp.qmd
 - 10-maps-package.qmd
 - 11-iter-and-range-funcs.qmd
+- 12-context-and-signals.qmd
+- 13-hashing-and-crypto.qmd
+- 14-filepath-and-fs.qmd
 
 ### 14-shipping
 - 01-static-analysis-and-security.qmd
