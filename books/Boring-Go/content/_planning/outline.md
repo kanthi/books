@@ -92,6 +92,7 @@ See `index.qmd` for the reader-facing map.
 - 12-context-and-signals.qmd
 - 13-hashing-and-crypto.qmd
 - 14-filepath-and-fs.qmd
+- 15-omitzero-json-tags.qmd
 
 ### 14-shipping
 - 01-static-analysis-and-security.qmd
