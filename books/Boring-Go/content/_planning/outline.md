@@ -87,6 +87,8 @@ See `index.qmd` for the reader-facing map.
 - 07-sorting-and-slices.qmd
 - 08-os-and-flags.qmd
 - 09-regexp.qmd
+- 10-maps-package.qmd
+- 11-iter-and-range-funcs.qmd
 
 ### 14-shipping
 - 01-static-analysis-and-security.qmd
