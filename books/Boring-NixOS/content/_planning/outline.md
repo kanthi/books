@@ -76,6 +76,10 @@
   - The `import` operator and passing arguments (`import ./config.nix { inherit pkgs; }`)
   - Organizing modular Nix codebases across files
   - Standard library (`pkgs.lib`) utility functions (`lib.mkDefault`, `lib.mkIf`, `lib.optional`)
+- **`02-nix-language/09-nix-repl-and-debugging.qmd`**: *The Nix REPL and Debugging Expressions* ← new
+  - Interactive evaluation: `:t`, `:e`, `:b`, `:r`, `:?` meta-commands
+  - Loading nixpkgs and flakes (`nix repl 'nixpkgs'`, `nix repl .#`)
+  - Printf debugging with `builtins.trace`, eval-time vs build-time errors
 
 ---
 
@@ -101,6 +105,12 @@
   - Overhead comparison: native Linux/macOS processes vs VM-backed Docker daemons
   - Direct IDE and language server integration (`gopls`, `rust-analyzer`, `pyright`)
   - Fast startup, instant caching, and eliminating file permission / volume mount latency
+- **`03-dev-environments/06-direnv-and-automatic-shells.qmd`**: *Automatic Dev Shells with direnv* ← new
+  - `direnv` + `nix-direnv`: auto-loading devShell on `cd`, GC-safe caching
+  - `use flake` in `.envrc`, polyglot named shells, `.direnv/` gcroot
+- **`03-dev-environments/07-nix-darwin-macos.qmd`**: *nix-darwin: Declarative macOS Configuration* ← new
+  - `darwinConfigurations` + `darwin-rebuild switch`
+  - Shared `commonPackages` across Linux + macOS in one flake, `nix-homebrew`, `system.defaults`
 
 ---
 
@@ -133,6 +143,11 @@
 - **`06-nixos-system/04-networking-firewall-security.qmd`**: Networking, Firewall, and Security
 - **`06-nixos-system/05-users-groups-ssh.qmd`**: Users, Groups, and SSH Configuration
 - **`06-nixos-system/06-hardware-drivers.qmd`**: Hardware Configuration and Drivers
+- **`06-nixos-system/07-disko-declarative-disk-partitioning.qmd`**: Declarative Disk Partitioning with Disko
+- **`06-nixos-system/08-ephemeral-roots-and-impermanence.qmd`**: Ephemeral Roots and Impermanence
+- **`06-nixos-system/09-nixos-generators.qmd`**: Image Generation with nixos-generators ← new
+  - `nixosGenerate` for ISO, QEMU qcow2, Raspberry Pi SD card, cloud images
+  - Shared module pattern between live systems and image pipelines
 
 ---
 
@@ -197,3 +212,27 @@
 - **`12-platform-engineering/06-testing-strategies.qmd`**: Testing Strategies for Nix Configurations
 - **`12-platform-engineering/07-maintenance-upgrades-migration.qmd`**: Maintenance, Upgrades, and Migration
 - **`12-platform-engineering/08-enterprise-operational-checklists.qmd`**: Enterprise Operational Checklists
+- **`12-platform-engineering/09-fleet-deployments-colmena.qmd`**: Fleet Deployments with Colmena
+- **`12-platform-engineering/10-microvms-and-virtualisation.qmd`**: MicroVMs and Virtualisation
+- **`12-platform-engineering/11-content-addressed-nix-internals.qmd`**: Content-Addressed Nix Internals
+
+---
+
+## Part 13: Production Capstone — Zero-Trust Fleet
+
+- **`13-production-capstone/01-enterprise-architecture-and-threat-model.qmd`**: Enterprise Architecture and Threat Model
+- **`13-production-capstone/02-disko-storage-and-ephemeral-base.qmd`**: Disko Storage and Ephemeral Base
+- **`13-production-capstone/03-hardened-network-and-vpn-mesh.qmd`**: Hardened Network and VPN Mesh
+- **`13-production-capstone/04-distributed-application-stack.qmd`**: Distributed Application Stack
+- **`13-production-capstone/05-automated-fleet-rollout-and-disaster-recovery.qmd`**: Automated Fleet Rollout and Disaster Recovery
+
+---
+
+## Appendices
+
+- **`99-appendices/01-glossary.qmd`**: Glossary of Nix and NixOS Terms
+- **`99-appendices/02-command-cheat-sheet.qmd`**: Command Cheat Sheet
+- **`99-appendices/03-nix-version-reference.qmd`**: Nix and NixOS Version Reference ← new
+  - Nix CLI 2.18–2.24 feature additions and reproducible examples
+  - NixOS 23.05–24.11 system changes and module configurations
+
