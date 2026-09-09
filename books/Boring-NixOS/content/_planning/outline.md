@@ -2,7 +2,7 @@
 
 **Title:** Boring NixOS  
 **Subtitle:** From Zero to Production — Reproducible Systems at Scale  
-**Target Toolchain:** Nix 2.24+ / NixOS 24.11+ / Flakes Enabled
+**Target Toolchain:** Nix 2.35+ / NixOS 26.05 “Yarara” / Flakes Enabled
 
 ---
 
@@ -13,6 +13,14 @@
   - Why Traditional Tooling Fails (Ambient host pollution, implicit path lookups)
   - A Different Approach: Declarative, Immutable Infrastructure
   - What This Book Will Teach You & How to Read It
+- **`00-introduction/02-installing-nix.qmd`**: *Installing Nix*
+  - Multi-user daemon install, flakes in the daemon `nix.conf`
+  - First substitute: `nix run nixpkgs#hello`
+  - Pin nixpkgs in a flake lock; do not stack installers
+- **`00-introduction/03-installing-nixos.qmd`**: *Installing NixOS*
+  - Disposable UEFI VM, partition, `nixos-generate-config`
+  - Tiny `configuration.nix`, `stateVersion`, first `nixos-rebuild switch`
+  - Rollback via `--rollback` and the bootloader menu
 
 ---
 
@@ -38,6 +46,8 @@
   - Low-level `derivation` primitive
   - Writing raw `.nix` recipes and evaluating with `nix-instantiate`
   - Building your first standalone store artifact with `nix-build`
+- **`01-nix-fundamentals/06-inspecting-the-store/01-why-depends-and-nix-tree.qmd`**: *Inspecting Closures*
+  - `nix path-info -Shr`, `nix why-depends`, `nix-store --tree`, `nix-tree`, `nom`
 
 ---
 
@@ -111,6 +121,10 @@
 - **`03-dev-environments/07-nix-darwin-macos.qmd`**: *nix-darwin: Declarative macOS Configuration* ← new
   - `darwinConfigurations` + `darwin-rebuild switch`
   - Shared `commonPackages` across Linux + macOS in one flake, `nix-homebrew`, `system.defaults`
+- **`03-dev-environments/08-nix-on-linux.qmd`**: *Nix on a Foreign Linux*
+  - Daemon + Home Manager + direnv on Ubuntu/Fedora/Arch; distro keeps the OS
+- **`03-dev-environments/09-nix-ld-and-fhs.qmd`**: *Vendor Binaries with nix-ld and FHS Envs*
+  - `programs.nix-ld`, `buildFHSEnv` / `steam-run`, no global `LD_LIBRARY_PATH`
 
 ---
 
@@ -121,6 +135,8 @@
 - **`04-packages-and-overlays/03-creating-composing-overlays.qmd`**: Creating and Composing Overlays
 - **`04-packages-and-overlays/04-custom-package-definitions.qmd`**: Custom Package Definitions
 - **`04-packages-and-overlays/05-managing-dependencies-across-projects.qmd`**: Managing Dependencies Across Projects
+- **`04-packages-and-overlays/06-fetchers-and-fixed-outputs.qmd`**: Fetchers and Fixed-Output Derivations
+- **`04-packages-and-overlays/07-nix-path-and-pinning.qmd`**: NIX_PATH, Channels, and Pinning Inputs (`<nixpkgs>`, npins, flake.lock)
 
 ---
 
@@ -130,8 +146,16 @@
 - **`05-building-from-source/02-c-cpp-cmake.qmd`**: Building C and C++ Projects with CMake
 - **`05-building-from-source/03-rust-cargo.qmd`**: Rust Packages with Cargo (`buildRustPackage`, `crane`)
 - **`05-building-from-source/04-python-pip-setuptools.qmd`**: Python Packages with Pip and Setuptools
-- **`05-building-from-source/05-go-and-nodejs.qmd`**: Go Modules and Node.js Packages
-- **`05-building-from-source/06-cross-compilation.qmd`**: Cross-Compilation for Multiple Platforms
+- **`05-building-from-source/05-go-modules.qmd`**: Go Modules with `buildGoModule` (`vendorHash`, CGO, toolchain pin)
+- **`05-building-from-source/06-cross-compilation.qmd`**: Cross-Compilation for Multiple Platforms (`pkgsCross`)
+- **`05-building-from-source/07-trivial-builders.qmd`**: Trivial Builders (`writeShellApplication`, `runCommand`, `symlinkJoin`)
+- **`05-building-from-source/08-source-filtering.qmd`**: Source Filtering (`fileset`, `cleanSource`)
+- **`05-building-from-source/09-patching-packages.qmd`**: Patching Packages (`patches`, `fetchpatch2`, `overrideAttrs`)
+- **`05-building-from-source/10-nodejs-packages.qmd`**: Node.js Packages (`buildNpmPackage`, pnpm)
+- **`05-building-from-source/11-go-toolchains-gomod2nix.qmd`**: Go Toolchains and gomod2nix (Crane analogue; pin `go`)
+- **`05-building-from-source/12-go-devshells.qmd`**: Go Development Environments (`gopls`, `GOTOOLCHAIN=local`)
+- **`05-building-from-source/13-go-cross-compilation.qmd`**: Cross-Compiling Go (`GOOS`/`GOARCH`, CGO off)
+- **`05-building-from-source/14-packaging-anti-patterns.qmd`**: Packaging Anti-Patterns
 
 ---
 
@@ -148,6 +172,8 @@
 - **`06-nixos-system/09-nixos-generators.qmd`**: Image Generation with nixos-generators ← new
   - `nixosGenerate` for ISO, QEMU qcow2, Raspberry Pi SD card, cloud images
   - Shared module pattern between live systems and image pipelines
+- **`06-nixos-system/10-backups-and-generation-hygiene.qmd`**: Backups and Generation Hygiene
+  - Restic of `/persist` and service state; restore drills; GC windows; ESP `configurationLimit`
 
 ---
 
@@ -169,6 +195,8 @@
 - **`08-cicd/04-build-caching-strategies.qmd`**: Build Caching Strategies
 - **`08-cicd/05-testing-in-ci-pipelines.qmd`**: Testing in CI Pipelines
 - **`08-cicd/06-secrets-management-in-ci.qmd`**: Secrets Management in CI
+- **`08-cicd/07-remote-builders.qmd`**: Remote Builders
+  - `nix.buildMachines`, `ssh-ng`, `builders-use-substitutes`, Darwin→Linux, KVM features
 
 ---
 
@@ -233,6 +261,6 @@
 - **`99-appendices/01-glossary.qmd`**: Glossary of Nix and NixOS Terms
 - **`99-appendices/02-command-cheat-sheet.qmd`**: Command Cheat Sheet
 - **`99-appendices/03-nix-version-reference.qmd`**: Nix and NixOS Version Reference ← new
-  - Nix CLI 2.18–2.24 feature additions and reproducible examples
-  - NixOS 23.05–24.11 system changes and module configurations
+  - Nix CLI 2.18–2.35 feature additions and reproducible examples
+  - NixOS 23.05–26.05 system changes and module configurations
 
