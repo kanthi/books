@@ -174,6 +174,9 @@
   - Shared module pattern between live systems and image pipelines
 - **`06-nixos-system/10-backups-and-generation-hygiene.qmd`**: Backups and Generation Hygiene
   - Restic of `/persist` and service state; restore drills; GC windows; ESP `configurationLimit`
+- **`06-nixos-system/11-systemd-stage1-initrd.qmd`**: Systemd Stage 1 Initrd ← new
+  - 26.05 default systemd initrd; LUKS mapper paths; `boot.initrd.systemd.mounts` / services
+  - Debug with `rd.systemd.debug_shell`; do not revert to scripted Stage 1 (removed in 26.11)
 
 ---
 
@@ -263,4 +266,3 @@
 - **`99-appendices/03-nix-version-reference.qmd`**: Nix and NixOS Version Reference ← new
   - Nix CLI 2.18–2.35 feature additions and reproducible examples
   - NixOS 23.05–26.05 system changes and module configurations
-

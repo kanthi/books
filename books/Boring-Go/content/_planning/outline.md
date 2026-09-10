@@ -20,6 +20,7 @@ See `index.qmd` for the reader-facing map.
 - 02-formatting-vetting-documentation.qmd
 - 03-dependency-management.qmd
 - 04-workspaces-and-multi-module.qmd
+- 05-tool-dependencies.qmd
 
 ### 03-types-and-values
 - 01-predeclared-types.qmd
@@ -98,6 +99,7 @@ See `index.qmd` for the reader-facing map.
 - 14-filepath-and-fs.qmd
 - 15-database-sql.qmd
 - 16-json-v2.qmd
+- 17-omitzero-json-tags.qmd
 
 ### 14-shipping
 - 01-static-analysis-and-security.qmd
