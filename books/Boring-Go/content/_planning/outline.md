@@ -60,6 +60,7 @@ See `index.qmd` for the reader-facing map.
 - 02-generic-functions.qmd
 - 03-generic-types.qmd
 - 04-idiomatic-generics.qmd
+- 05-generic-methods.qmd
 
 ### 10-errors
 - 01-errors-as-values.qmd
