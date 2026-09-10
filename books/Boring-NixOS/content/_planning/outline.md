@@ -125,6 +125,10 @@
   - Daemon + Home Manager + direnv on Ubuntu/Fedora/Arch; distro keeps the OS
 - **`03-dev-environments/09-nix-ld-and-fhs.qmd`**: *Vendor Binaries with nix-ld and FHS Envs*
   - `programs.nix-ld`, `buildFHSEnv` / `steam-run`, no global `LD_LIBRARY_PATH`
+- **`03-dev-environments/10-devenv.qmd`**: *devenv: Modules, Services, and Processes*
+  - Optional layer over `mkShell`: `devenv.nix` + `devenv.yaml` pin **nixos-26.05**, `devenv.lock`
+  - `languages.go`, `services.postgres`, native `devenv up`; direnv `use devenv`
+  - Flake wrap is impure (`--no-pure-eval`); production packages stay `buildGoModule`
 
 ---
 
@@ -177,6 +181,10 @@
 - **`06-nixos-system/11-systemd-stage1-initrd.qmd`**: Systemd Stage 1 Initrd ← new
   - 26.05 default systemd initrd; LUKS mapper paths; `boot.initrd.systemd.mounts` / services
   - Debug with `rd.systemd.debug_shell`; do not revert to scripted Stage 1 (removed in 26.11)
+- **`06-nixos-system/12-custom-iso-and-distro.qmd`**: Custom NixOS ISOs and Distro Branding
+  - Installer ISO from `installation-cd-minimal` / Calamares; `isoImage` name, volume, USB
+  - `distroId` / `distroName` / `extraOSReleaseArgs`; GRUB/syslinux splash; Plymouth; Calamares `branding.desc`
+  - Shared identity module for ISO and installed hosts; do not fork nixpkgs for a logo
 
 ---
 
@@ -256,6 +264,24 @@
 - **`13-production-capstone/03-hardened-network-and-vpn-mesh.qmd`**: Hardened Network and VPN Mesh
 - **`13-production-capstone/04-distributed-application-stack.qmd`**: Distributed Application Stack
 - **`13-production-capstone/05-automated-fleet-rollout-and-disaster-recovery.qmd`**: Automated Fleet Rollout and Disaster Recovery
+
+---
+
+## Part 14: Production Labs — Patterns from NixOS.org Infra
+
+Steal shapes from the public `github:NixOS/infra` tree (26.05-small, Colmena, Disko, sops, keys file, builder factory). Do not clone their hosts, flake-parts, NixOps README, or operator keys. Desk rewrite of each pattern.
+
+- **`14-production-labs/01-reading-nixos-infra.qmd`**: Reading NixOS.org Infra as a Pattern Source
+  - Flake is the contract; README still says NixOps
+  - `follows`, extra substituter, `mkHost` without flake-parts
+- **`14-production-labs/02-operator-keys-and-groups.qmd`**: Operator Keys and Groups
+  - `keys.nix` users/groups/machines/age; `mutableUsers = false`
+- **`14-production-labs/03-critical-vs-noncritical.qmd`**: Critical vs Non-Critical Hives
+  - `@core` vs `@apps`, two sops trees, staging as a host
+- **`14-production-labs/04-builder-factory-and-restricted-ssh.qmd`**: Builder Factory and Restricted Store SSH
+  - `mkBuilder` + forced `nix-store --serve --write` on user `build`
+- **`14-production-labs/05-channel-promotion-and-ci-hosts.qmd`**: Channel Promotion and CI Host Groups
+  - `channels.nix` status table, `.tested`, checks grouped by arch, OpenTofu envelope
 
 ---
 

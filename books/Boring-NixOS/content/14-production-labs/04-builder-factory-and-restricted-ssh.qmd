@@ -1,0 +1,247 @@
+---
+title: "Builder Factory and Restricted Store SSH"
+---
+
+# Builder Factory and Restricted Store SSH
+
+NixOS/infra’s `builders/` is a function `mkNixOS system config` that always imports the same common modules (hardening, ssh, nix, hydra-queue-builder, users), then a per-box instance (CPU, disks). The hydra queue runner may SSH in **only** as `nix-store --serve --write` — not a shell. The boring default is: **the same factory for desk builders, and a forced SSH command so CI cannot `rm -rf`**.
+
+The remote-builders chapter listed `nix.buildMachines`. This lab is the **other** side of that SSH: the box that receives the `.drv`.
+
+## Mental model
+
+```
+ops-01 / hydra-queue
+    ssh build@builder-01
+         forced command: nix-store --serve --write
+              │
+              ▼
+         builder-01  (kvm, big-parallel)
+              │  NAR
+              ▼
+         team cache
+```
+
+`users.users.build` (uid 2000 in their tree) holds **only** that authorized key, wrapped:
+
+```
+command="NIX_SSL_CERT_FILE=…/ca-bundle.crt  /nix/store/…-nix/bin/nix-store --serve --write" ssh-ed25519 AAAA…
+```
+
+`authorizedKeys` `command=` is OpenSSH forced command. Agent forwarding and `pty` will not get you bash. That is the point.
+
+Common modules stay boring: UTC, `mutableUsers = false`, nftables, `openssh`, nix flakes, node-exporter. Instance files set Disko `by-id` and `system`.
+
+## Worked examples
+
+### Case 1: `mkHost` factory with common modules
+
+Save as `lib/mk-builder.nix`:
+
+```nix
+# lib/mk-builder.nix
+{ nixpkgs, disko }:
+
+system: extraModules:
+nixpkgs.lib.nixosSystem {
+  inherit system;
+  modules = [
+    disko.nixosModules.disko
+    ../builders/common/system.nix
+    ../builders/common/ssh.nix
+    ../builders/common/nix.nix
+    extraModules
+  ];
+}
+```
+
+Save as `builders/common/system.nix`:
+
+```nix
+# builders/common/system.nix
+{ pkgs, ... }:
+{
+  time.timeZone = "UTC";
+  users.mutableUsers = false;
+  environment.systemPackages = [ pkgs.git pkgs.jq ];
+  system.stateVersion = "26.05";
+}
+```
+
+Save as `flake.nix`:
+
+```nix
+# flake.nix
+{
+  description = "Desk builders";
+
+  inputs = {
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-26.05";
+    disko.url = "github:nix-community/disko";
+    disko.inputs.nixpkgs.follows = "nixpkgs";
+  };
+
+  outputs = { self, nixpkgs, disko }:
+    let
+      mkBuilder = import ./lib/mk-builder.nix { inherit nixpkgs disko; };
+    in
+    {
+      nixosConfigurations = {
+        builder-01 = mkBuilder "x86_64-linux" [ ./builders/instances/builder-01.nix ];
+        builder-arm = mkBuilder "aarch64-linux" [ ./builders/instances/builder-arm.nix ];
+      };
+    };
+}
+```
+
+Two archs, one factory. NixOS/infra’s comments list cores and RAM next to each instance — do that in a comment, not in a wiki.
+
+### Case 2: Forced `nix-store --serve --write`
+
+Save as `builders/common/ssh.nix`:
+
+```nix
+# builders/common/ssh.nix
+{ config, lib, pkgs, ... }:
+
+let
+  keys = import ../../keys.nix;
+  authorizedNixStoreKey = key:
+    let
+      env = "NIX_SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt";
+      nixStore = "${config.nix.package}/bin/nix-store";
+    in
+    ''command="${env} ${nixStore} --serve --write" ${key}'';
+in
+{
+  services.openssh.enable = true;
+  services.openssh.settings.PasswordAuthentication = false;
+  services.openssh.settings.KbdInteractiveAuthentication = false;
+
+  users.users.root.openssh.authorizedKeys.keys = keys.ssh.groups.desk-core;
+
+  users.users.build = {
+    isNormalUser = true;
+    uid = 2000;
+    # no extraGroups. no lingering.
+    openssh.authorizedKeys.keys =
+      map authorizedNixStoreKey keys.ssh.users.hydra-queue;
+  };
+
+  nix.settings.trusted-users = [ "root" "build" ];
+}
+```
+
+`trusted-users` is required for `--serve --write` to import paths. Keep it `root` + `build`, not `@wheel`.
+
+```bash
+nix eval .#nixosConfigurations.builder-01.config.users.users.build.openssh.authorizedKeys.keys --json | jq -r '.[0][0:40]'
+```
+
+Output (shape):
+
+```
+command="NIX_SSL_CERT_FILE=/nix/store/…
+```
+
+If the line is a bare `ssh-ed25519`, the force is missing and CI has a shell.
+
+### Case 3: Nix daemon knobs the factory always sets
+
+Save as `builders/common/nix.nix`:
+
+```nix
+# builders/common/nix.nix
+{
+  nix.settings = {
+    experimental-features = [ "nix-command" "flakes" ];
+    cores = 0;           # one job may use all CPUs; pair with max-jobs
+    max-jobs = 8;        # set from nproc / RAM on the instance
+    sandbox = true;
+    builders-use-substitutes = true;
+    extra-substituters = [ "https://cache.nixos.org" ];
+    extra-trusted-public-keys = [
+      "cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY="
+    ];
+  };
+  nix.gc.automatic = true;
+  nix.gc.dates = "weekly";
+  nix.gc.options = "--delete-older-than 7d";
+  boot.binfmt.emulatedSystems = [ ]; # add aarch64-linux only if you meant qemu
+}
+```
+
+NixOS/infra sets `cores = 0` in `modules/common.nix`. On a shared builder, `max-jobs` is the throttle; `cores = 0` lets a single Chromium use the box. Do not copy `max-jobs = 96` from their Epyc comment onto a 4-core lab VM.
+
+### Case 4: Client `buildMachines` matches the forced user
+
+Save as `modules/use-builder-01.nix` on `ops-01`:
+
+```nix
+# modules/use-builder-01.nix
+{
+  nix.buildMachines = [{
+    hostName = "builder-01.desk.internal";
+    sshUser = "build";
+    sshKey = "/run/secrets/ops-builder-ssh";
+    system = "x86_64-linux";
+    protocol = "ssh-ng";
+    maxJobs = 8;
+    speedFactor = 4;
+    supportedFeatures = [ "kvm" "nixos-test" "big-parallel" ];
+  }];
+  nix.distributedBuilds = true;
+  nix.settings.builders-use-substitutes = true;
+}
+```
+
+The key in `sshKey` is the **private** half of `keys.ssh.users.hydra-queue`, on sops, mode `0400`. The public half is what Case 2 wrapped in `command=`. If you use alice’s laptop key here, alice can `--serve --write` **and** she still has a root shell from `desk-core` — two roles, two keys.
+
+```bash
+nix build .#nixosConfigurations.app-01.config.system.build.toplevel --max-jobs 0
+```
+
+`--max-jobs 0` forbids a local compile. The drv must go to `builder-01`. If it builds on `ops-01`, the feature flags or SSH forced command are wrong (`journalctl` on the builder, `ssh -v build@builder-01`).
+
+### Case 5: Instance file is disks + identity, not a second OS
+
+Save as `builders/instances/builder-01.nix`:
+
+```nix
+# builders/instances/builder-01.nix
+{ lib, ... }:
+{
+  networking.hostName = "builder-01";
+  # Epyc-class in prod; lab: one disk.
+  disko.devices.disk.main.device = lib.mkDefault "/dev/vda";
+  imports = [ ../disk-layouts/ext4.nix ];
+
+  nix.settings.max-jobs = 8;
+  nix.settings.system-features = [ "kvm" "nixos-test" "big-parallel" ];
+}
+```
+
+Hardware comments belong here (“48C/96T, 256 GB”) so the next human does not schedule Chromium on a cloud burstable. The OS is the factory. The instance is numbers.
+
+## The trap
+
+The trap is **a builder account with a login shell and `wheel`**. The queue runner then has root. Forced `command=` + `trusted-users = [ "build" ]` is the whole privilege.
+
+The other trap is wrapping `command=` around **root**’s keys so you cannot SSH in to repair. Root stays `desk-core` without a force. `build` is the restricted user.
+
+A third: `boot.binfmt.emulatedSystems = [ "aarch64-linux" ]` on an x86 builder so “we don’t need builder-arm.” Qemu is not a 96-thread Ampere. Separate `system` in the factory.
+
+## The boring rule
+
+- One `mkBuilder` function. Common modules always. Instance = disks + jobs + features.
+- `build` user: forced `nix-store --serve --write`, `trusted-users`, no `wheel`.
+- Root: `desk-core` keys, no force.
+- Client `sshUser = "build"` + sops private key. `--max-jobs 0` to prove it.
+- `system-features` advertised must match what you put in `supportedFeatures` on the client.
+
+## Try this
+
+1. Eval Case 2; confirm the `build` key starts with `command="`.
+2. On a lab VM, add the `build` user; `ssh build@vm` — must not get a shell; `nix store ping --store ssh-ng://build@vm` (or `nix ping-store`) from a client that has the matching key.
+3. `nix build nixpkgs#hello --max-jobs 0` from `ops-01` with Case 4; `journalctl -u nix-daemon` on the builder shows the compile (or a substitute).
+4. Add `builder-arm` with `system = "aarch64-linux"`; `nix flake show`. Do not binfmt it onto builder-01 for the lab.
