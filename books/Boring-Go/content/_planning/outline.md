@@ -20,6 +20,7 @@ See `index.qmd` for the reader-facing map.
 - 02-formatting-vetting-documentation.qmd
 - 03-dependency-management.qmd
 - 04-workspaces-and-multi-module.qmd
+- 05-tool-dependencies.qmd
 
 ### 03-types-and-values
 - 01-predeclared-types.qmd
