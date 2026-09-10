@@ -31,6 +31,7 @@ See `index.qmd` for the reader-facing map.
 ### 04-control-flow
 - 01-conditional-logic.qmd
 - 02-loops-and-iteration.qmd
+- 03-defer-and-cleanup.qmd
 
 ### 05-composite-types
 - 01-arrays-and-slices.qmd
@@ -42,6 +43,7 @@ See `index.qmd` for the reader-facing map.
 - 01-functions-in-depth.qmd
 - 02-functions-as-values.qmd
 - 03-methods-and-receivers.qmd
+- 04-functional-options.qmd
 
 ### 07-memory
 - 01-understanding-memory.qmd
@@ -70,6 +72,7 @@ See `index.qmd` for the reader-facing map.
 - 02-organization-and-coverage.qmd
 - 03-advanced-testing.qmd
 - 04-integration-and-system-testing.qmd
+- 05-testing-async-with-synctest.qmd
 
 ### 12-concurrency
 - 01-concurrency-basics.qmd
@@ -93,6 +96,9 @@ See `index.qmd` for the reader-facing map.
 - 12-context-and-signals.qmd
 - 13-hashing-and-crypto.qmd
 - 14-filepath-and-fs.qmd
+- 15-database-sql.qmd
+- 16-json-v2.qmd
+- 17-omitzero-json-tags.qmd
 
 ### 14-shipping
 - 01-static-analysis-and-security.qmd
@@ -110,3 +116,4 @@ See `index.qmd` for the reader-facing map.
 ### 99-appendices
 - 01-glossary.qmd
 - 02-command-cheat-sheet.qmd
+- 03-whats-new-1-21-to-1-27.qmd

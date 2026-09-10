@@ -4,70 +4,118 @@ title: "GitOps with Argo CD and Flux"
 
 # GitOps with Argo CD and Flux
 
-GitOps engines like Argo CD and Flux ensure clusters match git state, but letting them run arbitrary, unpinned build plugins leads to drifting environments and unreproducible deployments. The boring default is: **a two-stage pipeline where Nix evaluates and renders full static manifests into a deployment branch or repo, which Argo CD or Flux syncs without needing Nix in the cluster**.
+SSH-from-laptop `kubectl apply` does not scale and does not audit. The boring default is: **the cluster pulls generated YAML from git (Flux or Argo), and Nix only runs in CI to refresh that YAML**.
 
 ## Mental model
 
-1. **Pre-render in CI:** Evaluating Nix inside a Kubernetes pod on every sync loop requires giving the cluster Nix daemon privileges, CPU, and storage. Instead, evaluate in CI and commit flat manifests to the GitOps sync branch.
-2. **Clean separation of concerns:** 
-   - Development repo: Nix expressions, source code, tests, container definitions.
-   - CI runner: builds images, evaluates manifests, pushes images to registry, updates GitOps repository.
-   - Argo CD / Flux: Watches flat GitOps repo, syncs directly to Kubernetes API.
-3. **Instant rollbacks:** Every commit in the deployment branch represents the exact state applied to the cluster, enabling instant `git revert`.
+| Tool | Pull model |
+|---|---|
+| Flux | controllers reconcile `GitRepository` + `Kustomization` |
+| Argo CD | Application CR points at a git path |
+
+Both want **plain YAML** in the repo (or a Helm release they render). They do not eval your flake on the control plane. CI:
+
+```
+nix build .#manifests  →  commit generated/  →  Flux applies
+```
+
+Pick **one**. Running Argo and Flux on the same cluster is a fight.
 
 ## Worked examples
 
-### Case 1: CI workflow rendering manifests for Argo CD
+### Case 1: Generated tree layout
 
-Save as `render-gitops.sh`:
+```
+generated/
+  desk/
+    namespace.yaml
+    deploy.yaml
+    svc.yaml
+```
 
 ```bash
-# render-gitops.sh
-set -euo pipefail
-
-echo "Evaluating Kubernetes manifests via Nix..."
-nix-build manifests.nix -o rendered-manifests.json
-
-mkdir -p gitops-repo/apps/desk-service
-cp rendered-manifests.json gitops-repo/apps/desk-service/deployment.json
-
-cd gitops-repo
-git add apps/desk-service/
-git commit -m "Deploy desk-service commit ${GITHUB_SHA:-manual}"
-echo "Manifest ready for Argo CD sync."
+nix build .#manifests
+rsync -a --delete result/ generated/desk/
+git add generated && git diff --cached
 ```
 
-Execution output:
+Human reviews the YAML, not the Nix, at merge time — or reviews both.
 
-```bash
-bash render-gitops.sh
-```
+### Case 2: Flux GitRepository (illustrative)
 
-```
-Evaluating Kubernetes manifests via Nix...
-/nix/store/7wq1...-desk-deployment.json
-Manifest ready for Argo CD sync.
-```
-
-### Case 2: Argo CD Application definition
-
-Save as `argo-application.yaml`:
+Save as `generated/flux/gitrepo.yaml`:
 
 ```yaml
-# argo-application.yaml
+# gitrepo.yaml
+apiVersion: source.toolkit.fluxcd.io/v1
+kind: GitRepository
+metadata:
+  name: desk
+  namespace: flux-system
+spec:
+  interval: 1m
+  url: https://git.desk.internal/platform/desk.git
+  ref:
+    branch: main
+```
+
+The URL is your repo. Auth is a Secret Flux already knows, not a token in Nix.
+
+### Case 3: Kustomization pointing at generated YAML
+
+```yaml
+# kustomization-flux.yaml
+apiVersion: kustomize.toolkit.fluxcd.io/v1
+kind: Kustomization
+metadata:
+  name: desk-api
+  namespace: flux-system
+spec:
+  interval: 5m
+  sourceRef:
+    kind: GitRepository
+    name: desk
+  path: ./generated/desk
+  prune: true
+```
+
+`prune: true` deletes objects you removed from git. That is the point. Test in staging first.
+
+### Case 4: CI gate
+
+```yaml
+# .github/workflows/manifests.yml
+name: manifests
+on: [pull_request]
+jobs:
+  gen:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: cachix/install-nix-action@v27
+      - run: nix build .#manifests
+      - run: diff -ru generated/desk result
+```
+
+If someone edited YAML by hand, the PR fails. Edit Nix, regenerate, commit both.
+
+### Case 5: Argo Application (if the org standardised on Argo)
+
+```yaml
+# application.yaml
 apiVersion: argoproj.io/v1alpha1
 kind: Application
 metadata:
-  name: desk-service
+  name: desk-api
   namespace: argocd
 spec:
   project: default
   source:
-    repoURL: 'https://github.com/company/gitops-deployments.git'
+    repoURL: https://git.desk.internal/platform/desk.git
     targetRevision: main
-    path: apps/desk-service
+    path: generated/desk
   destination:
-    server: 'https://kubernetes.default.svc'
+    server: https://kubernetes.default.svc
     namespace: desk
   syncPolicy:
     automated:
@@ -75,17 +123,23 @@ spec:
       selfHeal: true
 ```
 
+Same generated path. Do not point Argo at `helm/` with unpinned deps.
+
 ## The trap
 
-The trap is **installing Nix into the Argo CD repo-server as a custom plugin**. This slows sync cycles, introduces in-cluster compilation risks, and causes synchronization timeouts when cache hits miss. Keep cluster controllers simple consumers of static files.
+The trap is **the laptop as GitOps**: `flux reconcile` after `kubectl apply` after `nix build` that never got pushed. Git is the desired state. If it is not in `main`, the cluster should not have it.
 
 ## The boring rule
 
-- Evaluate and validate all manifests in CI before committing to GitOps repos.
-- Keep Argo CD / Flux configurations strictly standard and declarative.
-- Store rendered artifacts in dedicated deployment repositories or branches.
+- One GitOps controller. Generated YAML in git. Nix in CI.
+- `diff` generated output on every PR.
+- `prune` in staging before production.
+- Secrets still not in that YAML (sops + KSOPS / External Secrets).
+- Pin git `targetRevision` to a tag for prod if you need freeze.
 
 ## Try this
 
-1. Run the render script locally to produce a flat JSON manifest from your Nix module.
-2. Validate that the rendered file can be directly applied to a local Minikube or Kind cluster using `kubectl apply -f`.
+1. `diff -ru` two `nix build .#manifests` trees with no edits — empty.
+2. Change a replica count in Nix, regenerate, read the YAML diff as if you were on-call.
+3. Write a one-page "we use Flux xor Argo" note in the desk repo.
+4. Confirm `kubectl` on your laptop is **read** against prod, not write (RBAC).

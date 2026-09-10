@@ -89,7 +89,7 @@ Every live book (and `Template/`) uses the same generator: **nested sections**, 
 ## Boring-NixOS book
 
 - Path: `Boring-NixOS/`
-- Deterministic, immutable infrastructure and developer environments.
+- Deterministic, immutable infrastructure and developer environments. **Nix 2.35+**, **NixOS / nixpkgs 26.05 “Yarara”**, flakes enabled.
 - **Independent** of `NixOS/` and every other title. Do not cross-link.
 - Every listing is a complete runnable expression/file **inline in the chapter** (`default.nix`, `flake.nix`, `shell.nix`, `configuration.nix`).
 - Recurring domain: an infrastructure desk (workstations, devShells, services).
