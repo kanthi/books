@@ -100,6 +100,7 @@ See `index.qmd` for the reader-facing map.
 - 15-database-sql.qmd
 - 16-json-v2.qmd
 - 17-omitzero-json-tags.qmd
+- 18-uuid.qmd
 
 ### 14-shipping
 - 01-static-analysis-and-security.qmd
