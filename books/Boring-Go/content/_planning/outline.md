@@ -38,6 +38,7 @@ See `index.qmd` for the reader-facing map.
 - 02-working-with-strings.qmd
 - 03-maps.qmd
 - 04-structs-and-data-modeling.qmd
+- 05-promoted-field-literals.qmd
 
 ### 06-functions-and-methods
 - 01-functions-in-depth.qmd
