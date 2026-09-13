@@ -59,7 +59,8 @@ Every book is meant to be read **on its own**. A reader of Python should never n
 | **`Linux`**, **`Linux book`** | `books/Linux/` |
 | **`Python`**, **`Python book`** | `books/Python/` |
 | **`Boring-Python`**, **`Boring Python`** | `books/Boring-Python/` |
-| **`Networking`**, **`C`**, **`VCS`**, **`Git`** | `books/<Name>/` (`Git` → `books/VCS/`) |
+| **`Networking`**, **`C`** | `books/<Name>/` |
+| **`VCS`**, **`Git`**, **`GitHub`**, **`JJ`**, **`Jujutsu`** | `books/VCS/` (`Git` → `content/01-git/`, `GitHub` → `content/02-github/`, `JJ`/`Jujutsu` → `content/03-jj/`) |
 
 For **NixOS** especially: normal chapters under `01-concepts/` … `02-nix-on-linux/` … `09-capstone/` + `99-projects/` — not day-calendar filenames.
 

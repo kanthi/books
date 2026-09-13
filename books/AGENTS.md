@@ -25,7 +25,7 @@ For books using `scripts/update-index.sh` in this repo:
 
 ## Book naming
 
-All titles under `books/` are **standalone libraries**. Paths: `books/Go/`, `books/Boring-Go/`, `books/Boring-Python/`, `books/NixOS/`, `books/Maths/`, `books/Linux/`, `books/Networking/`, `books/C/`, `books/Python/`, `books/VCS/` (Git content under `content/01-git/`). Prefer root **`AGENTS.md`** for inventory and workflow.
+All titles under `books/` are **standalone libraries**. Paths: `books/Go/`, `books/Boring-Go/`, `books/Boring-Python/`, `books/NixOS/`, `books/Maths/`, `books/Linux/`, `books/Networking/`, `books/C/`, `books/Python/`, `books/VCS/` (parts `01-git/`, `02-github/`, `03-jj/`, `04-forges/`). Prefer root **`AGENTS.md`** for inventory and workflow.
 
 ## Book independence
 
@@ -68,7 +68,10 @@ Every live book (and `Template/`) uses the same generator: **nested sections**, 
 
 ## VCS book
 
-- Path: `VCS/`; Git curriculum under `content/01-git/` (future parts may add `02-…`).
+- Path: `VCS/`
+- **Parts:** `01-git/` (Git the tool; mental model → recovery), `02-github/` (GitHub the product; Actions split, other seeds expand later), `03-jj/` (Jujutsu seed), `04-forges/` (GitLab, Gitea).
+- GitHub Flow as a *git topology* may stay in Git workflows. PRs, Actions, rulesets, `gh`, and orgs live in `02-github/`.
+- Do not add empty GitHub expansion dirs until a writing pass starts. Syllabus: `content/_planning/SYLLABUS.md`.
 
 ## Boring-Go book
 

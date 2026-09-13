@@ -135,18 +135,35 @@ humanize_dir_title() {
     overlays-tunnels)           printf '%s\n' "Overlays and Tunnels"; return ;;
     fabrics-multi-area)         printf '%s\n' "Fabrics and Multi-Area"; return ;;
     # VCS (before generic CamelCase split effects: GitHub → git-hub)
+    git)                        printf '%s\n' "Git"; return ;;
+    github|git-hub)             printf '%s\n' "GitHub"; return ;;
+    jj)                         printf '%s\n' "Jujutsu"; return ;;
+    forges)                     printf '%s\n' "Forges"; return ;;
+    gitlab)                     printf '%s\n' "GitLab"; return ;;
+    mental-model)               printf '%s\n' "Mental Model"; return ;;
+    install-and-config)         printf '%s\n' "Install and Config"; return ;;
+    first-repository)           printf '%s\n' "First Repository"; return ;;
+    commits-and-history)        printf '%s\n' "Commits and History"; return ;;
+    branching-and-merging)      printf '%s\n' "Branching and Merging"; return ;;
+    rebasing)                   printf '%s\n' "Rebasing"; return ;;
+    remotes)                    printf '%s\n' "Remotes"; return ;;
+    workflows)                  printf '%s\n' "Workflows"; return ;;
+    stash-tags-and-cleanup)     printf '%s\n' "Stash, Tags, and Cleanup"; return ;;
+    hooks)                      printf '%s\n' "Hooks"; return ;;
+    submodules-and-worktrees)   printf '%s\n' "Submodules and Worktrees"; return ;;
+    internals)                  printf '%s\n' "Internals"; return ;;
+    performance-and-scale)      printf '%s\n' "Performance and Scale"; return ;;
+    security)                   printf '%s\n' "Security"; return ;;
+    troubleshooting)            printf '%s\n' "Troubleshooting"; return ;;
     git-fundamentals)           printf '%s\n' "Git Fundamentals"; return ;;
     core-operations)            printf '%s\n' "Core Operations"; return ;;
     git-internals)              printf '%s\n' "Git Internals"; return ;;
     advanced-branching)         printf '%s\n' "Advanced Branching"; return ;;
-    github-intro|git-hub-intro) printf '%s\n' "GitHub Intro"; return ;;
     rewriting-history)          printf '%s\n' "Rewriting History"; return ;;
     advanced-commands)          printf '%s\n' "Advanced Commands"; return ;;
     hooks-automation)           printf '%s\n' "Hooks and Automation"; return ;;
-    github-actions|git-hub-actions) printf '%s\n' "GitHub Actions"; return ;;
-    github-advanced|git-hub-advanced) printf '%s\n' "GitHub Advanced"; return ;;
     open-source)                printf '%s\n' "Open Source"; return ;;
-    team-collaboration)         printf '%s\n' "Team Collaboration"; return ;;
+    orgs-and-teams)             printf '%s\n' "Orgs and Teams"; return ;;
     advanced-topics)            printf '%s\n' "Advanced Topics"; return ;;
   esac
 

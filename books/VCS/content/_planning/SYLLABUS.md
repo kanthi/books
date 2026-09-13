@@ -1,190 +1,69 @@
-# VCS — Git Syllabus
+# VCS syllabus
 
-## Course Overview
-This comprehensive guide covers Git version control system and GitHub platform from beginner to advanced levels, including practical workflows, collaboration techniques, and best practices.
+Four parts. Git is the tool. GitHub is a product. Jujutsu is a separate VCS (seed now, full later). Forges are GitLab and Gitea.
 
-## Learning Objectives
-By the end of this course, students will be able to:
-- Master Git fundamentals and advanced features
-- Effectively use GitHub for collaboration and project management
-- Implement professional Git workflows
-- Troubleshoot common Git issues
-- Set up and manage CI/CD pipelines
-- Contribute to open source projects
+Do not reteach Git inside GitHub or JJ. A GitHub reader needs remotes, branches, and commits; give a one-paragraph recap at the GitHub door, not a second Git course.
 
-## Course Structure
+---
 
-### Part I: Foundations (Chapters 1-4)
-**Chapter 1: Introduction to Version Control**
-- What is version control?
-- History of version control systems
-- Why Git?
-- Git vs other VCS
+## Part 1 — Git (`content/01-git/`)
 
-**Chapter 2: Git Fundamentals**
-- Installation and setup
-- Basic configuration
-- Repository initialization
-- The three states of Git
-- Basic workflow
+Rebased onto the practical Git TOC (mental model → recovery), merged with the old Git chapters. Pull requests and Actions stay in the GitHub part.
 
-**Chapter 3: Core Git Operations**
-- Adding and committing changes
-- Viewing history and status
-- Working with files
-- Ignoring files (.gitignore)
+| Section | Topics |
+|---------|--------|
+| Intro | One section: why Git, evolution, mental model (DAG, three trees, reset, detached HEAD), cheatsheet |
+| Install and config | Install, system/global/local, identity, SSH vs HTTPS |
+| First repository | init, add/commit, status, log, `.gitignore`, undo |
+| Commits and history | Amend, squash, cherry-pick, shared-history rewrites |
+| Branching and merging | Branches, tags, fast-forward / three-way / octopus, conflicts |
+| Rebasing | Interactive rebase, per-commit conflicts, `--force-with-lease`, vs merge |
+| Remotes | fetch/pull/push, tracking, extra remotes (no PR UI) |
+| Workflows | Git Flow, trunk-based, GitHub Flow as a *git topology*, monorepos |
+| Stash, tags, and cleanup | Stash (incl. `-p`), blame, grep, log, cleanup |
+| Hooks | Client/server hooks, templates, pre-commit framework (not Actions) |
+| Submodules and worktrees | Worktrees vs submodules vs subtree |
+| Internals | Object store, SHA, packfiles, plumbing, `cat-file` |
+| Performance and scale | Large repos, LFS, shallow/sparse/partial clone, bisect, tuning |
+| Security | Signed commits (SSH/GPG), `filter-repo`, secrets in history |
+| Troubleshooting | Reflog, `fsck`, recovery drills |
 
-**Chapter 4: Understanding Git Internals**
-- Git objects (blobs, trees, commits)
-- References and HEAD
-- The Git directory structure
-- How Git stores data
+GitHub Flow in Workflows is a **branch topology**. Pull-request UI belongs in GitHub.
 
-### Part II: Branching and Merging (Chapters 5-7)
-**Chapter 5: Branching Fundamentals**
-- What are branches?
-- Creating and switching branches
-- Branch management
-- Lightweight vs annotated tags
+---
 
-**Chapter 6: Merging and Conflict Resolution**
-- Fast-forward merges
-- Three-way merges
-- Merge conflicts
-- Conflict resolution strategies
-- Merge tools
+## Part 2 — GitHub (`content/02-github/`)
 
-**Chapter 7: Advanced Branching Strategies**
-- Git Flow workflow
-- GitHub Flow
-- Feature branching
-- Release branching
-- Hotfix workflows
+**Now:** six seed chapters moved out of Git (introduction, collaboration, Actions, platform, open source, orgs/teams). They are not the final outline.
 
-### Part III: Remote Repositories (Chapters 8-10)
-**Chapter 8: Working with Remotes**
-- Understanding remote repositories
-- Adding and managing remotes
-- Fetching and pulling
-- Pushing changes
-- Tracking branches
+**Next writing pass:** split and expand. Do not add empty section dirs until that pass starts.
 
-**Chapter 9: Introduction to GitHub**
-- GitHub overview and features
-- Creating repositories
-- GitHub interface
-- README files and documentation
-- GitHub vs Git
+| Future section | Intent |
+|----------------|--------|
+| Map | Git vs GitHub vs `gh`; what this part assumes |
+| Identity | Account, 2FA/passkeys, SSH vs HTTPS, fine-grained PATs, SSO, verified commits |
+| Repositories | Create, templates, `.github` repo, topics, README/LICENSE, default branch |
+| Pull requests | Drafts, reviews, CODEOWNERS, auto-merge, merge queue, merge methods, `gh pr` |
+| Issues and planning | Issues, types/sub-issues, labels, milestones, Projects v2, Discussions, forms |
+| Actions | **Published** under `02-github/03-actions/` (11 chapters): map, triggers (incl. fork PRs), jobs/steps/contexts, secrets/environments/`GITHUB_TOKEN`, matrix, cache vs artifacts, PR CI (desk-tickets Python), composite + `workflow_call`, custom actions, SHA pins / pwn requests / OIDC / self-hosted, `gh run` + concurrency + minutes |
+| Security | Rulesets vs classic branch protection, Dependabot, secret scanning, code scanning, advisories |
+| Ship artifacts | Releases, Packages, Pages, environments/deployments |
+| Automate GitHub | `gh` in depth, REST, GraphQL, webhooks, GitHub Apps vs OAuth apps |
+| Orgs and enterprise | Teams, roles, inner source, Enterprise Cloud vs Server vs data residency, audit log |
+| Open source | Community health files, sponsorships, first contribution, maintainer load |
 
-**Chapter 10: Collaboration Workflows**
-- Forking and cloning
-- Pull requests
-- Code reviews
-- Issue tracking
-- Project boards
+Copilot is at most a short aside (it dates fast). Current seed files get broken apart into these sections; they are not one more 800-line dump.
 
-### Part IV: Advanced Git Techniques (Chapters 11-14)
-**Chapter 11: Rewriting History**
-- Interactive rebasing
-- Squashing commits
-- Amending commits
-- Cherry-picking
-- When and when not to rewrite history
+---
 
-**Chapter 12: Advanced Git Commands**
-- Git stash
-- Git bisect
-- Git blame and annotate
-- Git grep and log searching
-- Submodules and subtrees
+## Part 3 — Jujutsu (`content/03-jj/`)
 
-**Chapter 13: Git Hooks and Automation**
-- Client-side hooks
-- Server-side hooks
-- Pre-commit hooks
-- Continuous integration basics
-- Automated testing
+**Now:** seed overview (former Misc page). Not current as a full curriculum.
 
-**Chapter 14: Troubleshooting and Recovery**
-- Common Git problems
-- Undoing changes
-- Recovery techniques
-- Git reflog
-- Data recovery
+**Later pass:** change IDs, no index, `@` working-copy commit, revsets, colocated Git repos, bookmarks, undo, `jj git push`. Do not reteach Git.
 
-### Part V: GitHub Advanced Features (Chapters 15-17)
-**Chapter 15: GitHub Actions and CI/CD**
-- Introduction to GitHub Actions
-- Workflow syntax
-- Building CI/CD pipelines
-- Deployment strategies
-- Security considerations
+---
 
-**Chapter 16: GitHub Advanced Features**
-- GitHub Pages
-- GitHub Packages
-- Security features
-- GitHub API
-- GitHub CLI
+## Part 4 — Forges (`content/04-forges/`)
 
-**Chapter 17: Open Source Contribution**
-- Finding projects to contribute to
-- Contribution guidelines
-- Making your first contribution
-- Maintaining open source projects
-- Community building
-
-### Part VI: Professional Workflows (Chapters 18-20)
-**Chapter 18: Team Collaboration Best Practices**
-- Code review processes
-- Branch protection rules
-- Team workflows
-- Documentation standards
-- Communication strategies
-
-**Chapter 19: Git in Enterprise Environments**
-- Large repository management
-- Monorepos vs multi-repos
-- Git LFS (Large File Storage)
-- Security and compliance
-- Integration with other tools
-
-**Chapter 20: Advanced Topics and Future**
-- Git performance optimization
-- Custom Git commands
-- Git internals deep dive
-- Alternative Git interfaces
-- Future of version control
-
-## Assessment Methods
-- Hands-on exercises after each chapter
-- Project-based assignments
-- Peer code reviews
-- Final capstone project
-
-## Prerequisites
-- Basic command line knowledge
-- Understanding of file systems
-- Basic programming concepts (helpful but not required)
-
-## Resources and Tools
-- Git command line
-- GitHub account
-- Text editor or IDE
-- Terminal/command prompt
-- Optional: Git GUI tools
-
-## Time Allocation
-- **Beginner Level (Chapters 1-7)**: 4-6 weeks
-- **Intermediate Level (Chapters 8-14)**: 4-6 weeks
-- **Advanced Level (Chapters 15-20)**: 4-6 weeks
-- **Total Duration**: 12-18 weeks (depending on pace and depth)
-
-## Practical Projects
-1. Personal portfolio repository
-2. Collaborative team project
-3. Open source contribution
-4. CI/CD pipeline setup
-5. Git workflow implementation
-
-This syllabus provides a structured path from Git basics to advanced GitHub workflows, ensuring comprehensive coverage of version control concepts and practical skills needed in professional development environments.
+Published seeds: GitLab, Gitea. Optional later: Codeberg, Forgejo, SourceHut. Not GitHub.
