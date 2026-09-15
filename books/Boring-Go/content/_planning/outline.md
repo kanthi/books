@@ -75,6 +75,7 @@ See `index.qmd` for the reader-facing map.
 - 03-advanced-testing.qmd
 - 04-integration-and-system-testing.qmd
 - 05-testing-async-with-synctest.qmd
+- 06-httptest-new-test-server.qmd
 
 ### 12-concurrency
 - 01-concurrency-basics.qmd
