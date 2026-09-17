@@ -190,6 +190,10 @@
   - Depend on `dbus.service` alias; opt out to `"dbus"` only with a measured regression
 - **`06-nixos-system/14-system-nix-entry-point.qmd`**: system.nix: Channel-Free NixOS Entry Point ← new
   - Pin nixpkgs with `fetchTarball`; empty `NIX_PATH` / no `nix-channel`; `--attr` / `--file`; `nix.nixPath` wiring; one entry point (flakes **or** system.nix)
+- **`06-nixos-system/15-switch-inhibitors.qmd`**: Switch Inhibitors ← new
+  - `system.switch.inhibitors` string map; refuse live switch when shared keys change
+  - Prefer `nixos-rebuild boot` + reboot; inspect `/run/current-system/switch-inhibitors`
+  - Extend sparingly (e.g. `systemd.package.version`); lab-only `NIXOS_NO_CHECK=1`
 
 ---
 
@@ -239,6 +243,7 @@
 ## Part 11: Secrets Management and Security
 
 - **`11-secrets-security/01-why-secrets-are-hard.qmd`**: Why Secrets Are Hard with Declarative Config
+
 - **`11-secrets-security/02-sops-nix.qmd`**: Using SOPS for Encrypted Configuration (`sops-nix`)
 - **`11-secrets-security/03-vault-integration.qmd`**: HashiCorp Vault Integration
 - **`11-secrets-security/04-age-encryption.qmd`**: Age Encryption for Simple Secrets
