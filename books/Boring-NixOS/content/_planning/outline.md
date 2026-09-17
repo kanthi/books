@@ -186,8 +186,10 @@
   - `distroId` / `distroName` / `extraOSReleaseArgs`; GRUB/syslinux splash; Plymouth; Calamares `branding.desc`
   - Shared identity module for ISO and installed hosts; do not fork nixpkgs for a logo
 - **`06-nixos-system/13-dbus-broker.qmd`**: D-Bus Broker Default ← new
-  - 26.05 default `services.dbus.implementation = "broker"`; reboot on implementation change
-  - Depend on `dbus.service` alias; do not normalize `NIXOS_NO_CHECK=1`
+  - 26.05 default `services.dbus.implementation = "broker"`; switch inhibitor; `boot` + reboot
+  - Depend on `dbus.service` alias; opt out to `"dbus"` only with a measured regression
+- **`06-nixos-system/14-system-nix-entry-point.qmd`**: system.nix: Channel-Free NixOS Entry Point ← new
+  - Pin nixpkgs with `fetchTarball`; empty `NIX_PATH` / no `nix-channel`; `--attr` / `--file`; `nix.nixPath` wiring; one entry point (flakes **or** system.nix)
 - **`06-nixos-system/15-switch-inhibitors.qmd`**: Switch Inhibitors ← new
   - `system.switch.inhibitors` string map; refuse live switch when shared keys change
   - Prefer `nixos-rebuild boot` + reboot; inspect `/run/current-system/switch-inhibitors`
