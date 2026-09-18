@@ -33,6 +33,7 @@ See `index.qmd` for the reader-facing map.
 - 03-dicts.qmd
 - 04-sets.qmd
 - 05-dataclasses-and-data-modeling.qmd
+- 06-template-strings.qmd
 
 ### 06-functions
 - 01-functions-in-depth.qmd
@@ -102,6 +103,19 @@ See `index.qmd` for the reader-facing map.
 - 02-ctypes-and-ffi.qmd
 - 03-performance-tuning.qmd
 - 04-designing-for-the-long-term.qmd
+
+### 17-data-structures-and-algorithms
+- 01-algorithmic-complexity.qmd
+- 02-stacks-queues-and-deques.qmd
+- 03-linked-lists.qmd
+- 04-binary-search-trees.qmd
+- 05-heaps-and-priority-queues.qmd
+- 06-tries-and-prefix-trees.qmd
+- 07-sorting-algorithms.qmd
+- 08-binary-search-and-bisect.qmd
+- 09-graphs-and-traversals.qmd
+- 10-shortest-paths-dijkstra.qmd
+- 11-string-search-and-bloom-filters.qmd
 
 ### 99-appendices
 - 01-glossary.qmd
