@@ -1,0 +1,144 @@
+---
+title: "Garbage Collector Tuning and Memory Limits"
+---
+
+# Garbage Collector Tuning and Memory Limits
+
+The boring default is to **leave Go's garbage collector at its standard settings**. Go's concurrent tri-color collector is tuned for low latency and sub-millisecond pauses. But when running inside containers with strict RAM ceilings, default settings can trigger Out-Of-Memory (OOM) kernel kills before the GC reacts. Understanding `GOMEMLIMIT`, `GOGC`, and pointer density allows you to maximize memory efficiency safely.
+
+## Mental model
+
+Go's garbage collector operates concurrently with running application goroutines:
+
+1. **Mark Phase:** The collector marks all live objects starting from roots (globals, stack frames). Any memory not marked is garbage.
+2. **Sweep Phase:** Unmarked memory is reclaimed and returned to runtime free lists.
+
+### GOGC: The Target Ratio
+
+`GOGC` (default `100`) controls the heap target trigger:
+$$\text{Next GC Target} = \text{Live Heap} \times \left(1 + \frac{\text{GOGC}}{100}\right)$$
+
+With `GOGC=100`, if your application has 50 MB of live data after a GC cycle, the next GC triggers when the heap hits 100 MB. Setting `GOGC=200` delays GC until 150 MB (saving CPU at the cost of memory). Setting `GOGC=50` triggers GC at 75 MB (saving memory at the cost of extra CPU).
+
+### GOMEMLIMIT: Soft Memory Ceiling
+
+In containerized environments (Kubernetes, Docker), the Linux kernel terminates processes that exceed container cgroup memory limits. Setting `GOGC` alone cannot prevent spikes if the base live heap expands.
+
+`GOMEMLIMIT` (introduced in Go 1.19 and standard in Go 1.27) provides a **soft memory cap**. When total memory approaches `GOMEMLIMIT`, the runtime automatically triggers GC cycles more frequently to stay under the limit. If memory usage is well below `GOMEMLIMIT`, the runtime relaxes GC frequency, conserving CPU cycles.
+
+> **Note on Memory Ballasts:** In older Go versions (prior to 1.19), developers allocated large dummy byte arrays (`var ballast = make([]byte, 1<<30)`) to trick the GC into running less often. In modern Go, **memory ballasts are obsolete and deprecated**. Use `GOMEMLIMIT` instead.
+
+### Pointer Density and the `noscan` Span
+
+The duration of the GC mark phase depends primarily on how many **pointers** it must follow. Heap memory allocations that contain **zero pointers** (such as `[]byte`, `[]int`, or structs composed purely of scalar numbers and booleans) are placed into special runtime memory spans tagged as `noscan`. The garbage collector skips scanning their contents entirely!
+
+## Worked examples
+
+### Case 1: Setting GOMEMLIMIT and observing pointer scan times
+
+Save as `gc_demo.go`. We inspect how `debug.SetMemoryLimit` works and compare GC pause times between pointer-heavy structs and pointer-free structs.
+
+```go
+// gc_demo.go
+package main
+
+import (
+	"fmt"
+	"runtime"
+	"runtime/debug"
+	"time"
+)
+
+type PointerTicket struct {
+	ID    *int
+	Label *string
+}
+
+type FlatTicket struct {
+	ID    int
+	Code  int64
+	Price int64
+}
+
+func main() {
+	// Query current limit (math.MaxInt64 by default)
+	oldLimit := debug.SetMemoryLimit(-1)
+	fmt.Printf("Current GOMEMLIMIT: %d bytes\n", oldLimit)
+
+	// Set soft limit to 256 MB (programmatic equivalent of GOMEMLIMIT=256MiB)
+	newLimit := int64(256 * 1024 * 1024)
+	debug.SetMemoryLimit(newLimit)
+	fmt.Printf("Configured GOMEMLIMIT: %d MB\n", debug.SetMemoryLimit(-1)/(1024*1024))
+
+	const n = 1_000_000
+
+	// 1. Slice of pointer-heavy structs
+	idVal := 42
+	lblVal := "STANDARD-TICKET"
+	ptrList := make([]PointerTicket, n)
+	for i := range n {
+		ptrList[i] = PointerTicket{ID: &idVal, Label: &lblVal}
+	}
+
+	start := time.Now()
+	runtime.GC()
+	ptrGCTime := time.Since(start)
+
+	// Clear pointer slice before second test
+	ptrList = nil
+	runtime.GC()
+
+	// 2. Slice of pointer-free structs
+	flatList := make([]FlatTicket, n)
+	for i := range n {
+		flatList[i] = FlatTicket{ID: i, Code: int64(i * 10), Price: 500}
+	}
+
+	start = time.Now()
+	runtime.GC()
+	flatGCTime := time.Since(start)
+
+	_ = flatList
+
+	fmt.Printf("GC scan time with 1M pointer structs:     %v\n", ptrGCTime)
+	fmt.Printf("GC scan time with 1M pointer-free structs: %v\n", flatGCTime)
+}
+```
+
+Run:
+
+```bash
+go run gc_demo.go
+```
+
+Output:
+
+```
+Current GOMEMLIMIT: 9223372036854775807 bytes
+Configured GOMEMLIMIT: 256 MB
+GC scan time with 1M pointer structs:     1.01824ms
+GC scan time with 1M pointer-free structs: 242.741µs
+```
+
+Notice that scanning 1,000,000 pointer-free structs took a fraction of the time. Because `FlatTicket` contains no pointers, the Go runtime marks its backing array as `noscan`, meaning the garbage collector marks the slice allocation in a single step without inspecting its individual fields.
+
+## The trap
+
+The dangerous trap is setting `GOMEMLIMIT` too close to your container's physical RAM limit. For example, if your container has a 512 MB limit and you set `GOMEMLIMIT=512MiB`, the Go runtime's memory limit does **not** include OS kernel buffers, thread stacks, or cgo allocations. If those non-heap allocations use 40 MB, your container may still be OOM-killed.
+
+The rule of thumb for containerized workloads is to set `GOMEMLIMIT` to **80–90% of the container's memory quota** (e.g., `GOMEMLIMIT=460MiB` for a 512 MiB container).
+
+Another trap is setting `GOGC=off`. If memory grows faster than expected, `GOMEMLIMIT` will still enforce GC runs, but setting `GOGC=off` removes the proportional pacing, leading to sudden CPU spikes when the ceiling is reached.
+
+## The boring rule
+
+- Keep `GOGC=100` as the default.
+- In container environments, set `GOMEMLIMIT` to 85% of your container's memory limit via environment variable (e.g., `GOMEMLIMIT=850MiB` for a 1 GiB pod).
+- Never use memory ballasts; use `GOMEMLIMIT`.
+- In large in-memory caches, design structs with scalar types (`int`, `int64`, byte offsets) rather than pointers to take advantage of `noscan` GC acceleration.
+
+## Try this
+
+1. Run `GOMEMLIMIT=64MiB GODEBUG=gctrace=1 go run gc_demo.go`. Inspect the trace output lines showing how GC triggers adaptively based on the configured limit.
+2. In `gc_demo.go`, replace `ID *int` with an `int` index and replace `Label *string` with a byte array `[16]byte`. Verify that GC scan time matches the `FlatTicket` baseline.
+3. Compare running a benchmark with `GOGC=50` versus `GOGC=200` using `go test -bench=. -benchtime=5s`. Observe how `GOGC=200` achieves higher ops/sec at the expense of higher resident heap size.

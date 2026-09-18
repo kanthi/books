@@ -1,0 +1,169 @@
+---
+title: "Long-Lived Connections and Leak Prevention"
+---
+
+# Long-Lived Connections and Leak Prevention
+
+The boring default is to enforce explicit **read and write deadlines** on every network socket. When building persistent streaming services—such as WebSockets, Server-Sent Events (SSE), or internal pub/sub feeds—connections are meant to remain open for minutes or hours. But when mobile clients lose coverage or network switches drop state without transmitting TCP termination packets (`FIN`/`RST`), server goroutines without deadlines sit blocked in the netpoller indefinitely, creating severe memory leaks.
+
+## Mental model
+
+In TCP, a connection can become **half-open**: one endpoint crashes or loses power, but the other endpoint believes the socket is healthy because no FIN packet was ever exchanged.
+
+If your Go server executes:
+
+```go
+// DANGER: Without a deadline, this blocks FOREVER on half-open sockets!
+n, err := conn.Read(buf)
+```
+
+The goroutine will stay parked in `netpollblock` for days. Each leaked connection retains:
+1. The goroutine stack (2 KB–8 KB+).
+2. The `net.Conn` struct and internal runtime poller handles.
+3. Any per-connection write buffers or channel subscriptions.
+4. An open operating system file descriptor.
+
+Over time, these "zombie goroutines" accumulate, slowly bleeding memory and eventually exhausting OS file descriptors.
+
+### The Heartbeat / Ping-Pong Pattern
+
+To detect dead connections reliably:
+1. The application establishes a heartbeat interval (e.g., ping every 30 seconds).
+2. The server sets a read deadline slightly longer than the interval (e.g., 35 seconds).
+3. Every time a valid packet or heartbeat arrives, the deadline is pushed forward:
+   `conn.SetReadDeadline(time.Now().Add(timeout))`
+4. If the client goes silent, `Read()` returns `os.ErrDeadlineExceeded`, allowing the server to close the socket and terminate the goroutine immediately.
+
+## Worked examples
+
+### Case 1: Active heartbeat monitoring and zombie eviction
+
+Save as `heartbeat_demo.go`. A streaming server enforces a 60ms deadline. When a client sends a PING, the server replies with PONG. When the client subsequently goes silent, the server evicts the zombie connection and reclaims the goroutine.
+
+```go
+// heartbeat_demo.go
+package main
+
+import (
+	"errors"
+	"fmt"
+	"io"
+	"net"
+	"os"
+	"runtime"
+	"sync"
+	"time"
+)
+
+func handleStreamingConnection(c net.Conn, timeout time.Duration) {
+	defer c.Close()
+
+	buf := make([]byte, 64)
+	for {
+		// Enforce deadline: must receive heartbeat or data before timeout
+		_ = c.SetReadDeadline(time.Now().Add(timeout))
+
+		n, err := c.Read(buf)
+		if err != nil {
+			if errors.Is(err, os.ErrDeadlineExceeded) {
+				fmt.Printf("Connection %s timed out (zombie evicted)\n", c.RemoteAddr())
+			}
+			return
+		}
+
+		msg := string(buf[:n])
+		if msg == "PING\n" {
+			_ = c.SetWriteDeadline(time.Now().Add(time.Second))
+			_, _ = c.Write([]byte("PONG\n"))
+		}
+	}
+}
+
+func main() {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		panic(err)
+	}
+	defer ln.Close()
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+
+	go func() {
+		defer wg.Done()
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		handleStreamingConnection(conn, 60*time.Millisecond)
+	}()
+
+	client, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		panic(err)
+	}
+	defer client.Close()
+
+	// Send 1 ping
+	_, _ = client.Write([]byte("PING\n"))
+	reply := make([]byte, 5)
+	_, _ = io.ReadFull(client, reply)
+	fmt.Printf("Client received reply: %s", reply)
+
+	// Client goes silent (simulating lost network or sudden crash)
+	// Wait for server deadline to trigger and evict zombie connection
+	time.Sleep(100 * time.Millisecond)
+	wg.Wait()
+
+	fmt.Printf("Active goroutines remaining: %d\n", runtime.NumGoroutine())
+}
+```
+
+Run:
+
+```bash
+go run heartbeat_demo.go
+```
+
+Output:
+
+```
+Client received reply: PONG
+Connection 127.0.0.1:35030 timed out (zombie evicted)
+Active goroutines remaining: 1
+```
+
+The dead connection was closed automatically, preventing resource leakage.
+
+## The trap
+
+A common trap is **ignoring write deadlines on slow clients** ("Slowloris" attack):
+
+```go
+// WRONG: A malicious or stalled client refuses to read bytes
+for event := range eventFeed {
+	_, err := conn.Write(event.Bytes()) // Can block indefinitely if client TCP window is full!
+}
+```
+
+If a client stops reading from its socket, the kernel TCP send buffer eventually fills up. The server's `conn.Write()` call will block forever, trapping the broadcaster goroutine.
+
+Always set a write deadline before pushing data to persistent streams:
+
+```go
+_ = conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+_, err := conn.Write(data)
+```
+
+## The boring rule
+
+- Never call `conn.Read()` or `conn.Write()` in production without an active deadline.
+- Implement an explicit heartbeat (ping/pong) protocol on all long-lived streams.
+- If a client fails to respond within the heartbeat window, immediately close the connection.
+- Monitor active goroutine counts with `runtime.NumGoroutine()` or Prometheus metrics to catch connection leaks early.
+
+## Try this
+
+1. In `heartbeat_demo.go`, send a second "PING\n" from the client at 40ms. Verify that the connection remains active and extends its deadline.
+2. In your HTTP server configuration, verify that `http.Server{ReadTimeout: 10*time.Second, WriteTimeout: 10*time.Second, IdleTimeout: 120*time.Second}` are explicitly configured.
+3. Test what happens if the client continuously reads very slowly (1 byte per second) when the server sets a 2-second write deadline.

@@ -1,0 +1,191 @@
+---
+title: "The Netpoller and Goroutine Scheduling"
+---
+
+# The Netpoller and Goroutine Scheduling
+
+The boring default in Go is to write **blocking network code**. You dial a connection, call `conn.Read()`, and let execution pause until bytes arrive. Under the hood, Go does not block the underlying operating system thread; it hands the socket descriptor to the **runtime netpoller**, parks the goroutine, and reuses the OS thread to do other work. Understanding how the netpoller operates is the foundation of high-concurrency networking in Go.
+
+## Mental model
+
+In traditional operating systems (such as C/C++ with synchronous I/O), calling `read()` on a socket blocks an entire OS thread. Because OS threads have fixed stack sizes (1 to 8 MB) and high kernel scheduling overhead, running 10,000 threads consumes gigabytes of memory and degrades performance through constant context switching.
+
+Other runtimes (such as Node.js or Python asyncio) solve this with **event loops** and asynchronous callbacks or promises, which fractures code into callback pyramids or `async/await` boundaries.
+
+Go combines the best of both worlds:
+
+1. **Non-blocking OS Sockets:** Every network file descriptor managed by package `net` is registered in non-blocking mode.
+2. **The Netpoller:** The Go runtime integrates directly with the OS event notification subsystem (`epoll` on Linux, `kqueue` on macOS/BSD, `IOCP` on Windows).
+3. **M-P-G Cooperative Scheduling:**
+   - **G (Goroutine):** Lightweight execution unit with a dynamic stack starting at just 2 KB.
+   - **M (Machine):** An operating system thread.
+   - **P (Processor):** A logical context for scheduling Go code (`GOMAXPROCS`).
+4. When a goroutine calls `conn.Read()` and no bytes are ready in the kernel socket buffer:
+   - The runtime parks the goroutine in state `_Gwaiting` (`netpollblock`).
+   - The OS thread (`M`) immediately picks up another runnable goroutine from the local run queue.
+   - When the kernel signals that bytes have arrived via `epoll_wait`, the netpoller moves the goroutine back to `_Grunnable`.
+
+You write clean, straight-line, synchronous-looking code while the runtime executes asynchronous event multiplexing behind the scenes.
+
+## Worked examples
+
+### Case 1: Goroutine-per-connection TCP echo server
+
+Save as `netpoll_demo.go`. We run an echo server that spawns a dedicated goroutine for each incoming client. We verify that after 50 concurrent connections finish, goroutine count returns cleanly to the baseline.
+
+```go
+// netpoll_demo.go
+package main
+
+import (
+	"fmt"
+	"io"
+	"net"
+	"runtime"
+	"sync"
+	"time"
+)
+
+func startEchoServer(addr string) (net.Listener, error) {
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		return nil, err
+	}
+
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				// Read into a small buffer; parked by netpoller when idle
+				buf := make([]byte, 128)
+				for {
+					n, err := c.Read(buf)
+					if err != nil {
+						return
+					}
+					_, _ = c.Write(buf[:n])
+				}
+			}(conn)
+		}
+	}()
+
+	return ln, nil
+}
+
+func main() {
+	ln, err := startEchoServer("127.0.0.1:0")
+	if err != nil {
+		panic(err)
+	}
+	defer ln.Close()
+
+	addr := ln.Addr().String()
+	const clientCount = 50
+
+	var wg sync.WaitGroup
+	initialGoroutines := runtime.NumGoroutine()
+
+	// Launch 50 concurrent connections
+	for i := range clientCount {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			conn, err := net.Dial("tcp", addr)
+			if err != nil {
+				return
+			}
+			defer conn.Close()
+
+			msg := fmt.Sprintf("ticket-ping-%d\n", id)
+			_, _ = conn.Write([]byte(msg))
+
+			reply := make([]byte, len(msg))
+			_, _ = io.ReadFull(conn, reply)
+		}(i)
+	}
+
+	wg.Wait()
+	time.Sleep(10 * time.Millisecond)
+
+	finalGoroutines := runtime.NumGoroutine()
+	fmt.Printf("Echo server started on: %s\n", addr)
+	fmt.Printf("Completed %d concurrent client connections\n", clientCount)
+	fmt.Printf("Goroutines before: %d, after: %d\n", initialGoroutines, finalGoroutines)
+}
+```
+
+Run:
+
+```bash
+go run netpoll_demo.go
+```
+
+Output:
+
+```
+Echo server started on: 127.0.0.1:46145
+Completed 50 concurrent client connections
+Goroutines before: 2, after: 2
+```
+
+Each client connection was handled by an independent goroutine without spinning an OS thread. When the client closed the socket, `Read()` returned `io.EOF`, the handler exited, and the goroutine terminated cleanly.
+
+### Case 2: Inspecting GOMAXPROCS and OS threads
+
+By default, Go sets `GOMAXPROCS` to match the number of available CPU cores. When goroutines are parked in the netpoller waiting on network packets, they consume **zero CPU time** and do not block other running goroutines.
+
+```go
+// maxprocs_demo.go
+package main
+
+import (
+	"fmt"
+	"runtime"
+)
+
+func main() {
+	numCPU := runtime.NumCPU()
+	curProcs := runtime.GOMAXPROCS(0) // Pass 0 to query without changing
+
+	fmt.Printf("Logical CPUs: %d\n", numCPU)
+	fmt.Printf("GOMAXPROCS:   %d\n", curProcs)
+}
+```
+
+Run:
+
+```bash
+go run maxprocs_demo.go
+```
+
+Output:
+
+```
+Logical CPUs: 8
+GOMAXPROCS:   8
+```
+
+## The trap
+
+The most frequent trap with Go's networking model is **blocking OS threads in CGO or un-polled file I/O**.
+
+While network sockets are non-blocking and managed by the netpoller, standard **disk file operations** (`os.Open`, `os.Read`) on Linux cannot use epoll. When a goroutine performs a blocking disk read, the Go runtime must allocate a new OS thread (`M`) to prevent other goroutines on that `P` from stalling. If thousands of goroutines simultaneously perform blocking disk or CGO calls, thread creation can skyrocket to hundreds of OS threads, triggering thread exhaustion or kernel limits.
+
+For network services, keep disk I/O asynchronous, buffered, or capped to a bounded worker pool.
+
+## The boring rule
+
+- Write idiomatic, synchronous-looking `conn.Read()` and `conn.Write()` calls; let the netpoller manage OS epoll/kqueue polling.
+- Launch a new goroutine per connection for server listeners unless handling more than 50,000 concurrent idle sockets (where memory per stack must be capped).
+- Ensure every connection handler terminates cleanly upon encountering `io.EOF` or an error.
+- Never override `GOMAXPROCS` unless running inside containerized CPU quotas where `automaxprocs` avoids CPU throttling.
+
+## Try this
+
+1. In `netpoll_demo.go`, increase `clientCount` to 500. Observe that execution completes in milliseconds without thread exhaustion.
+2. In the echo server connection loop, add `c.SetReadDeadline(time.Now().Add(50 * time.Millisecond))`. Observe how idle connections timeout and return `os.ErrDeadlineExceeded`.
+3. Check runtime scheduler trace events by running `GODEBUG=schedtrace=1000 go run netpoll_demo.go`. Note the `threads` and `idleprocs` counters reported every second.

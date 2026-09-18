@@ -1,0 +1,165 @@
+---
+title: "Scaling to Ten Thousand Concurrent Connections"
+---
+
+# Scaling to Ten Thousand Concurrent Connections
+
+The boring default in Go is to spawn a goroutine for every incoming connection. For hundreds or thousands of clients, this works without special tuning. But scaling to **10,000+ simultaneous connections (the C10K problem)** requires intentional memory accounting. While 10,000 goroutine stacks consume only ~20 MB of RAM, unmanaged socket buffers and per-connection heap allocations can easily explode into gigabytes.
+
+## Mental model
+
+Handling 10,000 concurrent sockets requires understanding where memory is spent:
+
+### 1. Goroutine Stacks (~20–40 MB)
+A goroutine in Go 1.27 starts with a 2 KB stack allocation. 10,000 idle goroutines parked on `conn.Read()` consume:
+$$10{,}000 \times 2\text{ KB} \approx 20\text{ MB}$$
+This is tiny compared to other language runtimes.
+
+### 2. User-Space Read/Write Buffers
+If each connection allocates its own private 4 KB read buffer and 4 KB write buffer:
+$$10{,}000 \times 8\text{ KB} = 80\text{ MB}$$
+If buffers grow dynamically or are sized to 64 KB, memory ballooning will quickly trigger OOM kills. The solution is **buffer pooling via `sync.Pool`**: allocate buffers only when active data is being decoded, and return them immediately when idle.
+
+### 3. Kernel Socket Buffers (TCP Windows)
+By default, the Linux kernel allocates receive (`SO_RCVBUF`) and send (`SO_SNDBUF`) buffers for each TCP socket (often 128 KB to 256 KB per socket under autotuning):
+$$10{,}000 \times 256\text{ KB} \approx 2.5\text{ GB (in OS kernel RAM!)}$$
+For high-density services with mostly idle persistent connections, tuning minimum socket buffer sizes in Linux via `sysctl` or `net.Dialer.Control` prevents kernel memory exhaustion.
+
+### 4. Operating System File Descriptors
+By default, Linux limits a single process to 1,024 open file descriptors. Attempting to open connection #1025 results in `socket: too many open files`. Raising `ulimit -n 65535` is required before starting the process.
+
+## Worked examples
+
+### Case 1: Measuring memory footprint across concurrent sockets
+
+Save as `tenk_demo.go`. We establish hundreds of concurrent TCP sockets and inspect resident heap memory consumption.
+
+```go
+// tenk_demo.go
+package main
+
+import (
+	"fmt"
+	"net"
+	"runtime"
+	"sync"
+	"time"
+)
+
+var readBufPool = sync.Pool{
+	New: func() any {
+		b := make([]byte, 1024) // 1 KB pooled buffer
+		return &b
+	},
+}
+
+func main() {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		panic(err)
+	}
+	defer ln.Close()
+
+	const targetConns = 500
+	var serverConns []net.Conn
+	var mu sync.Mutex
+
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			mu.Lock()
+			serverConns = append(serverConns, c)
+			mu.Unlock()
+
+			// In a high-density server, buffers are drawn from sync.Pool
+			// only when bytes arrive, rather than permanently pinned per socket.
+		}
+	}()
+
+	var clientConns []net.Conn
+	for range targetConns {
+		c, err := net.Dial("tcp", ln.Addr().String())
+		if err != nil {
+			panic(err)
+		}
+		clientConns = append(clientConns, c)
+	}
+
+	time.Sleep(50 * time.Millisecond)
+
+	var memStats runtime.MemStats
+	runtime.ReadMemStats(&memStats)
+
+	fmt.Printf("Successfully established %d concurrent sockets\n", targetConns)
+	fmt.Printf("Active goroutines:  %d\n", runtime.NumGoroutine())
+	fmt.Printf("Allocated heap RAM: %.2f MB\n", float64(memStats.Alloc)/(1024*1024))
+
+	for _, c := range clientConns {
+		_ = c.Close()
+	}
+	for _, c := range serverConns {
+		_ = c.Close()
+	}
+}
+```
+
+Run:
+
+```bash
+go run tenk_demo.go
+```
+
+Output:
+
+```
+Successfully established 500 concurrent sockets
+Active goroutines:  2
+Allocated heap RAM: 0.71 MB
+```
+
+Notice that 500 live TCP sockets consume less than 1 MB of Go heap RAM when per-socket buffers are not pre-allocated.
+
+### Case 2: Essential Linux host tuning for 10K+ connections
+
+Before running a 10K+ network server on Linux, adjust host limits in `/etc/security/limits.conf` and `sysctl.conf`:
+
+```bash
+# 1. Raise open file descriptor limit
+ulimit -n 65535
+
+# 2. Increase the listen queue backlog (prevent connection drop during SYN bursts)
+sysctl -w net.core.somaxconn=4096
+
+# 3. Expand ephemeral port range for outbound load testing
+sysctl -w net.ipv4.ip_local_port_range="1024 65535"
+
+# 4. Enable TCP TIME_WAIT socket reuse
+sysctl -w net.ipv4.tcp_tw_reuse=1
+```
+
+## The trap
+
+A major trap when writing 10K connection servers is **holding onto per-connection reader/writer structs forever**.
+
+For example, calling `bufio.NewReader(conn)` allocates a default 4 KB buffer on the heap. If 10,000 connections create a `bufio.Reader` and keep it referenced in the connection struct, that pins 40 MB of heap memory indefinitely, even if 95% of those connections are idle.
+
+If connections are mostly idle (e.g., push notifications, chat desks, IoT telemetry):
+- Read the initial command into a small buffer borrowed from `sync.Pool`.
+- Return the buffer to the pool while waiting for the next message.
+- Set read deadlines so silent or disconnected clients are evicted before they exhaust file descriptors.
+
+## The boring rule
+
+- Always check and raise `ulimit -n` before deploying high-concurrency servers.
+- Use `sync.Pool` for byte buffers rather than assigning dedicated 4 KB–64 KB slices to each connection.
+- Set conservative connection timeouts so dead connections do not linger in the netpoller.
+- Keep per-connection state structs minimal (e.g. user ID, socket handle, small bitflags).
+
+## Try this
+
+1. In `tenk_demo.go`, increase `targetConns` to 1,000. Verify whether your local OS file descriptor limit accommodates 2,000 open sockets (1,000 clients + 1,000 servers).
+2. Measure how resident memory changes if you allocate a dedicated `buf := make([]byte, 8192)` inside each connection handler before parking in `c.Read()`.
+3. Check your current system descriptor limit by running `ulimit -n` in your terminal.

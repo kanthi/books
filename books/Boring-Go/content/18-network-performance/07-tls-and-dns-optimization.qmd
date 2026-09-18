@@ -1,0 +1,202 @@
+---
+title: "TLS and DNS Performance"
+---
+
+# TLS and DNS Performance
+
+The boring default is to let Go's standard library handle DNS queries and TLS handshakes automatically. However, in distributed architectures where microservices communicate over encrypted HTTPS/gRPC endpoints, **TLS handshakes** and **un-cached DNS lookups** often dominate tail latency (p99). Enabling TLS session resumption and choosing the appropriate DNS resolver eliminates unnecessary round trips and CPU overhead.
+
+## Mental model
+
+### The Cost of TLS Handshakes
+Establishing a fresh TLS connection requires:
+1. TCP 3-way handshake (1 RTT).
+2. TLS 1.2 or TLS 1.3 cryptographic negotiation (1 to 2 RTTs), including exchanging certificates and deriving symmetric cipher keys.
+
+On wide-area networks (WAN) where ping latency between data centers is 50ms, establishing a brand-new TLS connection adds **150–250ms** before a single byte of HTTP payload is transferred.
+
+### TLS Session Resumption
+**TLS Session Resumption** (via session tickets in TLS 1.2 or Pre-Shared Keys in TLS 1.3) allows a client and server to reuse previously established cryptographic keys for subsequent connections:
+- Reduces handshake latency to **0 or 1 RTT**.
+- Skips heavy asymmetric CPU calculations (RSA / ECDHE key generation).
+- In Go clients, session resumption is enabled by configuring `tls.Config.ClientSessionCache = tls.NewLRUClientSessionCache(capacity)`.
+
+### Go DNS Resolvers: cgo vs netgo
+Go ships two DNS resolvers:
+1. **Pure Go Resolver (`netgo`):** Fully asynchronous, integrated into the Go runtime netpoller, and handles concurrent DNS queries without blocking OS threads.
+2. **cgo Resolver (`getaddrinfo`):** Uses the host C standard library. Because `getaddrinfo` is synchronous and blocking, each DNS lookup blocks an operating system thread (`M`), which can cause thread pool thrashing during DNS timeouts.
+
+By default, Go chooses the pure Go resolver on Linux unless specific conditions (like custom `/etc/nsswitch.conf` rules) force the cgo resolver. You can explicitly enforce the pure Go resolver via:
+
+```go
+resolver := &net.Resolver{
+	PreferGo: true,
+}
+```
+
+Or globally via the environment variable `GODEBUG=netdns=go`.
+
+Furthermore, **Go's standard library does not cache DNS lookups**. Every time a connection pool needs to dial a new socket, it performs a fresh DNS network query unless you maintain connection pools or configure an in-memory caching dialer.
+
+## Worked examples
+
+### Case 1: Enabling TLS session resumption with ClientSessionCache
+
+Save as `tls_dns_demo.go`. We configure a test HTTPS server and measure TLS handshake duration with and without session resumption via `httptrace.ClientTrace`.
+
+```go
+// tls_dns_demo.go
+package main
+
+import (
+	"crypto/tls"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"net/http/httptrace"
+	"time"
+)
+
+func main() {
+	// 1. Create a local HTTPS test server
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ticket response"))
+	}))
+	defer server.Close()
+
+	// 2. Client configured with TLS Session Cache
+	tlsConfig := server.Client().Transport.(*http.Transport).TLSClientConfig.Clone()
+	tlsConfig.ClientSessionCache = tls.NewLRUClientSessionCache(32)
+
+	transport := &http.Transport{
+		TLSClientConfig:     tlsConfig,
+		DisableKeepAlives:   true, // Force fresh connections to test TLS handshake resumption
+		MaxIdleConnsPerHost: 10,
+	}
+
+	client := &http.Client{Transport: transport}
+
+	for i := range 2 {
+		var tlsStart, tlsEnd time.Time
+		var resumed bool
+
+		trace := &httptrace.ClientTrace{
+			TLSHandshakeStart: func() { tlsStart = time.Now() },
+			TLSHandshakeDone: func(cs tls.ConnectionState, err error) {
+				tlsEnd = time.Now()
+				resumed = cs.DidResume
+			},
+		}
+
+		req, _ := http.NewRequest(http.MethodGet, server.URL, nil)
+		req = req.WithContext(httptrace.WithClientTrace(req.Context(), trace))
+
+		resp, err := client.Do(req)
+		if err != nil {
+			panic(err)
+		}
+		_ = resp.Body.Close()
+
+		fmt.Printf("Connection %d: TLS resumed=%v handshake_time=%v\n",
+			i+1, resumed, tlsEnd.Sub(tlsStart))
+	}
+}
+```
+
+Run:
+
+```bash
+go run tls_dns_demo.go
+```
+
+Output:
+
+```
+Connection 1: TLS resumed=false handshake_time=4.434383ms
+Connection 2: TLS resumed=true handshake_time=1.405297ms
+```
+
+On Connection 1, a full cryptographic handshake took over 4ms. On Connection 2, the client resumed the session ticket (`TLS resumed=true`), cutting handshake duration by two-thirds.
+
+### Case 2: Configuring a Pure Go DNS dialer
+
+Save as `dns_resolver.go`. We configure an `http.Transport` to use the non-blocking pure Go resolver:
+
+```go
+// dns_resolver.go
+package main
+
+import (
+	"context"
+	"fmt"
+	"net"
+	"net/http"
+	"time"
+)
+
+func createOptimizedTransport() *http.Transport {
+	dialer := &net.Dialer{
+		Timeout:   5 * time.Second,
+		KeepAlive: 30 * time.Second,
+		Resolver: &net.Resolver{
+			PreferGo:     true, // Use non-blocking netpoller DNS
+			StrictErrors: false,
+		},
+	}
+
+	return &http.Transport{
+		DialContext:         dialer.DialContext,
+		MaxIdleConns:        100,
+		MaxIdleConnsPerHost: 50,
+		IdleConnTimeout:     90 * time.Second,
+	}
+}
+
+func main() {
+	transport := createOptimizedTransport()
+	client := &http.Client{
+		Transport: transport,
+		Timeout:   10 * time.Second,
+	}
+
+	req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, "http://127.0.0.1", nil)
+	_ = client
+	_ = req
+
+	fmt.Println("Configured pure Go resolver transport successfully")
+}
+```
+
+Run:
+
+```bash
+go run dns_resolver.go
+```
+
+Output:
+
+```
+Configured pure Go resolver transport successfully
+```
+
+## The trap
+
+The most deceptive trap in DNS performance is **short TTLs in container environments**.
+
+In Kubernetes or cloud VPCs, internal service names (e.g. `desk-inventory.prod.svc.cluster.local`) often have DNS TTLs of 5 or 30 seconds. If an HTTP client does not pool connections and dials on every request, hundreds of simultaneous queries flood the cluster DNS service (`CoreDNS`), causing packet drops and multi-second p99 timeouts.
+
+The primary defense is **connection pooling**: as long as existing TCP connections remain idle in the pool and are reused, zero DNS lookups are performed.
+
+## The boring rule
+
+- Always configure `ClientSessionCache: tls.NewLRUClientSessionCache(64)` on outbound HTTPS clients.
+- Enforce the pure Go resolver (`PreferGo: true` or `GODEBUG=netdns=go`) on Linux to avoid blocking OS threads during slow DNS responses.
+- Reuse connections via `http.Transport` to avoid querying DNS repeatedly for the same hosts.
+- In container environments, watch CoreDNS latency metrics to detect client-side DNS thrashing.
+
+## Try this
+
+1. In `tls_dns_demo.go`, remove `tlsConfig.ClientSessionCache`. Verify that `resumed` remains `false` for every connection.
+2. Run your application with `GODEBUG=netdns=go+1` to print DNS debug trace messages for every hostname lookup.
+3. Test how your HTTP transport behaves if you add an in-memory map to cache resolved IP addresses for 60 seconds inside `DialContext`.

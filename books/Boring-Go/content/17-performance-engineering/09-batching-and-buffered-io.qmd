@@ -1,0 +1,258 @@
+---
+title: "Batching Operations and Buffered I/O"
+---
+
+# Batching Operations and Buffered I/O
+
+The boring default is to write small chunks directly to disk or network sockets until throughput metrics plateau. Every I/O call across an operating system boundary requires a **system call** (`syscall`), causing an OS context switch, CPU ring transition, and kernel bookkeeping. Combining multiple small items into **buffered streams** or **batched flushes** amortizes fixed overhead, multiplying throughput by orders of magnitude.
+
+## Mental model
+
+Consider saving 10,000 ticket transactions:
+
+- **Unbuffered I/O:** 10,000 individual `write(2)` syscalls. The CPU transitions back and forth between user space and kernel space 10,000 times.
+- **Buffered I/O (`bufio.Writer`):** Accumulates data in an internal user-space slice (typically 4 KB or 64 KB). The CPU executes only a handful of large system calls when the buffer fills.
+- **Batching:** Instead of processing incoming transactions one-by-one with immediate database queries or network transmissions, transactions are collected into a local slice and processed together when:
+  1. A **size threshold** is met (e.g., 100 items).
+  2. A **time threshold** expires (e.g., every 50ms), ensuring low latency under light traffic.
+
+## Worked examples
+
+### Case 1: Threshold-based batching with bufio.Writer
+
+Save as `batch_demo.go`. An audit logger collects ticket lifecycle events in memory and flushes to the underlying stream only when the batch threshold is reached or when an explicit flush is issued.
+
+```go
+// batch_demo.go
+package main
+
+import (
+	"bufio"
+	"bytes"
+	"fmt"
+	"time"
+)
+
+type AuditEvent struct {
+	ID        int
+	Action    string
+	Timestamp time.Time
+}
+
+type BatchWriter struct {
+	buf       *bufio.Writer
+	items     []AuditEvent
+	batchSize int
+}
+
+func NewBatchWriter(b *bytes.Buffer, batchSize int) *BatchWriter {
+	return &BatchWriter{
+		buf:       bufio.NewWriterSize(b, 4096),
+		items:     make([]AuditEvent, 0, batchSize),
+		batchSize: batchSize,
+	}
+}
+
+func (w *BatchWriter) Add(ev AuditEvent) error {
+	w.items = append(w.items, ev)
+	if len(w.items) >= w.batchSize {
+		return w.Flush()
+	}
+	return nil
+}
+
+func (w *BatchWriter) Flush() error {
+	if len(w.items) == 0 {
+		return nil
+	}
+	for _, ev := range w.items {
+		_, err := fmt.Fprintf(w.buf, "[%s] ticket=%d action=%s\n",
+			ev.Timestamp.Format("15:04:05"), ev.ID, ev.Action)
+		if err != nil {
+			return err
+		}
+	}
+	w.items = w.items[:0] // Reset slice without reallocating backing array
+	return w.buf.Flush()
+}
+
+func main() {
+	var dest bytes.Buffer
+	writer := NewBatchWriter(&dest, 3)
+
+	now := time.Date(2026, 9, 18, 10, 0, 0, 0, time.UTC)
+	_ = writer.Add(AuditEvent{ID: 101, Action: "CREATED", Timestamp: now})
+	_ = writer.Add(AuditEvent{ID: 102, Action: "ASSIGNED", Timestamp: now.Add(time.Second)})
+	fmt.Printf("Buffer length before threshold: %d bytes\n", dest.Len())
+
+	// 3rd item triggers batch threshold flush
+	_ = writer.Add(AuditEvent{ID: 103, Action: "RESOLVED", Timestamp: now.Add(2 * time.Second)})
+	fmt.Printf("Buffer length after 3rd item:   %d bytes\n", dest.Len())
+
+	// 4th item stays in batch until explicit flush
+	_ = writer.Add(AuditEvent{ID: 104, Action: "CLOSED", Timestamp: now.Add(3 * time.Second)})
+	_ = writer.Flush()
+	fmt.Printf("Final buffer length after flush: %d bytes\n", dest.Len())
+	fmt.Print("\nResulting output:\n" + dest.String())
+}
+```
+
+Run:
+
+```bash
+go run batch_demo.go
+```
+
+Output:
+
+```
+Buffer length before threshold: 0 bytes
+Buffer length after 3rd item:   113 bytes
+Final buffer length after flush: 149 bytes
+
+Resulting output:
+[10:00:00] ticket=101 action=CREATED
+[10:00:01] ticket=102 action=ASSIGNED
+[10:00:02] ticket=103 action=RESOLVED
+[10:00:03] ticket=104 action=CLOSED
+```
+
+### Case 2: Time-and-size batch flusher with channels and tickers
+
+Save as `timer_batch.go`. Under irregular traffic, items might sit buffered forever if the size threshold is never met. A `time.Ticker` guarantees a maximum latency ceiling.
+
+```go
+// timer_batch.go
+package main
+
+import (
+	"context"
+	"fmt"
+	"sync"
+	"time"
+)
+
+type EventFlusher struct {
+	in      chan string
+	batch   []string
+	maxSize int
+}
+
+func NewEventFlusher(maxSize int) *EventFlusher {
+	return &EventFlusher{
+		in:      make(chan string, 100),
+		batch:   make([]string, 0, maxSize),
+		maxSize: maxSize,
+	}
+}
+
+func (f *EventFlusher) Run(ctx context.Context, wg *sync.WaitGroup) {
+	defer wg.Done()
+	ticker := time.NewTicker(40 * time.Millisecond)
+	defer ticker.Stop()
+
+	flush := func() {
+		if len(f.batch) == 0 {
+			return
+		}
+		fmt.Printf("FLUSH: %d events -> %v\n", len(f.batch), f.batch)
+		f.batch = f.batch[:0]
+	}
+
+	for {
+		select {
+		case <-ctx.Done():
+			// Drain remaining events in channel before exiting
+			for {
+				select {
+				case ev := <-f.in:
+					f.batch = append(f.batch, ev)
+				default:
+					flush()
+					return
+				}
+			}
+		case ev := <-f.in:
+			f.batch = append(f.batch, ev)
+			if len(f.batch) >= f.maxSize {
+				flush()
+			}
+		case <-ticker.C:
+			flush()
+		}
+	}
+}
+
+func main() {
+	flusher := NewEventFlusher(3)
+	ctx, cancel := context.WithCancel(context.Background())
+	var wg sync.WaitGroup
+	wg.Add(1)
+
+	go flusher.Run(ctx, &wg)
+
+	// Send 2 events (below maxSize 3)
+	flusher.in <- "event-1"
+	flusher.in <- "event-2"
+
+	// Wait for ticker to trigger flush
+	time.Sleep(70 * time.Millisecond)
+
+	// Send 3 events (triggers size threshold)
+	flusher.in <- "event-3"
+	flusher.in <- "event-4"
+	flusher.in <- "event-5"
+
+	time.Sleep(10 * time.Millisecond)
+
+	cancel()
+	wg.Wait()
+}
+```
+
+Run:
+
+```bash
+go run timer_batch.go
+```
+
+Output:
+
+```
+FLUSH: 2 events -> [event-1 event-2]
+FLUSH: 3 events -> [event-3 event-4 event-5]
+```
+
+## The trap
+
+The most critical trap with buffered writers is **forgetting to call `Flush()` on exit or error**:
+
+```go
+// WRONG: Data loss trap!
+func writeReceipt(path string, data []byte) error {
+	f, _ := os.Create(path)
+	defer f.Close()
+	w := bufio.NewWriter(f)
+	w.Write(data)
+	// Missing w.Flush()!
+	// When f.Close() runs, any data remaining in w's buffer is silently discarded!
+	return nil
+}
+```
+
+Always call `defer w.Flush()` or explicitly check its return value before closing the underlying file or network connection.
+
+Another trap is creating a new `bufio.Writer` or `bufio.Reader` on every single operation. Sizing a buffer takes memory; instantiate it once on the connection or stream, or pool it with `sync.Pool`.
+
+## The boring rule
+
+- Wrap streams with `bufio.Writer` and `bufio.Reader` whenever doing multiple small writes or reads.
+- Always explicitly flush buffered writers before closing files or finishing handlers.
+- When batching events, always combine a size ceiling with a time ticker to prevent events from stalling under low traffic.
+- Reuse batch slice capacity with `batch = batch[:0]` instead of allocating fresh slices.
+
+## Try this
+
+1. In `batch_demo.go`, remove the line `_ = writer.Flush()` at the end of `main()`. Observe how the final event `ticket=104` disappears from the output.
+2. In `timer_batch.go`, send 10 events in rapid succession and observe how many flushes occur.
+3. Compare the time taken to write 100,000 small lines to an `os.File` using raw `f.WriteString` versus `bufio.NewWriter(f)`.

@@ -1,0 +1,172 @@
+---
+title: "HTTP Client and Connection Pooling"
+---
+
+# HTTP Client and Connection Pooling
+
+The boring default is to configure a single, shared **`*http.Client`** at application startup and reuse it for all outbound HTTP requests. Creating a new `http.Client` per request or per goroutine is one of the most common anti-patterns in Go: it spawns a fresh `http.Transport`, discards connection pools, wastes CPU on TLS handshakes, and rapidly exhausts operating system socket ports (`TIME_WAIT` socket storms).
+
+## Mental model
+
+In Go, `http.Client` is a lightweight struct that delegates actual network I/O and connection management to an internal `http.RoundTripper` implementation, usually **`*http.Transport`**.
+
+`http.Transport` maintains an internal pool of idle TCP/TLS connections. When your service sends a request:
+1. The Transport checks whether an idle connection to the target `host:port` is available in its pool.
+2. If available, it immediately reuses the established socket, avoiding TCP 3-way handshakes and TLS cryptographic negotiation.
+3. If no connection is idle, it dials a new socket.
+
+### The Default Bottleneck: MaxIdleConnsPerHost
+
+`http.DefaultTransport` provides sensible defaults for general web browsing, but has a major flaw for backend microservices:
+
+```go
+// Inside net/http default transport:
+DefaultMaxIdleConnsPerHost = 2
+```
+
+The default allows only **2 idle connections per target host**. If your desk service concurrently calls an inventory API or payment gateway with 50 goroutines, 48 sockets are forcibly closed and renegotiated on every round trip. Setting `MaxIdleConnsPerHost` to match your concurrency expectations (e.g. 50–200) is essential.
+
+### The Response Body Drain Contract
+
+For `http.Transport` to safely return an open TCP connection to the pool, the application **must read the response body to EOF before closing it**:
+
+```go
+// REQUIRED for TCP socket reuse:
+_, _ = io.Copy(io.Discard, resp.Body)
+_ = resp.Body.Close()
+```
+
+If you call `resp.Body.Close()` without reading the remaining bytes, the Transport cannot know whether unread data remains on the wire. To prevent data corruption on the next request, it is forced to terminate and destroy the TCP connection.
+
+## Worked examples
+
+### Case 1: Measuring connection reuse with httptrace
+
+Save as `http_pool_demo.go`. We use `httptest.NewServer` and `httptrace.ClientTrace` to verify whether successive requests reuse existing TCP connections.
+
+```go
+// http_pool_demo.go
+package main
+
+import (
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"net/http/httptrace"
+	"time"
+)
+
+func main() {
+	// 1. Mock server that returns ticket responses
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ticket_id": 101, "status": "CONFIRMED"}`))
+	}))
+	defer server.Close()
+
+	// 2. Properly configured pooled Transport
+	transport := &http.Transport{
+		Proxy: http.ProxyFromEnvironment,
+		DialContext: (&net.Dialer{
+			Timeout:   5 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		MaxIdleConns:        100,
+		MaxIdleConnsPerHost: 100, // Override default of 2
+		IdleConnTimeout:     90 * time.Second,
+	}
+
+	client := &http.Client{
+		Transport: transport,
+		Timeout:   10 * time.Second,
+	}
+
+	// 3. Measure connection reuse with httptrace
+	for i := range 3 {
+		req, _ := http.NewRequest(http.MethodGet, server.URL, nil)
+
+		var reused bool
+		trace := &httptrace.ClientTrace{
+			GotConn: func(connInfo httptrace.GotConnInfo) {
+				reused = connInfo.Reused
+			},
+		}
+
+		req = req.WithContext(httptrace.WithClientTrace(req.Context(), trace))
+
+		start := time.Now()
+		resp, err := client.Do(req)
+		if err != nil {
+			panic(err)
+		}
+
+		// Read body to EOF and close to guarantee socket reuse
+		_, _ = io.Copy(io.Discard, resp.Body)
+		_ = resp.Body.Close()
+
+		totalTime := time.Since(start)
+		fmt.Printf("Request %d: reused_tcp=%v total_latency=%v\n", i+1, reused, totalTime)
+	}
+}
+```
+
+Run:
+
+```bash
+go run http_pool_demo.go
+```
+
+Output:
+
+```
+Request 1: reused_tcp=false total_latency=752.654µs
+Request 2: reused_tcp=true total_latency=189.209µs
+Request 3: reused_tcp=true total_latency=199.583µs
+```
+
+Notice how Request 1 dialed a fresh TCP socket (`reused_tcp=false`). Requests 2 and 3 reused the existing socket from the pool (`reused_tcp=true`), cutting latency by roughly 75%.
+
+## The trap
+
+The most widespread bug in Go networking code is omitting `io.Copy(io.Discard, resp.Body)`:
+
+```go
+// WRONG: Leaks TCP connections and prevents pooling!
+resp, err := client.Do(req)
+if err != nil {
+	return err
+}
+defer resp.Body.Close() // Missing io.Copy!
+
+if resp.StatusCode != http.StatusOK {
+	// Exiting here without reading body forces Transport to close the socket!
+	return fmt.Errorf("bad status: %d", resp.StatusCode)
+}
+```
+
+Even if you do not care about the response payload (e.g. on error status codes), you must still drain the body before closing:
+
+```go
+// CORRECT: Always drain and close
+defer func() {
+	_, _ = io.Copy(io.Discard, resp.Body)
+	_ = resp.Body.Close()
+}()
+```
+
+Another trap is creating a new `&http.Client{}` inside an HTTP handler function. If a server receives 1,000 requests per second and creates 1,000 clients, each client creates a new transport that tries to hold idle sockets, crashing the server with `socket: too many open files`. Always instantiate clients once as shared dependencies.
+
+## The boring rule
+
+- Instantiate `http.Client` once as a package or struct field dependency; never instantiate clients inside request handlers.
+- Set `client.Timeout` on every client; `http.DefaultClient` has no timeout and can hang indefinitely.
+- In backend microservices, configure a custom `http.Transport` and increase `MaxIdleConnsPerHost` to 50–200.
+- Always drain `resp.Body` with `io.Copy(io.Discard, resp.Body)` before calling `resp.Body.Close()`.
+
+## Try this
+
+1. In `http_pool_demo.go`, comment out the line `_, _ = io.Copy(io.Discard, resp.Body)`. Re-run the program and observe whether `reused_tcp` remains false for subsequent requests.
+2. Add `httptrace.ClientTrace` callbacks for `DNSStart` and `ConnectStart`. Print timestamps to measure how many milliseconds are spent in DNS resolution vs TCP connection setup.
+3. Test a client with `Timeout: 50 * time.Millisecond` against a slow server handler (`time.Sleep(100 * time.Millisecond)`). Confirm that `client.Do()` fails with context deadline exceeded.

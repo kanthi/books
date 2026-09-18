@@ -1,0 +1,196 @@
+---
+title: "Object Pooling with sync.Pool"
+---
+
+# Object Pooling with sync.Pool
+
+The boring default is to allocate objects directly with `new` or struct literals until a CPU/memory profile explicitly flags allocation churn in a hot loop. When profiling reveals that your server spends noticeable CPU time in `runtime.mallocgc` allocating and discarding temporary scratch objects, **`sync.Pool`** is the standard tool to recycle them safely across goroutines without continuous heap pressure.
+
+## Mental model
+
+`sync.Pool` is a thread-safe cache of temporary objects managed by the Go runtime. It maintains per-processor (`P`) local pools, allowing goroutines running on the same hardware thread to grab and return instances with zero lock contention in the best case.
+
+Two critical properties govern `sync.Pool`:
+
+1. **Items can be dropped at any time by the Garbage Collector.** Go's GC empties or cycles pools between major GC sweeps. Therefore, `sync.Pool` is strictly for *ephemeral scratch data* (like serialization buffers, scratch slices, or encoders), never for stateful connection handles or persistent caches.
+2. **Objects retrieved from `Get()` may contain dirty data.** You must always reset an object's state (e.g. `buf.Reset()`) before reading from or writing to it.
+
+## Worked examples
+
+### Case 1: Scratch buffer recycling in a desk service
+
+Save as `pool_bench.go`. We simulate formatting 50,000 order receipts, comparing fresh heap allocations against a shared `sync.Pool`.
+
+```go
+// pool_bench.go
+package main
+
+import (
+	"bytes"
+	"fmt"
+	"runtime"
+	"sync"
+)
+
+var bufPool = sync.Pool{
+	New: func() any {
+		return new(bytes.Buffer)
+	},
+}
+
+func recordAllocs(fn func()) (uint64, uint64) {
+	var m1, m2 runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&m1)
+	fn()
+	runtime.ReadMemStats(&m2)
+	return m2.Mallocs - m1.Mallocs, m2.TotalAlloc - m1.TotalAlloc
+}
+
+func withoutPool(n int) {
+	for i := range n {
+		buf := new(bytes.Buffer)
+		fmt.Fprintf(buf, "order=%d items=3 total=$45.00\n", i)
+		_ = buf.Bytes()
+	}
+}
+
+func withPool(n int) {
+	for i := range n {
+		buf := bufPool.Get().(*bytes.Buffer)
+		buf.Reset()
+		fmt.Fprintf(buf, "order=%d items=3 total=$45.00\n", i)
+		_ = buf.Bytes()
+		bufPool.Put(buf)
+	}
+}
+
+func main() {
+	const iterations = 50000
+
+	allocsNoPool, bytesNoPool := recordAllocs(func() {
+		withoutPool(iterations)
+	})
+
+	allocsPool, bytesPool := recordAllocs(func() {
+		withPool(iterations)
+	})
+
+	fmt.Printf("without pool: allocs=%d bytes=%d\n", allocsNoPool, bytesNoPool)
+	fmt.Printf("with pool:    allocs=%d bytes=%d\n", allocsPool, bytesPool)
+}
+```
+
+Run:
+
+```bash
+go run pool_bench.go
+```
+
+Output:
+
+```
+without pool: allocs=149752 bytes=5999280
+with pool:    allocs=49751 bytes=399128
+```
+
+Notice how total allocated bytes plummeted from ~6 MB to under 400 KB. The remaining allocations are the `fmt.Fprintf` interface arguments, while the underlying byte backing arrays are reused thousands of times.
+
+### Case 2: Guarding against oversized memory retention
+
+Save as `pool_cap.go`. If an uncommonly large order payload causes a buffer to expand to 1 MB, returning that buffer into the pool forces future small 50-byte requests to hold onto that 1 MB backing array, bloating resident memory. We cap the maximum poolable capacity.
+
+```go
+// pool_cap.go
+package main
+
+import (
+	"bytes"
+	"fmt"
+	"sync"
+)
+
+var cappedPool = sync.Pool{
+	New: func() any {
+		return new(bytes.Buffer)
+	},
+}
+
+const maxPoolCapacity = 64 * 1024 // 64 KB
+
+func putBuffer(buf *bytes.Buffer) {
+	if buf.Cap() > maxPoolCapacity {
+		// Drop buffer; let GC reclaim oversize memory
+		return
+	}
+	buf.Reset()
+	cappedPool.Put(buf)
+}
+
+func main() {
+	buf1 := cappedPool.Get().(*bytes.Buffer)
+	buf1.WriteString("normal order")
+	fmt.Printf("buf1 cap before put: %d\n", buf1.Cap())
+	putBuffer(buf1)
+
+	// Simulate an unusually huge document payload
+	buf2 := cappedPool.Get().(*bytes.Buffer)
+	buf2.Write(make([]byte, 1024*1024)) // 1 MB
+	fmt.Printf("buf2 cap before put: %d\n", buf2.Cap())
+	putBuffer(buf2)
+
+	// Next caller gets a fresh or reasonably sized buffer, not a 1MB resident hog
+	buf3 := cappedPool.Get().(*bytes.Buffer)
+	fmt.Printf("buf3 cap from pool:  %d\n", buf3.Cap())
+}
+```
+
+Run:
+
+```bash
+go run pool_cap.go
+```
+
+Output:
+
+```
+buf1 cap before put: 64
+buf2 cap before put: 1048576
+buf3 cap from pool:  0
+```
+
+## The trap
+
+There are two major traps when working with `sync.Pool`:
+
+1. **Use-after-Put race condition:** Putting an object back into the pool while another goroutine or function still holds a slice or pointer to it:
+
+```go
+// WRONG: Returning slice of buffer while returning buffer to pool!
+func formatOrder(id int) []byte {
+	buf := bufPool.Get().(*bytes.Buffer)
+	buf.Reset()
+	fmt.Fprintf(buf, "order-%d", id)
+	data := buf.Bytes()
+	bufPool.Put(buf) // DANGER: another goroutine can now overwrite buf.Bytes()!
+	return data
+}
+```
+
+The fix is either to copy the bytes if they must outlive the call (`bytes.Clone(buf.Bytes())`) or keep the buffer alive until the caller is done.
+
+2. **Pooling pointers to pointers:** Calling `bufPool.Put(&buf)` when `buf` is already a pointer allocates an extra wrapper interface on the heap on every call, defeating the very purpose of the pool. Always store and retrieve direct pointer values (`*bytes.Buffer`, `*MyStruct`).
+
+## The boring rule
+
+- Profile first: do not add `sync.Pool` until memory profiles highlight high allocation rate in a specific function.
+- Always provide a clean `New: func() any` factory.
+- Always call `Reset()` before reusing the object.
+- Never store references to pooled objects in long-lived variables.
+- Place a threshold cap on reusable buffer sizes so an outlier request does not permanently pin megabytes in the pool.
+
+## Try this
+
+1. In `pool_bench.go`, modify `withPool` to remove `buf.Reset()`. Observe what happens if you print the contents of `buf.String()` across iterations.
+2. Build a `sync.Pool` for a custom `struct` type `OrderRecord{ID int, Customer string, Items []int}`. Ensure `Items` slice is sliced to length 0 (`o.Items = o.Items[:0]`) before calling `Put` so its allocated capacity is preserved without retaining old pointers.
+3. Verify with `go test -race` on a concurrent test that multiple goroutines calling `Get()` and `Put()` simultaneously do not trigger race warnings.

@@ -1,0 +1,238 @@
+---
+title: "Atomic Operations and Cache-Line False Sharing"
+---
+
+# Atomic Operations and Cache-Line False Sharing
+
+The boring default is to use **`sync.Mutex`** when coordinating state across goroutines. Mutexes are clear, robust, and protect multiple variables together. However, for isolated metrics, high-throughput counters, or read-heavy shared configuration, **`sync/atomic`** primitives provide lock-free synchronization directly through hardware CPU instructions. When multiple atomic fields sit too close together in memory, you must also be mindful of **false sharing**.
+
+## Mental model
+
+At the hardware level, modern multi-core processors do not read or write individual bytes from RAM. They move memory in **cache lines**, typically 64 bytes wide.
+
+1. **Atomic Instructions:** Operations like `atomic.Int64.Add()` or `atomic.Pointer.Store()` translate to single CPU atomic instructions (e.g., `LOCK XADD` on x86). They eliminate operating system context switches and mutex queue overhead.
+2. **False Sharing:** When two independent variables share the same 64-byte cache line and two separate CPU cores write to them concurrently, the CPU cache coherency protocol (MESI) repeatedly invalidates the cache line across both cores. The cores spend more time bouncing the cache line across the CPU bus ("cache line ping-pong") than executing actual program logic.
+3. **Copy-on-Write with `atomic.Pointer`:** In read-heavy systems (like dynamic desk configs or feature flags), even a `sync.RWMutex` creates write contention because every reader must atomically update the reader reference counter. Storing an immutable struct pointer in `atomic.Pointer[T]` enables completely contention-free reads.
+
+## Worked examples
+
+### Case 1: High-concurrency metrics counter: Mutex vs Atomic
+
+Save as `counter_bench.go`. We simulate 10 concurrent worker goroutines incrementing a shared desk order counter 200,000 times each.
+
+```go
+// counter_bench.go
+package main
+
+import (
+	"fmt"
+	"sync"
+	"sync/atomic"
+	"time"
+)
+
+type MutexCounter struct {
+	mu  sync.Mutex
+	val int64
+}
+
+func (c *MutexCounter) Inc() {
+	c.mu.Lock()
+	c.val++
+	c.mu.Unlock()
+}
+
+type AtomicCounter struct {
+	val atomic.Int64
+}
+
+func (c *AtomicCounter) Inc() {
+	c.val.Add(1)
+}
+
+func main() {
+	const workers = 10
+	const opsPerWorker = 200_000
+
+	// 1. Mutex benchmark
+	var mc MutexCounter
+	var wgM sync.WaitGroup
+	startM := time.Now()
+	for range workers {
+		wgM.Add(1)
+		go func() {
+			defer wgM.Done()
+			for range opsPerWorker {
+				mc.Inc()
+			}
+		}()
+	}
+	wgM.Wait()
+	durM := time.Since(startM)
+
+	// 2. Atomic benchmark
+	var ac AtomicCounter
+	var wgA sync.WaitGroup
+	startA := time.Now()
+	for range workers {
+		wgA.Add(1)
+		go func() {
+			defer wgA.Done()
+			for range opsPerWorker {
+				ac.Inc()
+			}
+		}()
+	}
+	wgA.Wait()
+	durA := time.Since(startA)
+
+	fmt.Printf("Mutex  total=%d time=%v\n", mc.val, durM)
+	fmt.Printf("Atomic total=%d time=%v\n", ac.val.Load(), durA)
+}
+```
+
+Run:
+
+```bash
+go run counter_bench.go
+```
+
+Output:
+
+```
+Mutex  total=2000000 time=136.494939ms
+Atomic total=2000000 time=24.870615ms
+```
+
+Under high contention, the atomic counter finished in roughly one-fifth the time because goroutines avoided sleeping on OS synchronization queues.
+
+### Case 2: Read-heavy configuration sharing with atomic.Pointer
+
+Save as `atomic_ptr.go`. A desk configuration is read thousands of times per second by incoming request handlers, but updated only occasionally by administrators.
+
+```go
+// atomic_ptr.go
+package main
+
+import (
+	"fmt"
+	"sync"
+	"sync/atomic"
+)
+
+type DeskConfig struct {
+	MaxOpenTickets int
+	FeeMultiplier  float64
+	Currency       string
+}
+
+type ConfigStore struct {
+	current atomic.Pointer[DeskConfig]
+}
+
+func (s *ConfigStore) Update(fee float64, maxTickets int) {
+	newCfg := &DeskConfig{
+		MaxOpenTickets: maxTickets,
+		FeeMultiplier:  fee,
+		Currency:       "USD",
+	}
+	// Atomic single-pointer store
+	s.current.Store(newCfg)
+}
+
+func (s *ConfigStore) Get() *DeskConfig {
+	// Zero lock contention, zero allocations
+	return s.current.Load()
+}
+
+func main() {
+	store := &ConfigStore{}
+	store.Update(1.05, 50)
+
+	var wg sync.WaitGroup
+	for i := range 5 {
+		wg.Add(1)
+		go func(workerID int) {
+			defer wg.Done()
+			cfg := store.Get()
+			fmt.Printf("Worker %d read: Max=%d Fee=%.2f Curr=%s\n",
+				workerID, cfg.MaxOpenTickets, cfg.FeeMultiplier, cfg.Currency)
+		}(i)
+	}
+
+	wg.Wait()
+}
+```
+
+Run:
+
+```bash
+go run atomic_ptr.go
+```
+
+Output:
+
+```
+Worker 1 read: Max=50 Fee=1.05 Curr=USD
+Worker 4 read: Max=50 Fee=1.05 Curr=USD
+Worker 0 read: Max=50 Fee=1.05 Curr=USD
+Worker 2 read: Max=50 Fee=1.05 Curr=USD
+Worker 3 read: Max=50 Fee=1.05 Curr=USD
+```
+
+Because the configuration struct is treated as immutable once published, readers safely inspect `cfg` without acquiring locks or waiting on writers.
+
+### Case 3: Preventing false sharing with cache-line padding
+
+When multiple independent atomic counters reside on the same struct, padding them to 64 bytes isolates them to distinct CPU cache lines:
+
+```go
+// Cache-line aligned counters (prevents false sharing)
+type DeskMetrics struct {
+	OrdersProcessed atomic.Int64
+	_               [56]byte // Pad to 64-byte boundary
+	TicketsCanceled atomic.Int64
+	_               [56]byte
+}
+```
+
+## The trap
+
+The most dangerous trap with atomics is **trying to coordinate multiple variables without a lock**:
+
+```go
+// WRONG: Atomicity is per-variable, not across both variables!
+var balance atomic.Int64
+var transactions atomic.Int64
+
+func Transfer(amount int64) {
+	balance.Add(-amount)       // Step 1
+	// Another goroutine can observe updated balance BEFORE transactions increments!
+	transactions.Add(1)        // Step 2
+}
+```
+
+If your invariant spans more than one field (e.g. updating a balance AND a ledger simultaneously), atomic operations cannot protect the consistency boundary. You must use a `sync.Mutex`.
+
+Another trap is mutating fields inside a struct loaded from `atomic.Pointer`:
+
+```go
+// WRONG: Violates immutability contract
+cfg := store.Get()
+cfg.FeeMultiplier = 2.0 // DATA RACE! Other readers are concurrently accessing this pointer!
+```
+
+Always create a new struct instance and call `store.Update()` with a fresh pointer.
+
+## The boring rule
+
+- Default to `sync.Mutex` for general business logic and multi-variable invariants.
+- Use `sync/atomic` (`atomic.Int64`, `atomic.Bool`) for single, isolated operational metrics.
+- Use `atomic.Pointer[T]` for read-heavy configuration or routing tables. Never mutate the loaded object in-place.
+- Add 64-byte padding between atomic variables only when profiling shows severe CPU bus contention across cores on hot structs.
+
+## Try this
+
+1. In `atomic_ptr.go`, write an updater loop that modifies `FeeMultiplier` every 5 milliseconds while readers query `store.Get()` continuously. Run with `go run -race atomic_ptr.go` to verify there are zero race conditions.
+2. In `counter_bench.go`, replace `mc.val++` with an atomic operation inside the mutex lock. Check whether combining both adds extra overhead.
+3. Use `unsafe.Sizeof` on `DeskMetrics` with and without padding to verify that each counter occupies its own 64-byte block.

@@ -117,6 +117,40 @@ See `index.qmd` for the reader-facing map.
 - 04-performance-tuning.qmd
 - 05-designing-for-the-long-term.qmd
 
+### 16-data-structures-and-algorithms
+- 01-algorithmic-complexity.qmd
+- 02-stacks-and-queues.qmd
+- 03-linked-lists.qmd
+- 04-binary-search-trees.qmd
+- 05-heaps-and-priority-queues.qmd
+- 06-tries-and-prefix-trees.qmd
+- 07-sorting-algorithms.qmd
+- 08-binary-search-and-selection.qmd
+- 09-graphs-and-traversals.qmd
+- 10-shortest-paths-dijkstra.qmd
+- 11-string-search-and-bloom-filters.qmd
+
+### 17-performance-engineering
+- 01-memory-preallocation-and-sizing.qmd
+- 02-object-pooling.qmd
+- 03-struct-alignment-and-padding.qmd
+- 04-stack-allocation-and-escape-analysis.qmd
+- 05-interface-boxing-and-monomorphization.qmd
+- 06-zero-copy-patterns.qmd
+- 07-garbage-collector-tuning.qmd
+- 08-atomic-operations-and-cache-lines.qmd
+- 09-batching-and-buffered-io.qmd
+- 10-compiler-optimizations-and-pgo.qmd
+
+### 18-network-performance
+- 01-netpoller-and-goroutine-scaling.qmd
+- 02-http-client-and-connection-pooling.qmd
+- 03-scaling-to-ten-thousand-connections.qmd
+- 04-resilience-backpressure-and-load-shedding.qmd
+- 05-long-lived-connections-and-leak-prevention.qmd
+- 06-socket-options-and-low-level-tuning.qmd
+- 07-tls-and-dns-optimization.qmd
+
 ### 99-appendices
 - 01-glossary.qmd
 - 02-command-cheat-sheet.qmd
