@@ -83,6 +83,7 @@ See `index.qmd` for the reader-facing map.
 - 03-synchronization.qmd
 - 04-context-and-cancellation.qmd
 - 05-concurrency-design-guidelines.qmd
+- 06-goroutine-leak-profile.qmd
 
 ### 13-stdlib
 - 01-time-and-scheduling.qmd
