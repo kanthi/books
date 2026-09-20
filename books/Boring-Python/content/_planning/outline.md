@@ -57,6 +57,7 @@ See `index.qmd` for the reader-facing map.
 - 02-type-hints-in-practice.qmd
 - 03-protocols-and-abcs.qmd
 - 04-generics-and-type-parameters.qmd
+- 05-deferred-annotations.qmd
 
 ### 10-errors
 - 01-exceptions-as-control-flow.qmd
