@@ -51,6 +51,7 @@ See `index.qmd` for the reader-facing map.
 - 02-pointers-explained.qmd
 - 03-mutability-and-data-sharing.qmd
 - 04-garbage-collection.qmd
+- 05-size-specialized-malloc.qmd
 
 ### 08-interfaces
 - 01-designing-with-interfaces.qmd

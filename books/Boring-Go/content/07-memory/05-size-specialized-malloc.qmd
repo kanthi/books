@@ -1,0 +1,309 @@
+---
+title: "Size-Specialized Memory Allocation"
+---
+
+# Size-Specialized Memory Allocation
+
+Go **1.27** speeds up many small heap allocations (about 80 bytes or fewer) by calling size-specialized `mallocgc` variants instead of one general path. You do not change your desk code to get it. Build with Go 1.27 and the hot common sizes — string headers, interface values, short slices — get cheaper. The release notes put the gain at up to about 30% for those allocations, and about 1% for allocation-heavy programs overall. Binary size grows by roughly 60 KB.
+
+## Mental model
+
+- Escaping values still go through the runtime allocator. The compiler used to call `newobject` then generic `mallocgc`. When it knows the **span class** (size class plus "has pointers?"), Go 1.27 can call a specialized function such as `mallocgcSmallNoScanSC3` directly.
+- Size classes bucket sizes. Through 80 bytes the classes look like this (ranges are inclusive of the upper end the span returns):
+
+| Size class | Byte range |
+| --- | --- |
+| 1 | 1–8 |
+| 2 | 9–16 |
+| 3 | 17–24 |
+| 4 | 25–32 |
+| 5 | 33–48 |
+| 6 | 49–64 |
+| 7 | 65–80 |
+
+- Specialization stops at 80 bytes on purpose. Larger clears dominate the cost, and more specialized functions would crowd the instruction cache.
+- When the size is **not** known at compile time (`make([]byte, n)` with a runtime `n`), the compiler still calls generic `mallocgc`, which may dispatch into a specialized helper. That path stays faster than the old generic-only loop, but the biggest win is the direct call for known sizes.
+- Opt out only if you are chasing a regression: build with `GOEXPERIMENT=nosizespecializedmalloc`. That knob is expected to disappear in Go 1.28. File an issue if you need it.
+
+## Worked examples
+
+### Case 1: Map everyday values onto size classes
+
+Save as `size_classes.go`. Headers for strings, interfaces, and slices land in the specialized window. Counts are for the **headers** (or the `Ticket` value), not the string bytes they point at.
+
+```go
+// size_classes.go
+package main
+
+import (
+	"fmt"
+	"unsafe"
+)
+
+type Ticket struct {
+	ID    int
+	Table int
+}
+
+func class(n uintptr) string {
+	switch {
+	case n <= 8:
+		return "SC1 (1-8)"
+	case n <= 16:
+		return "SC2 (9-16)"
+	case n <= 24:
+		return "SC3 (17-24)"
+	case n <= 32:
+		return "SC4 (25-32)"
+	case n <= 48:
+		return "SC5 (33-48)"
+	case n <= 64:
+		return "SC6 (49-64)"
+	case n <= 80:
+		return "SC7 (65-80)"
+	default:
+		return "above 80 (no size-specialized fast path in 1.27)"
+	}
+}
+
+func main() {
+	var s string
+	var iface any
+	var sl []int
+	var t Ticket
+
+	fmt.Printf("string header: %d bytes -> %s\n", unsafe.Sizeof(s), class(unsafe.Sizeof(s)))
+	fmt.Printf("interface any: %d bytes -> %s\n", unsafe.Sizeof(iface), class(unsafe.Sizeof(iface)))
+	fmt.Printf("slice header: %d bytes -> %s\n", unsafe.Sizeof(sl), class(unsafe.Sizeof(sl)))
+	fmt.Printf("Ticket value: %d bytes -> %s\n", unsafe.Sizeof(t), class(unsafe.Sizeof(t)))
+}
+```
+
+Run:
+
+```bash
+go run size_classes.go
+```
+
+Output (amd64 / arm64 with 64-bit words):
+
+```
+string header: 16 bytes -> SC2 (9-16)
+interface any: 16 bytes -> SC2 (9-16)
+slice header: 24 bytes -> SC3 (17-24)
+Ticket value: 16 bytes -> SC2 (9-16)
+```
+
+Those are exactly the sizes the Go blog calls out as the biggest winners. You did not pick magic numbers — the language's everyday headers already sit there.
+
+### Case 2: Escaping small structs still allocate once each
+
+Save as `escape_small.go`. `newTicket` is `noinline` so the compiler cannot stack-allocate the `Ticket`. Ten thousand escaping pointers mean ten thousand heap objects (plus the slice growth for `held`).
+
+```go
+// escape_small.go
+package main
+
+import (
+	"fmt"
+	"runtime"
+)
+
+type Ticket struct {
+	ID    int
+	Table int
+	Note  string
+}
+
+//go:noinline
+func newTicket(id int) *Ticket {
+	return &Ticket{ID: id, Table: id % 20, Note: "soup"}
+}
+
+func main() {
+	runtime.GC()
+	var before runtime.MemStats
+	runtime.ReadMemStats(&before)
+
+	held := make([]*Ticket, 0, 10_000)
+	for i := range 10_000 {
+		held = append(held, newTicket(i))
+	}
+
+	var after runtime.MemStats
+	runtime.ReadMemStats(&after)
+	fmt.Printf("tickets: %d\n", len(held))
+	fmt.Printf("mallocs: %d\n", after.Mallocs-before.Mallocs)
+	fmt.Printf("heap objects gained: %d\n", after.HeapObjects-before.HeapObjects)
+	_ = held
+}
+```
+
+Run:
+
+```bash
+go run escape_small.go
+```
+
+Output:
+
+```
+tickets: 10000
+mallocs: 10001
+heap objects gained: 10001
+```
+
+On Go 1.27 each of those small `Ticket` heap objects can take the specialized path when the size is known. The **count** does not drop — the **cost per malloc** does. Do not rewrite the loop to "help" the allocator; upgrade the toolchain.
+
+### Case 3: Known size vs dynamic length (same count, different call shape)
+
+Save as `known_vs_dyn.go`. Both loops allocate 50000 times. The known-size path is the one the compiler can call specialized malloc for directly. The dynamic `make` still goes through `mallocgc` first.
+
+```go
+// known_vs_dyn.go
+package main
+
+import (
+	"fmt"
+	"runtime"
+)
+
+//go:noinline
+func allocKnown() *[24]byte {
+	var b [24]byte
+	return &b
+}
+
+//go:noinline
+func allocDyn(n int) []byte {
+	return make([]byte, n)
+}
+
+func count(fn func()) uint64 {
+	runtime.GC()
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	for range 50_000 {
+		fn()
+	}
+	runtime.ReadMemStats(&after)
+	return after.Mallocs - before.Mallocs
+}
+
+func main() {
+	fmt.Printf("known 24-byte mallocs: %d\n", count(func() { _ = allocKnown() }))
+	fmt.Printf("dyn 24-byte mallocs: %d\n", count(func() { _ = allocDyn(24) }))
+}
+```
+
+Run:
+
+```bash
+go run known_vs_dyn.go
+```
+
+Output:
+
+```
+known 24-byte mallocs: 50000
+dyn 24-byte mallocs: 50000
+```
+
+Equal counts are the point. Size specialization is a **call-path** improvement, not an "allocate less" tip. Prefer clear code; let 1.27 cheapen the known-size cases.
+
+### Case 4: A/B the build flag on Go 1.27
+
+Save as `alloc_bench_test.go`. Run the same benchmark twice on a Go **1.27** toolchain: once with the default allocator, once with specialization disabled. Compare `ns/op` yourself — do not treat a single laptop number as a promise.
+
+```go
+// alloc_bench_test.go
+package allocbench
+
+import "testing"
+
+type Ticket struct {
+	ID    int
+	Table int
+	Note  string
+}
+
+//go:noinline
+func newTicket(id int) *Ticket {
+	return &Ticket{ID: id, Table: id % 20, Note: "soup"}
+}
+
+func BenchmarkNewTicket(b *testing.B) {
+	b.ReportAllocs()
+	var sink *Ticket
+	for i := 0; i < b.N; i++ {
+		sink = newTicket(i)
+	}
+	_ = sink
+}
+```
+
+Run (needs Go 1.27+):
+
+```bash
+go test -bench=BenchmarkNewTicket -benchmem -count=5 ./...
+GOEXPERIMENT=nosizespecializedmalloc go test -bench=BenchmarkNewTicket -benchmem -count=5 ./...
+```
+
+Expect the default build to win on `ns/op` for this escaping small struct. Magnitudes vary by machine. If the disabled build is somehow faster and you can reproduce it, file an issue at go.dev/issue/new before shipping the opt-out.
+
+### Case 5: Confirm the toolchain, not a magic import
+
+Save as `toolchain_hint.go`. There is no import that "turns on" size-specialized malloc. The feature is the compiler and runtime you build with.
+
+```go
+// toolchain_hint.go
+package main
+
+import (
+	"fmt"
+	"runtime"
+)
+
+func main() {
+	fmt.Println("go:", runtime.Version())
+	fmt.Println("Nothing to import. Build with Go 1.27+ for size-specialized malloc.")
+	fmt.Println("Opt out only while debugging: GOEXPERIMENT=nosizespecializedmalloc")
+}
+```
+
+Run:
+
+```bash
+go run toolchain_hint.go
+```
+
+On Go 1.27 you will see a `go1.27.x` version string and the two reminder lines. If `runtime.Version()` still prints 1.26 or older, you are not on the specialized allocator yet — upgrade the desk toolchain (and CI image) first.
+
+## The trap
+
+### Trap 1: Padding structs to "hit" a size class
+
+Do not add dummy fields so a type lands in SC2 instead of SC3. You grow every value, confuse the next reader, and fight the compiler's own layout. Size specialization exists so **ordinary** layouts stay fast.
+
+### Trap 2: Micro-rewrites that chase malloc counts
+
+Cutting allocations still matters when a profile says so (`sync.Pool`, `s = s[:0]`, fewer interfaces). That is a separate desk from this chapter. Size-specialized malloc makes the allocations you already do cheaper. It is not a reason to avoid clear escaping pointers.
+
+### Trap 3: Leaving `GOEXPERIMENT=nosizespecializedmalloc` in production scripts
+
+The opt-out is for regression hunts. It is expected to vanish in Go 1.28. Do not bake it into Dockerfiles "just in case."
+
+## The boring rule
+
+- On Go 1.27+, keep writing normal escaping code. Small heap allocs get faster without API changes.
+- Upgrade compilers and CI images before inventing allocation micro-tricks.
+- Use `GOEXPERIMENT=nosizespecializedmalloc` only to A/B a suspected regression, then remove it.
+- Trust size classes for headers you already use (string, `any`, slice) — do not invent padding.
+- Still measure with `pprof` / benchmarks when allocation volume is the real cost; cheaper malloc does not fix an unbounded leak.
+
+## Try this
+
+1. Add a `Note string` field to `Ticket` in `size_classes.go` and re-run. Which size class does the value move into?
+2. On Go 1.27, run Case 4's two `go test -bench` commands and note which `ns/op` is lower.
+3. In `known_vs_dyn.go`, change `allocDyn(24)` to `allocDyn(200)`. Does the malloc **count** change? (It should not — only the size class does.)
+4. Search your deploy scripts for `GOEXPERIMENT=nosizespecializedmalloc` and delete any leftover copies after you finish an A/B.
