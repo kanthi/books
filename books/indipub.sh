@@ -145,10 +145,11 @@ fi
 BOOK_PATH="$BOOKS_DIR/$BOOK_NAME"
 OUT_DIR="$BOOK_PATH/_book"
 
-# Per-book sentinel: skip PDF/EPUB until removed (VCS core-prose loop).
-if [ -f "$BOOK_PATH/content/_planning/html-only" ]; then
+# Per-book sentinel: skip PDF/EPUB locally until removed (VCS core-prose loop).
+# CI (CI / GITHUB_ACTIONS) must build all formats so validation checks pass.
+if [ -z "${CI:-}" ] && [ -z "${GITHUB_ACTIONS:-}" ] && [ -f "$BOOK_PATH/content/_planning/html-only" ]; then
   HTML_ONLY=1
-  echo "   html-only: $BOOK_PATH/content/_planning/html-only"
+  echo "   html-only: $BOOK_PATH/content/_planning/html-only (skipping PDF/EPUB for local build)"
 fi
 
 # Quarto often rebuilds _book per --to target and can drop earlier formats.
