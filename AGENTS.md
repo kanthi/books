@@ -60,7 +60,7 @@ Every book is meant to be read **on its own**. A reader of Python should never n
 | **`Python`**, **`Python book`** | `books/Python/` |
 | **`Boring-Python`**, **`Boring Python`** | `books/Boring-Python/` |
 | **`Networking`**, **`C`** | `books/<Name>/` |
-| **`VCS`**, **`Git`**, **`GitHub`**, **`JJ`**, **`Jujutsu`** | `books/VCS/` (`Git` → `content/01-git/`, `GitHub` → `content/02-github/`, `JJ`/`Jujutsu` → `content/03-jj/`) |
+| **`VCS`**, **`Git`**, **`GitHub`**, **`GitOps`**, **`Argo`** | `books/VCS/` (published: `content/01-git-foundations/`; map: `content/_planning/SYLLABUS.md`) |
 
 For **NixOS** especially: normal chapters under `01-concepts/` … `02-nix-on-linux/` … `09-capstone/` + `99-projects/` — not day-calendar filenames.
 
@@ -268,7 +268,7 @@ On the next full CI run (or local `renderpub.sh`), the new book appears on the p
 
 - **CI** is handled by two workflows: `incremental.yml` (push-triggered, per-book) is the default; `main.yml` (manual full rebuild) is the fallback.
 - Prefer **`renderpub.sh`** for local full library builds.
-- Prefer **`indipub.sh <Book>`** for single-book one-shot render.
+- Prefer **`indipub.sh <Book>`** for single-book one-shot render (`./indipub.sh VCS` is HTML-only while `VCS/content/_planning/html-only` exists).
 - Prefer **`indiprev.sh <Book>`** for local Safari preview (static `_book/`; use `--live` for Quarto reload).
 - Prefer **`scripts/gen-portal.sh`** to regenerate just the portal `index.html` without rendering any books.
 - Resolve **book vs volume** using **Book vs volume naming** above; ask if "Go" / "NixOS" / "Maths" is ambiguous.

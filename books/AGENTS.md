@@ -25,7 +25,7 @@ For books using `scripts/update-index.sh` in this repo:
 
 ## Book naming
 
-All titles under `books/` are **standalone libraries**. Paths: `books/Go/`, `books/Boring-Go/`, `books/Boring-Python/`, `books/NixOS/`, `books/Maths/`, `books/Linux/`, `books/Networking/`, `books/C/`, `books/Python/`, `books/VCS/` (parts `01-git/`, `02-github/`, `03-jj/`, `04-forges/`). Prefer root **`AGENTS.md`** for inventory and workflow.
+All titles under `books/` are **standalone libraries**. Paths: `books/Go/`, `books/Boring-Go/`, `books/Boring-Python/`, `books/NixOS/`, `books/Maths/`, `books/Linux/`, `books/Networking/`, `books/C/`, `books/Python/`, `books/VCS/` (published: `01-git-foundations/`; full map in `content/_planning/SYLLABUS.md`). Prefer root **`AGENTS.md`** for inventory and workflow.
 
 ## Book independence
 
@@ -69,9 +69,13 @@ Every live book (and `Template/`) uses the same generator: **nested sections**, 
 ## VCS book
 
 - Path: `VCS/`
-- **Parts:** `01-git/` (Git the tool; mental model → recovery), `02-github/` (GitHub the product; Actions split, other seeds expand later), `03-jj/` (Jujutsu seed), `04-forges/` (GitLab, Gitea).
-- GitHub Flow as a *git topology* may stay in Git workflows. PRs, Actions, rulesets, `gh`, and orgs live in `02-github/`.
-- Do not add empty GitHub expansion dirs until a writing pass starts. Syllabus: `content/_planning/SYLLABUS.md`.
+- Title: **Architectures, Platforms, Operations, and GitOps**.
+- **Published sidebar:** full TOC (`01-git-foundations/` … `09-argo-rollouts/`, `99-appendices/`). **Prose:** original pages in chapters 1–15, chapter 7 in full (reset, restore, checkout), and chapter 25 in full (Gitea and Forgejo). Other new core pages and later parts are stubs until a writing pass.
+- Syllabus (63 chapters): `content/_planning/SYLLABUS.md`.
+- Recurring desk repos: `desk-web`, `desk-api`, `desk-infra`.
+- **Linux-primary:** commands, paths, and package managers assume Linux. Do not write macOS/Windows install tracks.
+- **Local render:** HTML only while `content/_planning/html-only` exists (`./indipub.sh VCS`). CI still builds PDF/EPUB.
+- Do not add empty part directories until that part’s writing pass starts.
 
 ## Boring-Go book
 

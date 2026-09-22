@@ -94,12 +94,33 @@ if [[ -n "$_QUARTO_BIN" ]]; then
 fi
 
 # Check if book name is provided
-if [ $# -ne 1 ]; then
-    echo "Usage: ./indipub.sh <bookname>"
+#   ./indipub.sh Book
+#   ./indipub.sh Book --html     # skip PDF/EPUB (faster local loop)
+HTML_ONLY=0
+BOOK_NAME=""
+for _arg in "$@"; do
+  case "$_arg" in
+    --html|--to-html)
+      HTML_ONLY=1
+      ;;
+    -*)
+      echo "Usage: ./indipub.sh <bookname> [--html]"
+      exit 1
+      ;;
+    *)
+      if [ -n "$BOOK_NAME" ]; then
+        echo "Usage: ./indipub.sh <bookname> [--html]"
+        exit 1
+      fi
+      BOOK_NAME="$_arg"
+      ;;
+  esac
+done
+if [ -z "$BOOK_NAME" ]; then
+    echo "Usage: ./indipub.sh <bookname> [--html]"
     exit 1
 fi
 
-BOOK_NAME="$1"
 BOOKS_DIR="$(pwd)"
 
 # Check if the book directory exists
@@ -123,6 +144,12 @@ fi
 
 BOOK_PATH="$BOOKS_DIR/$BOOK_NAME"
 OUT_DIR="$BOOK_PATH/_book"
+
+# Per-book sentinel: skip PDF/EPUB until removed (VCS core-prose loop).
+if [ -f "$BOOK_PATH/content/_planning/html-only" ]; then
+  HTML_ONLY=1
+  echo "   html-only: $BOOK_PATH/content/_planning/html-only"
+fi
 
 # Quarto often rebuilds _book per --to target and can drop earlier formats.
 # Stage PDF/EPUB after each pass, then merge back so all three remain.
@@ -193,21 +220,40 @@ build_epub_pandoc() {
 # Order matters: each `quarto render --to X` often rebuilds _book/ and drops
 # other formats. Do **html last** so the site (index.html + chapters) remains.
 # PDF/EPUB are harvested after their passes and restored onto the final HTML tree.
-echo "🌐 Rendering book (sequential: pdf → epub → html)..."
-for fmt in pdf epub html; do
-  echo "   → format: $fmt"
-  if [ "$fmt" = epub ]; then
-    if ! quarto render "$BOOK_PATH" --to epub; then
-      echo "   ⚠️  quarto epub failed (often Deno OOM on huge books) — trying pandoc fallback..."
-      build_epub_pandoc
-    fi
-  else
-    quarto render "$BOOK_PATH" --to "$fmt"
-  fi
+#
+# --html / content/_planning/html-only: one HTML pass. Harvest existing PDF/EPUB
+# from _book and published_books so a local loop does not drop portal artifacts.
+if [ "$HTML_ONLY" -eq 1 ]; then
+  echo "🌐 Rendering book (html only)..."
   harvest_artifacts
-done
-
-restore_artifacts
+  if [ -d "$BOOKS_DIR/published_books" ]; then
+    for _ext in pdf epub; do
+      _prev="$BOOKS_DIR/published_books/${_ext}/${BOOK_NAME}.${_ext}"
+      if [ -f "$_prev" ]; then
+        cp -f "$_prev" "$STAGE/$(basename "$_prev")"
+        echo "   harvested portal $(basename "$_prev")"
+      fi
+    done
+  fi
+  quarto render "$BOOK_PATH" --to html
+  harvest_artifacts
+  restore_artifacts
+else
+  echo "🌐 Rendering book (sequential: pdf → epub → html)..."
+  for fmt in pdf epub html; do
+    echo "   → format: $fmt"
+    if [ "$fmt" = epub ]; then
+      if ! quarto render "$BOOK_PATH" --to epub; then
+        echo "   ⚠️  quarto epub failed (often Deno OOM on huge books) — trying pandoc fallback..."
+        build_epub_pandoc
+      fi
+    else
+      quarto render "$BOOK_PATH" --to "$fmt"
+    fi
+    harvest_artifacts
+  done
+  restore_artifacts
+fi
 
 if [ ! -f "$OUT_DIR/index.html" ]; then
   echo "ERROR: _book/index.html missing after render (HTML site not produced)" >&2
