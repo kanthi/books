@@ -120,6 +120,12 @@ if [ -z "$BOOK_NAME" ]; then
     echo "Usage: ./indipub.sh <bookname> [--html]"
     exit 1
 fi
+if [ "$BOOK_NAME" = "Borin-Rust" ]; then
+    BOOK_NAME="Boring-Rust"
+fi
+if [ "$BOOK_NAME" = "Kernel" ] || [ "$BOOK_NAME" = "Writing-Kernel" ] || [ "$BOOK_NAME" = "Writing-Kernels-with-AI" ]; then
+    BOOK_NAME="Writing-Kernel-with-AI"
+fi
 
 BOOKS_DIR="$(pwd)"
 

@@ -33,7 +33,7 @@ A **multi-book Quarto monorepo**. Each book is a self-contained Quarto project u
 
 ### Current books (as of last inventory)
 
-`C`, `Go`, `Boring-Go`, `Boring-NixOS`, `Boring-Python`, `Linux`, `Maths`, `Networking`, `NixOS`, `Python`, `VCS`
+`C`, `Go`, `Boring-Go`, `Boring-NixOS`, `Boring-Python`, `Boring-Rust`, `Linux`, `Maths`, `Networking`, `NixOS`, `Python`, `VCS`, `Writing-Kernel-with-AI`
 
 - **`Linux`**: merged former `Linux-Commands` + `Linux-Editors` + `Linux-ShellScripting-Bash` (parts Commands / Editors / Scripting→Bash).
 
@@ -59,6 +59,8 @@ Every book is meant to be read **on its own**. A reader of Python should never n
 | **`Linux`**, **`Linux book`** | `books/Linux/` |
 | **`Python`**, **`Python book`** | `books/Python/` |
 | **`Boring-Python`**, **`Boring Python`** | `books/Boring-Python/` |
+| **`Boring-Rust`**, **`Boring Rust`**, **`Borin-Rust`** | `books/Boring-Rust/` |
+| **`Writing-Kernel-with-AI`**, **`Writing Kernel with AI`**, **`Kernel`** | `books/Writing-Kernel-with-AI/` |
 | **`Networking`**, **`C`** | `books/<Name>/` |
 | **`VCS`**, **`Git`**, **`GitHub`**, **`GitOps`**, **`Argo`** | `books/VCS/` (published: `content/01-git-foundations/`; map: `content/_planning/SYLLABUS.md`) |
 

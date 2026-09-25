@@ -25,7 +25,7 @@ For books using `scripts/update-index.sh` in this repo:
 
 ## Book naming
 
-All titles under `books/` are **standalone libraries**. Paths: `books/Go/`, `books/Boring-Go/`, `books/Boring-Python/`, `books/NixOS/`, `books/Maths/`, `books/Linux/`, `books/Networking/`, `books/C/`, `books/Python/`, `books/VCS/` (published: `01-git-foundations/`; full map in `content/_planning/SYLLABUS.md`). Prefer root **`AGENTS.md`** for inventory and workflow.
+All titles under `books/` are **standalone libraries**. Paths: `books/Go/`, `books/Boring-Go/`, `books/Boring-Python/`, `books/Boring-Rust/`, `books/Writing-Kernel-with-AI/`, `books/Boring-NixOS/`, `books/Maths/`, `books/Linux/`, `books/Networking/`, `books/C/`, `books/Python/`, `books/VCS/` (published: `01-git-foundations/`; full map in `content/_planning/SYLLABUS.md`). Prefer root **`AGENTS.md`** for inventory and workflow.
 
 ## Book independence
 
@@ -100,6 +100,22 @@ Every live book (and `Template/`) uses the same generator: **nested sections**, 
 - **Independent** of `NixOS/` and every other title. Do not cross-link.
 - Every listing is a complete runnable expression/file **inline in the chapter** (`default.nix`, `flake.nix`, `shell.nix`, `configuration.nix`).
 - Recurring domain: an infrastructure desk (workstations, devShells, services).
+
+## Boring-Rust book
+
+- Path: `Boring-Rust/` (alias: `Borin-Rust`)
+- Safe, concurrent, high-performance systems programming. **Rust 2024 Edition**. Toolchain **`rustup`**, **`cargo`**, **`rustc`**.
+- **Independent** of other titles. Do not cross-link.
+- Full 20 chapters + 3 projects (CLI Task Manager, Parallel Data Pipeline with Rayon, Async HTTP API with Axum/SQLx).
+- Syllabus: `content/_planning/SYLLABUS.md`.
+
+## Writing-Kernel-with-AI book
+
+- Path: `Writing-Kernel-with-AI/` (alias: `Kernel`)
+- Accelerated computing and GPU kernel engineering from CPU to AI-written kernels.
+- **Independent** of other titles. Do not cross-link.
+- 6 Parts, 20 Chapters, and Industry Capstones (with Crusoe).
+- Syllabus: `content/_planning/SYLLABUS.md`.
 
 ## Python book
 
