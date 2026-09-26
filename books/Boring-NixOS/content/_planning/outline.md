@@ -194,6 +194,10 @@
   - `system.switch.inhibitors` string map; refuse live switch when shared keys change
   - Prefer `nixos-rebuild boot` + reboot; inspect `/run/current-system/switch-inhibitors`
   - Extend sparingly (e.g. `systemd.package.version`); lab-only `NIXOS_NO_CHECK=1`
+- **`06-nixos-system/16-activation-reload-restart-deprecation.qmd`**: Activation Reload/Restart Deprecation ← new
+  - 26.05 deprecates restart/reload via activation lists; removal targeted 26.11
+  - Prefer `restartTriggers` / `reloadIfChanged`; migrate prep: tmpfiles → ExecStartPre → oneshot
+  - `sysinit-reactivation.target` for switch-time re-runs; no new `activation-*-list` echoes
 
 ---
 
