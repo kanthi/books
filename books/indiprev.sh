@@ -97,8 +97,8 @@ while [[ $# -gt 0 ]]; do
       exit 1
       ;;
     *)
-      if [[ "$1" == "Borin-Rust" ]]; then
-        BOOKS+=("Boring-Rust")
+      if [[ "$1" == "Borin-Rust" || "$1" == "Boring-Rust" ]]; then
+        BOOKS+=("Rust")
       elif [[ "$1" == "Kernel" || "$1" == "Writing-Kernel" || "$1" == "Writing-Kernels-with-AI" ]]; then
         BOOKS+=("Writing-Kernel-with-AI")
       else

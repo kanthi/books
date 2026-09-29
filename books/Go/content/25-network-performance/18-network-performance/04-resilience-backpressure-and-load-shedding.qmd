@@ -1,0 +1,207 @@
+---
+title: "Resilience, Backpressure, and Load Shedding"
+---
+
+# Resilience, Backpressure, and Load Shedding
+
+The boring default is to process incoming requests as they arrive until system resources saturate. When a sudden surge in traffic hits a backend service, attempting to serve every request simultaneously causes queue buildup, skyrocketing latency percentiles, cascading timeouts across upstream callers, and eventual process collapse. To remain robust under overload, production Go services must implement **backpressure** and **load shedding**: failing fast to protect the requests that *can* be successfully handled.
+
+## Mental model
+
+When a service receives more traffic than its CPU, memory, or downstream database can process:
+
+- **Unbounded Queuing (Meltdown):** Requests sit in operating system socket queues or internal channels. By the time a worker picks up the request, the client's timeout has already elapsed. The server burns CPU computing results that the client has already abandoned, compounding the overload.
+- **Backpressure:** Forces upstream callers or network senders to slow down by stopping reads from the incoming socket or filling bounded input channels.
+- **Load Shedding:** When active concurrency or queue depth exceeds safe operating limits, the server **immediately rejects** surplus requests (returning HTTP 503 Service Unavailable or HTTP 429 Too Many Requests) before doing any database or CPU work.
+
+A buffered channel in Go functions as an extraordinarily efficient concurrency semaphore:
+
+```go
+sem := make(chan struct{}, maxCapacity)
+
+select {
+case sem <- struct{}{}:
+	defer func() { <-sem }()
+	// Process request
+default:
+	// Fast fail: reject request immediately
+}
+```
+
+## Worked examples
+
+### Case 1: Fast-fail load shedding middleware
+
+Save as `shed_demo.go`. We cap active handler concurrency to 3. When 10 concurrent requests arrive at once, exactly 3 are processed and 7 are rejected instantly with HTTP 503.
+
+```go
+// shed_demo.go
+package main
+
+import (
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"sync"
+	"sync/atomic"
+	"time"
+)
+
+// Bounded concurrency limiter middleware
+func LoadSheddingMiddleware(maxConcurrent int, next http.Handler) (http.Handler, *atomic.Int64, *atomic.Int64) {
+	sem := make(chan struct{}, maxConcurrent)
+	var processed, rejected atomic.Int64
+
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case sem <- struct{}{}:
+			defer func() { <-sem }()
+			processed.Add(1)
+			next.ServeHTTP(w, r)
+		default:
+			// Shed load immediately without queuing or blocking
+			rejected.Add(1)
+			w.Header().Set("Retry-After", "1")
+			http.Error(w, "desk busy, load shed", http.StatusServiceUnavailable)
+		}
+	})
+
+	return h, &processed, &rejected
+}
+
+func main() {
+	// Worker handler simulating 20ms of work
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(20 * time.Millisecond)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("order processed"))
+	})
+
+	// Allow maximum 3 concurrent active handlers
+	limitedHandler, processed, rejected := LoadSheddingMiddleware(3, handler)
+	server := httptest.NewServer(limitedHandler)
+	defer server.Close()
+
+	var wg sync.WaitGroup
+	var okCount, shedCount atomic.Int64
+
+	// Blast 10 concurrent requests simultaneously
+	for range 10 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			resp, err := http.Get(server.URL)
+			if err != nil {
+				return
+			}
+			defer resp.Body.Close()
+			if resp.StatusCode == http.StatusOK {
+				okCount.Add(1)
+			} else if resp.StatusCode == http.StatusServiceUnavailable {
+				shedCount.Add(1)
+			}
+		}()
+	}
+
+	wg.Wait()
+
+	fmt.Printf("Max concurrency limit: 3\n")
+	fmt.Printf("Total requests sent:   10\n")
+	fmt.Printf("Requests handled (200): %d\n", okCount.Load())
+	fmt.Printf("Requests shed (503):    %d\n", shedCount.Load())
+	fmt.Printf("Internal tracker: processed=%d rejected=%d\n", processed.Load(), rejected.Load())
+}
+```
+
+Run:
+
+```bash
+go run shed_demo.go
+```
+
+Output:
+
+```
+Max concurrency limit: 3
+Total requests sent:   10
+Requests handled (200): 3
+Requests shed (503):    7
+Internal tracker: processed=3 rejected=7
+```
+
+Under severe load, the service did not degrade; the 3 accepted requests completed in their normal 20ms window, while excess traffic was shed in microseconds.
+
+### Case 2: Respecting client disconnects with context propagation
+
+Save as `cancel_demo.go`. If a client cancels their request or closes their browser tab, checking `r.Context().Done()` allows your handlers to halt expensive background work immediately.
+
+```go
+// cancel_demo.go
+package main
+
+import (
+	"context"
+	"fmt"
+	"time"
+)
+
+func processDeskOrder(ctx context.Context, orderID int) error {
+	for step := 1; step <= 5; step++ {
+		select {
+		case <-ctx.Done():
+			// Client gave up or timed out; stop work immediately
+			return ctx.Err()
+		case <-time.After(10 * time.Millisecond):
+			// Simulate order verification step
+		}
+	}
+	return nil
+}
+
+func main() {
+	// Client timeout set to 25ms (shorter than 50ms needed for all 5 steps)
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Millisecond)
+	defer cancel()
+
+	err := processDeskOrder(ctx, 101)
+	fmt.Printf("Order processing outcome: %v\n", err)
+}
+```
+
+Run:
+
+```bash
+go run cancel_demo.go
+```
+
+Output:
+
+```
+Order processing outcome: context deadline exceeded
+```
+
+## The trap
+
+The most common trap is **unbounded in-memory queuing**:
+
+```go
+// WRONG: In-memory queue with huge buffer delays failure
+var workQueue = make(chan Request, 100000)
+```
+
+If your workers can only process 50 requests per second, a buffer of 100,000 items represents a **2,000-second queue delay** (~33 minutes!). Every client will have timed out long before their request is picked up by a worker.
+
+Keep internal queues very shallow (or zero-sized, relying on channel rendezvous). If workers are busy, reject immediately rather than accumulating a massive queue of stale requests.
+
+## The boring rule
+
+- Always place an upper bound on concurrent requests using a semaphore channel or rate limiter.
+- Fail fast with HTTP 503 or 429 when concurrency limits are reached; include a `Retry-After` header.
+- Avoid large in-memory queues. A queue that takes more than 1–2 seconds to drain under peak load should reject excess work.
+- Always propagate `r.Context()` to database queries and external RPCs so aborted client connections cancel downstream work.
+
+## Try this
+
+1. In `shed_demo.go`, increase `maxConcurrent` to 10 and verify that all 10 requests complete with status 200.
+2. Add a `time.Duration` timeout to the channel send: `select { case sem <- struct{}{}: ... case <-time.After(5 * time.Millisecond): ... }` to implement bounded queue wait time before shedding.
+3. Test how your HTTP client handles receiving status 503 by adding an exponential backoff retry loop.

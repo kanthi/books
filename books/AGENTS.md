@@ -25,7 +25,7 @@ For books using `scripts/update-index.sh` in this repo:
 
 ## Book naming
 
-All titles under `books/` are **standalone libraries**. Paths: `books/Go/`, `books/Boring-Go/`, `books/Boring-Python/`, `books/Boring-Rust/`, `books/Writing-Kernel-with-AI/`, `books/Boring-NixOS/`, `books/Maths/`, `books/Linux/`, `books/Networking/`, `books/C/`, `books/Python/`, `books/VCS/` (published: `01-git-foundations/`; full map in `content/_planning/SYLLABUS.md`). Prefer root **`AGENTS.md`** for inventory and workflow.
+All titles under `books/` are **standalone libraries**. Paths: `books/Go/`, `books/Rust/`, `books/Writing-Kernel-with-AI/`, `books/Maths/`, `books/Linux/`, `books/Networking/`, `books/C/`, `books/Python/`, `books/NixOS/`, `books/VCS/` (published: `01-git-foundations/`; full map in `content/_planning/SYLLABUS.md`). Prefer root **`AGENTS.md`** for inventory and workflow.
 
 ## Book independence
 
@@ -77,36 +77,12 @@ Every live book (and `Template/`) uses the same generator: **nested sections**, 
 - **Local render:** HTML only while `content/_planning/html-only` exists (`./indipub.sh VCS`). CI still builds PDF/EPUB.
 - Do not add empty part directories until that part’s writing pass starts.
 
-## Boring-Go book
+## Rust book
 
-- Path: `Boring-Go/`
-- Linear, example-heavy Go (clarity over cleverness). **Go 1.27**. Toolchain **`go`**.
-- **Independent** of `Go/` and every other title. Do not cross-link.
-- Every listing is a complete runnable program **inline in the chapter** — do not add a sibling `.go` tree.
-- Recurring domain: a small desk (orders, tickets, shifts).
-
-## Boring-Python book
-
-- Path: `Boring-Python/`
-- Linear, example-heavy Python (clarity over cleverness). **Python 3.14**. Toolchain **`uv`**, **`ruff`**, **`pytest`**.
-- **Independent** of `Python/`, `Boring-Go/`, and every other title. Do not cross-link.
-- Every listing is a complete runnable program **inline in the chapter** — do not add a sibling `.py` tree.
-- Recurring domain: a small desk (orders, tickets, shifts). No type hints until the typing part.
-
-## Boring-NixOS book
-
-- Path: `Boring-NixOS/`
-- Deterministic, immutable infrastructure and developer environments. **Nix 2.35+**, **NixOS / nixpkgs 26.05 “Yarara”**, flakes enabled.
-- **Independent** of `NixOS/` and every other title. Do not cross-link.
-- Every listing is a complete runnable expression/file **inline in the chapter** (`default.nix`, `flake.nix`, `shell.nix`, `configuration.nix`).
-- Recurring domain: an infrastructure desk (workstations, devShells, services).
-
-## Boring-Rust book
-
-- Path: `Boring-Rust/` (alias: `Borin-Rust`)
+- Path: `Rust/`
 - Safe, concurrent, high-performance systems programming. **Rust 2024 Edition**. Toolchain **`rustup`**, **`cargo`**, **`rustc`**.
 - **Independent** of other titles. Do not cross-link.
-- Full 20 chapters + 3 projects (CLI Task Manager, Parallel Data Pipeline with Rayon, Async HTTP API with Axum/SQLx).
+- Full 23 parts and capstone projects (CLI Task Manager, Parallel Data Pipeline with Rayon, Async HTTP API, WebAssembly, Embedded).
 - Syllabus: `content/_planning/SYLLABUS.md`.
 
 ## Writing-Kernel-with-AI book

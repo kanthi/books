@@ -109,6 +109,9 @@ humanize_dir_title() {
     home-and-flake-layout)      printf '%s\n' "Home and Flake Layout"; return ;;
     services-and-security)      printf '%s\n' "Services and Security"; return ;;
     ops-and-fleet)              printf '%s\n' "Ops and Fleet"; return ;;
+    cicd)                       printf '%s\n' "CI/CD"; return ;;
+    iac-and-cloud)              printf '%s\n' "IaC and Cloud"; return ;;
+    containers-and-kubernetes)  printf '%s\n' "Containers and Kubernetes"; return ;;
     # Maths
     pre-algebra)                printf '%s\n' "Pre-Algebra"; return ;;
     linear-algebra)             printf '%s\n' "Linear Algebra"; return ;;
