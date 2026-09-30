@@ -42,6 +42,7 @@ Configure and diagnose connectivity: addresses and routes (`ip`), sockets (`ss`)
 | `sftp` | sftp is the interactive SSH file-transfer client (SFTP subsystem). |
 | `ethtool` | ethtool queries and controls Ethernet NIC settings: link speed/duplex, offloads, ring parameters, and driver info. |
 | `firewall-cmd` | firewall-cmd is the client for firewalld, the dynamic firewall manager on Fedora, RHEL, CentOS Stream, and many… |
+| ssh-agent / ssh-add | ssh-agent holds decrypted private keys in memory; ssh-add loads, lists, locks, and removes those identities. |
 
 
 ## Suggested starting points
@@ -49,7 +50,7 @@ Configure and diagnose connectivity: addresses and routes (`ip`), sockets (`ss`)
 1. Local stack: `ip`, `ss`, `nmcli`/`resolvectl` as appropriate.
 2. Path checks: `ping`, `traceroute`/`mtr`, then `dig`/`host` for DNS.
 3. HTTP and APIs: `curl` (and `wget` for simple downloads).
-4. Remote admin: `ssh`, keys via `ssh-keygen`/`ssh-copy-id`, files via `scp`/`sftp`/`rsync`.
+4. Remote admin: `ssh`, keys via `ssh-keygen`/`ssh-copy-id`/`ssh-agent`, files via `scp`/`sftp`/`rsync`.
 5. Firewalls: `ufw` (Ubuntu), `firewall-cmd` (firewalld), or `nft`/`iptables`.
 6. Deep debug: `tcpdump`, `nmap`, `openssl`, `ethtool`.
 
