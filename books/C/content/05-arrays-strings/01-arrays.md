@@ -714,7 +714,7 @@ static void print_arr(const int *a, int n) {
     }
 }
 
-/* TODO: minmax, sum, freq, reverse_into */
+/* Exercise: implement minmax, sum, freq, reverse_into */
 
 int main(void) {
     int sample[] = {1, 4, 1, 5, 9, 2, 6, 5};

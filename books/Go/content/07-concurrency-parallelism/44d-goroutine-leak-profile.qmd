@@ -1,0 +1,366 @@
+---
+title: "Goroutine Leak Profiles"
+---
+
+# Goroutine Leak Profiles
+
+A leaked goroutine is blocked forever on a channel or `sync` primitive that nothing live can ever unblock. Over time those stacks burn memory and keep the GC busy. Go **1.27** makes the `goroutineleak` profile generally available in `runtime/pprof` (and at `/debug/pprof/goroutineleak` when you import `net/http/pprof`). Collect it in production the same way you collect heap or goroutine profiles — no `GOEXPERIMENT` flag.
+
+## Mental model
+
+- The runtime piggybacks on the garbage collector. Unblocked goroutines are live. Anything they can still reach (transitively) can still be used to wake waiters. A goroutine blocked on a primitive that is **unreachable from every live goroutine** is leaked.
+- Detection covers channel send/receive (including `nil` channels), blocking `select`, and `sync.Mutex` / `RWMutex` / `WaitGroup` / `Cond`. It does **not** mark goroutines stuck in network or file I/O as leaked.
+- Globals and still-runnable stacks can hide leaks (the primitive stays "reachable"). Prefer short-lived local channels whose lifetime you understand.
+- `pprof.Lookup("goroutineleak")` builds the profile on demand. `Count()` is the number of leaked samples. `WriteTo(w, 1)` prints an aggregated text dump; `WriteTo(w, 0)` writes the binary form for `go tool pprof`.
+- If you already serve `net/http/pprof`, the HTTP endpoint appears automatically. Hitting it triggers a GC cycle — profile on a schedule, not on every request.
+
+## Worked examples
+
+### Case 1: Prove a nil-channel leak with `Count`
+
+Save as `nil_recv_leak.go`. A receive on a nil channel never completes. After the child blocks, the leak profile reports it.
+
+```go
+// nil_recv_leak.go
+package main
+
+import (
+	"fmt"
+	"runtime"
+	"runtime/pprof"
+)
+
+func main() {
+	go func() {
+		var c chan int
+		<-c
+		panic("unreachable")
+	}()
+	for range 10 {
+		runtime.Gosched()
+	}
+
+	prof := pprof.Lookup("goroutineleak")
+	if prof == nil {
+		fmt.Println("profile missing")
+		return
+	}
+	fmt.Printf("name=%s\n", prof.Name())
+	fmt.Printf("leaked count=%d\n", prof.Count())
+}
+```
+
+Run:
+
+```bash
+go run nil_recv_leak.go
+```
+
+Output:
+
+```
+name=goroutineleak
+leaked count=1
+```
+
+`Count()` stays stable across machines. Stack addresses in a text dump would not.
+
+### Case 2: Early return abandons workers
+
+Save as `early_return_leak.go`. Desk workers send on an unbuffered channel. The parent hits an error and returns **without receiving** — every sender leaks.
+
+```go
+// early_return_leak.go
+package main
+
+import (
+	"errors"
+	"fmt"
+	"runtime"
+	"runtime/pprof"
+)
+
+type ticketResult struct {
+	id int
+}
+
+func processTickets(ids []int, failFast bool) error {
+	ch := make(chan ticketResult)
+	for _, id := range ids {
+		go func(id int) {
+			ch <- ticketResult{id: id}
+		}(id)
+	}
+	if failFast {
+		// Simulate discovering a problem before draining results.
+		return errors.New("desk closed")
+	}
+	for range ids {
+		<-ch
+	}
+	return nil
+}
+
+func main() {
+	err := processTickets([]int{1, 2, 3, 4, 5}, true)
+	fmt.Printf("err=%v\n", err)
+	for range 20 {
+		runtime.Gosched()
+	}
+	fmt.Printf("leaked count=%d\n", pprof.Lookup("goroutineleak").Count())
+}
+```
+
+Run:
+
+```bash
+go run early_return_leak.go
+```
+
+Output:
+
+```
+err=desk closed
+leaked count=5
+```
+
+Five senders, zero receives: five leaks. The same bug shows up when you return on the first worker error after partial receives — leftover senders still hang; the buffer fix below covers both shapes.
+
+### Case 3: Buffer the channel (the boring fix)
+
+Save as `early_return_fixed.go`. Size the buffer to the number of workers so every send completes even when the parent returns early.
+
+```go
+// early_return_fixed.go
+package main
+
+import (
+	"errors"
+	"fmt"
+	"runtime"
+	"runtime/pprof"
+)
+
+type ticketResult struct {
+	id int
+}
+
+func processTickets(ids []int, failFast bool) error {
+	ch := make(chan ticketResult, len(ids))
+	for _, id := range ids {
+		go func(id int) {
+			ch <- ticketResult{id: id}
+		}(id)
+	}
+	if failFast {
+		return errors.New("desk closed")
+	}
+	for range ids {
+		<-ch
+	}
+	return nil
+}
+
+func main() {
+	err := processTickets([]int{1, 2, 3, 4, 5}, true)
+	fmt.Printf("err=%v\n", err)
+	for range 20 {
+		runtime.Gosched()
+	}
+	fmt.Printf("leaked count=%d\n", pprof.Lookup("goroutineleak").Count())
+}
+```
+
+Run:
+
+```bash
+go run early_return_fixed.go
+```
+
+Output:
+
+```
+err=desk closed
+leaked count=0
+```
+
+A buffer of `len(ids)` is the boring default when every worker sends exactly once and you may abandon the receive loop. Context cancellation with a buffered result channel (or a drain on cancel) is the other common pattern.
+
+### Case 4: Timeout without a buffer
+
+Save as `timeout_leak.go`. When the context wins the `select`, the worker's send has nowhere to go.
+
+```go
+// timeout_leak.go
+package main
+
+import (
+	"context"
+	"fmt"
+	"runtime"
+	"runtime/pprof"
+	"time"
+)
+
+func fetchPrice(ctx context.Context) (int, error) {
+	ch := make(chan int)
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		ch <- 42
+	}()
+	select {
+	case price := <-ch:
+		return price, nil
+	case <-ctx.Done():
+		return 0, ctx.Err()
+	}
+}
+
+func main() {
+	for range 3 {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Millisecond)
+		_, err := fetchPrice(ctx)
+		cancel()
+		fmt.Printf("err=%v\n", err)
+	}
+	time.Sleep(80 * time.Millisecond)
+	for range 10 {
+		runtime.Gosched()
+	}
+	fmt.Printf("leaked count=%d\n", pprof.Lookup("goroutineleak").Count())
+}
+```
+
+Run:
+
+```bash
+go run timeout_leak.go
+```
+
+Output:
+
+```
+err=context deadline exceeded
+err=context deadline exceeded
+err=context deadline exceeded
+leaked count=3
+```
+
+Fix: `ch := make(chan int, 1)` so the late send parks in the buffer instead of forever.
+
+### Case 5: Text dump points at the send
+
+Save as `leak_dump.go`. `WriteTo` with debug level `1` prints only leaked stacks. Addresses differ per run; we print whether the dump mentions the leaking function name.
+
+```go
+// leak_dump.go
+package main
+
+import (
+	"bytes"
+	"fmt"
+	"runtime"
+	"runtime/pprof"
+	"strings"
+)
+
+func leakyWorker() {
+	ch := make(chan struct{})
+	go func() {
+		ch <- struct{}{}
+	}()
+	// Parent never receives — sender leaks.
+	for range 10 {
+		runtime.Gosched()
+	}
+}
+
+func main() {
+	leakyWorker()
+	var buf bytes.Buffer
+	if err := pprof.Lookup("goroutineleak").WriteTo(&buf, 1); err != nil {
+		fmt.Println("write:", err)
+		return
+	}
+	text := buf.String()
+	fmt.Printf("has total line? %v\n", strings.Contains(text, "total"))
+	fmt.Printf("mentions leakyWorker? %v\n", strings.Contains(text, "leakyWorker"))
+	fmt.Printf("leaked count=%d\n", pprof.Lookup("goroutineleak").Count())
+}
+```
+
+Run:
+
+```bash
+go run leak_dump.go
+```
+
+Output:
+
+```
+has total line? true
+mentions leakyWorker? true
+leaked count=1
+```
+
+In a service, prefer `curl http://127.0.0.1:6060/debug/pprof/goroutineleak?debug=1` or `go tool pprof http://127.0.0.1:6060/debug/pprof/goroutineleak` and `list` the hot function.
+
+## The trap
+
+Save as `global_hides_leak.go`. A channel kept in a package-level variable stays reachable from the main goroutine, so the profiler may **not** report the blocked sender as leaked — even though nobody will ever receive again.
+
+```go
+// global_hides_leak.go
+package main
+
+import (
+	"fmt"
+	"runtime"
+	"runtime/pprof"
+)
+
+var deskBus = make(chan int)
+
+func main() {
+	go func() {
+		deskBus <- 1
+	}()
+	for range 10 {
+		runtime.Gosched()
+	}
+	// Nobody receives, but deskBus is a global root.
+	fmt.Printf("leaked count=%d\n", pprof.Lookup("goroutineleak").Count())
+	fmt.Println("(global channel can hide a real hang from the profile)")
+}
+```
+
+Run:
+
+```bash
+go run global_hides_leak.go
+```
+
+Output:
+
+```
+leaked count=0
+(global channel can hide a real hang from the profile)
+```
+
+Absence of a leak sample is not proof that every goroutine will wake. Combine the profile with `goleak` / `synctest` in tests, and keep channel ownership local when you can.
+
+## The boring rule
+
+- On Go 1.27+, treat `goroutineleak` as a first-class production profile next to `heap` and `goroutine`.
+- Import `_ "net/http/pprof"` once (behind auth / localhost). Collect `/debug/pprof/goroutineleak` on a coarse schedule.
+- When every worker sends once and the parent may return early or cancel: buffer the result channel (`make(chan T, n)`), or drain on the cancel path.
+- Close work-distribution channels when the producer is done so `range` workers exit.
+- Do not rely on the profile for I/O hangs or for primitives parked in globals.
+- Keep `goleak` in unit tests; use the profile where tests cannot reach — long-running desk services.
+
+## Try this
+
+1. In `early_return_fixed.go`, change the buffer to `1` and re-run. How many leaks appear?
+2. In `timeout_leak.go`, switch to `make(chan int, 1)` and confirm `leaked count=0`.
+3. Add `import _ "net/http/pprof"` and `http.ListenAndServe("127.0.0.1:6060", nil)` to a tiny server that leaks on purpose. Fetch `?debug=1` with curl.
+4. Move `deskBus` in `global_hides_leak.go` into `main` as a local, drop all receives, and compare `Count()` to the global case.

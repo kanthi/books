@@ -1,4 +1,4 @@
-# Boring Rust
+# Rust
 
 A Complete Guide to Safe, Concurrent, High-Performance Programming.
 
@@ -12,14 +12,14 @@ From the monorepo `books/` directory:
 
 ```bash
 cd books
-./indipub.sh Boring-Rust --html
-./indiprev.sh Boring-Rust
+./indipub.sh Rust --html
+./indiprev.sh Rust
 ```
 
 Regenerate the sidebar after adding or renaming chapters:
 
 ```bash
-cd Boring-Rust
+cd Rust
 bash scripts/update-index.sh
 ```
 

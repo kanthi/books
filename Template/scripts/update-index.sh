@@ -9,6 +9,7 @@ BOOK_DIR="$(dirname "$SCRIPT_DIR")"
 CONTENT_DIR="$BOOK_DIR/content"
 QUARTO_YML="$BOOK_DIR/_quarto.yml"
 BOOK_NAME="$(basename "$BOOK_DIR")"
+BOOK_TITLE="${BOOK_TITLE:-$BOOK_NAME}"
 
 REPO_URL="${BOOK_REPO_URL:-https://github.com/kanthi/books}"
 BOOK_AUTHOR="${BOOK_AUTHOR:-K19G}"
@@ -206,7 +207,7 @@ project:
     - images/*-dark.svg
 
 book:
-  title: "$BOOK_NAME"
+  title: "$BOOK_TITLE"
   author: "$BOOK_AUTHOR"
   date: last-modified
   navbar:

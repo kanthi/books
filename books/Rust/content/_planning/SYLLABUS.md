@@ -1,4 +1,4 @@
-# Boring Rust: Syllabus & Table of Contents
+# Rust: Syllabus & Table of Contents
 
 **A Complete Guide to Safe, Concurrent, High-Performance Programming**
 

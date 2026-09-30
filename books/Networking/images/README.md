@@ -14,10 +14,10 @@ The hero figure `diagram-dist-switch-multihome.svg` (+ `-dark`) is the **first p
 | File | Chapter use | Dark sibling |
 |------|-------------|--------------|
 | `diagram-dist-switch-multihome.svg` | Index hero, L2 Ethernet, syllabus | yes |
-| `diagram-mac-learning.svg` | Ethernet & MAC | pending |
-| `diagram-vlan-trunk.svg` | VLANs & trunks | pending |
-| `diagram-lab-triangle.svg` | Containerlab, statics | pending |
-| `diagram-leaf-spine.svg` | Clos leaf-spine | pending |
+| `diagram-mac-learning.svg` | Ethernet & MAC | yes |
+| `diagram-vlan-trunk.svg` | VLANs & trunks | yes |
+| `diagram-lab-triangle.svg` | Containerlab, statics | yes |
+| `diagram-leaf-spine.svg` | Clos leaf-spine | yes |
 | `diagram-encapsulation.svg` etc. (mono) | Models / habits | n/a |
 
 When adding illustrated figures: dual files + reference tokens + theme-swap (already in `styles/reader-mode-body.html`). Embed light path only.
