@@ -1,0 +1,258 @@
+---
+title: "Subinterpreters"
+---
+
+# Subinterpreters
+
+A **subinterpreter** is another Python runtime in the **same process**: its own imports, its own globals, and (since 3.12) its **own GIL**. Python **3.14** puts this on the boring path with `concurrent.interpreters` (PEP 734) and `concurrent.futures.InterpreterPoolExecutor`. Isolation feels like `multiprocessing`. Staying in one process feels like `threading`. The boring default is still threads for shared-memory I/O and processes for hard isolation. Reach for subinterpreters when you want **CPU work in parallel without a process per worker**, and you can pass only **shareable** (or pickleable, for the pool) values between them.
+
+## Mental model
+
+- `interpreters.create()` starts an idle interpreter. `close()` destroys it. Leaving one open prints a `RuntimeWarning` at exit.
+- `interp.call(fn, *args)` switches to that interpreter **in the current OS thread**, runs `fn`, and returns the result. No extra thread appears unless you ask. Arguments and returns must be **shareable** (`interpreters.is_shareable`).
+- `interp.call_in_thread(fn, *args)` does the same work on a **new** OS thread and returns a `threading.Thread` you `join()`. The return value of `fn` is not on the `Thread` object — use a cross-interpreter `Queue` (`interpreters.create_queue()`) when you need the value back.
+- `interp.exec(source)` runs statements in the subinterpreter’s `__main__`. Bind names with `prepare_main(...)` before `exec` if the code must see objects from outside.
+- Most values are **not** shareable for `call` / `prepare_main` / queues. `None`, bools, ints, floats, str, bytes, and tuples of those usually are. `memoryview` and cross-interpreter `Queue` share underlying data. Custom class instances, locks, open files, and closures that close over cells are not. Check with `interpreters.is_shareable(obj)` before you design around a type.
+- `InterpreterPoolExecutor` is a `ThreadPoolExecutor` subclass: each worker thread owns its own interpreter (and GIL). It **pickles** the callable and arguments (like `ProcessPoolExecutor`), so the contract is pickleable + mostly stateless — broader than strict shareability, but still not “any object.”
+- Subinterpreters do **not** share the GIL with each other. Combine them with threads (or the pool) for multi-core CPU work. They are **not** a security boundary: same process, same address space. Many third-party extension modules are not multi-interpreter-safe yet; the stdlib extension modules are.
+
+## Worked examples
+
+### Case 1: Create, call, close
+
+Save as `interp_call.py`. A plain function and an `int` cross the boundary. Print both interpreter ids so you see they are not the same runtime.
+
+```python
+# interp_call.py
+from concurrent import interpreters
+
+
+def square(n):
+    return n * n
+
+
+def main():
+    interp = interpreters.create()
+    try:
+        print(interp.call(square, 12))
+        print("main", interpreters.get_main().id)
+        print("sub", interp.id)
+    finally:
+        interp.close()
+
+
+if __name__ == "__main__":
+    main()
+```
+
+Run:
+
+```bash
+uv run --python 3.14 python interp_call.py
+```
+
+Output:
+
+```
+144
+main 0
+sub 1
+```
+
+`call` is switch-and-run on **this** thread. Parallelism needs Case 3 or Case 4.
+
+### Case 2: Isolation with a queue
+
+Save as `interp_isolate.py`. The subinterpreter owns `counter`. The main interpreter never defines that name. A cross-interpreter queue carries the result back.
+
+```python
+# interp_isolate.py
+from concurrent import interpreters
+
+
+def main():
+    q = interpreters.create_queue()
+    interp = interpreters.create()
+    try:
+        interp.prepare_main(q=q)
+        interp.exec(
+            """
+counter = 0
+for _ in range(5):
+    counter += 1
+q.put(counter)
+"""
+        )
+        print("from sub:", q.get())
+        print("main has counter:", "counter" in globals())
+    finally:
+        interp.close()
+
+
+if __name__ == "__main__":
+    main()
+```
+
+Run:
+
+```bash
+uv run --python 3.14 python interp_isolate.py
+```
+
+Output:
+
+```
+from sub: 5
+main has counter: False
+```
+
+`prepare_main` puts `q` into the sub’s `__main__` before `exec`. The integer on the queue is a copy the main side can read. The sub’s `counter` never leaked into main globals.
+
+### Case 3: `InterpreterPoolExecutor`
+
+Save as `interp_pool.py`. Same shape as a process pool: map a pure function over ints. Workers are interpreters in threads, not OS processes. The executor pickles `dig` and each argument.
+
+```python
+# interp_pool.py
+from concurrent.futures import InterpreterPoolExecutor
+
+
+def dig(n):
+    total = 0
+    for i in range(n):
+        total += i * i
+    return total
+
+
+def main():
+    with InterpreterPoolExecutor(max_workers=2) as pool:
+        print(list(pool.map(dig, [200, 300, 400])))
+
+
+if __name__ == "__main__":
+    main()
+```
+
+Run:
+
+```bash
+uv run --python 3.14 python interp_pool.py
+```
+
+Output:
+
+```
+[2646700, 8955050, 21253400]
+```
+
+Keep `dig` **stateless** and its arguments pickleable. That is the whole contract. For a one-off shareable call, Case 1 is enough. For a pile of CPU chunks, use the pool.
+
+### Case 4: Thread + queue for a result
+
+Save as `interp_queue_thread.py`. `call_in_thread` returns a `Thread`, not the function’s return value. Put the answer on a queue, join, then `get`.
+
+```python
+# interp_queue_thread.py
+from concurrent import interpreters
+
+
+def put_square(n, queue):
+    queue.put(n * n)
+
+
+def main():
+    q = interpreters.create_queue()
+    interp = interpreters.create()
+    try:
+        t = interp.call_in_thread(put_square, 9, q)
+        t.join()
+        print(q.get())
+    finally:
+        interp.close()
+
+
+if __name__ == "__main__":
+    main()
+```
+
+Run:
+
+```bash
+uv run --python 3.14 python interp_queue_thread.py
+```
+
+Output:
+
+```
+81
+```
+
+The queue is one of the few mutable types meant to cross interpreters. Prefer it over inventing shared objects.
+
+## The trap
+
+Save as `interp_share_fail.py`. Pass a `threading.Lock` or a closure that closes over a cell. The call fails with `NotShareableError`. An `int` still works.
+
+```python
+# interp_share_fail.py
+from concurrent import interpreters
+import threading
+
+
+def lock_name(lock):
+    return type(lock).__name__
+
+
+def double(n):
+    return n * 2
+
+
+def main():
+    interp = interpreters.create()
+    try:
+        try:
+            print(interp.call(lock_name, threading.Lock()))
+        except interpreters.NotShareableError as exc:
+            print(type(exc).__name__)
+        print(interp.call(double, 7))
+        print("shareable int:", interpreters.is_shareable(7))
+        print("shareable Lock:", interpreters.is_shareable(threading.Lock()))
+    finally:
+        interp.close()
+
+
+if __name__ == "__main__":
+    main()
+```
+
+Run:
+
+```bash
+uv run --python 3.14 python interp_share_fail.py
+```
+
+Output:
+
+```
+NotShareableError
+14
+shareable int: True
+shareable Lock: False
+```
+
+Check `is_shareable` before you design a pipeline around custom objects for `call` / queues. If the value is not shareable, copy a plain type across a queue, use the pool’s pickle path deliberately, or stay on one interpreter.
+
+## The boring rule
+
+- Prefer **threads** when workers share memory and wait on I/O. Prefer **processes** when you need hard isolation or a library that is not interpreter-safe. Prefer **subinterpreters** when CPU work should fan out in-process and values are shareable (or pickleable for the pool).
+- Always `close()` (or use `InterpreterPoolExecutor`’s context manager). Idle interpreters are not free.
+- For `call` / `prepare_main` / queues: pass ints, strings, bytes, and simple tuples; use `create_queue()` for results from `call_in_thread`.
+- Keep callables **stateless** module-level functions. No closures over cells, no locks, no open files as arguments.
+- Do not treat subinterpreters as a sandbox. Same process can still see the same memory through a bad extension module.
+
+## Try this
+
+1. In `interp_call.py`, call `square` twice with `3` and `4`. Confirm both results print before `close`.
+2. In `interp_isolate.py`, `q.put(("ok", counter))` and print the tuple on the main side.
+3. In `interp_pool.py`, raise `RuntimeError("burnt")` inside `dig` for `n == 300`. Catch the failure from `pool.map`.
+4. In `interp_share_fail.py`, replace the lock with a nested function (`def outer(): x = 1; def inner(n): return n + x; return inner`) and show `NotShareableError` for `interp.call(outer(), 3)`.
