@@ -1,0 +1,256 @@
+---
+title: "PagedAttention and the KV Cache"
+---
+
+# PagedAttention and the KV Cache
+
+Autoregressive LLM serving is memory-bound in decode and **capacity-bound** in concurrency: each active sequence carries a growing key/value (KV) cache. Contiguous per-sequence KV allocations waste large fractions of GPU DRAM to fragmentation and over-reservation. **PagedAttention** (vLLM) borrows the OS virtual-memory idea—fixed-size blocks, a block table, allocate-on-demand—so attention kernels read logically contiguous tokens from physically non-contiguous KV blocks.
+
+This chapter goes deeper than a one-paragraph mention in inference-serving notes: why contiguous KV fails, how block tables work, prefill vs decode implications, layout choices for custom kernels, and how to verify/benchmark paging behavior.
+
+## Mental model
+
+| OS analogy | LLM serving |
+|------------|-------------|
+| Process virtual address space | Logical token positions $0..T-1$ in a sequence |
+| Pages | KV **blocks** of $B$ tokens |
+| Page table | Per-sequence **block table** (logical block → physical block) |
+| Physical frames | Slots in a GPU KV pool |
+| Internal fragmentation | At most one partially filled tail block |
+| External fragmentation | Largely eliminated (any free block can be used) |
+
+```text
+logical tokens:  [t0 t1 ... t15 | t16 ... t31 | t32 ... t40____]
+                   block 0          block 1       block 2 (partial)
+
+block table:     L0 → P17
+                 L1 → P3
+                 L2 → P9
+
+physical pool:   P0 P1 P2 P3[K/V] ... P9[K/V] ... P17[K/V] ...
+```
+
+Attention still needs $Q$ against all prior $K$, and weighted sum over $V$—but the kernel **gathers** $K,V$ through the block table instead of assuming one contiguous pointer.
+
+## Why contiguous KV wastes memory
+
+For a sequence with maximum length $L_{\max}$ and current length $t$:
+
+1. **Reservation waste:** many systems allocate KV for $L_{\max}$ up front even while $t \ll L_{\max}$.  
+2. **External fragmentation:** variable-length contiguous regions cannot pack tightly as sequences finish at different times.  
+3. **Batching rigidity:** contiguous layouts make sharing prefixes or compacting live sequences expensive.
+
+Empirical reports in the PagedAttention / vLLM line of work put waste often in the **60–80%** range under contiguous reservation—memory that cannot become additional concurrent sequences. Paging caps internal waste at roughly one block ($B$ tokens) per sequence (per managed cache partition) and removes most external fragmentation.
+
+### Capacity sketch
+
+Let one token’s KV footprint (all layers, all heads, K and V) be $b$ bytes. Contiguous reservation for $N$ sequences costs $\sim N L_{\max} b$. Paged on-demand costs $\sim b\sum_i t_i$ plus $< N B b$ partial-block slack (order-of-magnitude). The ratio $L_{\max}/\bar{t}$ dominates the win when outputs are much shorter than the configured max.
+
+## KV cache in Transformers (reminder)
+
+For each layer $\ell$ and head $h$, token position $i$ stores vectors $k_i^{(\ell,h)}, v_i^{(\ell,h)}\in\mathbb{R}^{d}$. Causality at decode step $t$ uses
+
+$$
+\alpha_{t,i}=\mathrm{softmax}_i\left(\frac{q_t^\top k_i}{\sqrt{d}}\right),\qquad
+o_t=\sum_{i=1}^{t}\alpha_{t,i}v_i.
+$$
+
+Prefill computes many $q$ rows in parallel against the prompt’s $K,V$; decode appends one new $(k_t,v_t)$ and attends with a single $q_t$ (or a small speculative set).
+
+**Serving reality:** weights are shared; **KV grows per request**. Throughput (tokens/s/GPU) often rises when more sequences fit—hence KV packing is a first-class systems problem, not a minor allocator tweak.
+
+## Block structure
+
+Choose block size $B$ (vLLM commonly discusses values like 16). Logical block $j$ holds tokens $(j-1)B+1,\ldots,jB$ (or $0$-based equivalents):
+
+$$
+K_j=(k_{(j-1)B+1},\ldots,k_{jB}),\qquad
+V_j=(v_{(j-1)B+1},\ldots,v_{jB}).
+$$
+
+Attention becomes a loop over logical blocks: load the physical block pointed by the table, compute partial scores/outputs, advance. The last block carries a **filled-token count** $1..B$.
+
+### Worked layout numbers
+
+$B=16$, head dim $d=128$, dtype FP16: one head’s K block stores $16\times 128$ elements $=2048$ halves $\approx 4$ KiB (order of magnitude), and V similarly. Multi-layer multi-head caches scale linearly; production engines may use separate block tables per layer/head partition or pack carefully for coalescing—design choice, not a change to the paging idea.
+
+## Block table and allocator
+
+Per sequence (and often per KV partition):
+
+| Field | Role |
+|-------|------|
+| Logical index $j$ | Token range $[jB,(j+1)B)$ |
+| Physical block id | Index into GPU (or CPU swap) pool |
+| Filled count | Valid tokens in the tail block |
+| Refcount (advanced) | Prefix sharing / copy-on-write |
+
+**Allocate on demand:** when decode would write past the filled count, pull a free physical block, append a table entry. **Free on finish:** return blocks to the pool (and decrement refcounts if shared).
+
+```text
+decode step:
+  if filled == B:
+      phys = alloc_block()
+      table.append(phys)
+      filled = 0
+  write k_t,v_t into table[-1] at offset filled
+  filled += 1
+  run paged attention(q_t, table)
+```
+
+### Prefix sharing (copy-on-write intuition)
+
+If two requests share a prompt prefix, map their early logical blocks to the **same** physical blocks with elevated refcounts. Divergence (different generated tokens) allocates private blocks from the fork point. Automatic prefix caching builds on the same indirection: hash logical block contents (+prefix identity) to reuse physical KV.
+
+## Prefill vs decode under paging
+
+| Phase | Compute character | Paging interaction |
+|-------|-------------------|--------------------|
+| **Prefill** | Compute-heavy; many tokens written | Allocate enough blocks for prompt; write K/V densely left-to-right; attention over prompt blocks |
+| **Decode** | Memory-bound; one token at a time | Append into tail block; attention gathers all prior blocks for one $q$ |
+
+Custom kernels must handle **variable block lists per sequence in a batch**: sequence A may have 3 blocks, sequence B 40. Batching strategies (continuous batching) reshape which sequences sit in a wave while the block tables remain the source of truth for KV addresses.
+
+### Implication
+
+A FlashAttention-style tiled softmax over a **contiguous** $K,V$ buffer is not drop-in compatible. You need a kernel that:
+
+1. Accepts block tables + pool base pointers, or  
+2. Materializes contiguous KV (defeats paging), or  
+3. Uses a hybrid (e.g., paged decode kernels + specialized prefill paths).
+
+vLLM’s historical PagedAttention CUDA kernels (`attention_kernels`-style designs) are built for case (1): thread blocks iterate paged K/V vectors with careful vectorized loads.
+
+## Paged KV layouts (kernel writer view)
+
+Exact layouts evolve; treat the following as a **mental checklist** when reading kernels or writing prototypes:
+
+```text
+Pool: physical_block[p] → storage for B tokens × head_dim (K or V)
+
+K access for logical token t:
+  j = t / B
+  o = t % B
+  p = block_table[seq][j]
+  addr = base_K + p * stride_block + o * stride_token + head_offset
+
+V access: similar with base_V / possibly different vectorization shape
+```
+
+**K vs V vectorization:** kernels often pack K for efficient Q·K dots (e.g., threads cooperating on a head vector) while V layouts favor weighting and accumulating into the output. Do not assume K and V share identical lane mapping.
+
+**Separate K and V caches:** common—two pools, parallel tables or mirrored indices.
+
+### Illustrative host-side table (not a production kernel)
+
+```python
+# file: toy_block_table.py
+# Toy model of logical→physical mapping (host-side). Not CUDA.
+
+from dataclasses import dataclass, field
+
+B = 16
+
+
+@dataclass
+class SequenceKV:
+    table: list[int] = field(default_factory=list)  # physical ids
+    filled: int = 0  # tokens used in last block
+
+
+class BlockPool:
+    def __init__(self, n_blocks: int):
+        self.free = list(range(n_blocks))
+
+    def alloc(self) -> int:
+        if not self.free:
+            raise MemoryError("KV pool exhausted")
+        return self.free.pop()
+
+    def free_block(self, p: int) -> None:
+        self.free.append(p)
+
+
+def append_token(seq: SequenceKV, pool: BlockPool) -> None:
+    if not seq.table or seq.filled == B:
+        seq.table.append(pool.alloc())
+        seq.filled = 0
+    # device would write K/V into pool[seq.table[-1]][seq.filled]
+    seq.filled += 1
+
+
+def release(seq: SequenceKV, pool: BlockPool) -> None:
+    for p in seq.table:
+        pool.free_block(p)
+    seq.table.clear()
+    seq.filled = 0
+```
+
+Use this only to reason about allocation traffic; real engines track layers/heads, CUDA streams, and fragmentation across devices.
+
+## Implications for custom kernels
+
+1. **Indirection tax:** every K/V load pays a table lookup (often cached in shared memory / registers for the active block list).  
+2. **Tail blocks:** masks for `filled < B` are mandatory—same family of bugs as ragged sequence lengths.  
+3. **Batching:** one wave may include many tables; prefer grouped launches or paged-friendly attention APIs over naively padding to $L_{\max}$ contiguous.  
+4. **Fusion:** paging composes with continuous batching, speculative decoding (extra parallel tokens), and quantization of KV (INT8/FP8 caches)—each changes strides and scales, not the block-table story.  
+5. **Swap / multi-tier:** physical blocks may live in CPU RAM; kernels and schedulers must not assume all table entries are GPU-resident without a residency check.
+
+When generating kernels with AI assistants: specify **block size, K/V separation, dtype, head dim, and tail masking** explicitly. Ambiguous “write attention” prompts usually emit contiguous FlashAttention clones that cannot consume a paged pool.
+
+## Verification and benchmark notes
+
+### Functional checks
+
+| Check | Idea |
+|-------|------|
+| Match contiguous golden | For small $T$, gather paged KV to contiguous and compare attention outs vs a reference softmax |
+| Tail mask | Lengths $B-1$, $B$, $B+1$ across block boundaries |
+| Multi-sequence batch | Different table lengths in one launch |
+| Prefix share | Refcount: mutate after fork must not clobber peer |
+
+### Performance / capacity checks
+
+| Metric | Why |
+|--------|-----|
+| Max concurrent sequences at fixed $L_{\max}$ | Primary paging win |
+| KV bytes reserved vs bytes touched | Fragmentation / over-reserve detector |
+| Decode tokens/s vs batch size | Memory bandwidth + kernel efficiency |
+| Allocation failures under load | Pool sizing / preemption / swap policy |
+
+Microbenchmarks that only time a contiguous GEMM miss the point—page-table attention is about **fitting more live KV** without catastrophic gather overhead. Profile both **allocator** and **attention kernel**.
+
+### Profiling tips
+
+- Trace block alloc/free counts per request; spikes may indicate missing prefix sharing.  
+- Compare achieved occupancy / bytes loaded for paged vs contiguous decode on identical batch shapes.  
+- Watch for CPU-sync on block-table uploads each step—pin tables or update incrementally.
+
+## Pitfalls
+
+| Pitfall | Result |
+|---------|--------|
+| Assuming contiguous FlashAttention works unchanged | Wrong answers or illegal loads |
+| Ignoring partial-block fill | Garbage tokens in softmax |
+| Oversized $B$ | More internal waste; less flexible packing |
+| Undersized pool | Preemption thrash or request rejects |
+| Forgetting refcount on shared prefixes | Silent cross-request corruption |
+| Benchmarking only prefill TFLOPs | Misses decode memory + paging behavior |
+
+## Checkpoint
+
+- Explain why contiguous $L_{\max}$ reservation destroys concurrency.  
+- Map OS paging terms onto block tables and KV pools.  
+- Describe allocate-on-demand during decode and tail `filled` counts.  
+- List what a paged attention kernel must accept beyond $Q,K,V$ pointers.  
+- Name two functional tests and one capacity metric for paging.
+
+## Summary
+
+PagedAttention makes KV cache **virtually contiguous and physically sparse**. The win is utilization—more sequences per GPU—at the cost of attention kernels that understand block tables, tail masks, and pool lifetimes. Prefill still wants heavy compute paths; decode wants lean paged gathers. For custom or AI-written kernels, treat the block table as part of the ABI, verify against contiguous goldens at block boundaries, and benchmark concurrency and KV bytes—not only matmul TFLOPs.
+
+## Sources (for further reading)
+
+- Kwon et al., “Efficient Memory Management for Large Language Model Serving with PagedAttention” (SOSP 2023; arXiv:2309.06180).  
+- vLLM design docs on PagedAttention / paged KV layouts.  
+- vLLM blog: “Easy, Fast, and Cheap LLM Serving with PagedAttention.”
