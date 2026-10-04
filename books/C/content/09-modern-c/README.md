@@ -20,6 +20,7 @@ By the end of this module, you will be able to:
 3. **C17 and C23 Features** - typeof operators, binary literals, enhanced preprocessor directives, attributes
 4. **Modern C Development Practices** - DevOps integration, containerized development, WebAssembly, cloud-native C
 5. **Advanced Preprocessor** - Macro definitions, conditional compilation, pragma directives, token manipulation
+6. **C23 `#embed`, `nullptr`, and `constexpr`** - Binary assets, null pointer constant, typed translation-time values
 
 ## Key Concepts Covered
 - Variable-length arrays (VLAs)
