@@ -20,6 +20,7 @@ Control the running system under systemd: units, journals, kernel parameters, re
 | `systemd-analyze` | systemd-analyze diagnoses boot performance and unit graphs: how long boot took, which units delayed it, whether unit… |
 | `loginctl` | loginctl manages systemd-logind seats, sessions, and users: who is logged in, idle hints, kill sessions, and… |
 | `modprobe` | modprobe loads and unloads kernel modules, resolving dependencies via modules.dep — preferred over raw insmod/rmmod… |
+| `systemd-creds` | systemd-creds encrypts, decrypts, and inspects service credentials for LoadCredentialEncrypted= / credstore. |
 
 
 ## Suggested starting points
@@ -30,6 +31,7 @@ Control the running system under systemd: units, journals, kernel parameters, re
 4. Ad-hoc units/timers: `systemd-run`; boot analysis: `systemd-analyze`.
 5. User sessions / linger: `loginctl`.
 6. Containers: `podman`.
+7. Service secrets: `systemd-creds` + `LoadCredentialEncrypted=`.
 
 ## Related parts
 
