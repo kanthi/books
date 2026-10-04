@@ -27,6 +27,7 @@ By the end of this module you should be able to:
 | 2 | [Debugging Techniques](02-debugging-techniques.md) | GDB transcripts, `DEBUG_LOG`, Valgrind, strace/ltrace, core dumps, systematic isolation |
 | 3 | [Error Handling](03-error-handling.md) | Return codes, enums, `errno`, cleanup on failure, partial-success pitfalls |
 | 4 | [Code Quality](04-code-quality.md) | Warning archaeology, early-return design, `_Static_assert`, load/ownership patterns, CI-style local gates |
+| 5 | [Compiler Sanitizers](05-sanitizers.md) | ASan, UBSan, TSan, brief MSan: flags, reports, CI matrix, false friends |
 
 ## Suggested order
 
@@ -34,6 +35,7 @@ By the end of this module you should be able to:
 2. **Debugging Techniques** — deliberately break code and recover with GDB/Valgrind.  
 3. **Error Handling** — make APIs fail loudly and cleanly.  
 4. **Code Quality** — lock in habits that keep the above sustainable (`-Werror`, checklists, scripts).
+5. **Compiler Sanitizers** — deepen ASan/UBSan and add TSan/MSan operator practice beyond the harness chapter.
 
 ## Tooling cheat sheet
 
