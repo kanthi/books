@@ -1,0 +1,509 @@
+---
+title: "os.Root: Traversal-Resistant File Access"
+---
+
+# os.Root: Traversal-Resistant File Access
+
+## Thesis
+
+Any code that joins a **trusted directory** with an **untrusted name** — an upload handler, an archive extractor, a static file server, a per-tenant storage layer — is one symlink away from reading or writing somewhere else. Lexical checks (`filepath.Clean`, `filepath.IsLocal`, a `HasPrefix` jail) only inspect the *string*; the kernel resolves the *filesystem*, and the two disagree the moment a symlink exists. Since Go 1.24 the standard library has the right tool: **`os.Root`**, a handle on a directory whose every operation is resolved inside that directory or refused. Go 1.25 filled in the rest of the API (`MkdirAll`, `ReadFile`, `WriteFile`, `Symlink`, `Rename`, `RemoveAll`, and friends), so on Go 1.27 there is no longer an excuse to build host paths by hand.
+
+## Mental model
+
+`os.OpenRoot(dir)` opens a file descriptor on `dir`. Every method on the returned `*os.Root` takes a name **relative to that descriptor** and walks it one component at a time with the `openat` family of system calls. At each step it checks: did `..` climb above the root? Did a symlink point above the root, or to an absolute path? If yes, the call fails with a `*PathError` whose message is `path escapes from parent`.
+
+```text
+classic jail                         os.Root
+-------------                        -------
+string  "avatar/secret.txt"          fd(work/uploads)
+  |  Clean + Join + HasPrefix          |  openat(fd, "avatar")    -> symlink "../private"
+  v  "work/uploads/avatar/secret.txt"  |  resolve: climbs above fd -> refuse
+kernel open() follows the symlink     v
+  -> work/private/secret.txt  (leak)  error: path escapes from parent
+```
+
+Three properties matter in practice:
+
+| Property | Consequence |
+|----------|-------------|
+| Resolution happens **in the kernel walk**, not before it | No time-of-check/time-of-use gap between "validate" and "open" |
+| Symlinks and `..` are **allowed while they stay inside** | `root.Open("a/../b")` and in-root links still work |
+| The root is a **descriptor**, not a path (Linux, macOS, BSD) | Renaming or moving the directory does not redirect later operations |
+
+The method set mirrors package `os`: `Open`, `OpenFile`, `Create`, `ReadFile`, `WriteFile`, `Mkdir`, `MkdirAll`, `Remove`, `RemoveAll`, `Rename`, `Link`, `Symlink`, `Readlink`, `Stat`, `Lstat`, `Chmod`, `Chown`, `Lchown`, `Chtimes`, plus `OpenRoot` (a narrower root inside this one) and `FS` (an `io/fs.FS` view that implements `StatFS`, `ReadFileFS`, `ReadDirFS`, and `ReadLinkFS`). For one-off opens there is `os.OpenInRoot(dir, name)`.
+
+Rule of thumb from the Go team, and the one this chapter follows: if you are about to call `filepath.Join(fixedDir, externalName)`, use `os.Root` instead.
+
+## Worked examples
+
+Every listing below was run with **Go 1.27.1 on Linux (amd64)**; the output blocks are copied from those runs. Each case lives in its own directory so `go run` sees one `main` package.
+
+### Case 1: The prefix-check jail leaks through a symlink
+
+The classic defence cleans the name, joins it to the root, and checks the prefix. It defeats `../` — and nothing else. Here an attacker who can write into `uploads/` (a previous upload, an unpacked archive, a shared volume) plants `avatar -> ../private`.
+
+```bash
+mkdir -p case1 && cd case1
+```
+
+```go
+// escape.go
+package main
+
+import (
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+)
+
+// safeJoin is the classic lexical jail: clean, join, prefix-check.
+func safeJoin(root, name string) (string, error) {
+	full := filepath.Join(root, filepath.Clean("/"+name))
+	if !strings.HasPrefix(full, filepath.Clean(root)+string(filepath.Separator)) {
+		return "", errors.New("path escapes root")
+	}
+	return full, nil
+}
+
+func main() {
+	// Lay out a sandbox and a secret that lives outside it.
+	must(os.MkdirAll("work/uploads", 0o755))
+	must(os.MkdirAll("work/private", 0o700))
+	must(os.WriteFile("work/private/secret.txt", []byte("db-password=hunter2\n"), 0o600))
+	must(os.WriteFile("work/uploads/hello.txt", []byte("hello\n"), 0o644))
+
+	// Someone who can write into uploads/ plants a symlink.
+	_ = os.Remove("work/uploads/avatar")
+	must(os.Symlink("../private", "work/uploads/avatar"))
+
+	for _, name := range []string{"hello.txt", "../private/secret.txt", "avatar/secret.txt"} {
+		fmt.Printf("== %s\n", name)
+
+		if p, err := safeJoin("work/uploads", name); err != nil {
+			fmt.Println("  safeJoin:   rejected:", err)
+		} else if b, err := os.ReadFile(p); err != nil {
+			fmt.Println("  safeJoin:   error:", err)
+		} else {
+			fmt.Printf("  safeJoin:   read %q\n", b)
+		}
+
+		f, err := os.OpenInRoot("work/uploads", name)
+		if err != nil {
+			fmt.Println("  OpenInRoot: rejected:", err)
+			continue
+		}
+		b := make([]byte, 64)
+		n, _ := f.Read(b)
+		f.Close()
+		fmt.Printf("  OpenInRoot: read %q\n", b[:n])
+	}
+}
+
+func must(err error) {
+	if err != nil {
+		panic(err)
+	}
+}
+```
+
+```bash
+go run escape.go
+```
+
+Output:
+
+```
+== hello.txt
+  safeJoin:   read "hello\n"
+  OpenInRoot: read "hello\n"
+== ../private/secret.txt
+  safeJoin:   error: open work/uploads/private/secret.txt: no such file or directory
+  OpenInRoot: rejected: openat ../private/secret.txt: path escapes from parent
+== avatar/secret.txt
+  safeJoin:   read "db-password=hunter2\n"
+  OpenInRoot: rejected: openat avatar/secret.txt: path escapes from parent
+```
+
+The string `work/uploads/avatar/secret.txt` passes every lexical test — it really is "under" `work/uploads`. The kernel follows the link anyway. `OpenInRoot` refuses both escapes and still serves the honest request. Note that `safeJoin` "handled" `../` by silently clamping it to the root, which is its own small lie: the caller asked for a file that does not exist there.
+
+### Case 2: An archive extractor that cannot write outside its output directory
+
+Archive extraction is the textbook traversal bug ("zip slip"): entries named `../x`, absolute names, and — the one most hand-rolled guards miss — a symlink entry followed by a file entry *through* that symlink. The extractor below never constructs a host path; every write goes through the `Root`.
+
+```bash
+mkdir -p case2 && cd case2
+```
+
+```go
+// untar.go
+package main
+
+import (
+	"archive/tar"
+	"bytes"
+	"errors"
+	"fmt"
+	"io"
+	"io/fs"
+	"os"
+)
+
+// hostileTar builds an archive the way an attacker would.
+func hostileTar() *bytes.Buffer {
+	var buf bytes.Buffer
+	tw := tar.NewWriter(&buf)
+	add := func(h *tar.Header, body string) {
+		h.Size = int64(len(body))
+		if h.Mode == 0 {
+			h.Mode = 0o644
+		}
+		if err := tw.WriteHeader(h); err != nil {
+			panic(err)
+		}
+		io.WriteString(tw, body)
+	}
+	add(&tar.Header{Name: "docs/", Typeflag: tar.TypeDir, Mode: 0o755}, "")
+	add(&tar.Header{Name: "docs/readme.txt", Typeflag: tar.TypeReg}, "fine\n")
+	add(&tar.Header{Name: "../escape.txt", Typeflag: tar.TypeReg}, "dotdot\n")
+	add(&tar.Header{Name: "/etc/evil.conf", Typeflag: tar.TypeReg}, "absolute\n")
+	add(&tar.Header{Name: "link", Typeflag: tar.TypeSymlink, Linkname: "../outside"}, "")
+	add(&tar.Header{Name: "link/pwned.txt", Typeflag: tar.TypeReg}, "via symlink\n")
+	tw.Close()
+	return &buf
+}
+
+// extract writes every entry through root. It never builds a host path.
+func extract(root *os.Root, r io.Reader) error {
+	tr := tar.NewReader(r)
+	var errs []error
+	for {
+		h, err := tr.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil && !errors.Is(err, tar.ErrInsecurePath) {
+			return err
+		}
+		if err := extractOne(root, h, tr); err != nil {
+			fmt.Printf("  skip %-16s %v\n", h.Name, err)
+			errs = append(errs, err)
+			continue
+		}
+		fmt.Printf("  ok   %s\n", h.Name)
+	}
+	return errors.Join(errs...)
+}
+
+func extractOne(root *os.Root, h *tar.Header, body io.Reader) error {
+	mode := fs.FileMode(h.Mode).Perm()
+	switch h.Typeflag {
+	case tar.TypeDir:
+		return root.MkdirAll(h.Name, mode|0o700)
+	case tar.TypeSymlink:
+		return root.Symlink(h.Linkname, h.Name)
+	case tar.TypeReg:
+		f, err := root.OpenFile(h.Name, os.O_WRONLY|os.O_CREATE|os.O_EXCL, mode)
+		if err != nil {
+			return err
+		}
+		_, err = io.Copy(f, io.LimitReader(body, 1<<20))
+		return errors.Join(err, f.Close())
+	default:
+		return fmt.Errorf("unsupported type %q", h.Typeflag)
+	}
+}
+
+func main() {
+	must(os.MkdirAll("out", 0o755))
+	must(os.MkdirAll("outside", 0o755))
+
+	root, err := os.OpenRoot("out")
+	must(err)
+	defer root.Close()
+
+	fmt.Println("extracting:")
+	err = extract(root, hostileTar())
+	fmt.Println("errors:", err != nil)
+
+	_, err = os.Stat("outside/pwned.txt")
+	fmt.Println("outside/pwned.txt exists:", err == nil)
+	_, err = os.Stat("escape.txt")
+	fmt.Println("escape.txt exists:", err == nil)
+}
+
+func must(err error) {
+	if err != nil {
+		panic(err)
+	}
+}
+```
+
+```bash
+rm -rf out outside   # O_EXCL makes reruns fail otherwise
+go run untar.go
+find out outside | sort
+```
+
+Output:
+
+```
+extracting:
+  ok   docs/
+  ok   docs/readme.txt
+  skip ../escape.txt    openat ../escape.txt: path escapes from parent
+  skip /etc/evil.conf   openat /etc/evil.conf: path escapes from parent
+  ok   link
+  skip link/pwned.txt   openat link/pwned.txt: path escapes from parent
+errors: true
+outside/pwned.txt exists: false
+escape.txt exists: false
+out
+out/docs
+out/docs/readme.txt
+out/link
+outside
+```
+
+Things worth copying from this listing:
+
+- `O_CREATE|O_EXCL` refuses to overwrite an existing entry — including a link the archive planted earlier under the same name.
+- `io.LimitReader` caps each entry; traversal is not the only hostile property of an archive.
+- `archive/tar` only returns `tar.ErrInsecurePath` from `Next` when you run with `GODEBUG=tarinsecurepath=0`; the default still hands you the header. The extractor tolerates both, because the `Root` is the real guard, not the header check.
+- `out/link` was created and points outside. `Root` stopped every *traversal* of it, but it did not stop its *creation*. See "The trap".
+
+### Case 3: Serving static files — `http.Dir` versus `root.FS()`
+
+`http.Dir` rejects `..` in URLs but follows any symlink on disk. If a deploy step, a CMS, or a user can create links under the web root, `http.Dir` will serve whatever they point at. `http.FileServerFS(root.FS())` serves the same tree with `Root` semantics.
+
+```bash
+mkdir -p case3 && cd case3
+```
+
+```go
+// serve.go
+package main
+
+import (
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"os"
+)
+
+func main() {
+	must(os.MkdirAll("site", 0o755))
+	must(os.MkdirAll("private", 0o700))
+	must(os.WriteFile("site/index.html", []byte("<h1>home</h1>\n"), 0o644))
+	must(os.WriteFile("private/id_ed25519", []byte("-----BEGIN OPENSSH PRIVATE KEY-----\n"), 0o600))
+	_ = os.Remove("site/assets")
+	must(os.Symlink("../private", "site/assets")) // planted by a compromised deploy step
+
+	root, err := os.OpenRoot("site")
+	must(err)
+	defer root.Close()
+
+	handlers := []struct {
+		label string
+		h     http.Handler
+	}{
+		{"http.Dir ", http.FileServer(http.Dir("site"))},
+		{"root.FS()", http.FileServerFS(root.FS())},
+	}
+	for _, tc := range handlers {
+		srv := httptest.NewServer(tc.h)
+		for _, path := range []string{"/index.html", "/assets/id_ed25519"} {
+			resp, err := http.Get(srv.URL + path)
+			must(err)
+			body, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			fmt.Printf("%s %-20s %d %q\n", tc.label, path, resp.StatusCode, firstLine(body))
+		}
+		srv.Close()
+	}
+}
+
+func firstLine(b []byte) string {
+	for i, c := range b {
+		if c == '\n' {
+			return string(b[:i])
+		}
+	}
+	return string(b)
+}
+
+func must(err error) {
+	if err != nil {
+		panic(err)
+	}
+}
+```
+
+```bash
+go run serve.go
+```
+
+Output:
+
+```
+http.Dir  /index.html          200 "<h1>home</h1>"
+http.Dir  /assets/id_ed25519   200 "-----BEGIN OPENSSH PRIVATE KEY-----"
+root.FS() /index.html          200 "<h1>home</h1>"
+root.FS() /assets/id_ed25519   500 "500 Internal Server Error"
+```
+
+The escape becomes a `500`, not a `404`: the file server maps only `fs.ErrNotExist` and `fs.ErrPermission` to friendly codes, and "path escapes from parent" is neither. That is acceptable for a static site — and a useful alert signal. If you want a `404`, wrap the `fs.FS` and translate errors yourself; do not "fix" it by going back to `http.Dir`.
+
+### Case 4: Per-tenant roots that survive a rename
+
+A `Root` can open a narrower `Root`. Give each tenant its own and cross-tenant access becomes impossible by construction rather than by review. Because the root is a descriptor, an operator moving the data directory mid-flight does not redirect writes to whatever now sits at the old path.
+
+```bash
+mkdir -p case4 && cd case4
+```
+
+```go
+// tenants.go
+package main
+
+import (
+	"fmt"
+	"os"
+)
+
+func main() {
+	must(os.MkdirAll("data/tenants/acme", 0o755))
+	must(os.MkdirAll("data/tenants/globex", 0o755))
+
+	data, err := os.OpenRoot("data")
+	must(err)
+	defer data.Close()
+
+	// Narrow the jail per tenant: a Root opened from a Root.
+	acme, err := data.OpenRoot("tenants/acme")
+	must(err)
+	defer acme.Close()
+	fmt.Println("acme root name:", acme.Name())
+
+	must(acme.WriteFile("invoice-001.json", []byte(`{"total":42}`), 0o644))
+	_, err = acme.ReadFile("../globex/invoice-001.json")
+	fmt.Println("cross-tenant read:", err)
+
+	// An operator renames the data directory while the service runs.
+	must(os.Rename("data", "data.old"))
+	must(acme.WriteFile("invoice-002.json", []byte(`{"total":7}`), 0o644))
+
+	entries, err := os.ReadDir("data.old/tenants/acme")
+	must(err)
+	for _, e := range entries {
+		fmt.Println("on disk:", "data.old/tenants/acme/"+e.Name())
+	}
+}
+
+func must(err error) {
+	if err != nil {
+		panic(err)
+	}
+}
+```
+
+```bash
+rm -rf data data.old   # the program renames data -> data.old
+go run tenants.go
+```
+
+Output:
+
+```
+acme root name: data/tenants/acme
+cross-tenant read: openat ../globex/invoice-001.json: path escapes from parent
+on disk: data.old/tenants/acme/invoice-001.json
+on disk: data.old/tenants/acme/invoice-002.json
+```
+
+`Name()` reports the path the root was opened with; after the rename that string is stale, but the descriptor is not — `invoice-002.json` landed in the moved directory. Log `Name()` for humans; never re-open by it.
+
+## The trap
+
+**1. Treating `Root` as a sandbox.** `os.Root` stops *path traversal by things an ordinary user can create* — `..` and symlinks. Its documentation is explicit that it does **not** stop traversal across bind mounts or other mount points, does not block `/proc` magic files, and does not stop opening device nodes inside the root. If the threat includes a process with mount privileges, you need namespaces, a container, or a separate user — not a different file API.
+
+**2. Letting hostile symlinks outlive the extraction.** Case 2 left `out/link -> ../outside` on disk. Your `Root` will never follow it, but the next program that runs `cp -r out/ …` or a plain `os.Open` will. Validate link targets *before* creating them:
+
+```go
+// linkcheck.go
+package main
+
+import (
+	"fmt"
+	"path/filepath"
+)
+
+// localLink reports whether a symlink named name with target target
+// would stay inside the extraction root when followed.
+func localLink(name, target string) bool {
+	if filepath.IsAbs(target) {
+		return false
+	}
+	return filepath.IsLocal(filepath.Join(filepath.Dir(name), target))
+}
+
+func main() {
+	for _, l := range [][2]string{
+		{"link", "../outside"},
+		{"docs/latest", "v2"},
+		{"docs/up", ".."},
+		{"docs/abs", "/etc"},
+		{"a/b/c", "../../d"},
+	} {
+		fmt.Printf("%-12s -> %-11s local=%v\n", l[0], l[1], localLink(l[0], l[1]))
+	}
+}
+```
+
+```bash
+go run linkcheck.go
+```
+
+Output:
+
+```
+link         -> ../outside  local=false
+docs/latest  -> v2          local=true
+docs/up      -> ..          local=true
+docs/abs     -> /etc        local=false
+a/b/c        -> ../../d     local=true
+```
+
+The lexical check is fine *here* because it runs on archive metadata, not on the live filesystem, and `Root` still guards the actual writes. Belt and braces: `Root` for every operation, `IsLocal` for what you agree to leave behind.
+
+**3. Matching the error string.** The "escapes" error is an unexported sentinel wrapped in `*os.PathError`; there is no `errors.Is` target for it. Treat **any** error from a `Root` method on untrusted input as a rejection. Do not string-match `"path escapes"` to decide whether to retry somewhere else.
+
+**4. Using `Root` where the user owns the path.** A CLI flag like `-o /tmp/report.csv` is a *trusted* path chosen by the operator. Jailing it inside the working directory is a bug, not hardening. `Root` is for names that arrive from outside the trust boundary.
+
+**5. Assuming every method is race-free.** On Unix, `Root.Chmod`, `Root.Chown`, and `Root.Chtimes` can act on a symlink if the target is swapped between check and use (documented limitation). Do metadata changes on a file you just opened, or on entries you created yourself in the same operation.
+
+**6. Forgetting the cost.** Resolving component-by-component is more expensive than one `open(2)`, and many `..` segments make it worse. Reject absurd names early (length, depth, `filepath.IsLocal`) — for cost and clarity, not for safety; safety comes from the `Root`.
+
+## The boring rule
+
+> Open the trusted directory **once** with `os.OpenRoot`, keep the `*os.Root` for the life of the component, and route **every** operation on an untrusted name through it — never `filepath.Join` a fixed directory with external input, never re-open by `Root.Name()`, and treat every `Root` error as "no".
+
+## Try this
+
+1. In Case 1, replace the symlink with a hard link (`os.Link("../private/secret.txt", "work/uploads/avatar.txt")`). Run it. Explain why `Root` allows the read (hint: a hard link is a second *name* for the same inode, not a path that points elsewhere — `Root` guards name resolution, and Linux's `fs.protected_hardlinks` is what limits who may create such links).
+2. Extend Case 2 to call `localLink` before `root.Symlink` and skip escaping links. Confirm `out/link` no longer exists after extraction.
+3. Rerun Case 2 with `GODEBUG=tarinsecurepath=0 go run untar.go` and add a log line when `Next` returns `tar.ErrInsecurePath`. Which entries does the header check catch, and which one (hint: the symlink pair) does only `Root` catch?
+4. Wrap `root.FS()` in Case 3 with your own `fs.FS` whose `Open` converts any non-`ErrNotExist` error into `fs.ErrNotExist`, so escapes return `404`. Log the original error.
+5. In Case 4, start a goroutine that writes to `acme` in a loop while `main` renames `data` back and forth. Run with `-race`. `Root` methods are documented safe for concurrent use; verify the race detector agrees.
+6. Grep your own services for `filepath.Join(` followed by a request field, form value, or archive header name. Convert one to `os.Root` and keep its old test cases passing.
+
+## Sources
+
+- Go blog, "Traversal-resistant file APIs" (Damien Neil, 2025): <https://go.dev/blog/osroot>
+- Package `os`, type `Root` and `OpenInRoot`: <https://pkg.go.dev/os#Root>
+- Go 1.24 release notes (introduces `os.Root`): <https://go.dev/doc/go1.24#directory-limited-filesystem-access>
+- Go 1.25 release notes (adds `Chmod`, `Chown`, `Chtimes`, `Lchown`, `Link`, `MkdirAll`, `ReadFile`, `Readlink`, `RemoveAll`, `Rename`, `Symlink`, `WriteFile`; `io/fs.ReadLinkFS`): <https://go.dev/doc/go1.25#ospkgos>
+- Package `archive/tar`, `ErrInsecurePath` and `GODEBUG=tarinsecurepath`: <https://pkg.go.dev/archive/tar#Reader.Next>
+- Package `path/filepath`, `IsLocal`: <https://pkg.go.dev/path/filepath#IsLocal>
