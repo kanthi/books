@@ -1,0 +1,529 @@
+---
+title: "BFD — Fast Failure Detection"
+---
+
+# BFD — Fast Failure Detection
+
+Routing protocols are good at choosing paths and bad at noticing that a path died. When the failure is **not** a local link-down — a switch in the middle, a provider handoff, a hung line card, a VM whose host froze — BGP waits for its hold timer and OSPF for its dead interval. That is **minutes** of blackholed traffic with every session looking healthy. **Bidirectional Forwarding Detection (BFD)** is the boring fix: a tiny, protocol-independent hello that proves the forwarding path works and tells its clients (BGP, OSPF, static routes) within a second when it does not. This chapter runs the failure first without BFD, then with it, on two FRR routers behind a Linux bridge — and measures both.
+
+## Learning goals
+
+By the end of this chapter you can:
+
+- Explain why carrier loss on *one* side does not reach the other side through a switch  
+- Predict BGP failure detection time from keepalive/hold timers (and why it is a range)  
+- Describe BFD control packets, the session states, and the detection-time formula  
+- Enable BFD for an FRR BGP neighbor with a profile and verify the negotiated timers  
+- Show that the **slower side wins** timer negotiation  
+- Attach BFD to a static route so it is withdrawn when the next hop dies  
+- Choose timers that do not turn CPU hiccups into routing flaps  
+
+## Why carrier is not enough
+
+```text
+           r1-eth1                        r2-eth1
+ r1 (AS65001) ──────── sw (bridge) ──────── r2 (AS65002) ── h2
+ 10.0.12.1/24        sw-r1      sw-r2       10.0.12.2/24     203.0.113.10/24
+                                  ✖
+                     failure here: r2 sees NO-CARRIER,
+                     r1's port to the switch stays UP
+```
+
+Direct cable: either end losing light usually drops the link at both ends, and routing reacts to the interface event in milliseconds. Through a switch, a media converter, a provider's L2 service, or a virtual switch, **each side only sees its own port**. r2 notices instantly and tears its session down; r1 still has carrier, still has an Established BGP session, and still forwards toward a next hop that will never answer.
+
+| Mechanism | Default (FRR "traditional") | Detects |
+|-----------|-----------------------------|---------|
+| Local carrier | Immediate | Only *your* link |
+| BGP hold timer | keepalive 60 s, hold 180 s | Peer silent for hold time |
+| OSPF dead interval | hello 10 s, dead 40 s | Neighbor silent for dead interval |
+| BFD (async) | 300 ms × 3 = 900 ms | Forwarding path silent for detect time |
+
+Tuning BGP to keepalive 3 / hold 9 helps, but it puts liveness inside a TCP session handled by a busy control-plane process, it is per-protocol, and you still get several seconds. BFD exists so that every protocol can share **one** cheap, sub-second liveness check.
+
+## Concepts — BFD in one page
+
+**What it is.** RFC 5880 defines BFD; RFC 5881 maps it onto single-hop IPv4/IPv6 (UDP destination port **3784**, sent with TTL/hop-limit **255** and checked on receipt so only a directly connected peer can inject packets); RFC 5883 covers multihop sessions (UDP **4784**, e.g., between loopbacks); RFC 5882 describes how clients such as BGP and OSPF should react.
+
+**Asynchronous mode.** Both sides send control packets periodically. Each packet carries the sender's *My Discriminator* and the receiver's *Your Discriminator* (session IDs), the state, a diagnostic code, and three timer values: **Desired Min TX**, **Required Min RX**, and **Detect Mult**.
+
+**States.** `AdminDown` → `Down` → `Init` → `Up`. A three-way handshake brings a session up; while not Up, packets are sent at most once per second (slow start), so a flapping peer cannot generate a burst.
+
+**Timer negotiation — the slower side wins.**
+
+```text
+r1 transmit interval = max(r1 Desired Min TX, r2 Required Min RX)
+r1 detection time    = r2 Detect Mult × max(r1 Required Min RX, r2 Desired Min TX)
+```
+
+Each side declares what it *wants* to send and what it *can* receive; nobody is forced to receive faster than it said. Transmit times are jittered (75–100% of the interval) so sessions do not synchronize.
+
+**Diagnostics.** When a session goes down the reason is in the packet and in `show bfd peer`: `control detection time expired` (no packets in time — the classic failure), `neighbor signaled session down`, `administratively down` (the peer disabled it on purpose — RFC 5882 says clients should *not* treat this as a path failure), and others.
+
+**Echo mode** (optional) sends packets that the peer loops back in its forwarding plane, testing the data path rather than the peer's BFD process. Single-hop only. In FRR it works only when the peer is also FRR, unless you have hardware-offloaded BFD.
+
+**Clients.** BFD itself changes nothing in the RIB. A client registers interest in a peer; when BFD declares it Down, the client acts — BGP closes the session and withdraws routes, OSPF drops the adjacency, a static route is removed. Several clients share one session to the same peer.
+
+## Addressing plan (BFD lab)
+
+| Node | Interface | Address | Role |
+|------|-----------|---------|------|
+| r1 | r1-eth1 | 10.0.12.1/24 | AS 65001 |
+| r2 | r2-eth1 | 10.0.12.2/24 | AS 65002 |
+| r2 | r2-eth2 | 203.0.113.1/24 | Customer LAN gateway |
+| r2 | lo | 198.51.100.1/24 | Static-route target (Drill 4) |
+| h2 | h2-eth0 | 203.0.113.10/24 | Customer host |
+| sw | br0 (sw-r1, sw-r2) | — | L2 switch |
+
+## Lab build (Linux namespaces + FRR)
+
+This lab needs no container images: four network namespaces, veth pairs, a Linux bridge as the switch, and one FRR instance per router namespace using FRR's **pathspace** option (`-N`), which gives each instance its own sockets and PID files under `/var/run/frr/<name>/` and its own `vtysh -N <name>`. It was run on **Debian 13 with the distro `frr` package (FRR 10.3)**, as root. Outputs below are copied from those runs; ages, IDs, and PIDs will differ on yours.
+
+The same `frr.conf` snippets drop unchanged into the FRR containers used in other labs in this book — add `bfdd=yes` to their `daemons` file.
+
+Install FRR and helpers (Debian/Ubuntu), and make sure the system-wide FRR service is not running (it would use the default pathspace, not these):
+
+```bash
+sudo apt-get install -y frr iputils-ping bc
+```
+
+```bash
+#!/usr/bin/env bash
+# lab.sh — r1 and r2 (FRR) behind a Linux-bridge "switch", h2 on r2's LAN
+# usage: sudo ./lab.sh up | down
+set -euo pipefail
+FRR=/usr/lib/frr
+DAEMONS="mgmtd zebra bgpd bfdd staticd"
+
+up() {
+  for ns in r1 r2 sw h2; do ip netns add "$ns"; ip -n "$ns" link set lo up; done
+
+  # the switch: one bridge, two access ports
+  ip -n sw link add br0 type bridge
+  ip -n sw link set br0 up
+  for r in r1 r2; do
+    ip link add "$r-eth1" netns "$r" type veth peer name "sw-$r" netns sw
+    ip -n sw link set "sw-$r" master br0 up
+    ip -n "$r" link set "$r-eth1" up
+  done
+  ip -n r1 addr add 10.0.12.1/24 dev r1-eth1
+  ip -n r2 addr add 10.0.12.2/24 dev r2-eth1
+
+  # r2's customer LAN with one host
+  ip link add r2-eth2 netns r2 type veth peer name h2-eth0 netns h2
+  ip -n r2 addr add 203.0.113.1/24 dev r2-eth2
+  ip -n h2 addr add 203.0.113.10/24 dev h2-eth0
+  ip -n r2 link set r2-eth2 up
+  ip -n h2 link set h2-eth0 up
+  ip -n h2 route add default via 203.0.113.1
+  ip netns exec r2 sysctl -qw net.ipv4.ip_forward=1
+  ip netns exec r1 sysctl -qw net.ipv4.ip_forward=1
+
+  for ns in r1 r2; do
+    install -d -o frr -g frr "/var/run/frr/$ns" "/etc/frr/$ns"
+    : > "/etc/frr/$ns/vtysh.conf"
+    for d in $DAEMONS; do
+      ip netns exec "$ns" "$FRR/$d" -d -N "$ns" -F traditional \
+        -u frr -g frr --limit-fds 1024 >/dev/null 2>&1
+    done
+    vtysh -N "$ns" -f "$ns.conf" >/dev/null
+  done
+}
+
+down() {
+  for ns in r1 r2; do
+    for d in $DAEMONS; do
+      pidf="/var/run/frr/$ns/$d.pid"
+      [ -f "$pidf" ] && kill "$(cat "$pidf")" 2>/dev/null || true
+    done
+  done
+  for ns in r1 r2 sw h2; do ip netns del "$ns" 2>/dev/null || true; done
+}
+
+"$@"
+```
+
+Router configs — plain eBGP first, **no BFD**:
+
+```text
+! r1.conf — AS 65001, plain eBGP (no BFD yet)
+hostname r1
+router bgp 65001
+ bgp router-id 10.0.12.1
+ no bgp ebgp-requires-policy
+ neighbor 10.0.12.2 remote-as 65002
+```
+
+```text
+! r2.conf — AS 65002, originates the customer LAN
+hostname r2
+router bgp 65002
+ bgp router-id 10.0.12.2
+ no bgp ebgp-requires-policy
+ neighbor 10.0.12.1 remote-as 65001
+ address-family ipv4 unicast
+  network 203.0.113.0/24
+ exit-address-family
+```
+
+The failure drill — it fails r2's switch port, confirms r1's port is still up, and times how long r1 keeps the dead route in its kernel FIB:
+
+```bash
+#!/usr/bin/env bash
+# drill.sh — fail r2's switch port, time how long r1 keeps a dead route
+# usage: sudo ./drill.sh [prefix]   (default 203.0.113.0/24)
+set -euo pipefail
+PFX=${1:-203.0.113.0/24}
+
+ip -n r1 route show "$PFX" | grep -q . || { echo "no route to $PFX on r1"; exit 1; }
+echo "before: $(ip -n r1 route show "$PFX")"
+
+start=$(date +%s.%N)
+ip -n sw link set sw-r2 down            # r2 loses carrier; r1's port stays up
+echo "r1-eth1 state after failure: $(ip -n r1 -br link show r1-eth1 | awk '{print $2}')"
+
+while ip -n r1 route show "$PFX" | grep -q .; do sleep 0.05; done
+end=$(date +%s.%N)
+printf 'route withdrawn on r1 after %.2f s\n' "$(echo "$end - $start" | bc)"
+
+ip -n sw link set sw-r2 up               # heal for the next run
+```
+
+Bring it up and check the baseline:
+
+```bash
+chmod +x lab.sh drill.sh
+sudo ./lab.sh up
+sleep 10
+sudo vtysh -N r1 -c 'show ip route bgp'
+sudo ip netns exec r1 ping -c2 -W1 203.0.113.10
+```
+
+Output (tails):
+
+```text
+IPv4 unicast VRF default:
+B>* 203.0.113.0/24 [20/0] via 10.0.12.2, r1-eth1, weight 1, 00:00:08
+2 packets transmitted, 2 received, 0% packet loss, time 1023ms
+```
+
+Each daemon prints a `[pid|daemon] done` line as `vtysh -f` applies configuration; that is normal.
+
+## Drill 1 — the silent failure (no BFD)
+
+### Predict
+
+r1's hold time is 180 s and keepalives arrive every 60 s. The failure happens at a random point in the keepalive cycle. How long will r1 keep the route?
+
+```bash
+sudo vtysh -N r1 -c 'show ip bgp neighbors 10.0.12.2' | grep -i 'hold time'
+```
+
+```text
+  Hold time is 180 seconds, keepalive interval is 60 seconds
+  Configured hold time is 180 seconds, keepalive interval is 60 seconds
+```
+
+### Observe
+
+```bash
+sudo ./drill.sh
+```
+
+While it waits, in a second terminal:
+
+```bash
+sudo ip netns exec r1 ping -c3 -W1 203.0.113.10 | tail -2
+sudo vtysh -N r1 -c 'show ip bgp summary' | grep -A1 Neighbor
+sudo vtysh -N r2 -c 'show ip bgp summary' | grep -A1 Neighbor
+```
+
+```text
+3 packets transmitted, 0 received, 100% packet loss, time 2039ms
+
+Neighbor        V         AS   MsgRcvd   MsgSent   TblVer  InQ OutQ  Up/Down State/PfxRcd   PfxSnt Desc
+10.0.12.2       4      65002         4         5        1    0    0 00:00:35            1        1 N/A
+Neighbor        V         AS   MsgRcvd   MsgSent   TblVer  InQ OutQ  Up/Down State/PfxRcd   PfxSnt Desc
+10.0.12.1       4      65001         4         4        0    0    0 00:00:13       Active        0 N/A
+```
+
+r2 already knows (its port lost carrier). r1 shows **Established with 1 prefix** and drops every packet. The drill finishes:
+
+```text
+before: 203.0.113.0/24 nhid 6 via 10.0.12.2 dev r1-eth1 proto bgp metric 20 
+r1-eth1 state after failure: UP
+route withdrawn on r1 after 158.87 s
+```
+
+### Explain
+
+Not 180 s: the hold timer restarts on every keepalive, so detection is anywhere from **hold − keepalive** (120 s) to **hold** (180 s), depending on when the last keepalive landed. Two and a half minutes of blackhole with a green dashboard.
+
+## Drill 2 — add BFD and repeat
+
+Define a profile on each router and attach it to the BGP neighbor. The profile asks for 100 ms intervals with multiplier 3 (300 ms detection). FRR's defaults are 300 ms × 3.
+
+```text
+! r1-bfd.conf — add a BFD profile and attach it to the BGP neighbor
+bfd
+ profile fast
+  detect-multiplier 3
+  receive-interval 100
+  transmit-interval 100
+ exit
+exit
+router bgp 65001
+ neighbor 10.0.12.2 bfd profile fast
+```
+
+```text
+! r2-bfd.conf — add a BFD profile and attach it to the BGP neighbor
+bfd
+ profile fast
+  detect-multiplier 3
+  receive-interval 100
+  transmit-interval 100
+ exit
+exit
+router bgp 65002
+ neighbor 10.0.12.1 bfd profile fast
+```
+
+```bash
+sudo vtysh -N r1 -f r1-bfd.conf
+sudo vtysh -N r2 -f r2-bfd.conf
+sleep 3
+sudo vtysh -N r1 -c 'show bfd peers brief'
+sudo vtysh -N r1 -c 'show bfd peer 10.0.12.2'
+sudo vtysh -N r1 -c 'show ip bgp neighbors 10.0.12.2' | grep -A3 'BFD'
+```
+
+Output (session IDs will differ):
+
+```text
+Session count: 1
+SessionId  LocalAddress                             PeerAddress                             Status         
+=========  ============                             ===========                             ======         
+3526470594 10.0.12.1                                10.0.12.2                               up             
+```
+
+```text
+BFD Peer:
+	peer 10.0.12.2 local-address 10.0.12.1 vrf default interface r1-eth1
+		ID: 3526470594
+		Remote ID: 1869221485
+		Active mode
+		Status: up
+		Uptime: 2 second(s)
+		Diagnostics: ok
+		Remote diagnostics: ok
+		Peer Type: dynamic
+		RTT min/avg/max: 0/0/0 usec
+		Local timers:
+			Detect-multiplier: 3
+			Receive interval: 100ms
+			Transmission interval: 100ms
+			Echo receive interval: 50ms
+			Echo transmission interval: disabled
+		Remote timers:
+			Detect-multiplier: 3
+			Receive interval: 100ms
+			Transmission interval: 100ms
+			Echo receive interval: 50ms
+```
+
+```text
+  BFD: Type: single hop
+  Detect Multiplier: 3, Min Rx interval: 300, Min Tx interval: 300
+  Status: Up, Last update: 0:00:00:02
+```
+
+(That last block was captured right after the first apply, before the 100 ms profile values were in place — BGP's neighbor view shows what the session had at registration. Trust `show bfd peer` for live timers.) `Peer Type: dynamic` means a client (BGP) created the session; you did not declare a `peer` under `bfd`.
+
+Run the drill again, a few times:
+
+```bash
+sudo ./drill.sh
+```
+
+```text
+before: 203.0.113.0/24 nhid 6 via 10.0.12.2 dev r1-eth1 proto bgp metric 20 
+r1-eth1 state after failure: UP
+route withdrawn on r1 after 0.38 s
+```
+
+Repeated runs: `0.33 s`, `0.33 s`, `0.33 s` — the 300 ms detection time plus BGP and zebra doing their work. After a failure the session records why:
+
+```bash
+sudo vtysh -N r1 -c 'show bfd peer 10.0.12.2' | grep -E 'Status|Diagnostics|Downtime'
+```
+
+```text
+		Status: down
+		Downtime: 0 second(s)
+		Diagnostics: control detection time expired
+```
+
+From 158.87 s to 0.33 s, with the same BGP timers.
+
+## Drill 3 — the slower side wins
+
+Put r2 back to 300 ms while r1 stays at 100 ms:
+
+```bash
+sed 's/interval 100/interval 300/g' r2-bfd.conf > r2-slow.conf
+sudo vtysh -N r2 -f r2-slow.conf
+sleep 3
+sudo vtysh -N r1 -c 'show bfd peer 10.0.12.2 json' | python3 -m json.tool | grep -E 'interval|multiplier'
+```
+
+```text
+    "receive-interval": 100,
+    "transmit-interval": 100,
+    "echo-receive-interval": 50,
+    "echo-transmit-interval": 0,
+    "detect-multiplier": 3,
+    "remote-receive-interval": 300,
+    "remote-transmit-interval": 300,
+    "remote-echo-receive-interval": 50,
+    "remote-detect-multiplier": 3,
+```
+
+### Predict
+
+r1 detection time = r2 Detect Mult × max(r1 Required Min RX, r2 Desired Min TX) = 3 × max(100, 300) = **900 ms**.
+
+### Observe
+
+```bash
+sudo ./drill.sh | tail -1
+```
+
+```text
+route withdrawn on r1 after 0.86 s
+```
+
+Configuring one end aggressively buys nothing; detection follows the slower declaration. Restore r2 with `sudo vtysh -N r2 -f r2-bfd.conf`.
+
+## Drill 4 — BFD for a static route
+
+Static routes are the other place silent failures hurt: a static next hop "stays up" as long as the interface does. FRR's `staticd` can make a static route a BFD client — installed only while the session is Up.
+
+```bash
+sudo ip -n r2 addr add 198.51.100.1/24 dev lo
+```
+
+```text
+! r1-static.conf — a static route that is only installed while BFD says the next hop is alive
+ip route 198.51.100.0/24 10.0.12.2 bfd profile fast
+```
+
+```text
+! r2-static.conf — answer BFD for r1 even without a routing protocol
+bfd
+ peer 10.0.12.1 interface r2-eth1
+  profile fast
+ exit
+exit
+```
+
+r2 has no routing protocol for this prefix, so it gets an explicit `peer` under `bfd` to answer the session (in this lab BGP's session to the same address already exists and is shared — one session, two clients).
+
+```bash
+sudo vtysh -N r1 -f r1-static.conf
+sudo vtysh -N r2 -f r2-static.conf
+sleep 3
+sudo vtysh -N r1 -c 'show ip route 198.51.100.0/24'
+sudo ./drill.sh 198.51.100.0/24
+```
+
+```text
+Routing entry for 198.51.100.0/24
+  Known via "static", distance 1, metric 0, best
+  Last update 00:00:03 ago
+  * 10.0.12.2, via r1-eth1, weight 1
+```
+
+```text
+before: 198.51.100.0/24 nhid 6 via 10.0.12.2 dev r1-eth1 proto static metric 20 
+r1-eth1 state after failure: UP
+route withdrawn on r1 after 0.27 s
+```
+
+A few seconds after the drill heals the port, both the static and the BGP route are back. While a monitored static is uninstalled it disappears from `show ip route`; use `show bfd static route` to see it. This is what makes a floating static (a backup with a higher distance) actually float when the primary next hop dies behind a switch.
+
+## Drill 5 — one-sided BFD (predict, then try)
+
+Tear the lab down and up again, and apply `r1-bfd.conf` **only on r1**.
+
+```bash
+sudo ./lab.sh down && sudo ./lab.sh up
+sudo vtysh -N r1 -f r1-bfd.conf
+sleep 10
+sudo vtysh -N r1 -c 'show bfd peers brief'
+sudo vtysh -N r1 -c 'show ip bgp summary'
+```
+
+Predict before you look: does BGP come up? Is the BFD session Up? Does the drill now take 0.3 s or ~150 s? (FRR's default BGP–BFD integration reacts to a session going **down**; a session that never came up does not hold BGP back. Newer FRR releases add `neighbor … bfd strict`, which refuses to bring BGP up until BFD is Up — check `neighbor 10.0.12.2 bfd ?` on your build.) The lesson either way: BFD must be configured on **both** ends, and your verification must check BFD state, not just BGP state.
+
+Clean up when done:
+
+```bash
+sudo ./lab.sh down
+```
+
+## Choosing timers
+
+| Environment | Starting point | Why |
+|-------------|----------------|-----|
+| Physical routers, hardware/offloaded BFD | 50–100 ms × 3 | Packets handled off the main CPU |
+| Software routers (FRR on servers) | 300 ms × 3 (default) | Survives scheduler hiccups and GC pauses |
+| VMs / containers / cloud | 300–1000 ms × 3–5 | Noisy neighbors, live migration, steal time |
+| Over a provider L2/L3 service | Agree with the provider | Their policers may drop small UDP |
+
+Rules of thumb:
+
+- **Detection time is the number you choose**; interval and multiplier are how you get there. 900 ms that never false-positives beats 150 ms that flaps every afternoon.
+- A false BFD-down is not free: it tears down BGP, withdraws routes, and triggers reconvergence across the network. Combine with BGP **graceful restart** awareness (`bfd check-control-plane-failure` in FRR) when routers restart their control planes.
+- Protect BFD from your own filters and QoS: allow UDP 3784/4784 (and the echo port 3785 if used) in control-plane policy, and do not let it queue behind bulk traffic.
+- Use **multihop** BFD (RFC 5883) for loopback-to-loopback iBGP; single-hop rules (TTL 255) do not apply, so set `minimum-ttl` sensibly.
+
+## Verification checklist
+
+| Check | Command | Intent |
+|-------|---------|--------|
+| Session up on both ends | `show bfd peers brief` (r1 and r2) | No one-sided config |
+| Live timers | `show bfd peer <ip>` | Negotiated values, not just configured |
+| Client attached | `show ip bgp neighbors <ip>` → `BFD:` block | BGP actually registered |
+| Monitored statics | `show bfd static route` | Uninstalled statics are visible here |
+| Last failure reason | `show bfd peer <ip>` → `Diagnostics` | Detection expired vs admin down |
+| Filters | Control-plane ACL permits UDP 3784/4784 | BFD not dropped by your own policy |
+| Drill | `drill.sh` or equivalent | Measured, not assumed, detection time |
+
+## Common mistakes
+
+| Mistake | Symptom |
+|---------|---------|
+| BFD on one side only | BFD never Up; failures still take hold-timer time |
+| Aggressive timers on VMs | Random BGP flaps under load; `control detection time expired` with no link event |
+| Tuning only one end | Detection follows the slower side (Drill 3) |
+| Filtering UDP 3784 in control-plane policy | BFD Down, BGP Up — or worse, BGP reset by strict modes |
+| Treating `AdminDown` as a failure | Maintenance on the peer causes an outage |
+| Single-hop BFD between loopbacks | Session never forms; needs multihop |
+| Trusting `show ip bgp summary` alone | "Established" while forwarding is dead (Drill 1) |
+
+## Summary
+
+- Through a switch or L2 service, carrier loss is **local**: the far router keeps its port, its session, and its route  
+- BGP detection is **hold − keepalive … hold** (120–180 s by default) — measured here at **158.87 s**  
+- BFD is a shared sub-second liveness check; clients (BGP, OSPF, statics) act on its Down event — measured here at **0.33 s**  
+- Detection time = remote multiplier × max(local Required Min RX, remote Desired Min TX): **the slower side wins**  
+- Configure both ends, verify negotiated timers, size timers for your platform, and drill the failure  
+
+## Sources
+
+- RFC 5880 — Bidirectional Forwarding Detection (BFD): <https://www.rfc-editor.org/rfc/rfc5880>  
+- RFC 5881 — BFD for IPv4 and IPv6 (Single Hop): <https://www.rfc-editor.org/rfc/rfc5881>  
+- RFC 5882 — Generic Application of BFD: <https://www.rfc-editor.org/rfc/rfc5882>  
+- RFC 5883 — BFD for Multihop Paths: <https://www.rfc-editor.org/rfc/rfc5883>  
+- FRRouting user guide — BFD (`bfdd`, profiles, BGP and static integration): <https://docs.frrouting.org/en/latest/bfd.html>  
+- FRRouting user guide — BGP neighbor timers: <https://docs.frrouting.org/en/latest/bgp.html>  
