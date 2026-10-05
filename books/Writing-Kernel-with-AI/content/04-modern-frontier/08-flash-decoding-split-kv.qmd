@@ -1,0 +1,569 @@
+---
+title: "Flash-Decoding: Split-KV Attention for Long-Context Decode"
+---
+
+# Flash-Decoding: Split-KV Attention for Long-Context Decode
+
+FlashAttention made **prefill** fast by tiling $QK^\top$, softmax, and $PV$ into one kernel that never writes the score matrix to HBM. **Decode** is a different problem. Each step has *one* new query row per sequence and head, attending over a KV cache that may hold tens or hundreds of thousands of tokens. A FlashAttention-style grid parallelizes over batch × heads × query tiles, and at decode there is only one query tile. With a small batch and a long context, that leaves a handful of CTAs to stream gigabytes of KV while most SMs sit idle.
+
+**Flash-Decoding** (Dao, Haziza, Massa, Sizov, 2023) adds the missing parallel dimension: the **KV sequence**. Each split of the cache runs the familiar online-softmax loop independently and emits a partial output plus one scalar, its **log-sum-exp (LSE)**. A tiny second kernel then merges the splits exactly. The authors reported up to 8× faster decode for very long sequences, and the same split-then-merge pattern now sits under paged decode kernels, cascade or shared-prefix attention, and context-parallel attention across GPUs.
+
+This chapter builds the idea from the algebra up. It proves the merge is exact, writes a two-kernel Triton implementation that you can verify on a laptop with the Triton interpreter, compiles it for a GPU you do not own, ports the production split-count heuristic, and lists the checks that catch the real bugs.
+
+---
+
+## 1. Why decode starves the GPU
+
+For one (sequence, head) pair at decode step $t$:
+
+$$
+s_i=\frac{q^\top k_i}{\sqrt d},\qquad o=\sum_{i=1}^{t}\mathrm{softmax}(s)_i\,v_i .
+$$
+
+The work is about $4td$ FLOPs against $2td$ elements of K and V that must be read from HBM. In FP16 that is about **1 FLOP per byte**, which puts it far left on the roofline: decode attention is purely **bandwidth-bound**. The only goal is to keep every SM's load pipeline full.
+
+| Kernel style | Grid at decode | CTAs for batch 1, 8 KV heads |
+|--------------|----------------|------------------------------|
+| FlashAttention (one CTA per batch × head × query tile) | $B\cdot H\cdot 1$ | 8 |
+| Flash-Decoding (adds $S$ KV splits) | $B\cdot H\cdot S$ | $8S$ (e.g. 232 with $S=29$) |
+
+### Worked numbers
+
+Batch 1, 8 KV heads (grouped-query attention), context $128\,000$, head dim 128, FP16 cache. K plus V for **one layer** is
+
+$$
+2\times 8\times 128\,000\times 128\times 2\ \text{B}\approx 524\ \text{MB}.
+$$
+
+At the H100 SXM's roughly 3.35 TB/s HBM3 peak, that is about 160 µs per layer if bandwidth is saturated. Eight CTAs on a 132-SM part cannot get close: each SM can only keep a limited number of loads in flight. Splitting the sequence 29 ways gives 232 CTAs, enough to occupy every SM and keep loads outstanding. The model is the same and so are the bytes; the kernel is simply parallelized along the dimension that actually has work.
+
+**GQA note:** with grouped-query attention, several query heads share one KV head. Good decode kernels pack the query heads of a group into the "M" rows of a tile (FlashAttention-3 calls this `pack_gqa`), so the KV block is loaded once per group, not once per query head. The parallelism problem, and the split-KV fix, are about **KV heads × batch**.
+
+---
+
+## 2. Mental model: attention states and the merge operator
+
+For a set of key indices $I$, define its **attention state** as the pair
+
+$$
+\mathrm{LSE}(I)=\log\sum_{i\in I}e^{s_i},\qquad
+o(I)=\sum_{i\in I}\frac{e^{s_i}}{e^{\mathrm{LSE}(I)}}\,v_i .
+$$
+
+$o(I)$ is the attention output you would get if the cache contained **only** the keys in $I$. $\mathrm{LSE}(I)$ records how much total softmax mass $I$ carries.
+
+**Claim.** For disjoint $I$ and $J$:
+
+$$
+\mathrm{LSE}(I\cup J)=\log\!\left(e^{\mathrm{LSE}(I)}+e^{\mathrm{LSE}(J)}\right),\qquad
+o(I\cup J)=\frac{e^{\mathrm{LSE}(I)}\,o(I)+e^{\mathrm{LSE}(J)}\,o(J)}{e^{\mathrm{LSE}(I)}+e^{\mathrm{LSE}(J)}} .
+$$
+
+**Proof.** $e^{\mathrm{LSE}(I)}\,o(I)=\sum_{i\in I}e^{s_i}v_i$ is the *unnormalized* numerator over $I$, and $e^{\mathrm{LSE}(I)}$ is the unnormalized denominator. Numerators and denominators over disjoint sets simply add. $\blacksquare$
+
+Call this merge $\oplus$. It is **associative and commutative**, so the splits can be combined in any order: sequentially, as a tree, across warps, across CTAs, or across GPUs. It is the same operator FlashAttention applies tile by tile inside one CTA (the online softmax), now applied *between* CTAs. FlashInfer makes it the canonical output of every attention kernel ("attention state") and exposes `merge_state` / `merge_states` as first-class operations.
+
+**Numerically stable form.** Never exponentiate an LSE directly. Subtract the maximum first:
+
+$$
+m=\max_j \mathrm{LSE}_j,\qquad w_j=e^{\mathrm{LSE}_j-m},\qquad o=\frac{\sum_j w_j\,o_j}{\sum_j w_j},\qquad \mathrm{LSE}=m+\log\sum_j w_j .
+$$
+
+```text
+            KV cache for one (sequence, head):  t tokens
+ ┌───────────────┬───────────────┬───────────────┬──────────┐
+ │   split 0     │   split 1     │   split 2     │ split 3  │   (last split may be short or empty)
+ └──────┬────────┴──────┬────────┴──────┬────────┴────┬─────┘
+        │ online softmax over BLOCK_N tiles (kernel 1, one CTA per split)
+        ▼               ▼               ▼             ▼
+   (o0, lse0)      (o1, lse1)      (o2, lse2)    (o3, lse3)     fp32 workspace in HBM
+        └───────────────┴───────┬───────┴─────────────┘
+                                ▼  kernel 2: m = max lse; w = exp(lse - m); o = Σ w·o / Σ w
+                         final o  (and lse, if a caller wants to merge further)
+```
+
+---
+
+## 3. Verify the algebra before writing a kernel
+
+Start with a host reference so that every GPU result later has a ground truth.
+
+```python
+# file: split_kv_reference.py
+# NumPy reference: one decode query against a long KV cache, computed
+#  (a) in one pass, and (b) as Flash-Decoding style splits merged by log-sum-exp.
+import numpy as np
+
+rng = np.random.default_rng(0)
+D, T, S = 128, 10_000, 7            # head dim, cached tokens, number of KV splits
+q = rng.standard_normal(D).astype(np.float32)
+K = rng.standard_normal((T, D)).astype(np.float32)
+V = rng.standard_normal((T, D)).astype(np.float32)
+scale = 1.0 / np.sqrt(D)
+
+
+def attend(q, K, V):
+    """Return (o, lse) for one query over a KV segment: o normalised, lse = log sum exp(s)."""
+    s = (K @ q) * scale
+    m = s.max()
+    p = np.exp(s - m)
+    l = p.sum()
+    return (p @ V) / l, m + np.log(l)
+
+
+def merge(states):
+    """Combine (o_i, lse_i) partial states into the exact full-segment state."""
+    lse = np.array([st[1] for st in states])
+    m = lse.max()
+    w = np.exp(lse - m)                    # unnormalised weight of each split
+    o = sum(wi * st[0] for wi, st in zip(w, states)) / w.sum()
+    return o, m + np.log(w.sum())
+
+
+o_full, lse_full = attend(q, K, V)
+
+bounds = np.linspace(0, T, S + 1).astype(int)          # uneven split lengths are fine
+parts = [attend(q, K[a:b], V[a:b]) for a, b in zip(bounds[:-1], bounds[1:])]
+o_split, lse_split = merge(parts)
+
+# The merge is associative: merging pairwise in a tree gives the same answer.
+tree = merge([merge(parts[:3]), merge(parts[3:])])
+
+print("split boundaries :", bounds.tolist())
+print("max |o_full - o_split| =", float(np.abs(o_full - o_split).max()))
+print("|lse_full - lse_split| =", float(abs(lse_full - lse_split)))
+print("max |o_split - o_tree|  =", float(np.abs(o_split - tree[0]).max()))
+```
+
+```bash
+python3 -m venv .venv && . .venv/bin/activate
+pip install numpy
+python split_kv_reference.py
+```
+
+Output:
+
+```text
+split boundaries : [0, 1428, 2857, 4285, 5714, 7142, 8571, 10000]
+max |o_full - o_split| = 3.8762266595278316e-10
+|lse_full - lse_split| = 1.7920598338605487e-10
+max |o_split - o_tree|  = 1.3877787807814457e-17
+```
+
+Split, merge, or tree-merge: the results agree to rounding. Uneven split lengths do not matter, because each split's LSE carries its own weight.
+
+### The trap: the textbook merge overflows
+
+```python
+# file: merge_trap.py
+# The textbook merge  o = sum(exp(lse_i) * o_i) / sum(exp(lse_i))  overflows float32
+# as soon as any lse_i > ~88.7. Subtracting max(lse) first is not optional.
+import numpy as np
+
+lse = np.array([95.0, 97.5, 91.2], dtype=np.float32)        # plausible with large logits
+o = np.array([[1.0, 0.0], [0.0, 1.0], [0.5, 0.5]], dtype=np.float32)
+
+with np.errstate(over="ignore", invalid="ignore"):
+    w_naive = np.exp(lse)
+    print("naive weights :", w_naive)
+    print("naive merge   :", (w_naive[:, None] * o).sum(0) / w_naive.sum())
+
+m = lse.max()
+w = np.exp(lse - m)
+print("stable weights:", w)
+print("stable merge  :", (w[:, None] * o).sum(0) / w.sum())
+print("merged lse    :", m + np.log(w.sum()))
+```
+
+```bash
+python merge_trap.py
+```
+
+Output:
+
+```text
+naive weights : [inf inf inf]
+naive merge   : [nan nan]
+stable weights: [0.08208501 1.         0.0018363 ]
+stable merge  : [0.07657673 0.92342323]
+merged lse    : 97.58058
+```
+
+`exp` overflows FP32 above about 88.7, and LSE values that large are routine once logits grow (long contexts, no QK-norm, large activations). Kernels that "pass the unit test" with `randn` inputs and then NaN in production usually have exactly this bug in the combine step.
+
+---
+
+## 4. A two-kernel Triton implementation
+
+The design is the minimum that is still honest about production concerns:
+
+- **Kernel 1** (`split_kv_kernel`), grid $(B\cdot H,\ S)$. Each program owns one split of one (sequence, head) pair, streams its keys in `BLOCK_N` tiles with the online-softmax recurrence, and writes a normalized partial output and its LSE to an FP32 workspace.
+- **Kernel 2** (`combine_kernel`), grid $(B\cdot H)$. Loads $S$ LSEs and $S$ partial outputs, applies the stable merge, and writes the result.
+- **Ragged batches.** `SEQ_LENS[b]` bounds every sequence, so a sequence shorter than the split layout leaves some splits **empty**. An empty split must write $o=0$ and $\mathrm{LSE}=-\infty$, giving it weight $e^{-\infty}=0$. Writing $0/0$ there is the classic NaN.
+- **FP32 everywhere it matters.** Scores, running max, running sum, accumulator, and workspace are all FP32, whatever the cache dtype. FlashAttention-2's split-KV path allocates its `out_accum` and `softmax_lse_accum` workspaces in FP32 for the same reason.
+
+```python
+# file: flash_decode_triton.py
+# Two-kernel Flash-Decoding (split-KV) for batched single-token decode, written in Triton.
+#   kernel 1: grid = (batch*heads, num_splits)  -> partial (o, lse) per split
+#   kernel 2: grid = (batch*heads,)             -> log-sum-exp merge across splits
+# Runs on a GPU, or on CPU for correctness work with:  TRITON_INTERPRET=1 python flash_decode_triton.py
+import math
+import os
+
+import torch
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def split_kv_kernel(Q, K, V, SEQ_LENS, O_PART, LSE_PART,
+                    stride_kb, stride_kh, stride_kt,      # K/V: [B, H, T_max, D], last dim contiguous
+                    H, chunk, scale,
+                    D: tl.constexpr, BLOCK_N: tl.constexpr, NUM_SPLITS: tl.constexpr):
+    bh = tl.program_id(0)
+    split = tl.program_id(1)
+    b = bh // H
+    h = bh % H
+    seq_len = tl.load(SEQ_LENS + b)
+
+    start = split * chunk
+    end = tl.minimum(start + chunk, seq_len)               # may be <= start: empty split
+
+    offs_d = tl.arange(0, D)
+    q = tl.load(Q + bh * D + offs_d).to(tl.float32)        # Q: [B*H, D]
+    kv_base = b * stride_kb + h * stride_kh
+
+    m_i = -float("inf")                                    # running max of scores
+    l_i = 0.0                                              # running sum of exp(score - m_i)
+    acc = tl.zeros([D], dtype=tl.float32)                  # running sum of p * v
+
+    for n0 in range(start, end, BLOCK_N):
+        offs_n = n0 + tl.arange(0, BLOCK_N)
+        mask_n = offs_n < end
+        ptrs = kv_base + offs_n[:, None] * stride_kt + offs_d[None, :]
+        k = tl.load(K + ptrs, mask=mask_n[:, None], other=0.0).to(tl.float32)
+        s = tl.sum(k * q[None, :], axis=1) * scale         # [BLOCK_N] scores
+        s = tl.where(mask_n, s, -float("inf"))
+        m_new = tl.maximum(m_i, tl.max(s, axis=0))
+        alpha = tl.exp(m_i - m_new)                        # rescale old state
+        p = tl.exp(s - m_new)
+        v = tl.load(V + ptrs, mask=mask_n[:, None], other=0.0).to(tl.float32)
+        acc = acc * alpha + tl.sum(p[:, None] * v, axis=0)
+        l_i = l_i * alpha + tl.sum(p, axis=0)
+        m_i = m_new
+
+    has_keys = end > start
+    safe_l = tl.where(has_keys, l_i, 1.0)
+    o = tl.where(has_keys, acc / safe_l, 0.0)              # empty split -> o = 0 ...
+    lse = tl.where(has_keys, m_i + tl.log(safe_l), -float("inf"))  # ... with weight exp(-inf) = 0
+    out = bh * NUM_SPLITS + split
+    tl.store(O_PART + out * D + offs_d, o)
+    tl.store(LSE_PART + out, lse)
+
+
+@triton.jit
+def combine_kernel(O_PART, LSE_PART, O,
+                   D: tl.constexpr, NUM_SPLITS: tl.constexpr):
+    bh = tl.program_id(0)
+    offs_s = tl.arange(0, NUM_SPLITS)
+    offs_d = tl.arange(0, D)
+    lse = tl.load(LSE_PART + bh * NUM_SPLITS + offs_s)      # [S]
+    m = tl.max(lse, axis=0)
+    w = tl.exp(lse - m)                                     # empty splits contribute 0
+    o_part = tl.load(O_PART + (bh * NUM_SPLITS + offs_s)[:, None] * D + offs_d[None, :])
+    o = tl.sum(w[:, None] * o_part, axis=0) / tl.sum(w, axis=0)
+    tl.store(O + bh * D + offs_d, o)
+
+
+def flash_decode(q, k, v, seq_lens, num_splits=8, block_n=32):
+    """q: [B, H, D]; k, v: [B, H, T_max, D]; seq_lens: [B] int32. Returns [B, H, D] float32."""
+    B, H, T_max, D = k.shape
+    chunk = triton.cdiv(T_max, num_splits)
+    o_part = torch.empty(B * H, num_splits, D, dtype=torch.float32, device=q.device)
+    lse_part = torch.empty(B * H, num_splits, dtype=torch.float32, device=q.device)
+    out = torch.empty(B, H, D, dtype=torch.float32, device=q.device)
+    split_kv_kernel[(B * H, num_splits)](
+        q.contiguous(), k, v, seq_lens, o_part, lse_part,
+        k.stride(0), k.stride(1), k.stride(2),
+        H, chunk, 1.0 / math.sqrt(D),
+        D=D, BLOCK_N=block_n, NUM_SPLITS=num_splits)
+    combine_kernel[(B * H,)](o_part, lse_part, out, D=D, NUM_SPLITS=num_splits)
+    return out
+
+
+def reference(q, k, v, seq_lens):
+    B, H, _, D = k.shape
+    out = torch.empty(B, H, D, dtype=torch.float32)
+    for b in range(B):
+        L = int(seq_lens[b])
+        s = torch.einsum("hd,htd->ht", q[b].float(), k[b, :, :L].float()) / math.sqrt(D)
+        out[b] = torch.einsum("ht,htd->hd", torch.softmax(s, dim=-1), v[b, :, :L].float())
+    return out
+
+
+if __name__ == "__main__":
+    device = "cpu" if os.environ.get("TRITON_INTERPRET") == "1" else "cuda"
+    torch.manual_seed(0)
+    B, H, T_max, D = 3, 4, 1000, 64
+    seq_lens = torch.tensor([1000, 37, 1], dtype=torch.int32, device=device)  # ragged batch
+    q = torch.randn(B, H, D, device=device)
+    k = torch.randn(B, H, T_max, D, device=device)
+    v = torch.randn(B, H, T_max, D, device=device)
+    for q_gain in (1.0, 40.0):                        # 40x -> logits in the hundreds
+        for splits in (1, 4, 8):
+            qq = q * q_gain
+            got = flash_decode(qq, k, v, seq_lens, num_splits=splits)
+            ref = reference(qq.cpu(), k.cpu(), v.cpu(), seq_lens.cpu())
+            err = (got.cpu() - ref).abs().max().item()
+            print(f"q_gain={q_gain:>4}  num_splits={splits}:  max abs error = {err:.2e}")
+```
+
+Run it on a CPU with the Triton interpreter. The same file runs unchanged on a CUDA GPU without the environment variable.
+
+```bash
+pip install torch --index-url https://download.pytorch.org/whl/cpu
+pip install triton
+TRITON_INTERPRET=1 python flash_decode_triton.py
+```
+
+Output (Triton 3.8.0, PyTorch 2.14.1 CPU, interpreter mode):
+
+```text
+q_gain= 1.0  num_splits=1:  max abs error = 2.38e-07
+q_gain= 1.0  num_splits=4:  max abs error = 2.38e-07
+q_gain= 1.0  num_splits=8:  max abs error = 2.38e-07
+q_gain=40.0  num_splits=1:  max abs error = 9.18e-06
+q_gain=40.0  num_splits=4:  max abs error = 9.06e-06
+q_gain=40.0  num_splits=8:  max abs error = 9.06e-06
+```
+
+What the test matrix covers:
+
+| Case | Why |
+|------|-----|
+| `num_splits=1` | Degenerates to plain FlashAttention decode: the baseline |
+| `seq_lens = [1000, 37, 1]` | Ragged batch. With 8 splits of 125 tokens, sequence 1 has 7 empty splits and sequence 2 has a one-token cache |
+| `q_gain=40` | Logits in the hundreds: exercises the max-subtraction in both kernels |
+| Comparison against `torch.softmax` | An independent reference, not a second copy of the same algorithm |
+
+The interpreter executes the kernel's tile semantics with NumPy on the CPU. It proves **correctness**, not performance: it does not model warps, shared memory, or bandwidth. It is still the fastest loop for an AI-assisted workflow, because a generated kernel can be run against a reference in seconds without a GPU.
+
+---
+
+## 5. Compile for a GPU you do not have
+
+Interpreter success does not guarantee that the kernel lowers. Loop-carried values that change dtype, non-constexpr shapes, and unsupported ops fail only in the real compiler. Triton can compile ahead of time for a named target on a CPU-only machine:
+
+```python
+# file: compile_check.py
+# Ahead-of-time compile both kernels for an H100 (sm_90) on a machine with no GPU.
+# Catches type errors, bad constexpr use and loop-carried dtype mismatches before you rent a GPU.
+import triton
+from triton.backends.compiler import GPUTarget
+from triton.compiler import ASTSource
+
+from flash_decode_triton import combine_kernel, split_kv_kernel
+
+target = GPUTarget("cuda", 90, 32)          # backend, compute capability, warp size
+split_sig = {"Q": "*fp32", "K": "*fp32", "V": "*fp32", "SEQ_LENS": "*i32",
+             "O_PART": "*fp32", "LSE_PART": "*fp32",
+             "stride_kb": "i32", "stride_kh": "i32", "stride_kt": "i32",
+             "H": "i32", "chunk": "i32", "scale": "fp32",
+             "D": "constexpr", "BLOCK_N": "constexpr", "NUM_SPLITS": "constexpr"}
+combine_sig = {"O_PART": "*fp32", "LSE_PART": "*fp32", "O": "*fp32",
+               "D": "constexpr", "NUM_SPLITS": "constexpr"}
+
+jobs = [
+    ("split_kv_kernel", ASTSource(fn=split_kv_kernel, signature=split_sig,
+                                  constexprs={"D": 128, "BLOCK_N": 64, "NUM_SPLITS": 32})),
+    ("combine_kernel", ASTSource(fn=combine_kernel, signature=combine_sig,
+                                 constexprs={"D": 128, "NUM_SPLITS": 32})),
+]
+for name, src in jobs:
+    k = triton.compile(src, target=target)
+    md = k.metadata
+    print(f"{name:16s} stages={','.join(k.asm.keys())}  "
+          f"num_warps={md.num_warps}  shared={md.shared} B  ptx_lines={k.asm['ptx'].count(chr(10))}")
+```
+
+```bash
+python compile_check.py
+```
+
+Output (Triton 3.8.0 on a CPU-only Linux box):
+
+```text
+split_kv_kernel  stages=source,ttir,ttgir,llir,ptx,cubin  num_warps=4  shared=128 B  ptx_lines=5067
+combine_kernel   stages=source,ttir,ttgir,llir,ptx,cubin  num_warps=4  shared=0 B  ptx_lines=1035
+```
+
+Both kernels lower all the way to an `sm_90` cubin. `k.asm["ptx"]` and `k.asm["ttgir"]` are there for inspection, and they repay it. In this build every K/V load comes out as a scalar `ld.global.b32`, because the hand-written signature tells the compiler nothing about pointer alignment or stride divisibility. At a normal launch, Triton specializes on arguments that are divisible by 16, and that specialization is what typically unlocks wider vector loads. Grepping the PTX of the kernel you actually launch is a cheap way to confirm you got them.
+
+Wire this compile check, together with the interpreter test, into the agent loop as a cheap gate before any GPU time is spent.
+
+---
+
+## 6. How many splits?
+
+Too few splits leave SMs idle. Too many add workspace traffic and combine work, and make each split too short to amortize its prologue. FlashAttention-2's dispatcher chooses $S$ by **wave efficiency**: launch $B\cdot H\cdot S$ CTAs onto a fixed number of slots, and prefer the smallest $S$ whose last wave is nearly as full as the best achievable.
+
+```python
+# file: choose_splits.py
+# Wave-efficiency heuristic for picking the number of KV splits, ported from the
+# FlashAttention-2 split-KV dispatcher (num_splits_heuristic in csrc/flash_attn/flash_api.cpp).
+import math
+
+
+def num_splits(work_items, slots, n_kv_blocks, max_splits=128):
+    if work_items >= 0.8 * slots:           # already ~fills the machine: do not split
+        return 1
+    max_splits = min(max_splits, slots, n_kv_blocks)
+
+    def eligible(s):                        # 11 vs 12 splits of 64 blocks is really 11 splits
+        return s == 1 or math.ceil(n_kv_blocks / s) != math.ceil(n_kv_blocks / (s - 1))
+
+    eff = {}
+    for s in range(1, max_splits + 1):
+        if eligible(s):
+            waves = work_items * s / slots
+            eff[s] = waves / math.ceil(waves)   # fraction of the last wave that is busy
+    best = max(eff.values())
+    return next(s for s in sorted(eff) if eff[s] >= 0.85 * best)
+
+
+SMS = 132                    # e.g. H100 SXM; FA2 passes 2 * num_SMs as the slot count
+BLOCK_N = 128                # KV tokens per inner tile for head_dim 128
+print(f"{'batch':>5} {'heads':>8} {'context':>8} {'work':>5} {'splits':>6} {'CTAs':>5}")
+for batch, heads, ctx in [(1, 8, 128_000), (1, 32, 32_000), (4, 8, 8_000),
+                          (16, 8, 4_000), (64, 32, 2_000), (1, 8, 300)]:
+    work = batch * heads
+    s = num_splits(work, 2 * SMS, math.ceil(ctx / BLOCK_N))
+    print(f"{batch:>5} {heads:>8} {ctx:>8} {work:>5} {s:>6} {work * s:>5}")
+```
+
+```bash
+python3 choose_splits.py
+```
+
+Output:
+
+```text
+batch    heads  context  work splits  CTAs
+    1        8   128000     8     29   232
+    1       32    32000    32      7   224
+    4        8     8000    32      7   224
+   16        8     4000   128      2   256
+   64       32     2000  2048      1  2048
+    1        8      300     8      3    24
+```
+
+Reading the table:
+
+- **Small batch, long context** is where Flash-Decoding matters: 8 work items become 232 CTAs.
+- **Large batch** already fills the machine (2048 work items), so the heuristic returns 1 split and the extra pass is skipped entirely.
+- **Short context** is capped by the number of KV tiles: 300 tokens are only 3 tiles of 128, so at most 3 splits.
+- The "eligible" check skips split counts that produce the same tiles per split as a smaller count, which would add a combine for nothing.
+
+**Overhead check.** Per (sequence, head), the workspace costs $S\cdot d$ FP32 values written and read back, about $8Sd$ bytes, while the KV stream is $4td$ bytes in FP16. The ratio $2S/t$ is about $0.05\%$ for $S=29$, $t=128\,000$. The combine kernel should be a sliver in an Nsight Systems timeline. If it is not, $S$ is too large or the combine is badly written.
+
+---
+
+## 7. Where the pattern shows up in production
+
+| System | How it uses split-KV and merge |
+|--------|--------------------------------|
+| FlashAttention-2 (≥ 2.2), `flash_attn_with_kvcache` | `num_splits=0` selects the heuristic above; `block_table=` combines splits with a paged KV cache; `return_softmax_lse=True` returns the state for further merging |
+| FlashAttention-3 (Hopper) interface | Exposes `num_splits` and `pack_gqa` for decode-shaped problems |
+| FlashInfer | "Attention state" `(o, lse)` is the standard output; `merge_state` / `merge_states` combine segments; **cascade attention** computes a shared prompt prefix once for many requests and merges it with each request's private suffix |
+| Paged-KV decode kernels | Split boundaries are aligned to KV pages; each CTA walks its slice of the block table |
+| Context / ring parallelism | Each GPU holds a shard of the KV sequence; the same $\oplus$ merges partial states across devices |
+| FlashDecoding++ (Hong et al.) | Replaces the per-split running max with a precomputed unified max to avoid synchronized rescaling, with a fallback path when values exceed it |
+| LeanAttention | Applies Stream-K–style work partitioning to attention to reduce wave quantization |
+
+**Short query blocks.** Speculative decoding verifies several draft tokens at once, so $q$ has 2–8 rows rather than 1. The same kernel shape applies, with a few query rows per CTA and the same split and merge.
+
+---
+
+## 8. Verification and benchmark plan
+
+### Functional
+
+| Check | Catches |
+|-------|---------|
+| `num_splits ∈ {1, 2, 3, S_max}` all equal the reference | Merge bugs, off-by-one split boundaries |
+| `seq_len ∈ {1, BLOCK_N−1, BLOCK_N, BLOCK_N+1, chunk·k ± 1}` | Tail masks and split edges |
+| Ragged batch with empty splits | $0/0$ in the empty-split path |
+| Large-logit inputs (scale $q$) | Missing max subtraction in either kernel |
+| BF16/FP8 cache vs FP32 reference with tolerance | Accumulating in the cache dtype |
+| Return LSE and merge two halves externally | LSE scaling bugs (natural log vs `log2`, missing `1/√d`) |
+
+**`log2` vs `ln`:** many fast kernels compute `exp2(x * log2(e))` internally and keep the running max in base 2. Whatever the kernel uses internally, the LSE it **returns** must state its base. Merging a base-2 LSE with a natural-log LSE silently reweights the splits.
+
+### Performance
+
+| Metric | Target |
+|--------|--------|
+| Achieved bandwidth $=$ KV bytes / kernel time | Approaches HBM peak for long contexts |
+| Speedup vs `num_splits=1` across a (batch, context) sweep | Large at batch 1 and long context; about 1× at large batch |
+| Combine kernel share of time | A few percent at most |
+| Occupancy and eligible warps (Nsight Compute) | No spills from oversized `BLOCK_N × D` tiles |
+
+Benchmark with **realistic shapes**: the KV heads count after GQA, the actual cache dtype, and the batch sizes a server sees at its latency SLO. A sweep made only at batch 64 will "prove" split-KV is useless.
+
+---
+
+## 9. Prompting an AI assistant for a decode kernel
+
+Generated attention kernels default to prefill-shaped FlashAttention clones. State the decode contract explicitly:
+
+1. **Shapes:** query `[B, H_q, D]` (or `[B, q_len, H_q, D]` for speculative decode), KV `[B, H_kv, T_max, D]` or a paged pool plus `block_table`, and per-sequence `seq_lens`.
+2. **Split-KV:** the number of splits as a runtime argument, an FP32 `(o, lse)` workspace, and a separate combine kernel or a documented fused alternative.
+3. **Numerics:** an FP32 accumulator, stable max-subtracted merge, empty split ⇒ `lse = -inf` and `o = 0`, and the LSE base stated.
+4. **Tests first:** an interpreter-mode test against `torch.softmax` covering ragged lengths, empty splits, and large logits, plus an ahead-of-time compile for the deployment architecture.
+5. **Metric:** achieved GB/s versus HBM peak, not TFLOP/s.
+
+---
+
+## Pitfalls
+
+| Pitfall | Result |
+|---------|--------|
+| Naive $\sum e^{\mathrm{LSE}_j} o_j$ merge | `inf` and `NaN` with large logits |
+| Empty split writes `acc / l` with `l = 0` | NaN that poisons the merged output |
+| FP16 workspace or accumulator | Accuracy loss that grows with context and split count |
+| Splitting at large batch | Extra launch and combine with no gain |
+| Splitting a 300-token cache 32 ways | Splits shorter than one tile, so the overhead dominates |
+| Mixing `log2` and natural-log LSEs | Silently wrong weights, no crash |
+| Benchmarking only TFLOP/s | Misses the point: decode is about bytes per second |
+
+## Checkpoint
+
+- Explain why a FlashAttention grid underfills the GPU at decode with a small batch.
+- Define an attention state and prove that $\oplus$ merges disjoint KV sets exactly.
+- Write the max-subtracted merge and say why the naive form fails in FP32.
+- Describe what an empty split must write, and why.
+- Use the wave-efficiency heuristic to say when *not* to split.
+- Name three systems that reuse the same merge operator.
+
+## Try this
+
+1. Change `split_kv_reference.py` to merge the splits in random order 100 times and confirm that the result never changes beyond rounding.
+2. Make `split_kv_kernel` accumulate in FP16 and measure the error growth against `T_max` under `TRITON_INTERPRET=1`.
+3. Add a `block_table` argument so that K and V come from a paged pool, and align the split boundaries to page boundaries.
+4. Fuse the combine into kernel 1 using an atomic counter: the last CTA to finish for a (sequence, head) performs the merge. Compare launch counts in Nsight Systems on a real GPU.
+5. On a GPU, sweep batch ∈ {1, 4, 16, 64} and context ∈ {1k, 8k, 64k, 128k} with `num_splits=1` vs the heuristic, and plot achieved GB/s.
+
+## Summary
+
+Decode attention is bandwidth-bound, and at small batch the FlashAttention grid has too few CTAs to use that bandwidth. Flash-Decoding splits the KV sequence across CTAs. Each split produces an attention state $(o,\mathrm{LSE})$, and an associative, max-subtracted merge recombines the states exactly. The kernel engineering lives in the details: FP32 state, empty-split handling, ragged lengths, a split count chosen by wave efficiency, and an LSE convention stated as part of the ABI. Verify on CPU with the Triton interpreter, compile ahead of time for the target GPU, and judge the result in GB/s.
+
+## Sources (for further reading)
+
+- Dao, Haziza, Massa, Sizov, "Flash-Decoding for long-context inference" (PyTorch blog / Stanford CRFM, Oct 2023).
+- Dao, "FlashAttention-2: Faster Attention with Better Parallelism and Work Partitioning" (2023); FlashAttention repository: `flash_attn_with_kvcache` docs and `num_splits_heuristic` in `csrc/flash_attn/flash_api.cpp`.
+- Shah et al., "FlashAttention-3" (2024); `hopper/flash_attn_interface.py` (`num_splits`, `pack_gqa`).
+- Ye et al., "FlashInfer: Efficient and Customizable Attention Engine for LLM Inference Serving" (arXiv:2501.01005); FlashInfer docs: "Attention States and Recursive Attention", `flashinfer.cascade.merge_state`.
+- Hong et al., "FlashDecoding++: Faster Large Language Model Inference on GPUs" (arXiv:2311.01282).
+- Milakov & Gimelshein, "Online normalizer calculation for softmax" (2018).
+- Triton documentation: `TRITON_INTERPRET=1` interpreter mode and `triton.compile` / `GPUTarget`.
