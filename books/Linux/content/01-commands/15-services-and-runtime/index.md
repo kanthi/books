@@ -21,6 +21,7 @@ Control the running system under systemd: units, journals, kernel parameters, re
 | `loginctl` | loginctl manages systemd-logind seats, sessions, and users: who is logged in, idle hints, kill sessions, and… |
 | `modprobe` | modprobe loads and unloads kernel modules, resolving dependencies via modules.dep — preferred over raw insmod/rmmod… |
 | `systemd-creds` | systemd-creds encrypts, decrypts, and inspects service credentials for LoadCredentialEncrypted= / credstore. |
+| `unshare` / `nsenter` | unshare runs a program in new namespaces (user, net, pid, mount, uts, time); nsenter joins the namespaces of a running process. |
 
 
 ## Suggested starting points
@@ -32,6 +33,7 @@ Control the running system under systemd: units, journals, kernel parameters, re
 5. User sessions / linger: `loginctl`.
 6. Containers: `podman`.
 7. Service secrets: `systemd-creds` + `LoadCredentialEncrypted=`.
+8. Namespaces and sandboxes: `unshare` to create, `nsenter` to debug from the host.
 
 ## Related parts
 
