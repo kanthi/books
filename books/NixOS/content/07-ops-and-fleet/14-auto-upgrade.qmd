@@ -1,0 +1,434 @@
+---
+title: "Unattended upgrades (system.autoUpgrade)"
+---
+
+# Unattended upgrades (system.autoUpgrade)
+
+**Goal:** Let hosts upgrade themselves on a schedule from a **reviewed Git ref**. Reboot only when the kernel or initrd changed, and only inside a window. Stagger the fleet in rings, and page someone when an upgrade fails. Read the unit that NixOS generates, so nothing about the automation is magic.
+
+Baseline: NixOS **26.05** ("Yarara"), where `nixos-rebuild` is the Python rewrite (`nixos-rebuild-ng`) and the Bash version is gone. The 26.05 default `pkgs.nix` is **2.34.x**. `nixVersions.latest` is **2.35.x** if you set `nix.package`. Nothing here depends on that split. Every option below comes from `nixos/modules/tasks/auto-upgrade.nix` on the `nixos-26.05` branch.
+
+## Thesis
+
+`system.autoUpgrade` is a systemd timer that runs `nixos-rebuild` as root. That is all it is. Whether it is safe depends entirely on **what it builds from**:
+
+- From a channel, or from a flake whose lock file the host updates itself, it is an **unreviewed production change** at 03:00.
+- From a Git branch that CI has already built, tested, and pushed to a cache, it is just the **pull half of GitOps**: every host converges on a commit a human approved.
+
+Use it only in the second mode. Then the remaining questions are scheduling ones: when to run, when a reboot is allowed, and how to hear about failures.
+
+## Mental model
+
+```text
+nixos-upgrade.timer  (OnCalendar=dates, RandomizedDelaySec, FixedRandomDelay, Persistent)
+        │
+        ▼
+nixos-upgrade.service  (Type=oneshot, root, After/Wants=network-online.target,
+        │               X-RestartIfChanged=false: a switch never kills its own upgrade)
+        │
+        ├─ allowReboot = false ─► nixos-rebuild <operation> <flags> [--upgrade]
+        │
+        └─ allowReboot = true ──► nixos-rebuild boot <flags>          (new default boot entry)
+                                   compare readlink of {initrd,kernel,kernel-modules}
+                                   /run/booted-system  vs  /nix/var/nix/profiles/system
+                                     ├─ same      ─► nixos-rebuild <operation> <flags>
+                                     ├─ different, outside rebootWindow ─► "skipping" (nothing activated)
+                                     └─ different, inside rebootWindow  ─► shutdown -r +1
+        │
+        └─ OnSuccess=nix-gc.service   (only if runGarbageCollection = true)
+```
+
+| Option (26.05) | Default | What it really does |
+|----------------|---------|---------------------|
+| `enable` | `false` | Creates the timer and the service |
+| `flake` | `null` | Flake URI. Adds `--refresh --flake <uri>` (`--refresh` forces a re-fetch of the branch tip) |
+| `channel` | `null` | Channel URL, passed as `-I nixpkgs=<url>/nixexprs.tar.xz`. Cannot be combined with `flake` |
+| `upgrade` | `true` | Adds `--upgrade` when no `channel` is set. That updates **channels**, not your flake lock. Set it to `false` for flakes |
+| `operation` | `"switch"` | `"switch"` or `"boot"` |
+| `flags` | `[ ]` | Extra `nixos-rebuild` arguments |
+| `dates` | `"04:40"` | `OnCalendar=` expression (`systemd.time(7)`) |
+| `randomizedDelaySec` | `"0"` | Timer jitter, so a fleet does not stampede the Git server and the cache |
+| `fixedRandomDelay` | `false` | Keep the same jitter on every run (stable per host) |
+| `persistent` | `true` | Catch up on a run missed while powered off |
+| `allowReboot` | `false` | Reboot instead of switching when kernel, initrd, or modules changed |
+| `rebootWindow` | `null` | `{ lower = "HH:MM"; upper = "HH:MM"; }`. Crossing midnight is supported. Bounds are **exclusive** |
+| `runGarbageCollection` | `false` | `OnSuccess=nix-gc.service` (needs `nix.enable`). Tune retention with `nix.gc.options` |
+
+## Worked examples (Cases)
+
+### Case 1: A server tracking a reviewed branch
+
+```nix
+# auto-upgrade-server.nix — unattended upgrades for a flake-defined server
+{ ... }:
+{
+  system.autoUpgrade = {
+    enable = true;
+    flake = "git+https://git.example.com/infra/nixos?ref=release/prod#web1";
+    upgrade = false;              # flake: never pass --upgrade; lock comes from Git
+    operation = "boot";           # stage the new generation; reboot applies it
+    dates = "Wed 03:00";
+    randomizedDelaySec = "45min";
+    fixedRandomDelay = true;      # same offset every week on this host
+    persistent = true;
+    allowReboot = true;
+    rebootWindow = { lower = "03:00"; upper = "05:30"; };
+    runGarbageCollection = true;
+  };
+}
+```
+
+Do not trust the option descriptions. Evaluate the module and read what it generates. This evaluation runs on any machine with Nix, with no NixOS required:
+
+```nix
+# eval.nix — evaluate a minimal NixOS system and print what autoUpgrade generates
+let
+  sys = import <nixpkgs/nixos> {
+    configuration = { ... }: {
+      imports = [ ./auto-upgrade-server.nix ];
+      boot.loader.grub.enable = false;
+      fileSystems."/" = { device = "/dev/disk/by-label/nixos"; fsType = "ext4"; };
+      system.stateVersion = "26.05";
+    };
+  };
+  svc = sys.config.systemd.services.nixos-upgrade;
+in {
+  flags = sys.config.system.autoUpgrade.flags;
+  startAt = svc.startAt;
+  onSuccess = svc.unitConfig.OnSuccess;
+  timer = sys.config.systemd.timers.nixos-upgrade.timerConfig;
+  script = svc.script;
+}
+```
+
+```bash
+nix-instantiate --parse auto-upgrade-server.nix >/dev/null && echo parse ok
+nix-instantiate --eval --strict --json -I nixpkgs=channel:nixos-26.05 eval.nix > out.json
+jq -c '.flags, .startAt, .onSuccess, .timer' out.json
+jq -r .script out.json
+```
+
+```text
+parse ok
+["--refresh","--flake git+https://git.example.com/infra/nixos?ref=release/prod#web1"]
+["Wed 03:00"]
+["nix-gc.service"]
+{"FixedRandomDelay":true,"OnCalendar":["Wed 03:00"],"Persistent":true,"RandomizedDelaySec":"45min"}
+/nix/store/26nvrcq5…-nixos-rebuild-ng-26.05/bin/nixos-rebuild boot --refresh --flake git+https://git.example.com/infra/nixos?ref=release/prod#web1
+booted="$(/nix/store/833invqv…-coreutils-9.11/bin/readlink /run/booted-system/{initrd,kernel,kernel-modules})"
+built="$(/nix/store/833invqv…-coreutils-9.11/bin/readlink /nix/var/nix/profiles/system/{initrd,kernel,kernel-modules})"
+
+current_time="$(/nix/store/833invqv…-coreutils-9.11/bin/date +%H:%M)"
+
+lower="03:00"
+upper="05:30"
+
+if [[ "${lower}" < "${upper}" ]]; then
+  if [[ "${current_time}" > "${lower}" ]] && \
+     [[ "${current_time}" < "${upper}" ]]; then
+    do_reboot="true"
+  else
+    do_reboot="false"
+  fi
+else
+  # lower > upper, so we are crossing midnight (e.g. lower=23h, upper=6h)
+  # we want to reboot if cur > 23h or cur < 6h
+  if [[ "${current_time}" < "${upper}" ]] || \
+     [[ "${current_time}" > "${lower}" ]]; then
+    do_reboot="true"
+  else
+    do_reboot="false"
+  fi
+fi
+
+
+if [ "${booted}" = "${built}" ]; then
+  /nix/store/26nvrcq5…-nixos-rebuild-ng-26.05/bin/nixos-rebuild boot --refresh --flake git+https://git.example.com/infra/nixos?ref=release/prod#web1
+elif [ "${do_reboot}" != true ]; then
+  echo "Outside of configured reboot window, skipping."
+
+else
+  /nix/store/b4b1x5fh…-systemd-260.4/bin/shutdown -r +1
+fi
+```
+
+That is real evaluator output against `nixos-26.05` (store hashes shortened). Three facts you can only see here:
+
+1. `--upgrade` is gone (`upgrade = false`), and `--refresh` makes Nix re-fetch `release/prod` on every run instead of trusting its fetcher cache.
+2. `current_time` is read **after** the build, and both bounds use strict `>` / `<`.
+3. With `operation = "boot"`, the "kernel unchanged" branch runs `nixos-rebuild boot` **again**. Userland-only changes are staged and never activated. Case 2 and the trap below explain why that matters.
+
+### Case 2: Switch userland now, reboot only for kernel and initrd
+
+For most servers this is the right shape. Service and package changes go live on the night they land, and a reboot happens only when it is actually required, inside the window:
+
+```nix
+# auto-upgrade-switch.nix — live switch for userland, windowed reboot for kernel/initrd
+{ ... }:
+{
+  system.autoUpgrade = {
+    enable = true;
+    flake = "git+https://git.example.com/infra/nixos?ref=release/prod#web1";
+    upgrade = false;
+    operation = "switch";         # userland changes go live now
+    dates = "Wed 03:00";
+    randomizedDelaySec = "45min";
+    fixedRandomDelay = true;
+    allowReboot = true;
+    rebootWindow = { lower = "03:00"; upper = "05:30"; };
+  };
+}
+```
+
+The generated script now ends with:
+
+```text
+if [ "${booted}" = "${built}" ]; then
+  /nix/store/26nvrcq5…-nixos-rebuild-ng-26.05/bin/nixos-rebuild switch --refresh --flake git+https://git.example.com/infra/nixos?ref=release/prod#web1
+elif [ "${do_reboot}" != true ]; then
+  echo "Outside of configured reboot window, skipping."
+```
+
+The rendered units, from `config.systemd.units."nixos-upgrade.timer".text` and `."nixos-upgrade.service".text`, with the store-path `Environment=` lines (`PATH`, `LOCALE_ARCHIVE`, `TZDIR`) trimmed:
+
+```text
+[Timer]
+FixedRandomDelay=true
+OnCalendar=Wed 03:00
+Persistent=true
+RandomizedDelaySec=45min
+
+[Install]
+WantedBy=timers.target
+```
+
+```text
+[Unit]
+After=network-online.target
+Description=NixOS Upgrade
+Wants=network-online.target
+X-StopOnRemoval=false
+
+[Service]
+Environment="HOME=/root"
+Environment="NIX_PATH=nixpkgs=/nix/var/nix/profiles/per-user/root/channels/nixos:nixos-config=/etc/nixos/configuration.nix:/nix/var/nix/profiles/per-user/root/channels"
+X-RestartIfChanged=false
+ExecStart=/nix/store/v085579p…-unit-script-nixos-upgrade-start/bin/nixos-upgrade-start
+Type=oneshot
+```
+
+`X-RestartIfChanged=false` and `X-StopOnRemoval=false` tell `switch-to-configuration` not to restart or stop the upgrade unit in the middle of its own run. `HOME=/root` means credentials for a private flake are **root's**.
+
+### Case 3: Rings: canary, early, prod from one module
+
+Run every host off the same module. The ring decides which branch a host tracks and on which day it upgrades:
+
+```nix
+# modules/auto-upgrade-rings.nix — one module, every host; the ring decides when and what
+{ config, lib, ... }:
+let
+  rings = {
+    canary = { branch = "release/canary"; dates = "Mon 03:00"; };
+    early  = { branch = "release/prod";   dates = "Wed 03:00"; };
+    prod   = { branch = "release/prod";   dates = "Thu 03:00"; };
+  };
+  ring = rings.${config.fleet.ring};
+in
+{
+  options.fleet.ring = lib.mkOption {
+    type = lib.types.enum (builtins.attrNames rings);
+    default = "prod";
+    description = "Upgrade ring: decides which Git branch this host tracks and when it upgrades.";
+  };
+
+  config.system.autoUpgrade = {
+    enable = true;
+    flake = "git+https://git.example.com/infra/nixos?ref=${ring.branch}#${config.networking.hostName}";
+    upgrade = false;
+    operation = "switch";
+    dates = ring.dates;
+    randomizedDelaySec = "30min";
+    fixedRandomDelay = true;
+    allowReboot = true;
+    rebootWindow = { lower = "02:30"; upper = "05:30"; };
+  };
+}
+```
+
+A host sets `networking.hostName = "lab1"; fleet.ring = "canary";`. Evaluating three hosts gives:
+
+```text
+lab1 {"dates": "Mon 03:00", "flake": "git+https://git.example.com/infra/nixos?ref=release/canary#lab1"}
+web1 {"dates": "Wed 03:00", "flake": "git+https://git.example.com/infra/nixos?ref=release/prod#web1"}
+db1  {"dates": "Thu 03:00", "flake": "git+https://git.example.com/infra/nixos?ref=release/prod#db1"}
+```
+
+The release process now happens entirely in Git and CI. **Hosts never touch the lock file**:
+
+```bash
+# CI job (weekly): bump inputs, build every host, push to the binary cache, open a PR
+nix flake update
+nix build .#nixosConfigurations.{lab1,web1,db1}.config.system.build.toplevel
+# … run checks / nixosTests, push closures to the cache, merge PR into main
+
+# promotion is a fast-forward, not a rebuild:
+git push origin main:release/canary            # Monday: canaries take it
+git push origin release/canary:release/prod    # after a clean soak: early + prod rings
+```
+
+Because CI has already pushed the closures, hosts **substitute** from the cache instead of compiling, so a run takes minutes. Rolling back the fleet means resetting `release/prod` to the previous commit. Hosts converge back to it on their next run.
+
+### Case 4: Hear about failures
+
+A oneshot that fails at 03:00 is invisible unless something reports it:
+
+```nix
+# modules/upgrade-alerts.nix — page someone when an unattended upgrade fails
+{ pkgs, ... }:
+{
+  systemd.services.nixos-upgrade.onFailure = [ "upgrade-alert@%n.service" ];
+
+  systemd.services."upgrade-alert@" = {
+    description = "Report failure of %i";
+    serviceConfig = {
+      Type = "oneshot";
+      EnvironmentFile = "/run/secrets/ntfy.env";   # NTFY_URL=https://ntfy.example.com/ops
+    };
+    scriptArgs = "%i";
+    path = [ pkgs.curl pkgs.systemd pkgs.coreutils ];
+    script = ''
+      unit="$1"
+      journalctl -u "$unit" -n 30 --no-pager -o cat \
+        | curl -fsS -H "Title: $(hostname): $unit failed" -H "Priority: high" \
+            --data-binary @- "$NTFY_URL"
+    '';
+  };
+}
+```
+
+Both modules parse (`nix-instantiate --parse`) and evaluate against `nixos-26.05`. The rendered template unit contains `EnvironmentFile=/run/secrets/ntfy.env` and `ExecStart=…/upgrade-alert_-start %i`. Ship `ntfy.env` with your secrets tool (sops-nix or agenix). Never put the URL or token in the Nix store.
+
+A **skipped** reboot is not a failure: the unit exits `0`. If you want to know about kernels waiting for a reboot, alert on the condition directly, for example with a node-exporter textfile metric or a daily check:
+
+```bash
+# pending-reboot.sh — exit 1 if the default boot generation has a different kernel/initrd
+for f in initrd kernel kernel-modules; do
+  [ "$(readlink /run/booted-system/$f)" = "$(readlink /nix/var/nix/profiles/system/$f)" ] || { echo "reboot pending ($f)"; exit 1; }
+done
+echo "booted system is current"
+```
+
+### Case 5: Operate it on the host
+
+Trigger a run by hand and watch it. The commands are exact. The output below is illustrative, from a 26.05 lab host:
+
+```bash
+systemctl list-timers nixos-upgrade.timer
+sudo systemctl start nixos-upgrade.service      # blocks until the oneshot finishes
+journalctl -u nixos-upgrade.service -b --no-pager -o cat | tail -n 8
+nix store diff-closures /run/booted-system /run/current-system
+```
+
+```text
+NEXT                         LEFT LAST                         PASSED UNIT                ACTIVATES
+Wed 2026-10-07 03:21:44 IST  18h  Wed 2026-09-30 03:21:44 IST  6 days ago nixos-upgrade.timer nixos-upgrade.service
+
+building the system configuration...
+updating GRUB 2 menu...
+activating the configuration...
+setting up /etc...
+reloading user units for root...
+restarting the following units: nginx.service
+Finished NixOS Upgrade.
+
+nginx: 1.28.0 → 1.28.1, +4.1 KiB
+openssl: 3.5.4 → 3.5.5, -12.3 KiB
+```
+
+Because of `fixedRandomDelay`, the `NEXT` time lands at the same offset after 03:00 every week. A changing offset means the option is not set.
+
+### Case 6: Laptops and desktops
+
+```nix
+# auto-upgrade-laptop.nix — never reboot a user's machine; stage, then let them reboot
+{ ... }:
+{
+  system.autoUpgrade = {
+    enable = true;
+    flake = "git+https://git.example.com/infra/nixos?ref=release/prod#laptop1";
+    upgrade = false;
+    operation = "boot";           # nothing changes under the user's open session
+    dates = "daily";
+    randomizedDelaySec = "1h";
+    persistent = true;            # catch up after the lid was closed all night
+    allowReboot = false;
+  };
+}
+```
+
+Here `operation = "boot"` is correct. Nothing changes under an open desktop session, and the next reboot the user chooses applies the update. `persistent = true` means a laptop that slept through 03:00 runs the upgrade soon after it wakes. If that is unwelcome on battery, add a condition to the service:
+
+```nix
+# auto-upgrade-ac-only.nix — skip the run (not fail it) when not on AC power
+{ ... }:
+{
+  systemd.services.nixos-upgrade.unitConfig.ConditionACPower = true;
+}
+```
+
+## The trap
+
+**`operation = "boot"` together with `allowReboot = true` quietly stops applying changes.**
+
+Read the Case 1 script again. When the kernel, initrd, and modules are unchanged (most weeks), the script runs `nixos-rebuild boot` and stops there. The new generation becomes the default boot entry, but the running system stays on the old one: a patched OpenSSH, a new firewall rule, or a rotated certificate path is **built and never activated**. The next reboot, perhaps an unplanned one months later, applies every staged change at once, and nobody knows which change broke the boot.
+
+The reboot window has a second, related failure. `current_time` is checked **after** the build, with exclusive bounds. If a slow build finishes after `upper`, or exactly at `lower`, the host logs `Outside of configured reboot window, skipping.`, exits successfully, and activates **nothing**, userland included, because only the "kernel unchanged" branch ever switches. This repeats every week until a run happens to finish inside the window.
+
+Fixes:
+
+- Servers: `operation = "switch"` with `allowReboot = true` (Case 2). Userland goes live, and a reboot happens only when the kernel requires one.
+- Make the window wider than `randomizedDelaySec` plus your worst build time. Better still, keep builds short by having CI push closures to a cache (Case 3).
+- Alert on "reboot pending" (Case 4), not just on failure.
+- Never set `operation = "boot"` with `allowReboot = true` unless you really want "nothing changes until a kernel changes".
+
+## Pitfalls
+
+| Symptom | Cause / fix |
+|---------|-------------|
+| Fleet drifts: hosts run different nixpkgs commits | Hosts update their own lock (`--recreate-lock-file`, or the deprecated `--update-input` that the module docs still suggest). Update locks in CI only, and set `upgrade = false` |
+| Upgrade "does nothing" on a flake host | The branch tip did not move, or the host tracks the wrong ref. Check `nixos-version --configuration-revision` against `git rev-parse release/prod` (needs `system.configurationRevision` set from `self.rev`) |
+| `error: … Permission denied (publickey)` in the journal | The private repo needs **root's** credentials (`HOME=/root`). Use a read-only deploy key for `git+ssh://`, declare host keys with `programs.ssh.knownHosts`, or put `access-tokens` for `github:` / `gitlab:` refs in `nix.extraOptions = "!include /run/secrets/nix-access-tokens.conf";` |
+| Every host compiles for an hour | Nothing was pushed to a cache before promotion. Build in CI and add the cache to `nix.settings.substituters` and `trusted-public-keys` |
+| Thundering herd on the Git server and cache | `randomizedDelaySec` is unset. Add jitter, and `fixedRandomDelay` for predictability |
+| Out of disk mid-upgrade | Two closures plus the build need space. Use `runGarbageCollection = true` with `nix.gc.options = "--delete-older-than 14d"`, plus `nix.settings.min-free` |
+| `channel` and `flake` both set | Evaluation assertion: pick one. On flake hosts, also delete leftover root channels |
+| Reboot never happens | `rebootWindow` crosses midnight with a typo, or exclusive bounds miss the run. Test the window with the generated script |
+| Switch inhibitor blocks the run | 26.05 switch inhibitors (for example a changed `dbus` implementation) refuse `switch`. The unit fails. Schedule a reboot instead of forcing it with `NIXOS_NO_CHECK=1` |
+
+## The boring rule
+
+> Hosts **pull a reviewed branch**; they never update locks. `upgrade = false`, `operation = "switch"`, `allowReboot = true` with a generous window on servers. `operation = "boot"` with no auto-reboot on laptops. Jitter with `randomizedDelaySec` + `fixedRandomDelay`, rings by branch and day, closures pre-pushed to a cache, and an `onFailure` alert plus a "reboot pending" check. Promotion and rollback are both `git push`.
+
+## Try this
+
+1. Run `eval.nix` against `nixos-26.05` with your real host module. Read the generated script and write down which branch runs on a week when only userland changed.
+2. Change `rebootWindow` to cross midnight (`lower = "23:00"; upper = "02:00";`), re-evaluate, and walk the script by hand for `current_time` values `22:59`, `23:00`, `23:01`, and `01:59`.
+3. Add `modules/auto-upgrade-rings.nix` to a two-host lab. Put one host in `canary`, promote a harmless change (a new `environment.etc` file) with `git push origin main:release/canary`, and confirm only the canary picks it up on its next run (`sudo systemctl start nixos-upgrade.service`).
+4. Break the flake on `release/canary` (an undefined option). Confirm that `upgrade-alert@nixos-upgrade.service` fires, and that the host keeps running its previous generation.
+5. Bump the kernel (`boot.kernelPackages = pkgs.linuxPackages_latest;`) on a lab VM. Trigger the upgrade outside the window and run `pending-reboot.sh`. Then trigger it inside the window and confirm the `shutdown -r +1` path.
+
+## Checkpoint
+
+- [ ] Every auto-upgrading host uses `flake = …?ref=<release branch>#<host>` and `upgrade = false`
+- [ ] No host updates `flake.lock`. CI does, then builds, tests, and caches
+- [ ] Servers use `operation = "switch"`; any `boot` + `allowReboot` combination is written down and intended
+- [ ] Reboot window is wider than jitter plus worst build time
+- [ ] `onFailure` alert and a pending-reboot check are deployed
+- [ ] Promotion and rollback procedures are written as `git push` commands
+
+## Sources
+
+- [nixpkgs `nixos/modules/tasks/auto-upgrade.nix` (nixos-26.05)](https://github.com/NixOS/nixpkgs/blob/nixos-26.05/nixos/modules/tasks/auto-upgrade.nix): option definitions and the generated script
+- [NixOS manual, Automatic Upgrades](https://nixos.org/manual/nixos/stable/#sec-upgrading-automatic), and [26.05 release notes](https://nixos.org/manual/nixos/stable/release-notes) (`nixos-rebuild-ng` only, switch inhibitors)
+- [systemd.timer(5)](https://www.freedesktop.org/software/systemd/man/latest/systemd.timer.html) (`RandomizedDelaySec=`, `FixedRandomDelay=`, `Persistent=`) and [systemd.unit(5)](https://www.freedesktop.org/software/systemd/man/latest/systemd.unit.html) (`OnFailure=`, `OnSuccess=`, `ConditionACPower=`)
+- [Nix reference manual 2.35: `nix flake update`, `--refresh`; `--update-input` deprecated](https://nix.dev/manual/nix/2.35/command-ref/new-cli/nix3-flake-update)
