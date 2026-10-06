@@ -1,0 +1,462 @@
+---
+title: "workloadbuilder and Gang Scheduling (Kubernetes 1.37)"
+---
+
+# workloadbuilder and Gang Scheduling (Kubernetes 1.37)
+
+Kubernetes 1.37 advances Workload-Aware Scheduling (WAS): `Workload` / `PodGroup` and gang scheduling graduate toward Beta, and controllers get a shared Go path instead of each inventing their own `PodGroup` dialect. The idea surfaced widely in the 1.37 release notes and companion write-ups; this chapter teaches the **Go API** you actually call — the `scheduling.k8s.io/v1alpha3` building blocks and the `workloadbuilder` library in `k8s.io/component-helpers`.
+
+If you maintain a Job-like CRD, a trainer operator, or anything that must place N pods together (or a tree of groups), this is the boring contract: embed the blocks, compile with the library, stamp pods with `spec.schedulingGroup.podGroupName`, and let kube-scheduler do gang / topology / disruption.
+
+Pin modules to the cluster minor you target. These listings use **`v0.37.1`** (Kubernetes 1.37.1).
+
+```bash
+go get k8s.io/component-helpers@v0.37.1 \
+      k8s.io/api@v0.37.1 \
+      k8s.io/apimachinery@v0.37.1
+```
+
+Import path:
+
+```go
+import "k8s.io/component-helpers/scheduling/schedulingv1/workloadbuilder"
+```
+
+## Mental model
+
+WAS splits **policy templates** from **runtime groups**:
+
+```text
+user fills fields on YOUR CRD
+        │
+        ▼
+v1alpha3 building blocks  (WorkloadPodGroup… / WorkloadCompositePodGroup…)
+        │
+        ▼
+workloadbuilder.Builder
+   Validate → BuildWorkload → NewPodGroup / NewCompositePodGroup
+        │
+        ▼
+scheduling.k8s.io/v1beta1 Workload   (templates: PodGroupTemplate / Composite…)
+scheduling.k8s.io/v1beta1 PodGroup   (runtime leaf group)
+scheduling.k8s.io/v1alpha3 CompositePodGroup  (runtime group-of-groups)
+        │
+        ▼
+Pods with spec.schedulingGroup.podGroupName → kube-scheduler gang / topology / preemption
+```
+
+| Object | Role |
+|--------|------|
+| **Building blocks** | Strongly typed structs you embed in *your* API (`spec.scheduling`, etc.). Users never author raw `Workload` YAML. |
+| **`Workload`** | Compiled template: owns `podGroupTemplates` / `compositePodGroupTemplates`, carries `controllerRef`. |
+| **`PodGroup`** | Runtime leaf unit the scheduler queues and gangs (`minCount`). |
+| **`CompositePodGroup`** | Runtime parent over child groups (`minGroupCount`). |
+| **`workloadbuilder`** | Shared defaulting, validation, and compilation so Job, JobSet, LWS, and your CRD speak one dialect. |
+
+Leaf policy is **`basic`** (pod-by-pod) or **`gang`** (`minCount`). Composite gang uses **`minGroupCount`** (how many *child groups* must be schedulable together). Disruption is **`single`** or **`all`**. Topology co-location is a node-label key on the constraints block. Shared DRA claims can hang off the group instead of per pod.
+
+Feature gates (cluster side, not on the library itself): `GenericWorkload` (core WAS / gang / preemption), `WorkloadWithJob` (Job `spec.scheduling`), `CompositePodGroup`, `TopologyAwareWorkloadScheduling`, `DRAWorkloadResourceClaims`. Check the current 1.37 docs for which are Beta vs Alpha and which components need them.
+
+## Building blocks you embed
+
+The Job API groups all four leaf blocks under `spec.scheduling`. Copy that shape unless your domain needs per-component nesting.
+
+```go
+// Shape mirrored by batch/v1 Job's spec.scheduling (Kubernetes 1.37).
+type JobSchedulingConfiguration struct {
+	SchedulingPolicy      *schedulingv1alpha3.WorkloadPodGroupSchedulingPolicy
+	SchedulingConstraints *schedulingv1alpha3.WorkloadPodGroupSchedulingConstraints
+	DisruptionMode        *schedulingv1alpha3.WorkloadPodGroupDisruptionMode
+	ResourceClaims        []schedulingv1alpha3.WorkloadPodGroupResourceClaim
+}
+```
+
+Composite controllers (JobSet-like) use the parallel `WorkloadCompositePodGroup…` types. Field *names* on your CRD are yours; the *struct types* are shared so users recognize the same knobs across controllers.
+
+Allow-lists matter: `BuildOptions.AllowedPolicies` / `AllowedDisruptionModes` are deny-by-default. A future policy does not silently appear in your CRD until you opt in (and bump your vendored helpers).
+
+## Builder flow
+
+A `WorkloadItem` is one logical component. No children → one `PodGroupTemplate`. Children → `CompositePodGroupTemplate` over them. Each node carries:
+
+- **DefaultConfig** — controller defaults when the user omits a field (Job defaults unset policy to basic).
+- **Input** — user blocks plus **field path elements** so validation errors land on *their* CRD path, not a synthetic `Workload`.
+- **Callbacks** — post-merge tweaks (e.g. default gang `minCount` from Job `parallelism`).
+
+Then: `NewBuilder` → `Validate` → `BuildWorkload` → `NewPodGroup` (and/or `NewCompositePodGroup`). Parent/child split: if a parent already owns the `Workload`, the child uses `NewBuilderFromExistingWorkload` and only materializes its `PodGroup` — it must not recompile.
+
+## Worked examples
+
+### Case 1: Compile a gang Workload like the Job controller
+
+Save as `wb_gang_e2e.go`. Map user intent (gang, zone topology, all-or-nothing disruption), default unset `minCount` to parallelism `8`, validate, compile, and stamp a runtime `PodGroup`.
+
+```go
+// wb_gang_e2e.go
+package main
+
+import (
+	"context"
+	"fmt"
+
+	schedulingv1alpha3 "k8s.io/api/scheduling/v1alpha3"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/validation/field"
+	"k8s.io/component-helpers/scheduling/schedulingv1/workloadbuilder"
+)
+
+func main() {
+	parallelism := int32(8)
+	userInput := workloadbuilder.WorkloadInput{
+		Policy: workloadbuilder.PolicyInput{
+			PodGroupData: &schedulingv1alpha3.WorkloadPodGroupSchedulingPolicy{
+				Gang: &schedulingv1alpha3.WorkloadPodGroupGangSchedulingPolicy{}, // minCount defaulted below
+			},
+			PathElements: []string{"schedulingPolicy"},
+		},
+		Constraints: workloadbuilder.ConstraintsInput{
+			PodGroupData: &schedulingv1alpha3.WorkloadPodGroupSchedulingConstraints{
+				Topology: []schedulingv1alpha3.TopologyConstraint{
+					{Key: "topology.kubernetes.io/zone"},
+				},
+			},
+			PathElements: []string{"schedulingConstraints"},
+		},
+		DisruptionMode: workloadbuilder.DisruptionModeInput{
+			PodGroupData: &schedulingv1alpha3.WorkloadPodGroupDisruptionMode{
+				All: &schedulingv1alpha3.WorkloadPodGroupAllDisruptionMode{},
+			},
+			PathElements: []string{"disruptionMode"},
+		},
+	}
+
+	item := &workloadbuilder.WorkloadItem{
+		Name: "workers",
+		Path: field.NewPath("spec", "scheduling"),
+		DefaultConfig: &workloadbuilder.SchedulingConfig{
+			Policy: &workloadbuilder.SchedulingPolicy{
+				Basic: &workloadbuilder.BasicSchedulingPolicy{},
+			},
+		},
+		Input: userInput,
+		Callbacks: []workloadbuilder.SchedulingConfigFunc{
+			func(cfg *workloadbuilder.SchedulingConfig) {
+				if g := cfg.Policy.Gang; g != nil && g.MinCount == nil {
+					n := parallelism
+					g.MinCount = &n
+				}
+			},
+		},
+	}
+
+	ctrl := true
+	owner := &metav1.OwnerReference{
+		APIVersion: "batch/v1",
+		Kind:       "Job",
+		Name:       "train",
+		UID:        "job-uid",
+		Controller: &ctrl,
+	}
+	builder := workloadbuilder.NewBuilder(item, workloadbuilder.BuildOptions{
+		Name:                   "train-wl",
+		Namespace:              "ml",
+		Owner:                  owner,
+		AllowedPolicies:        []workloadbuilder.SchedulingPolicyOption{workloadbuilder.BasicPolicy, workloadbuilder.GangPolicy},
+		AllowedDisruptionModes: []workloadbuilder.DisruptionModeOption{workloadbuilder.SingleMode, workloadbuilder.AllMode},
+	})
+
+	if errs := builder.Validate(context.Background(), workloadbuilder.ValidationInput{}); len(errs) > 0 {
+		fmt.Printf("validation failed: %v\n", errs.ToAggregate())
+		return
+	}
+
+	wl, err := builder.BuildWorkload()
+	if err != nil {
+		fmt.Printf("build failed: %v\n", err)
+		return
+	}
+	pg, err := builder.NewPodGroup("train-pg", item.Name)
+	if err != nil {
+		fmt.Printf("podgroup failed: %v\n", err)
+		return
+	}
+
+	tmpl := wl.Spec.PodGroupTemplates[0]
+	fmt.Printf("Workload %s/%s controllerRef=%s/%s\n",
+		wl.Namespace, wl.Name, wl.Spec.ControllerRef.Kind, wl.Spec.ControllerRef.Name)
+	fmt.Printf("  template %q: gang minCount=%d topology=%s disruption=all\n",
+		tmpl.Name, tmpl.SchedulingPolicy.Gang.MinCount, tmpl.SchedulingConstraints.Topology[0].Key)
+	fmt.Printf("PodGroup %s/%s -> workload=%s template=%s minCount=%d\n",
+		pg.Namespace, pg.Name,
+		pg.Spec.WorkloadRef.WorkloadName, pg.Spec.WorkloadRef.TemplateName,
+		pg.Spec.SchedulingPolicy.Gang.MinCount)
+}
+```
+
+Run:
+
+```bash
+go run wb_gang_e2e.go
+```
+
+Output:
+
+```
+Workload ml/train-wl controllerRef=Job/train
+  template "workers": gang minCount=8 topology=topology.kubernetes.io/zone disruption=all
+PodGroup ml/train-pg -> workload=train-wl template=workers minCount=8
+```
+
+After create/patch of `Workload` and `PodGroup`, set each pod's `spec.schedulingGroup.podGroupName` to `train-pg`. Discovery uses `Workload.spec.controllerRef` and `PodGroup.spec.workloadRef`, not brittle name conventions. Owner refs on the objects you create keep GC aligned with your CR.
+
+Out-of-tree controllers leave declarative validation **on** (default). In-tree Job sets `DisableDeclarativeValidation: true` because the apiserver already ran DV on the embedded blocks.
+
+### Case 2: Validation rejects basic + all disruption
+
+Save as `wb_reject_basic_all.go`. The preemption unit must not be larger than the scheduling unit — `all` disruption with `basic` policy is nonsense and `Validate` reports it at the user's field path.
+
+```go
+// wb_reject_basic_all.go
+package main
+
+import (
+	"context"
+	"fmt"
+
+	schedulingv1alpha3 "k8s.io/api/scheduling/v1alpha3"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/validation/field"
+	"k8s.io/component-helpers/scheduling/schedulingv1/workloadbuilder"
+)
+
+func main() {
+	item := &workloadbuilder.WorkloadItem{
+		Name: "worker",
+		Path: field.NewPath("spec", "scheduling"),
+		DefaultConfig: &workloadbuilder.SchedulingConfig{
+			Policy: &workloadbuilder.SchedulingPolicy{Basic: &workloadbuilder.BasicSchedulingPolicy{}},
+		},
+		Input: workloadbuilder.WorkloadInput{
+			Policy: workloadbuilder.PolicyInput{
+				PodGroupData: &schedulingv1alpha3.WorkloadPodGroupSchedulingPolicy{
+					Basic: &schedulingv1alpha3.WorkloadPodGroupBasicSchedulingPolicy{},
+				},
+				PathElements: []string{"schedulingPolicy"},
+			},
+			DisruptionMode: workloadbuilder.DisruptionModeInput{
+				PodGroupData: &schedulingv1alpha3.WorkloadPodGroupDisruptionMode{
+					All: &schedulingv1alpha3.WorkloadPodGroupAllDisruptionMode{},
+				},
+				PathElements: []string{"disruptionMode"},
+			},
+		},
+	}
+
+	errs := workloadbuilder.NewBuilder(item, workloadbuilder.BuildOptions{
+		Owner: &metav1.OwnerReference{
+			APIVersion: "example.com/v1", Kind: "TrainJob", Name: "bad", UID: "u",
+		},
+		AllowedPolicies:        []workloadbuilder.SchedulingPolicyOption{workloadbuilder.BasicPolicy, workloadbuilder.GangPolicy},
+		AllowedDisruptionModes: []workloadbuilder.DisruptionModeOption{workloadbuilder.SingleMode, workloadbuilder.AllMode},
+	}).Validate(context.Background(), workloadbuilder.ValidationInput{})
+
+	if len(errs) > 0 {
+		fmt.Printf("rejected: %v\n", errs.ToAggregate())
+		return
+	}
+	fmt.Println("accepted")
+}
+```
+
+Run:
+
+```bash
+go run wb_reject_basic_all.go
+```
+
+Output:
+
+```
+rejected: spec.scheduling.disruptionMode: Invalid value: "": the disruptionMode `all` is not supported with the Basic scheduling policy
+```
+
+On **update**, pass `ValidationInput{OldRoot: oldItem}` so immutability checks compare against the previously stored tree. Zero `ValidationInput` is create.
+
+### Case 3: Composite WorkloadItem tree (group of groups)
+
+Save as `wb_composite.go`. A parent node with children compiles to a `CompositePodGroupTemplate`; leaf gang uses `minCount`, composite gang uses `minGroupCount`.
+
+```go
+// wb_composite.go
+package main
+
+import (
+	"context"
+	"fmt"
+
+	schedulingv1alpha3 "k8s.io/api/scheduling/v1alpha3"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/validation/field"
+	"k8s.io/component-helpers/scheduling/schedulingv1/workloadbuilder"
+)
+
+func main() {
+	minWorkers, minDriver, minGroups := int32(4), int32(1), int32(2)
+
+	workers := &workloadbuilder.WorkloadItem{
+		Name: "workers",
+		Path: field.NewPath("spec", "workers", "scheduling"),
+		Input: workloadbuilder.WorkloadInput{
+			Policy: workloadbuilder.PolicyInput{
+				PodGroupData: &schedulingv1alpha3.WorkloadPodGroupSchedulingPolicy{
+					Gang: &schedulingv1alpha3.WorkloadPodGroupGangSchedulingPolicy{MinCount: &minWorkers},
+				},
+				PathElements: []string{"schedulingPolicy"},
+			},
+		},
+	}
+	driver := &workloadbuilder.WorkloadItem{
+		Name: "driver",
+		Path: field.NewPath("spec", "driver", "scheduling"),
+		Input: workloadbuilder.WorkloadInput{
+			Policy: workloadbuilder.PolicyInput{
+				PodGroupData: &schedulingv1alpha3.WorkloadPodGroupSchedulingPolicy{
+					Gang: &schedulingv1alpha3.WorkloadPodGroupGangSchedulingPolicy{MinCount: &minDriver},
+				},
+				PathElements: []string{"schedulingPolicy"},
+			},
+		},
+	}
+	root := &workloadbuilder.WorkloadItem{
+		Name: "root",
+		Path: field.NewPath("spec", "scheduling"),
+		Input: workloadbuilder.WorkloadInput{
+			Policy: workloadbuilder.PolicyInput{
+				CompositePodGroupData: &schedulingv1alpha3.WorkloadCompositePodGroupSchedulingPolicy{
+					Gang: &schedulingv1alpha3.WorkloadCompositePodGroupGangSchedulingPolicy{
+						MinGroupCount: &minGroups,
+					},
+				},
+				PathElements: []string{"schedulingPolicy"},
+			},
+		},
+		Children: []*workloadbuilder.WorkloadItem{workers, driver},
+	}
+
+	owner := &metav1.OwnerReference{
+		APIVersion: "example.com/v1", Kind: "TrainJob", Name: "jobset-like", UID: "u",
+	}
+	b := workloadbuilder.NewBuilder(root, workloadbuilder.BuildOptions{
+		Name:                   "trainjob-wl",
+		Namespace:              "ml",
+		Owner:                  owner,
+		AllowedPolicies:        []workloadbuilder.SchedulingPolicyOption{workloadbuilder.BasicPolicy, workloadbuilder.GangPolicy},
+		AllowedDisruptionModes: []workloadbuilder.DisruptionModeOption{workloadbuilder.SingleMode, workloadbuilder.AllMode},
+	})
+	if errs := b.Validate(context.Background(), workloadbuilder.ValidationInput{}); len(errs) > 0 {
+		fmt.Printf("validation failed: %v\n", errs.ToAggregate())
+		return
+	}
+	wl, err := b.BuildWorkload()
+	if err != nil {
+		fmt.Printf("build failed: %v\n", err)
+		return
+	}
+	cpg, err := b.NewCompositePodGroup("trainjob-root", "root")
+	if err != nil {
+		fmt.Printf("composite failed: %v\n", err)
+		return
+	}
+
+	fmt.Printf("Workload %s/%s compositeTemplates=%d topLevelPodTemplates=%d\n",
+		wl.Namespace, wl.Name, len(wl.Spec.CompositePodGroupTemplates), len(wl.Spec.PodGroupTemplates))
+	ct := wl.Spec.CompositePodGroupTemplates[0]
+	fmt.Printf("  composite %q minGroupCount=%d nestedPodGroups=%d\n",
+		ct.Name, ct.SchedulingPolicy.Gang.MinGroupCount, len(ct.PodGroupTemplates))
+	fmt.Printf("CompositePodGroup %s/%s template=%s\n",
+		cpg.Namespace, cpg.Name, cpg.Spec.WorkloadRef.TemplateName)
+}
+```
+
+Run:
+
+```bash
+go run wb_composite.go
+```
+
+Output:
+
+```
+Workload ml/trainjob-wl compositeTemplates=1 topLevelPodTemplates=0
+  composite "root" minGroupCount=2 nestedPodGroups=2
+CompositePodGroup ml/trainjob-root template=root
+```
+
+Wire child `PodGroup`s with `spec.parentCompositePodGroupName` pointing at the runtime composite. Parent controllers that own the `Workload` typically name templates and let children call `NewBuilderFromExistingWorkload` + `NewPodGroup` (Job's `scheduling.k8s.io/group-template-name` annotation is the in-tree seam for that delegation).
+
+## Job `spec.scheduling` (operator view)
+
+With `WorkloadWithJob` enabled, users state intent on the Job instead of hoping the controller infers it:
+
+```yaml
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: distributed-training-job
+spec:
+  parallelism: 8
+  completions: 8
+  scheduling:
+    schedulingPolicy:
+      gang: {}   # minCount omitted → defaults to parallelism (8)
+    schedulingConstraints:
+      topology:
+        - key: topology.kubernetes.io/zone
+    disruptionMode:
+      all: {}
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: worker
+          image: example.com/train:1.2.3
+```
+
+Omit `spec.scheduling` (or its policy) → **basic**, same as ordinary Jobs. After create, most scheduling fields are frozen; **`schedulingPolicy.gang.minCount` stays mutable** so elastic gangs can rescale without recreating the Job (and `minCount` must not exceed `parallelism`).
+
+## Integrating your controller (checklist)
+
+1. Embed the `v1alpha3` blocks you support on your CRD; reuse Job's field names when you can.
+2. Build a `WorkloadItem` tree in reconcile (flat or nested); record `Path` / `PathElements`.
+3. Set allow-lists; leave DV on out-of-tree.
+4. `NewBuilder` → `Validate` → `BuildWorkload` → `NewPodGroup` / `NewCompositePodGroup`; create or patch; stamp pods.
+5. Do **not** write a private gang controller or invent a second `PodGroup` schema.
+
+You are explicitly not coupling users to a particular queueing product. Queueing/quota layers (e.g. Kueue) should compose on top of the in-tree `Workload` / `PodGroup` contract rather than replace it.
+
+## Gotchas
+
+| Trap | Fix |
+|------|-----|
+| Hand-assembling `Workload` YAML in every controller | Embed blocks + `workloadbuilder` |
+| Empty allow-lists | Deny-by-default — list `BasicPolicy` / `GangPolicy` (and modes) explicitly |
+| `all` disruption + `basic` policy | Rejected; use gang if you need group-level disruption |
+| Child recompiles parent's `Workload` | Use `NewBuilderFromExistingWorkload` |
+| Library works, cluster ignores gangs | Enable `GenericWorkload` (and friends) on apiserver / controller-manager / scheduler |
+| Alpha/Beta churn (`v1alpha2` → `v1alpha3`, disruption rename) | Pin helpers to cluster minor; read upgrade notes |
+| Shared DRA claim with gate off | Know `DRAWorkloadResourceClaims` behavior so you do not flood per-pod claims |
+
+## Try next
+
+1. Run the three programs above against `v0.37.1` helpers.
+2. On a kind cluster with the documented feature gates, apply a Job with `spec.scheduling.schedulingPolicy.gang` and watch `Workload` / `PodGroup` appear.
+3. Sketch your CRD's `spec.scheduling` (or per-component nest) and a single-node `WorkloadItem` before adding composite children.
+4. Read the package examples under `k8s.io/component-helpers/.../workloadbuilder/examples` for the canonical Job and delegation flows.
+
+## Sources
+
+- [Scheduling Building Block APIs and the workloadbuilder Library](https://kubernetes.io/docs/concepts/workloads/workload-api/workloadbuilder/)
+- [Kubernetes v1.37: Advancing Workload-Aware Scheduling](https://kubernetes.io/blog/2026/09/08/kubernetes-v1-37-advancing-workload-aware-scheduling/)
+- [pkg.go.dev — workloadbuilder](https://pkg.go.dev/k8s.io/component-helpers/scheduling/schedulingv1/workloadbuilder)
+- [KEP-6089 — Workload Aware Scheduling Controller APIs](https://www.kubernetes.dev/resources/keps/6089/)
+- [KEP-5547 — Integrate Workload APIs with Job Controller](https://www.kubernetes.dev/resources/keps/5547/)
