@@ -33,6 +33,7 @@ List, prioritize, signal, and background work. Covers classic job control in the
 | `ulimit` | ulimit is a shell builtin (bash/zsh/etc.) that shows or sets resource limits for the current shell and its child… |
 | `ipcs` | ipcs lists System V IPC objects: message queues, shared memory segments, and semaphore arrays. |
 | `ipcrm` | ipcrm removes System V IPC objects: shared memory segments, semaphore arrays, and message queues. |
+| `flock` | flock wraps a command or script section in a kernel file lock so two copies never run at once (cron overlap, deploy/backup mutual exclusion). |
 
 
 ## Suggested starting points
@@ -42,6 +43,7 @@ List, prioritize, signal, and background work. Covers classic job control in the
 3. Job control in one shell: `jobs`, `fg`, `bg`, `nohup`.
 4. Priority and I/O class: `nice`, `renice`, `ionice`.
 5. Limits and IPC: `ulimit`, `ipcs`/`ipcrm`, `fuser`.
+6. Mutual exclusion for jobs and scripts: `flock`.
 
 ## Related parts
 
