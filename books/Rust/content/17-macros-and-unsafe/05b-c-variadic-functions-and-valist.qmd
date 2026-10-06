@@ -1,0 +1,443 @@
+---
+title: "C-Variadic Functions and VaList"
+---
+
+# C-Variadic Functions and `VaList`
+
+## Thesis
+
+Since **Rust 1.99** (October 2026) you can *define* functions with a C variable argument list — `unsafe extern "C" fn f(fmt: *const c_char, args: ...)` — not just call foreign ones like `printf`. The `...` parameter arrives as a [`core::ffi::VaList`](https://doc.rust-lang.org/stable/core/ffi/struct.VaList.html), which is layout- and ABI-compatible with the platform's C `va_list`, so you can read arguments yourself or hand the whole list to a C `v*` function such as `vsnprintf`.
+
+That closes a long-standing FFI gap: a Rust library can now implement a C header that contains `void log(int level, const char *fmt, ...)`, sentinel-terminated APIs in the style of `execl`, or plugin callback tables that expect variadic slots — without a C shim file.
+
+The feature is deliberately sharp. A variadic list carries **no count and no types**. Every read is an `unsafe` promise that the caller sent exactly what you are about to take. The job of this chapter is to make that promise small, explicit, and checked by the C compiler wherever possible.
+
+## Mental model
+
+```text
+C caller                       Rust callee (unsafe extern "C" fn f(fixed, ap: ...))
+─────────                      ───────────────────────────────────────────────────
+f(2, "x", 3.5f)                ap: VaList          ← va_start happens for you
+   │  default argument               │
+   │  promotions:                    ├─ ap.next_arg::<*const c_char>()   ← va_arg
+   │   char/short → int              ├─ ap.next_arg::<c_double>()        ← va_arg
+   │   float      → double           │
+   ▼                                 ├─ ap.clone()                       ← va_copy
+registers / stack per ABI            │
+                                     └─ drop(ap)                         ← va_end
+```
+
+| C | Rust 1.99 |
+|---|-----------|
+| `void f(int n, ...)` (definition) | `unsafe extern "C" fn f(n: c_int, mut ap: ...)` |
+| `va_list ap; va_start(ap, n);` | implicit — `ap` *is* the started `VaList` |
+| `va_arg(ap, int)` | `unsafe { ap.next_arg::<c_int>() }` |
+| `va_copy(dst, src)` | `let dst = src.clone();` |
+| `va_end(ap)` | `Drop` of the `VaList` |
+| `void vf(int n, va_list ap)` | `unsafe fn vf(n: c_int, ap: VaList<'_>)` |
+
+Rules the compiler enforces:
+
+1. **The definition must be `unsafe`.** Callers cannot be checked, so the function is unsafe to call.
+2. **ABI must be `"C"` or `"C-unwind"`** for a Rust-bodied definition (other ABIs are only allowed for declarations in `extern` blocks, or naked functions written in assembly).
+3. **The `...` parameter needs a name** in a definition (`args: ...`), and it must be last.
+4. **Only promotion-safe types can be read.** `next_arg::<T>()` requires the (nightly-only) trait `VaArgSafe`; on stable you just use the concrete types it is implemented for: `c_int`/`c_uint` and wider integers, `c_double`, and raw pointers. `f32`, `i8`, `u16`, and `bool` are rejected because C never passes them through `...` unpromoted.
+
+Rules the compiler **cannot** enforce: how many arguments there are, and what type each one has. Those come from a *protocol* — a count, a format string, or a sentinel — that you document in the `# Safety` section and, ideally, encode in the C header.
+
+## Worked examples
+
+All listings were built with `rustc 1.99.0 (b940084d7 2026-09-28)` and GCC 14.2 on x86_64 Linux, edition 2024.
+
+### Case 1: count-prefixed list, defined and called in Rust
+
+The simplest protocol: the first fixed argument says how many follow. The second function shows the `v`-variant split you will want for anything non-trivial — a thin variadic entry point that forwards its `VaList` to an ordinary `unsafe fn`.
+
+```rust
+// sum.rs — define and call a C-variadic function entirely in Rust.
+use std::ffi::{c_double, c_int, VaList};
+
+/// # Safety
+/// The caller must pass exactly `count` further arguments, each a C `int`.
+unsafe extern "C" fn sum_ints(count: c_int, mut args: ...) -> c_int {
+    let mut total = 0;
+    for _ in 0..count {
+        // SAFETY: the caller promised `count` ints follow.
+        total += unsafe { args.next_arg::<c_int>() };
+    }
+    total
+}
+
+/// The `v`-variant: takes an already-started list, like C's `vprintf`.
+///
+/// # Safety
+/// `ap` must hold exactly `count` C `double`s.
+unsafe fn vmean(count: c_int, mut ap: VaList<'_>) -> c_double {
+    let mut acc = 0.0;
+    for _ in 0..count {
+        acc += unsafe { ap.next_arg::<c_double>() };
+    }
+    acc / count as c_double
+}
+
+/// # Safety
+/// The caller must pass exactly `count` further `double`s.
+unsafe extern "C" fn mean(count: c_int, args: ...) -> c_double {
+    unsafe { vmean(count, args) }
+}
+
+fn main() {
+    let s = unsafe { sum_ints(3, 10, 20, 12) };
+    let m = unsafe { mean(4, 1.0, 2.0, 3.0, 4.5) };
+    let small: u8 = 7;
+    let k = unsafe { sum_ints(2, small as c_int, -2) }; // explicit promotion
+    println!("sum = {s}, mean = {m}, k = {k}");
+}
+```
+
+```bash
+rustc --edition 2024 sum.rs && ./sum
+```
+
+```text
+sum = 42, mean = 2.625, k = 5
+```
+
+Note `small as c_int`: when *Rust* calls a variadic function, it refuses to pass `u8` or `f32` and asks you to promote by hand (see *The trap*).
+
+### Case 2: a printf-style logger implemented in Rust, called from C
+
+This is the case the feature exists for. A C program (or a C plugin host) expects `rlog(int level, const char *fmt, ...)`. The Rust implementation never parses the format string itself; it forwards the list to libc's `vsnprintf`, which is the only component that actually understands `%s`, `%.1f`, and `%llu`.
+
+Two details matter:
+
+- `vsnprintf` **consumes** the `va_list` it receives. To measure first and then render, pass `ap.clone()` (C `va_copy`) to the measuring call and the original to the rendering call.
+- `VaList` can be passed **by value across FFI** — declare the C parameter as `ap: VaList` in the `extern` block.
+
+```rust
+// rlog.rs — printf-style logging and a sentinel-terminated API,
+// implemented in Rust and exported with the C ABI.
+use std::ffi::{c_char, c_int, CStr, VaList};
+use std::ptr;
+
+unsafe extern "C" {
+    // int vsnprintf(char *str, size_t size, const char *format, va_list ap);
+    fn vsnprintf(buf: *mut c_char, size: usize, fmt: *const c_char, ap: VaList) -> c_int;
+}
+
+/// Format `fmt` with `ap` into an owned Rust `String`.
+///
+/// # Safety
+/// `fmt` must be a valid NUL-terminated C format string and `ap` must hold
+/// arguments matching it exactly (same rules as C `vprintf`).
+unsafe fn vformat(fmt: *const c_char, ap: VaList<'_>) -> Option<String> {
+    // Pass 1: measure. vsnprintf consumes the list it is given, so hand it a
+    // clone (C: va_copy) and keep the original for pass 2.
+    let needed = unsafe { vsnprintf(ptr::null_mut(), 0, fmt, ap.clone()) };
+    if needed < 0 {
+        return None;
+    }
+    // Pass 2: render into a buffer with room for the trailing NUL.
+    let mut buf = vec![0u8; needed as usize + 1];
+    let written = unsafe { vsnprintf(buf.as_mut_ptr().cast(), buf.len(), fmt, ap) };
+    if written != needed {
+        return None;
+    }
+    buf.truncate(needed as usize);
+    String::from_utf8(buf).ok()
+}
+
+/// C signature: `void rlog(int level, const char *fmt, ...);`
+///
+/// # Safety
+/// Same contract as `printf`: the variadic arguments must match `fmt`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rlog(level: c_int, fmt: *const c_char, args: ...) {
+    let tag = match level {
+        0 => "DEBUG",
+        1 => "INFO",
+        2 => "WARN",
+        _ => "ERROR",
+    };
+    match unsafe { vformat(fmt, args) } {
+        Some(msg) => eprintln!("[{tag}] {msg}"),
+        None => {
+            let raw = unsafe { CStr::from_ptr(fmt) };
+            eprintln!("[{tag}] <format error: {raw:?}>");
+        }
+    }
+}
+
+/// C signature: `size_t rjoin_len(const char *first, ...);`
+/// Sum of strlen() of every string up to a terminating NULL pointer.
+///
+/// # Safety
+/// Every argument must be a `const char *` to a NUL-terminated string,
+/// and the list must end with `(char *)NULL`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rjoin_len(first: *const c_char, mut rest: ...) -> usize {
+    let mut total = 0;
+    let mut cur = first;
+    while !cur.is_null() {
+        total += unsafe { CStr::from_ptr(cur) }.count_bytes();
+        cur = unsafe { rest.next_arg::<*const c_char>() };
+    }
+    total
+}
+```
+
+The public C header is where you buy back type checking. `format(printf, 2, 3)` tells GCC and Clang that argument 2 is a printf format and checking starts at argument 3; `sentinel` demands a trailing null pointer.
+
+```c
+/* rlog.h — public C header for the Rust-implemented logger. */
+#ifndef RLOG_H
+#define RLOG_H
+#include <stddef.h>
+
+/* format(printf, 2, 3): argument 2 is the format, checking starts at 3. */
+void rlog(int level, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
+
+/* sentinel: the variadic list must end with a NULL pointer. */
+size_t rjoin_len(const char *first, ...) __attribute__((sentinel));
+
+#endif
+```
+
+```c
+/* main.c — C caller for the Rust-implemented variadic functions. */
+#include <stdio.h>
+#include "rlog.h"
+
+int main(void) {
+    rlog(1, "listening on %s:%d", "0.0.0.0", 8443);
+    rlog(2, "disk %s at %.1f%% (%llu bytes free)", "/var", 91.5, 4294967296ULL);
+    rlog(3, "%s", "plain string, no surprises");
+
+    size_t n = rjoin_len("usr", "local", "bin", (char *)NULL);
+    printf("rjoin_len = %zu\n", n);
+    return 0;
+}
+```
+
+Build the Rust side as a static library, then link it into the C program with the C compiler driver:
+
+```bash
+rustc --edition 2024 -O --crate-type=staticlib rlog.rs -o librlog.a
+cc -std=c17 -Wall -Wextra main.c -L. -lrlog -o demo
+./demo
+```
+
+```text
+[INFO] listening on 0.0.0.0:8443
+[WARN] disk /var at 91.5% (4294967296 bytes free)
+[ERROR] plain string, no surprises
+rjoin_len = 11
+```
+
+If the link fails with undefined symbols from libc, pthreads, or libdl, ask `rustc` what the static library needs and append it to the `cc` line:
+
+```bash
+rustc --edition 2024 --crate-type=staticlib rlog.rs -o librlog.a --print native-static-libs
+```
+
+```text
+note: native-static-libs: -lgcc_s -lutil -lrt -lpthread -lm -ldl -lc
+```
+
+In a Cargo project the equivalent is `[lib] crate-type = ["staticlib"]` (or `"cdylib"`) in `Cargo.toml`; nothing else about the code changes.
+
+### Case 3: the header catches caller mistakes before they become UB
+
+The Rust callee cannot detect a wrong argument type — it will happily read 4 bytes of an 8-byte `long long`. The defence lives at the call site, in the C compiler, driven by the attributes in `rlog.h`:
+
+```c
+/* bad.c — mistakes the header attributes catch at compile time. */
+#include "rlog.h"
+
+int main(void) {
+    long long bytes = 4294967296LL;
+    rlog(1, "free: %d bytes", bytes);        /* wrong conversion */
+    return (int)rjoin_len("usr", "bin");     /* missing NULL sentinel */
+}
+```
+
+```bash
+cc -std=c17 -Wall -Wextra -c bad.c -o /dev/null
+```
+
+```text
+bad.c: In function ‘main’:
+bad.c:6:21: warning: format ‘%d’ expects argument of type ‘int’, but argument 3 has type ‘long long int’ [-Wformat=]
+    6 |     rlog(1, "free: %d bytes", bytes);        /* wrong conversion */
+      |                    ~^         ~~~~~
+      |                     |         |
+      |                     int       long long int
+      |                    %lld
+bad.c:7:5: warning: missing sentinel in function call [-Wformat=]
+    7 |     return (int)rjoin_len("usr", "bin");     /* missing NULL sentinel */
+      |     ^~~~~~
+```
+
+Clang reports the same two problems (`-Wformat`, `-Wsentinel`) and even suggests the fix (`, NULL`). In CI, build C callers with `-Werror=format` (GCC files the missing-sentinel warning under `-Wformat`; Clang under `-Wsentinel`, so add `-Werror=sentinel` there) so these never ship.
+
+### Case 4: what the compiler refuses
+
+Three mistakes are rejected at compile time on Rust 1.99. Seeing the errors once makes the rules stick.
+
+A definition that is not `unsafe`:
+
+```rust
+// not_unsafe.rs
+use std::ffi::c_int;
+extern "C" fn count_args(_n: c_int, _args: ...) {}
+fn main() {}
+```
+
+```bash
+rustc --edition 2024 not_unsafe.rs
+```
+
+```text
+error: functions with a C variable argument list must be unsafe
+ --> not_unsafe.rs:3:37
+  |
+3 | extern "C" fn count_args(_n: c_int, _args: ...) {}
+  |                                     ^^^^^^^^^^
+  |
+help: add the `unsafe` keyword to this definition
+  |
+3 | unsafe extern "C" fn count_args(_n: c_int, _args: ...) {}
+  | ++++++
+
+error: aborting due to 1 previous error
+```
+
+Reading a type that C always promotes:
+
+```rust
+// read_f32.rs
+unsafe extern "C" fn first_float(mut args: ...) -> f32 {
+    unsafe { args.next_arg::<f32>() }
+}
+fn main() {}
+```
+
+```bash
+rustc --edition 2024 read_f32.rs
+```
+
+```text
+error[E0277]: the trait bound `f32: VaArgSafe` is not satisfied
+ --> read_f32.rs:3:30
+  |
+3 |     unsafe { args.next_arg::<f32>() }
+  |                   --------   ^^^ the nightly-only, unstable trait `VaArgSafe` is not implemented for `f32`
+  |                   |
+  |                   required by a bound introduced by this call
+  |
+  = help: the following other types implement trait `VaArgSafe`:
+            f64
+            i128
+            i32
+            i64
+            isize
+            u128
+            u32
+            u64
+            usize
+note: required by a bound in `VaList::<'f>::next_arg`
+```
+
+(`i16`, `u8`, and `bool` fail the same way. Read `c_int` / `c_uint` / `c_double` and narrow afterwards with a checked conversion.)
+
+Passing an unpromoted type *from Rust*:
+
+```rust
+// promote.rs
+use std::ffi::c_int;
+
+unsafe extern "C" fn sum_ints(count: c_int, mut args: ...) -> c_int {
+    let mut total = 0;
+    for _ in 0..count {
+        total += unsafe { args.next_arg::<c_int>() };
+    }
+    total
+}
+
+fn main() {
+    let small: u8 = 7;
+    let ratio: f32 = 0.5;
+    let s = unsafe { sum_ints(2, small, ratio) };
+    println!("{s}");
+}
+```
+
+```bash
+rustc --edition 2024 promote.rs
+```
+
+```text
+error[E0617]: can't pass `u8` to variadic function
+  --> promote.rs:15:34
+   |
+15 |     let s = unsafe { sum_ints(2, small, ratio) };
+   |                                  ^^^^^
+   |
+help: cast the value to `c_uint`
+   |
+15 |     let s = unsafe { sum_ints(2, small as c_uint, ratio) };
+   |                                        +++++++++
+
+error[E0617]: can't pass `f32` to variadic function
+  --> promote.rs:15:41
+   |
+15 |     let s = unsafe { sum_ints(2, small, ratio) };
+   |                                         ^^^^^
+   |
+help: cast the value to `c_double`
+   |
+15 |     let s = unsafe { sum_ints(2, small, ratio as c_double) };
+   |                                               +++++++++++
+
+error: aborting due to 2 previous errors
+```
+
+Notice the second error also exposes a *logic* bug the compiler cannot see: `sum_ints` reads `c_int`s, but the caller is now about to send a `c_double`. Casting to silence E0617 is correct only if the cast type matches what the callee reads.
+
+## The trap
+
+**Treating `next_arg` as if it were type-checked.** It is a raw read guided only by your protocol. Every one of these is undefined behaviour, and none produces a compile error in the callee:
+
+- **Reading past the end.** There is no length; `next_arg` on an exhausted list reads whatever is in the next register or stack slot. A missing sentinel in Case 2 walks off into garbage pointers.
+- **Reading the wrong type.** Caller passes `long long`, you read `c_int`; caller passes `double`, you read a pointer. The `VaList` docs allow only *compatible* types: identical types, same-size integers whose value fits both, compatible pointers, or `*const c_void` ↔ `*const u8`/`i8`.
+- **Trusting integer widths across platforms.** `c_long` is 64-bit on Linux x86_64 and 32-bit on Windows x86_64. Read `c_long` when the C side passes `long`, not `i64`. The `VaArgSafe` docs say implementations for `i32`/`usize` "shouldn't be relied upon directly"; spell the C type.
+- **Re-reading a consumed list.** After `vsnprintf(…, ap)` the list is spent; use `ap.clone()` *before* the first consumer if you need two passes.
+- **Panicking out of an `extern "C"` function.** A panic that reaches an `extern "C"` boundary aborts the process. If unwinding through C is genuinely intended, use `"C-unwind"`; otherwise catch and convert errors to return codes, as `rlog` does with its `None` branch.
+- **Calling your own variadic from Rust.** Rust callers get none of the C header's format checking. Give Rust code a normal, safe function (`fn log(level: Level, msg: &str)`) and keep the variadic entry point for C.
+
+## The boring rule
+
+> A C-variadic function in Rust is a thin, `unsafe`, `#[unsafe(no_mangle)]` door for C callers. It reads arguments only under a documented protocol — a count, a format string handed to libc's `v*` functions, or a NULL sentinel — reads only C-spelled promoted types (`c_int`, `c_uint`, `c_long`, `c_double`, pointers), clones before any second pass, never unwinds through `extern "C"`, and ships with a C header carrying `format(printf, …)` or `sentinel` so the *caller's* compiler checks what the callee cannot.
+
+Checklist before merging:
+
+1. `# Safety` section states the exact protocol (how many, which types, how the list ends).
+2. Real formatting is delegated to `vsnprintf`/`vfprintf`; you do not reimplement `%` parsing.
+3. Every read type is a `core::ffi` C type or a raw pointer.
+4. The C header has `__attribute__((format(printf, N, M)))` or `__attribute__((sentinel))`, and CI builds C callers with `-Werror=format`.
+5. Rust-side callers use a safe non-variadic API instead.
+
+## Try this
+
+1. Add `rlog_count(void)` to `rlog.rs` that returns how many messages have been logged (an `AtomicU32`), call it from `main.c`, and confirm it prints `3`.
+2. Remove `(char *)NULL` from the `rjoin_len` call in `main.c`, rebuild with `-Wall`, and read the warning. Then delete `__attribute__((sentinel))` from the header and observe that the warning disappears while the bug remains — that is why the attribute is part of the API.
+3. Write `vrlog(int level, const char *fmt, va_list ap)` in Rust taking `ap: VaList<'_>`, make `rlog` a one-line forwarder to it, and export both. Call `vrlog` from a C wrapper function that does its own `va_start`/`va_end`.
+4. Change `vformat` to pass `ap` (not `ap.clone()`) to the measuring `vsnprintf` call. Explain why the second call is now undefined behaviour even if it appears to work on your machine.
+5. Run `rustc --print native-static-libs` for your target and wire the result into a `Makefile` rule so the link line is never guessed.
+
+## Sources
+
+- [Announcing Rust 1.99.0 — extern "C" variadics](https://blog.rust-lang.org/2026/10/01/Rust-1.99.0/) (Rust Blog, 2026-10-01)
+- [`core::ffi::VaList`](https://doc.rust-lang.org/stable/core/ffi/struct.VaList.html) and [`VaArgSafe`](https://doc.rust-lang.org/stable/core/ffi/trait.VaArgSafe.html) — std/core API docs
+- [The Rust Reference — Functions: C-variadic parameters](https://doc.rust-lang.org/reference/items/functions.html) and [External blocks: variadic functions](https://doc.rust-lang.org/reference/items/external-blocks.html)
+- GCC manual, *Common Function Attributes* (`format`, `sentinel`)
