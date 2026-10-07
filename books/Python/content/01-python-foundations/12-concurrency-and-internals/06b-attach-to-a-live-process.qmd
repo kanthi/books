@@ -1,0 +1,450 @@
+---
+title: "Attaching to a Live Process"
+---
+
+# Attaching to a Live Process
+
+A service has been running for six hours and now it is stuck, or slow, or holding a value it should not have. Restarting it destroys the evidence. Adding a `print` means redeploying and waiting for the bug to come back. Python **3.14** adds a supported way in from the outside ([PEP 768](https://peps.python.org/pep-0768/)). Another Python process with the right OS permissions can ask a running interpreter to execute a script at its next safe point. Three tools are built on that one mechanism:
+
+| Tool | What it does |
+|------|--------------|
+| `sys.remote_exec(pid, path)` | Queue a `.py` file to run **inside** the target process |
+| `python -m pdb -p PID` | Attach the full `pdb` debugger to a running process; `quit` detaches |
+| `python -m asyncio ps PID` / `pstree PID` | Print every asyncio task and who awaits whom, without stopping the loop |
+
+All examples run with `uv` on Linux and CPython 3.14 (3.14.8 at the time of writing). No code in the target has to change: these are **live** processes started the normal way.
+
+## Mental model
+
+- **Safe point, not a signal handler.** `sys.remote_exec` writes a script path and a "pending" flag into the target's thread state, then sets a bit in the interpreter's *eval breaker*. That is the same check the interpreter uses for signals and the GIL hand-off. The target's **main thread** runs the script the next time it executes Python bytecode. The call returns at once and tells you nothing about when, or whether, the script ran.
+- **It runs as the target.** The script executes with the target's globals reachable through `sys.modules["__main__"]`, its open files, its threads, and its privileges. `print` goes to the **target's** stdout. Anything you want back you must write somewhere yourself (a file, a socket).
+- **Same interpreter family.** Caller and target must be the same CPython `major.minor`. If either is a pre-release (alpha, beta, rc), they must be the exact same version.
+- **OS permission is the gate.** On Linux this is the same check `gdb` or `strace -p` need: same user, and not blocked by Yama `ptrace_scope`, a container seccomp profile, or another tracer already attached. Python adds no new privilege. Root can attach to anything.
+- **Opt-out exists.** `PYTHON_DISABLE_REMOTE_DEBUG=1` or `-X disable_remote_debug` turns off the in-process side, for hardened deployments where nobody should ever attach.
+
+## Worked examples
+
+### Case 1: Run a probe inside a running worker
+
+Save as `worker.py`. It is an ordinary long-running loop with a background thread and some module-level state.
+
+```python
+# worker.py
+import os
+import threading
+import time
+
+jobs_done = 0
+config = {"batch": 50, "mode": "slow"}
+
+
+def heartbeat():
+    while True:
+        time.sleep(1)
+
+
+def process(n):
+    time.sleep(0.2)
+    return n * n
+
+
+def main():
+    global jobs_done
+    threading.Thread(target=heartbeat, name="heartbeat", daemon=True).start()
+    print("pid", os.getpid(), flush=True)
+    while True:
+        process(jobs_done)
+        jobs_done += 1
+        if config["mode"] == "fast":
+            print("switched to fast after", jobs_done, "jobs", flush=True)
+            config["mode"] = "done"
+
+
+if __name__ == "__main__":
+    main()
+```
+
+Save as `hello_probe.py`. This is the code that will run **inside** the worker.
+
+```python
+# hello_probe.py
+import os
+import sys
+
+main = sys.modules["__main__"]
+print(f"[probe] running inside pid {os.getpid()}: "
+      f"jobs_done={main.jobs_done} mode={main.config['mode']}", flush=True)
+```
+
+Save as `attach_hello.py`. This is the caller.
+
+```python
+# attach_hello.py
+import os
+import sys
+
+pid = int(sys.argv[1])
+script = os.path.abspath("hello_probe.py")
+sys.remote_exec(pid, script)
+print(f"queued {script} for pid {pid}")
+```
+
+Run the worker in one terminal:
+
+```bash
+uv run --python 3.14 python worker.py
+```
+
+```
+pid 666610
+```
+
+In a second terminal, use the PID the worker printed:
+
+```bash
+uv run --python 3.14 python attach_hello.py 666610
+```
+
+```
+queued /tmp/livepy/hello_probe.py for pid 666610
+```
+
+Back in the first terminal, the worker printed one more line by itself:
+
+```
+[probe] running inside pid 666610: jobs_done=7 mode=slow
+```
+
+Pass an **absolute** path. The caller checks that the file exists relative to *its own* working directory, and the target opens the path later from *its* working directory. From a subdirectory (`other/`), pass a relative name:
+
+```bash
+cd other && uv run --python 3.14 python -c "import sys; sys.remote_exec(666610, 'hello_probe.py')"
+```
+
+```
+Traceback (most recent call last):
+  File "<string>", line 1, in <module>
+    import sys; sys.remote_exec(666610, 'hello_probe.py')
+                ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^
+FileNotFoundError: Script file does not exist
+```
+
+### Case 2: Dump every thread's stack and bring it home
+
+Save as `dump_stacks.py`. This is the tool you actually keep in a toolbox. It writes a probe into a private temp directory, queues it, and waits for a result file. The probe writes to a temporary name and then `os.replace`s it into place, so the caller never reads a half-written file. `faulthandler.dump_traceback(all_threads=True)` prints every thread's Python stack.
+
+```python
+# dump_stacks.py
+import os
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+
+PROBE = """\
+import faulthandler, os, sys
+main = sys.modules["__main__"]
+with open({tmp!r}, "w") as fh:
+    print("jobs_done:", getattr(main, "jobs_done", "?"), file=fh)
+    faulthandler.dump_traceback(file=fh, all_threads=True)
+os.replace({tmp!r}, {out!r})
+"""
+
+
+def dump(pid, timeout=5.0):
+    workdir = Path(tempfile.mkdtemp(prefix="pydump-"))
+    out = workdir / "stacks.txt"
+    tmp = workdir / "stacks.tmp"
+    script = workdir / "probe.py"
+    script.write_text(PROBE.format(tmp=str(tmp), out=str(out)))
+    sys.remote_exec(pid, str(script))   # returns at once; runs later
+    deadline = time.monotonic() + timeout
+    while not out.exists():             # probe renames when done
+        if time.monotonic() > deadline:
+            # Leave probe.py in place: the target may still run it later.
+            raise TimeoutError(f"pid {pid} did not run the probe in {timeout}s; "
+                               f"left {script}")
+        time.sleep(0.05)
+    text = out.read_text()
+    script.unlink()
+    out.unlink()
+    workdir.rmdir()
+    return text
+
+
+if __name__ == "__main__":
+    limit = float(sys.argv[2]) if len(sys.argv) > 2 else 5.0
+    print(dump(int(sys.argv[1]), timeout=limit), end="")
+```
+
+With `worker.py` running (this run printed `pid 667102`):
+
+```bash
+uv run --python 3.14 python dump_stacks.py 667102
+```
+
+Output (stdlib paths shortened to `…/lib/python3.14/`; thread IDs vary):
+
+```
+jobs_done: 7
+Thread 0x00007f1d966a66c0 [heartbeat] (most recent call first):
+  File "/tmp/livepy/worker.py", line 12 in heartbeat
+  File "…/lib/python3.14/threading.py", line 1024 in run
+  File "…/lib/python3.14/threading.py", line 1082 in _bootstrap_inner
+  File "…/lib/python3.14/threading.py", line 1044 in _bootstrap
+
+Current thread 0x00007f1d96963780 [python3.14] (most recent call first):
+  File "<string>", line 5 in <module>
+  File "/tmp/livepy/worker.py", line 16 in process
+  File "/tmp/livepy/worker.py", line 25 in main
+  File "/tmp/livepy/worker.py", line 33 in <module>
+```
+
+Read it bottom-up as usual. The `<string>` frame on top of the main thread is the probe itself. Everything under it is what the worker was doing when it reached the safe point: inside `process`, in `time.sleep`. The heartbeat thread is parked in its own sleep.
+
+### Case 3: `pdb -p` — a debugger on a process you did not start under one
+
+`python -m pdb -p PID` uses the same mechanism to make the target connect back to your terminal. You get a normal `(Pdb)` prompt stopped at the target's current line. You can inspect, evaluate, and even change state. `quit` **detaches** and the target keeps running; it does not kill it.
+
+With `worker.py` running:
+
+```bash
+uv run --python 3.14 python -m pdb -p 667102
+```
+
+Type these at the prompt (shown here as a pipe so the session is reproducible):
+
+```bash
+printf 'p jobs_done, config\nwhere\n!config["mode"] = "fast"\nquit\n' | uv run --python 3.14 python -m pdb -p 667102
+```
+
+Output:
+
+```
+> /tmp/livepy/worker.py(16)process()
+-> time.sleep(0.2)
+(Pdb) (8, {'batch': 50, 'mode': 'slow'})
+(Pdb)   /tmp/livepy/worker.py(33)<module>()
+-> main()
+  /tmp/livepy/worker.py(25)main()
+-> process(jobs_done)
+> /tmp/livepy/worker.py(16)process()
+-> time.sleep(0.2)
+(Pdb) (Pdb)
+```
+
+The worker's own terminal shows the change took effect after detach:
+
+```
+pid 667102
+switched to fast after 9 jobs
+```
+
+While the `(Pdb)` prompt is open the target's main thread is **stopped**. On a server that means requests queue behind you. Get in, read, get out.
+
+### Case 4: See every asyncio task with `ps` and `pstree`
+
+Save as `aio_service.py`. Two workers each run two long "fetches" inside `TaskGroup`s. Name your tasks; the tools print the names.
+
+```python
+# aio_service.py
+import asyncio, os
+
+async def fetch(name, delay):
+    await asyncio.sleep(delay)
+
+async def worker(name):
+    async with asyncio.TaskGroup() as tg:
+        tg.create_task(fetch(f"{name}-a", 3600), name=f"{name}-fetch-a")
+        tg.create_task(fetch(f"{name}-b", 3600), name=f"{name}-fetch-b")
+
+async def main():
+    print("pid", os.getpid(), flush=True)
+    async with asyncio.TaskGroup() as tg:
+        tg.create_task(worker("orders"), name="orders")
+        tg.create_task(worker("billing"), name="billing")
+
+asyncio.run(main())
+```
+
+Run it, then from another terminal:
+
+```bash
+uv run --python 3.14 python aio_service.py
+uv run --python 3.14 python -m asyncio ps 667133
+```
+
+Output:
+
+```
+tid        task id              task name            coroutine stack                                    awaiter chain                                      awaiter name    awaiter id
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+667133     0x7f7e64c68b90       Task-1               TaskGroup._aexit -> TaskGroup.__aexit__ -> main                                                                       0x0
+667133     0x7f7e64c68d70       orders               TaskGroup._aexit -> TaskGroup.__aexit__ -> worker  TaskGroup._aexit -> TaskGroup.__aexit__ -> main    Task-1          0x7f7e64c68b90
+667133     0x7f7e64e03df0       billing              TaskGroup._aexit -> TaskGroup.__aexit__ -> worker  TaskGroup._aexit -> TaskGroup.__aexit__ -> main    Task-1          0x7f7e64c68b90
+667133     0x7f7e64e03c20       orders-fetch-a       sleep -> fetch                                     TaskGroup._aexit -> TaskGroup.__aexit__ -> worker  orders          0x7f7e64c68d70
+667133     0x7f7e64bde350       orders-fetch-b       sleep -> fetch                                     TaskGroup._aexit -> TaskGroup.__aexit__ -> worker  orders          0x7f7e64c68d70
+667133     0x7f7e64bde6d0       billing-fetch-a      sleep -> fetch                                     TaskGroup._aexit -> TaskGroup.__aexit__ -> worker  billing         0x7f7e64e03df0
+667133     0x7f7e64e56de0       billing-fetch-b      sleep -> fetch                                     TaskGroup._aexit -> TaskGroup.__aexit__ -> worker  billing         0x7f7e64e03df0
+```
+
+`ps` is a flat table: each task, its coroutine stack, and the task awaiting it. `pstree` draws the same data as an await tree:
+
+```bash
+uv run --python 3.14 python -m asyncio pstree 667133
+```
+
+Output (stdlib paths shortened):
+
+```
+└── (T) Task-1
+    └──  main /tmp/livepy/aio_service.py:14
+        └──  TaskGroup.__aexit__ …/lib/python3.14/asyncio/taskgroups.py:72
+            └──  TaskGroup._aexit …/lib/python3.14/asyncio/taskgroups.py:121
+                ├── (T) orders
+                │   └──  worker /tmp/livepy/aio_service.py:8
+                │       └──  TaskGroup.__aexit__ …/lib/python3.14/asyncio/taskgroups.py:72
+                │           └──  TaskGroup._aexit …/lib/python3.14/asyncio/taskgroups.py:121
+                │               ├── (T) orders-fetch-a
+                │               │   └──  fetch /tmp/livepy/aio_service.py:5
+                │               │       └──  sleep …/lib/python3.14/asyncio/tasks.py:712
+                │               └── (T) orders-fetch-b
+                │                   └──  fetch /tmp/livepy/aio_service.py:5
+                │                       └──  sleep …/lib/python3.14/asyncio/tasks.py:712
+                └── (T) billing
+                    └──  worker /tmp/livepy/aio_service.py:8
+                        └──  TaskGroup.__aexit__ …/lib/python3.14/asyncio/taskgroups.py:72
+                            └──  TaskGroup._aexit …/lib/python3.14/asyncio/taskgroups.py:121
+                                ├── (T) billing-fetch-a
+                                │   └──  fetch /tmp/livepy/aio_service.py:5
+                                │       └──  sleep …/lib/python3.14/asyncio/tasks.py:712
+                                └── (T) billing-fetch-b
+                                    └──  fetch /tmp/livepy/aio_service.py:5
+                                        └──  sleep …/lib/python3.14/asyncio/tasks.py:712
+```
+
+Neither command runs code in the target. They read the interpreter's memory through the same debug offsets, so they work even when the event loop is wedged and could never service a request.
+
+## The trap
+
+**A busy C call delays the probe.** The script runs at the next bytecode safe point on the **main thread**. If the main thread is blocked inside one long C call (a `sleep`, a blocking `recv`, a big NumPy operation, a lock acquire), nothing runs until that call returns. Save as `blocked.py`:
+
+```python
+# blocked.py
+import os
+import time
+
+print("pid", os.getpid(), flush=True)
+time.sleep(8)          # one long C-level call in the main thread
+print("woke up", flush=True)
+time.sleep(2)
+```
+
+Run it, then give `dump_stacks.py` a 2-second timeout:
+
+```bash
+uv run --python 3.14 python blocked.py
+uv run --python 3.14 python dump_stacks.py 667435 2
+```
+
+Output from the caller (last line):
+
+```
+TimeoutError: pid 667435 did not run the probe in 2.0s; left /tmp/pydump-hyem4e8i/probe.py
+```
+
+The target printed `woke up` six seconds later and **then** ran the probe. The file it left behind shows it ran at line 6, after the sleep:
+
+```
+jobs_done: ?
+Current thread 0x00007efe7ce36780 [python3.14] (most recent call first):
+  File "<string>", line 5 in <module>
+  File "/tmp/livepy/blocked.py", line 6 in <module>
+```
+
+So never delete the probe right after `remote_exec` returns. Wait for an effect you can see (the result file), and on timeout leave the script where it is. A missing file at execution time is an error in the target, not in your tool. When the main thread is stuck in C code, reach for `asyncio ps` (for async code) or a native tool such as `py-spy`/`gdb`, because they read memory instead of waiting for a safe point.
+
+**Async deadlocks show up as cycles.** Save as `aio_deadlock.py`. Two tasks await each other:
+
+```python
+# aio_deadlock.py
+import asyncio
+import os
+
+tasks = {}
+
+
+async def a():
+    await asyncio.sleep(0.1)
+    await tasks["b"]
+
+
+async def b():
+    await asyncio.sleep(0.1)
+    await tasks["a"]
+
+
+async def main():
+    print("pid", os.getpid(), flush=True)
+    tasks["a"] = asyncio.create_task(a(), name="task-a")
+    tasks["b"] = asyncio.create_task(b(), name="task-b")
+    await asyncio.gather(tasks["a"], tasks["b"])
+
+
+asyncio.run(main())
+```
+
+Run it, then point `pstree` at the PID it printed:
+
+```bash
+uv run --python 3.14 python aio_deadlock.py
+uv run --python 3.14 python -m asyncio pstree PID
+```
+
+Output (exit status 1):
+
+```
+ERROR: await-graph contains cycles - cannot print a tree!
+
+cycle: task-a → task-b → task-a
+```
+
+That error is the diagnosis. `asyncio ps` still prints the flat table if you need the stacks.
+
+**The usual refusals, and what they mean:**
+
+| Message | Cause |
+|---------|-------|
+| `RuntimeError: Remote debugging is not enabled in the remote process` | Target started with `PYTHON_DISABLE_REMOTE_DEBUG=1` or `-X disable_remote_debug` |
+| `RuntimeError: Can't send commands from a pre-release Python interpreter to a process running a different Python version` | Caller is 3.15rc, target is 3.14: versions must match |
+| `RuntimeError: PyRuntime address lookup failed during debug offsets initialization` | The PID is not a CPython process (here, the PID of the shell wrapper, not the Python child) |
+| `FileNotFoundError: Script file does not exist` | Relative path, or the file was removed |
+| A permission error (`PermissionError` / `Operation not permitted`) | Different user, Yama `ptrace_scope`, container seccomp, or another tracer already attached |
+
+A failing probe does **not** crash the target. A typo in the probe is printed to the target's stderr and the program keeps running:
+
+```
+Error executing debugger script /tmp/livepy/bad_probe.py:
+Traceback (most recent call last):
+  File "<string>", line 3, in <module>
+AttributeError: module '__main__' has no attribute 'jobs_dne'
+```
+
+## The boring rule
+
+- Read-only first: `asyncio ps` / `pstree` and a stack-dump probe answer most "what is it doing?" questions without changing anything.
+- Use `sys.remote_exec` with an **absolute** path to a script that **writes its result somewhere** and renames it into place. Wait for that result; never delete the script until you see it.
+- Use `pdb -p` for interactive work, keep the session short (the main thread is paused), and leave with `quit`, which detaches.
+- Match the interpreter: same `major.minor`, the exact version if pre-release. Attach to the **Python** PID, not a wrapper.
+- In hardened production images where no one should ever attach, set `PYTHON_DISABLE_REMOTE_DEBUG=1`. Do not loosen `ptrace_scope` system-wide to make debugging easier. Use `setpriv --ptracer` on the one process, or `sudo` for a one-off.
+
+Looking ahead: Python 3.15 (final due 2026-10-09) adds a sampling profiler that attaches the same way (`python -m profiling.sampling attach PID`, PEP 799).
+
+## Try this
+
+1. Extend the probe in `dump_stacks.py` to also write `len(gc.get_objects())` and the top ten `tracemalloc` statistics (start tracing from a first probe, read from a second).
+2. Run `worker.py` with `PYTHON_DISABLE_REMOTE_DEBUG=1` and confirm all three tools refuse. Then check whether `asyncio ps` refuses too.
+3. In `aio_service.py`, make one `fetch` raise after a second. Watch how `pstree` changes as the `TaskGroup` cancels its siblings.
+4. Attach `pdb -p` to `worker.py`, set a breakpoint with `b worker.py:26`, `continue`, and inspect `jobs_done` when it stops. Then `quit` and confirm the worker keeps running.
+5. Start `blocked.py` with a 30-second sleep and compare `dump_stacks.py` (times out) with `python -m asyncio ps PID` (answers at once with an empty table, because there is no event loop). Explain why one waits and the other does not.
