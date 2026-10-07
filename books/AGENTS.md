@@ -7,7 +7,7 @@
 
 - Treat each book's `_quarto.yml` as generated output.
 - Do not hand-edit `_quarto.yml`; edits will be overwritten.
-- **Content PRs / branches**: Do not commit `_quarto.yml` in content PRs. Commit only content files (`.qmd`/`.md`) and assets. `_quarto.yml` is synchronized on `main` after merging to prevent cross-branch merge conflicts and collation churn.
+- **Content PRs / branches**: Do not commit `_quarto.yml` in content PRs. Commit only content files (`.qmd`/`.md`) and assets. Bot-authored PRs should carry the `bot-content` label. `_quarto.yml` is synchronized on `main` after merging to prevent cross-branch merge conflicts and collation churn.
 - Regenerate with that book's script:
   - `./scripts/update-index.sh` (run from inside the specific book directory).
 
