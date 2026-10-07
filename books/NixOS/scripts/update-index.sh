@@ -3,6 +3,7 @@
 # Do not hand-edit _quarto.yml; re-run this script after structural changes.
 # Supports nested sections (part → section → nested section → chapters).
 set -euo pipefail
+export LC_COLLATE=C
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BOOK_DIR="$(dirname "$SCRIPT_DIR")"

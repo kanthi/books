@@ -71,12 +71,13 @@ Shared behaviour (Template + every live book): nested sections, `humanize_dir_ti
 ## Critical rules
 
 1. **Never hand-edit `_quarto.yml`** inside a book. It is overwritten by `scripts/update-index.sh`.
-2. After adding/removing/renaming content files or folders, run that book's `update-index.sh` (or a full render script that calls it).
-3. **Primary CI** is `incremental.yml` (push-triggered, per-book). Full-rebuild fallback is `main.yml` (manual only).
-4. **Full-build script** is `books/renderpub.sh`. Single-book: `indipub.sh`. Preview: `indiprev.sh`. Portal-only: `scripts/gen-portal.sh`.
-5. `published_books/` and `_book/` are build artifacts — do not commit them.
-6. Older full-library scripts live under **`_archive/scripts/`** (not used by CI). Do not restore them to `books/` without a reason.
-7. Live books under `books/` share the **Template shell**: `scripts/update-index.sh` (GitHub link, `date-modified` + “Updated” label, `epub.css`), monorepo README, no per-book `.github/`.
+2. **Content PRs / branches**: When submitting PRs or new chapters, commit **only** content files (`.qmd` / `.md`) and assets (`images/`). **Do not commit `_quarto.yml` in content PRs** to avoid cross-branch merge conflicts and collation churn. Synchronize `_quarto.yml` on `main` after merging.
+3. After adding/removing/renaming content files or folders on `main`, run that book's `update-index.sh` (or a full render script that calls it).
+4. **Primary CI** is `incremental.yml` (push-triggered, per-book). Full-rebuild fallback is `main.yml` (manual only).
+5. **Full-build script** is `books/renderpub.sh`. Single-book: `indipub.sh`. Preview: `indiprev.sh`. Portal-only: `scripts/gen-portal.sh`.
+6. `published_books/` and `_book/` are build artifacts — do not commit them.
+7. Older full-library scripts live under **`_archive/scripts/`** (not used by CI). Do not restore them to `books/` without a reason.
+8. Live books under `books/` share the **Template shell**: `scripts/update-index.sh` (GitHub link, `date-modified` + “Updated” label, `epub.css`), monorepo README, no per-book `.github/`.
 
 ## Content conventions
 
