@@ -22,6 +22,7 @@ By the end of this module, you will be able to:
 5. **Advanced Preprocessor** - Macro definitions, conditional compilation, pragma directives, token manipulation
 6. **C23 `#embed`, `nullptr`, and `constexpr`** - Binary assets, null pointer constant, typed translation-time values
 7. **Checked Integer Arithmetic** - C23 `<stdckdint.h>` (`ckd_add`/`ckd_sub`/`ckd_mul`), overflow-safe allocation sizing, `reallocarray`, portable fallback
+8. **C23 `<stdbit.h>`** - Bit and byte utilities, defined zero handling, power-of-two ring buffers, endianness
 
 ## Key Concepts Covered
 - Variable-length arrays (VLAs)
