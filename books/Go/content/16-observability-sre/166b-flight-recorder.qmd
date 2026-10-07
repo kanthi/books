@@ -1,0 +1,505 @@
+---
+title: "Flight Recorder: Trace the Seconds Before an Incident"
+---
+
+# Flight Recorder: Trace the Seconds Before an Incident
+
+An execution trace answers the question metrics and profiles cannot: *what was every goroutine doing, and why was it not running?* The problem in a long-lived service is timing. By the time a p99 alert fires, the interesting moment is gone, and running `trace.Start` around the whole process for days produces gigabytes nobody will read. Since Go **1.25**, `runtime/trace.FlightRecorder` keeps the most recent few seconds of trace data in a ring buffer in memory and writes it out only when you ask. The program that notices the problem (a slow request, a failed health check, a timeout) takes the snapshot itself. Everything here runs unchanged on Go **1.27.1**, the current stable release.
+
+## Mental model
+
+- **A moving window, not a recording.** The runtime produces the normal execution trace, but the flight recorder keeps only the tail of it. `WriteTo(w)` copies the current window to `w` as an ordinary trace file. `go tool trace` reads it like any other trace.
+- **Two knobs, both hints.** `MinAge` is how far back the window should reach (keep events at least this old). `MaxBytes` caps the buffer and **wins** when the two disagree. The Go team suggests `MinAge` of about **2x the window you are debugging**: for a 5 s timeout, keep 10 s. A busy service produces on the order of a few MB of trace per second, so size `MaxBytes` from that.
+- **One at a time.** Only one flight recorder may be active per process, and only one `WriteTo` may run at a time. A flight recorder can run alongside a normal `trace.Start` consumer.
+- **The trigger is your code.** Nothing fires automatically. You decide which condition is worth a snapshot (latency over a threshold, error spike, an operator request) and you rate-limit it.
+- **Cost.** Go 1.21 cut tracer overhead to a small percentage of CPU for most programs. The flight recorder adds memory for the window, but no disk or network traffic until you snapshot.
+
+| Tool | Question it answers | When it runs |
+|------|---------------------|--------------|
+| CPU / heap profile | Where is CPU or memory spent, in aggregate? | Sampled window you choose |
+| `trace.Start` / `go test -trace` | Full timeline of a test, benchmark, or short CLI | Start to Stop |
+| `FlightRecorder` | Timeline of the **last N seconds** before something went wrong | Always on, written on demand |
+
+## Worked examples
+
+### Case 1: Start, snapshot, stop
+
+Save as `fr_basics.go`. This is the whole API: configure, `Start`, `WriteTo`, `Stop`. It also shows the one-recorder-per-process rule.
+
+```go
+// fr_basics.go
+package main
+
+import (
+	"bytes"
+	"fmt"
+	"os"
+	"runtime/trace"
+	"time"
+)
+
+func busy(d time.Duration) int {
+	n := 0
+	for end := time.Now().Add(d); time.Now().Before(end); {
+		n++
+	}
+	return n
+}
+
+func main() {
+	fr := trace.NewFlightRecorder(trace.FlightRecorderConfig{
+		MinAge:   2 * time.Second,
+		MaxBytes: 4 << 20, // 4 MiB hint
+	})
+	if err := fr.Start(); err != nil {
+		fmt.Println("start:", err)
+		return
+	}
+	defer fr.Stop()
+	fmt.Println("enabled:", fr.Enabled())
+
+	for range 3 {
+		go busy(20 * time.Millisecond)
+		time.Sleep(30 * time.Millisecond)
+	}
+
+	var buf bytes.Buffer
+	n, err := fr.WriteTo(&buf)
+	fmt.Printf("snapshot: err=%v nonEmpty=%t sameAsReturned=%t\n", err, n > 0, int64(buf.Len()) == n)
+	if err := os.WriteFile("snapshot.trace", buf.Bytes(), 0o644); err != nil {
+		fmt.Println("write:", err)
+	}
+
+	second := trace.NewFlightRecorder(trace.FlightRecorderConfig{})
+	fmt.Println("second recorder start:", second.Start())
+}
+```
+
+Run:
+
+```bash
+go run fr_basics.go
+go tool trace -d=footprint snapshot.trace | awk 'NR<=8'
+```
+
+Output (byte counts vary from run to run):
+
+```
+enabled: true
+snapshot: err=<nil> nonEmpty=true sameAsReturned=true
+second recorder start: flight recorder already enabled
+Event                Bytes  %       Count  %
+-                    -      -       -      -
+String               2285   62.14%  76     36.54%
+Stack                665    18.09%  22     10.58%
+EventBatch           128    3.48%   8      3.85%
+ProcStart            84     2.28%   15     7.21%
+HeapAlloc            76     2.07%   12     5.77%
+GoStatusStack        76     2.07%   5      2.40%
+```
+
+`-d=footprint` is a quick check that a file is a real trace and what fills it. For the interactive timeline, run `go tool trace snapshot.trace` and open the printed URL. In Go 1.27, `-http=:6060` binds to localhost only. Pass `-http=0.0.0.0:6060` only if you really mean to expose it.
+
+### Case 2: The service snapshots its own slow request
+
+Save as `fr_slow_request.go`. A small stock service answers `GET /stock/{item}` in microseconds. A background goroutine pushes counters upstream every 300 ms, and it holds the same mutex for the whole 120 ms "RPC". Middleware times each request. The first request over 50 ms triggers **one** snapshot (`atomic.Bool` guard), taken on a separate goroutine so the request path never waits on disk. A `trace.WithRegion` labels the upstream call so it is easy to find in the trace.
+
+```go
+// fr_slow_request.go
+package main
+
+import (
+	"context"
+	"fmt"
+	"io"
+	"log"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"runtime/trace"
+	"sync"
+	"sync/atomic"
+	"time"
+)
+
+type stock struct {
+	mu    sync.Mutex
+	items map[string]int
+}
+
+// pushUpstream copies the counters to a slow remote system.
+// BUG: it holds the lock for the whole network call.
+func (s *stock) pushUpstream(ctx context.Context) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	trace.WithRegion(ctx, "pushUpstream.rpc", func() {
+		time.Sleep(120 * time.Millisecond) // pretend RPC with s.items
+	})
+}
+
+func (s *stock) get(w http.ResponseWriter, r *http.Request) {
+	s.mu.Lock()
+	n := s.items[r.PathValue("item")]
+	s.mu.Unlock()
+	fmt.Fprintf(w, "%d\n", n)
+}
+
+// recorder takes at most one snapshot per process lifetime.
+type recorder struct {
+	fr   *trace.FlightRecorder
+	path string
+	done atomic.Bool
+}
+
+func (rec *recorder) capture(reason string) {
+	if !rec.done.CompareAndSwap(false, true) {
+		return
+	}
+	f, err := os.Create(rec.path)
+	if err != nil {
+		log.Println("snapshot:", err)
+		return
+	}
+	defer f.Close()
+	if _, err := rec.fr.WriteTo(f); err != nil {
+		log.Println("snapshot:", err)
+		return
+	}
+	fmt.Printf("snapshot: reason=%q file=%s\n", reason, rec.path)
+}
+
+// slowGuard times every request and triggers a snapshot past the threshold.
+func slowGuard(next http.Handler, limit time.Duration, rec *recorder) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		next.ServeHTTP(w, r)
+		if time.Since(start) > limit && rec.fr.Enabled() {
+			fmt.Printf("slow request: %s over %s\n", r.URL.Path, limit)
+			go rec.capture("latency>" + limit.String())
+		}
+	})
+}
+
+func main() {
+	fr := trace.NewFlightRecorder(trace.FlightRecorderConfig{
+		MinAge:   time.Second, // about 2x the window you care about
+		MaxBytes: 8 << 20,     // hint, not a hard cap
+	})
+	if err := fr.Start(); err != nil {
+		log.Fatal(err)
+	}
+	defer fr.Stop()
+	rec := &recorder{fr: fr, path: "slow-request.trace"}
+
+	s := &stock{items: map[string]int{"apple": 3}}
+	go func() {
+		for range time.Tick(300 * time.Millisecond) {
+			s.pushUpstream(context.Background())
+		}
+	}()
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /stock/{item}", s.get)
+	srv := httptest.NewServer(slowGuard(mux, 50*time.Millisecond, rec))
+	defer srv.Close()
+
+	for deadline := time.Now().Add(2 * time.Second); time.Now().Before(deadline) && !rec.done.Load(); {
+		resp, err := http.Get(srv.URL + "/stock/apple")
+		if err != nil {
+			log.Fatal(err)
+		}
+		io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+		time.Sleep(5 * time.Millisecond)
+	}
+	time.Sleep(200 * time.Millisecond) // let capture finish writing
+	if !rec.done.Load() {
+		fmt.Println("no request over the limit in 2s; no snapshot")
+	}
+}
+```
+
+Run:
+
+```bash
+go run fr_slow_request.go
+```
+
+Output:
+
+```
+slow request: /stock/apple over 50ms
+snapshot: reason="latency>50ms" file=slow-request.trace
+```
+
+The window holds the request **and** the second before it, so the cause is in the file even though the alarm fired after the fact. Turn the trace into a synchronization-blocking profile and ask who waited on a mutex:
+
+```bash
+go tool trace -pprof=sync slow-request.trace > sync.pprof
+go tool pprof -top -focus='Mutex' sync.pprof
+```
+
+Output (durations vary):
+
+```
+Main binary filename not available.
+Type: delay
+Active filters:
+   focus=Mutex
+Showing nodes accounting for 119.50ms, 10.58% of 1128.96ms total
+      flat  flat%   sum%        cum   cum%
+  119.50ms 10.58% 10.58%   119.50ms 10.58%  sync.(*Mutex).Lock
+         0     0% 10.58%   119.50ms 10.58%  main.(*stock).get
+         0     0% 10.58%   119.50ms 10.58%  main.slowGuard.func1
+         0     0% 10.58%   119.50ms 10.58%  net/http.(*ServeMux).ServeHTTP
+         0     0% 10.58%   119.50ms 10.58%  net/http.(*conn).serve
+         0     0% 10.58%   119.50ms 10.58%  net/http.HandlerFunc.ServeHTTP
+         0     0% 10.58%   119.50ms 10.58%  net/http.serverHandler.ServeHTTP
+```
+
+The handler spent about 120 ms blocked in `Mutex.Lock`: the whole slow request. The other `-pprof` modes are `net`, `syscall`, and `sched`. To see **who held** the lock, look for the labelled region. The text dump of events is enough on a headless box:
+
+```bash
+go tool trace -d=parsed slow-request.trace > events.txt
+grep -m1 -A5 'RegionBegin.*pushUpstream' events.txt
+```
+
+Output (from a run in `/tmp/flight`; IDs, time, and PCs vary):
+
+```
+M=665582 P=5 G=11 RegionBegin Time=144831167709632 Task=0 Type="pushUpstream.rpc"
+Stack=
+	main.(*stock).pushUpstream @ 0x66f568
+		/tmp/flight/fr_slow_request.go:28
+	main.main.func1 @ 0x670404
+		/tmp/flight/fr_slow_request.go:90
+```
+
+In the browser view (`go tool trace slow-request.trace`, then *View trace by proc*), goroutine 11 sits in `pushUpstream.rpc` for 120 ms while request goroutines pile up behind it, and the flow arrow from its `Unlock` wakes them. The fix: copy under the lock, release it, then do the slow call. Replace `pushUpstream` with:
+
+```go
+// fr_slow_request.go (fixed pushUpstream; add "maps" to the imports)
+// pushUpstream copies the counters under the lock, then talks to the
+// slow remote system with the lock released.
+func (s *stock) pushUpstream(ctx context.Context) {
+	s.mu.Lock()
+	batch := maps.Clone(s.items)
+	s.mu.Unlock()
+	trace.WithRegion(ctx, "pushUpstream.rpc", func() {
+		time.Sleep(120 * time.Millisecond) // pretend RPC with batch
+		_ = batch
+	})
+}
+```
+
+Run again:
+
+```bash
+go run fr_slow_request.go
+```
+
+Output:
+
+```
+no request over the limit in 2s; no snapshot
+```
+
+### Case 3: An operator endpoint for on-demand snapshots
+
+Save as `fr_admin.go`. Sometimes a human notices first ("it feels slow right now"). Expose `WriteTo` on a **separate, loopback-only** admin listener, never the public mux. `TryLock` turns a second concurrent request into a clean `429` instead of a half-written body.
+
+```go
+// fr_admin.go
+package main
+
+import (
+	"fmt"
+	"log"
+	"net/http"
+	"runtime/trace"
+	"sync"
+	"time"
+)
+
+// snapshotHandler streams the flight recorder window to the caller.
+// One snapshot at a time; extra callers get 429 instead of an error mid-body.
+func snapshotHandler(fr *trace.FlightRecorder) http.HandlerFunc {
+	var mu sync.Mutex
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !mu.TryLock() {
+			http.Error(w, "snapshot already in progress", http.StatusTooManyRequests)
+			return
+		}
+		defer mu.Unlock()
+		if !fr.Enabled() {
+			http.Error(w, "flight recorder off", http.StatusServiceUnavailable)
+			return
+		}
+		name := fmt.Sprintf("flight-%s.trace", time.Now().UTC().Format("20060102T150405Z"))
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.Header().Set("Content-Disposition", `attachment; filename="`+name+`"`)
+		if _, err := fr.WriteTo(w); err != nil {
+			log.Println("snapshot:", err) // headers are gone; just log
+		}
+	}
+}
+
+func main() {
+	fr := trace.NewFlightRecorder(trace.FlightRecorderConfig{
+		MinAge:   10 * time.Second,
+		MaxBytes: 32 << 20,
+	})
+	if err := fr.Start(); err != nil {
+		log.Fatal(err)
+	}
+
+	app := http.NewServeMux()
+	app.HandleFunc("GET /", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintln(w, "hello")
+	})
+
+	admin := http.NewServeMux()
+	admin.Handle("GET /debug/flightrecorder", snapshotHandler(fr))
+
+	go func() { log.Fatal(http.ListenAndServe("127.0.0.1:6061", admin)) }()
+	log.Println("app on 127.0.0.1:8080, admin on 127.0.0.1:6061")
+	log.Fatal(http.ListenAndServe("127.0.0.1:8080", app))
+}
+```
+
+Run in one terminal:
+
+```bash
+go run fr_admin.go
+```
+
+In another, make some traffic, pull a snapshot, and check it:
+
+```bash
+for i in $(seq 50); do curl -s localhost:8080/ >/dev/null; done
+curl -s -D - -o flight.trace http://127.0.0.1:6061/debug/flightrecorder
+go tool trace -d=footprint flight.trace | awk 'NR<=6'
+```
+
+Output (date and sizes vary):
+
+```
+HTTP/1.1 200 OK
+Content-Disposition: attachment; filename="flight-20261007T033257Z.trace"
+Content-Type: application/octet-stream
+Date: Wed, 07 Oct 2026 03:32:57 GMT
+Transfer-Encoding: chunked
+
+Event                Bytes  %       Count  %
+-                    -      -       -      -
+String               9535   34.82%  311    9.59%
+Stack                6122   22.36%  90     2.78%
+GoSyscallBegin       3122   11.40%  647    19.95%
+ProcStart            1683   6.15%   276    8.51%
+```
+
+The server's log shows:
+
+```
+2026/10/07 09:02:55 app on 127.0.0.1:8080, admin on 127.0.0.1:6061
+```
+
+A trace contains stack traces, goroutine labels, and region names. Treat it like a heap dump: internal, access-controlled, and short-lived.
+
+## The trap
+
+Save as `fr_trap.go`. Ten slow requests arrive in the same instant and each one calls `WriteTo` directly. Only one snapshot can be in progress, so the rest fail. Calling `WriteTo` after `Stop` also fails.
+
+```go
+// fr_trap.go
+package main
+
+import (
+	"fmt"
+	"io"
+	"maps"
+	"runtime/trace"
+	"slices"
+	"sync"
+	"time"
+)
+
+// slowWriter simulates shipping a snapshot to a slow disk or network.
+type slowWriter struct{}
+
+func (slowWriter) Write(p []byte) (int, error) {
+	time.Sleep(50 * time.Millisecond)
+	return len(p), nil
+}
+
+func main() {
+	fr := trace.NewFlightRecorder(trace.FlightRecorderConfig{MinAge: time.Second})
+	if err := fr.Start(); err != nil {
+		fmt.Println(err)
+		return
+	}
+	time.Sleep(50 * time.Millisecond)
+
+	// Ten "slow request" alarms fire at once and each tries to snapshot.
+	var (
+		wg      sync.WaitGroup
+		mu      sync.Mutex
+		results = map[string]int{}
+	)
+	for range 10 {
+		wg.Go(func() {
+			key := "ok"
+			if _, err := fr.WriteTo(slowWriter{}); err != nil {
+				key = err.Error()
+			}
+			mu.Lock()
+			results[key]++
+			mu.Unlock()
+		})
+	}
+	wg.Wait()
+	for _, k := range slices.Sorted(maps.Keys(results)) {
+		fmt.Printf("%2d x %s\n", results[k], k)
+	}
+
+	fr.Stop()
+	_, err := fr.WriteTo(io.Discard)
+	fmt.Println("after Stop:", err)
+}
+```
+
+Run:
+
+```bash
+go run fr_trap.go
+```
+
+Output:
+
+```
+ 9 x call to WriteTo for trace.FlightRecorder already in progress
+ 1 x ok
+after Stop: cannot snapshot a disabled flight recorder
+```
+
+In a real incident the slow-request condition fires for **every** request at once. A trigger without a guard spams errors at best. At worst it competes for the recorder exactly when you need one clean file. Case 2's `atomic.Bool` (once per process) and Case 3's `TryLock` (one at a time) are the two boring shapes. For a long-running service, use a cooldown (one snapshot per N minutes) and a cap on files kept on disk.
+
+Second trap: `MinAge` shorter than the problem. With `MinAge: 100*time.Millisecond`, a snapshot taken after a 2 s timeout shows the end of the timeout and none of its cause. Set it to about twice the slowest thing you alert on, then let `MaxBytes` bound memory.
+
+Third trap: assuming a snapshot is enough to tell **who** held a lock. The sync profile tells you who *waited*. Add `trace.WithRegion` / `trace.NewTask` around suspicious critical sections and slow calls so the holder has a name in the timeline.
+
+## The boring rule
+
+- Start one `FlightRecorder` in `main`, next to your logger and metrics. Set `MinAge` ≈ 2x your alert window, `MaxBytes` from a measured MB/s, and `Stop` it on shutdown.
+- Trigger snapshots from code that already knows something is wrong (latency guard, error path, failed probe). Guard the trigger: once, cooldown, or `TryLock`. Never block the request path on `WriteTo`.
+- Expose on-demand snapshots only on a loopback or authenticated admin listener.
+- Analyse with `go tool trace` (timeline) and `go tool trace -pprof=sync|net|syscall|sched` (text profiles). Label hot sections with regions so the timeline names the culprit.
+- Keep traces short-lived and internal; they contain stacks and labels from your code.
+
+## Try this
+
+1. In `fr_slow_request.go`, change the trigger to fire on **any 5xx** as well as latency, and include the request ID in the snapshot file name.
+2. Lower `MinAge` to `50*time.Millisecond` and `MaxBytes` to `64 << 10`, take the snapshot, and check whether `pushUpstream.rpc` is still in the window.
+3. Add a cooldown to `recorder` (one snapshot per 10 minutes, at most 5 files on disk) and test it with a loop that triggers 100 times.
+4. Run `go tool trace -pprof=sched slow-request.trace` and explain which goroutines show scheduler latency and why.
+5. Wrap the stock lookup in `trace.NewTask(ctx, "getStock")` and find the tasks in the browser view's *User-defined tasks* page.
