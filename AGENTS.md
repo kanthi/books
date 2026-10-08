@@ -70,9 +70,8 @@ Shared behaviour (Template + every live book): nested sections, `humanize_dir_ti
 
 ## Critical rules
 
-1. **Never hand-edit `_quarto.yml`** inside a book. It is overwritten by `scripts/update-index.sh`.
-2. **Content PRs / branches**: When submitting PRs or new chapters, commit **only** content files (`.qmd` / `.md`) and assets (`images/`). **Do not commit `_quarto.yml` in content PRs** to avoid cross-branch merge conflicts and collation churn. Bot-authored PRs carry the `bot-content` label for fast-track filtering, review, and batch merges. Synchronize `_quarto.yml` on `main` after merging.
-3. After adding/removing/renaming content files or folders on `main`, run that book's `update-index.sh` (or a full render script that calls it).
+1. **Ignore `_quarto.yml` entirely**: Do not hand-edit, manually regenerate, or commit `_quarto.yml` (neither in content PRs nor after merging on `main`). Regeneration is handled automatically by the repository's build scripts and CI pipelines.
+2. **Strict content naming conventions**: Follow content naming conventions based on existing files (`01-*`, `02-*`, etc.) to ensure correct automatic collation. Commit **only** content files (`.qmd` / `.md`) and assets (`images/`). Bot-authored PRs carry the `bot-content` label.
 4. **Primary CI** is `incremental.yml` (push-triggered, per-book). Full-rebuild fallback is `main.yml` (manual only).
 5. **Full-build script** is `books/renderpub.sh`. Single-book: `indipub.sh`. Preview: `indiprev.sh`. Portal-only: `scripts/gen-portal.sh`.
 6. `published_books/` and `_book/` are build artifacts — do not commit them.
@@ -275,5 +274,5 @@ On the next full CI run (or local `renderpub.sh`), the new book appears on the p
 - Resolve **book vs volume** using **Book vs volume naming** above; ask if "Go" / "NixOS" / "Maths" is ambiguous.
 - **Diagrams:** follow `includes/diagrams/STANDARD.md` and the reference topology SVGs; dual light/dark files for illustrated figures.
 - Do not re-explain this pipeline unless the user asks; assume it is known.
-- Do not invent hand-maintained chapter lists in `_quarto.yml`.
-- When unsure whether `_quarto.yml` is stale after content moves, regenerate it.
+- Do not touch, regenerate, or commit `_quarto.yml` — repository build scripts and CI handle generation automatically.
+- Follow existing file naming conventions strictly for deterministic chapter discovery and collation.

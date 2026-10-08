@@ -5,11 +5,9 @@
 
 ## Quarto Generation Rules (All Book Folders)
 
-- Treat each book's `_quarto.yml` as generated output.
-- Do not hand-edit `_quarto.yml`; edits will be overwritten.
-- **Content PRs / branches**: Do not commit `_quarto.yml` in content PRs. Commit only content files (`.qmd`/`.md`) and assets. Bot-authored PRs should carry the `bot-content` label. `_quarto.yml` is synchronized on `main` after merging to prevent cross-branch merge conflicts and collation churn.
-- Regenerate with that book's script:
-  - `./scripts/update-index.sh` (run from inside the specific book directory).
+- **Ignore `_quarto.yml` entirely**: Do not edit, manually regenerate, or commit `_quarto.yml` (neither in content PR branches nor after merging on `main`). `_quarto.yml` generation is completely taken care of automatically by repo build scripts and CI pipelines.
+- Commit only content files (`.qmd`/`.md`) and assets (`images/`). Bot-authored PRs should carry the `bot-content` label.
+- Always follow content naming conventions based on existing files (`01-*`, `02-*`, etc.) for automatic chapter collation and ordering.
 
 ## Content Ordering Convention
 
