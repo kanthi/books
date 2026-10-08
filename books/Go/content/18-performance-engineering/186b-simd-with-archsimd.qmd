@@ -1,0 +1,621 @@
+---
+title: "SIMD Without Assembly: simd/archsimd (GOEXPERIMENT=simd)"
+author:
+  - name: "K19G"
+  - name: "grok-bot"
+---
+
+# SIMD Without Assembly: `simd/archsimd`
+
+Until recently, the only way to make a Go hot loop use the vector units in your CPU was to write Plan 9 assembly by hand, or to hope the compiler would do it for you (it largely doesn't auto-vectorize). Go **1.26** added an experimental, amd64-only SIMD API behind `GOEXPERIMENT=simd`. Go **1.27** revised it, added **arm64 (NEON)** and **wasm (128-bit SIMD)**, and put a portable, width-agnostic `simd` package on top. Both remain **experimental**. They exist only when you build with the experiment, and they are not covered by the Go 1 compatibility promise.
+
+This chapter is about the low layer, `simd/archsimd`: real vector types, real instructions, and the engineering discipline that keeps them safe to ship. That means build tags, runtime CPU checks, a scalar twin, and tests that exercise every path on one machine. Everything below was compiled and run with **Go 1.27.1** on an amd64 box whose CPU reports AVX2, FMA, AVX-512 and GFNI.
+
+## Mental model
+
+```text
+ your code ──► simd            portable, width chosen at run time (Float32s, Uint8s…)
+           │      │ ToArch / *FromArch
+           └────► simd/archsimd fixed-width, per-architecture (Float32x8, Uint8x64…)
+                          │  methods are compiler intrinsics
+                          ▼
+                 VFMADD213PS, VPCMPEQB, VGF2P8AFFINEQB …  (one method ≈ one instruction)
+```
+
+- **Types carry shape.** `Float32x8` is 256 bits of eight `float32`s; `Uint8x64` is a 512-bit register of bytes. Masks are separate opaque types (`Mask8x64`) because AVX-512, AVX2, NEON and wasm encode them differently.
+- **Methods have plain names.** `x.Add(y)`, `x.MulAdd(y, acc)`, `x.Equal(y)`, not `_mm512_fmadd_ps`. The doc comment of each method names the instruction and the CPU feature it needs (`Asm: VFMADD213PS, CPU Feature: FMA`).
+- **The compiler doesn't know your CPU.** A binary built for amd64 may run on a machine without AVX-512. You must branch on `archsimd.X86.AVX512()` (and friends). Otherwise the program dies with `SIGILL`. The check also tells the compiler which instruction forms are allowed inside that branch.
+- **It is not portable by design.** `Float32x8` does not exist on arm64. Code that imports `archsimd` needs a build constraint and a fallback for every other target.
+
+| Layer | Use it for | Cost of using it |
+|-------|-----------|------------------|
+| Plain Go loop | Everything, until a profile says otherwise | None |
+| Standard library (`bytes.Count`, `bytes.Index`, `crypto/*`) | Searching, hashing, crypto. These already have hand-written vector code | None |
+| `simd` (portable) | Arithmetic kernels you want on every architecture | Experiment flag |
+| `simd/archsimd` | Instructions with no portable equivalent (GFNI, lane permutes), or the last few % on one target | Experiment flag, build tags, CPU dispatch, per-arch tests |
+
+## Worked examples
+
+Set up a module. The `go` line must be 1.27 or later.
+
+```bash
+mkdir simdlab && cd simdlab
+go mod init example.com/simdlab   # then set "go 1.27" in go.mod
+go version
+```
+
+```
+go version go1.27.1 linux/amd64
+```
+
+The package is split into three files, which is the shape every `archsimd` package should have:
+
+1. a scalar reference that always compiles,
+2. a vector file guarded by `//go:build goexperiment.simd && amd64`,
+3. a fallback file with the opposite constraint, so the package builds everywhere.
+
+### Case 1: the scalar twin
+
+```go
+// scalar.go — portable reference implementations (always compiled)
+package simdlab
+
+import "math/bits"
+
+func dotScalar(a, b []float32) float32 {
+	var s float32
+	for i := range a {
+		s += a[i] * b[i]
+	}
+	return s
+}
+
+func countScalar(s []byte, c byte) int {
+	n := 0
+	for _, x := range s {
+		if x == c {
+			n++
+		}
+	}
+	return n
+}
+
+func reverseScalar(dst, src []byte) {
+	for i, x := range src[:len(dst)] {
+		dst[i] = bits.Reverse8(x)
+	}
+}
+```
+
+These functions are the specification. Every vector path is tested against them, and they are what runs on every machine the vector code doesn't cover.
+
+### Case 2: dispatching vector code
+
+```go
+// dispatch_simd.go — vector paths, built only with GOEXPERIMENT=simd on amd64
+//go:build goexperiment.simd && amd64
+
+package simdlab
+
+import (
+	"math/bits"
+	"simd/archsimd"
+)
+
+// Path reports which implementation Dot will use on this CPU.
+func Path() string {
+	switch {
+	case archsimd.X86.AVX512():
+		return "avx512"
+	case archsimd.X86.AVX2() && archsimd.X86.FMA():
+		return "avx2+fma"
+	default:
+		return "scalar"
+	}
+}
+
+// Dot returns the inner product of a and b (len(b) must be >= len(a)).
+func Dot(a, b []float32) float32 {
+	b = b[:len(a)]
+	switch {
+	case archsimd.X86.AVX512():
+		return dot16(a, b)
+	case archsimd.X86.AVX2() && archsimd.X86.FMA():
+		return dot8(a, b)
+	}
+	return dotScalar(a, b)
+}
+
+func dot8(a, b []float32) float32 {
+	var acc archsimd.Float32x8
+	i := 0
+	for ; i < len(a)-8+1; i += 8 {
+		x := archsimd.LoadFloat32x8(a[i : i+8])
+		y := archsimd.LoadFloat32x8(b[i : i+8])
+		acc = x.MulAdd(y, acc)
+	}
+	if i < len(a) {
+		x, _ := archsimd.LoadFloat32x8Part(a[i:])
+		y, _ := archsimd.LoadFloat32x8Part(b[i:])
+		acc = x.MulAdd(y, acc) // zero-filled lanes add 0
+	}
+	var lanes [8]float32
+	acc.StoreArray(&lanes)
+	var s float32
+	for _, v := range lanes {
+		s += v
+	}
+	return s
+}
+
+func dot16(a, b []float32) float32 {
+	var acc archsimd.Float32x16
+	i := 0
+	for ; i < len(a)-16+1; i += 16 {
+		x := archsimd.LoadFloat32x16(a[i : i+16])
+		y := archsimd.LoadFloat32x16(b[i : i+16])
+		acc = x.MulAdd(y, acc)
+	}
+	if i < len(a) {
+		x, _ := archsimd.LoadFloat32x16Part(a[i:])
+		y, _ := archsimd.LoadFloat32x16Part(b[i:])
+		acc = x.MulAdd(y, acc)
+	}
+	var lanes [16]float32
+	acc.StoreArray(&lanes)
+	var s float32
+	for _, v := range lanes {
+		s += v
+	}
+	return s
+}
+
+// Count returns how many bytes of s equal c.
+func Count(s []byte, c byte) int {
+	if !archsimd.X86.AVX512() {
+		return countScalar(s, c)
+	}
+	needle := archsimd.BroadcastUint8x64(c)
+	n, i := 0, 0
+	for ; i < len(s)-64+1; i += 64 {
+		m := archsimd.LoadUint8x64(s[i : i+64]).Equal(needle)
+		n += bits.OnesCount64(m.ToBits())
+	}
+	return n + countScalar(s[i:], c)
+}
+
+// ReverseBits writes bits.Reverse8(src[i]) into dst[i] for every i.
+func ReverseBits(dst, src []byte) {
+	if !archsimd.X86.AVX512GFNI() {
+		reverseScalar(dst, src)
+		return
+	}
+	src = src[:len(dst)]
+	rev := archsimd.BroadcastUint64x8(0x8040201008040201) // anti-diagonal bit matrix
+	i := 0
+	for ; i < len(src)-64+1; i += 64 {
+		v := archsimd.LoadUint8x64(src[i : i+64])
+		v.GaloisFieldAffineTransform(rev, 0).Store(dst[i : i+64])
+	}
+	if i < len(src) {
+		v, _ := archsimd.LoadUint8x64Part(src[i:])
+		v.GaloisFieldAffineTransform(rev, 0).StorePart(dst[i:])
+	}
+}
+```
+
+```go
+// dispatch_generic.go — the same API without the experiment (or on other GOARCHes)
+//go:build !(goexperiment.simd && amd64)
+
+package simdlab
+
+func Path() string                { return "scalar (no GOEXPERIMENT=simd)" }
+func Dot(a, b []float32) float32  { return dotScalar(a, b[:len(a)]) }
+func Count(s []byte, c byte) int  { return countScalar(s, c) }
+func ReverseBits(dst, src []byte) { reverseScalar(dst, src) }
+```
+
+Things to notice:
+
+- **Dispatch once per call, at the top.** Each exported function asks the CPU what it has and picks the widest safe path. Inside `dot16`, every instruction is AVX-512, and the call is only reached when `X86.AVX512()` is true.
+- **Full vectors, then one partial vector.** `LoadFloat32x16Part` zero-fills the lanes past the end of the slice and `StorePart` writes only the real ones. For a dot product the zero lanes contribute `0*0`, so the tail needs no special case.
+- **`Count` reduces a mask to an integer.** `Equal` yields a `Mask8x64`, `ToBits()` turns it into a `uint64` with one bit per byte, and `bits.OnesCount64` counts them: 64 comparisons, one compare instruction, one popcount.
+- **`ReverseBits` is the GFNI trick** from the Go team's `archsimd` article. One `VGF2P8AFFINEQB` multiplies every byte by an 8×8 bit matrix, and the anti-diagonal matrix reverses the bits of 64 bytes at once. No portable SIMD API has this instruction. It is the kind of thing `archsimd` exists for.
+- **The loop bound is `i < len(s)-64+1`**, not `i+64 <= len(s)`. That is deliberate. See the trap below.
+
+A small driver:
+
+```go
+// cmd/demo/main.go — call the dispatching API and compare with plain loops
+package main
+
+import (
+	"bytes"
+	"fmt"
+	"math/bits"
+
+	"example.com/simdlab"
+)
+
+func main() {
+	fmt.Println("path:", simdlab.Path())
+
+	a := make([]float32, 1000)
+	b := make([]float32, 1000)
+	for i := range a {
+		a[i] = 1.0 / float32(i+1)
+		b[i] = float32(i%3) + 0.1
+	}
+	var loop float32
+	for i := range a {
+		loop += a[i] * b[i]
+	}
+	fmt.Printf("dot: simd=%.7f loop=%.7f equal=%t\n", simdlab.Dot(a, b), loop, simdlab.Dot(a, b) == loop)
+
+	text := bytes.Repeat([]byte("line one\nline two\n"), 50)
+	fmt.Println("newlines:", simdlab.Count(text, '\n'), "bytes.Count:", bytes.Count(text, []byte{'\n'}))
+
+	src := []byte{0b0000_0001, 0b1100_0000, 0b1010_1010, 0xF0}
+	dst := make([]byte, len(src))
+	simdlab.ReverseBits(dst, src)
+	for i := range src {
+		fmt.Printf("%08b -> %08b (bits.Reverse8 %08b)\n", src[i], dst[i], bits.Reverse8(src[i]))
+	}
+}
+```
+
+```bash
+GOEXPERIMENT=simd go run ./cmd/demo
+go run ./cmd/demo
+```
+
+```
+path: avx512
+dot: simd=7.3820782 loop=7.3820772 equal=false
+newlines: 100 bytes.Count: 100
+00000001 -> 10000000 (bits.Reverse8 10000000)
+11000000 -> 00000011 (bits.Reverse8 00000011)
+10101010 -> 01010101 (bits.Reverse8 01010101)
+11110000 -> 00001111 (bits.Reverse8 00001111)
+path: scalar (no GOEXPERIMENT=simd)
+dot: simd=7.3820772 loop=7.3820772 equal=true
+newlines: 100 bytes.Count: 100
+00000001 -> 10000000 (bits.Reverse8 10000000)
+11000000 -> 00000011 (bits.Reverse8 00000011)
+10101010 -> 01010101 (bits.Reverse8 01010101)
+11110000 -> 00001111 (bits.Reverse8 00001111)
+```
+
+The same source builds both ways. Integer results match exactly. The floating-point dot product differs in the seventh significant digit, which is correct behaviour and the subject of the second trap.
+
+### Case 3: test every path on one machine
+
+A vector path that only runs on the CI machine's CPU is a path you haven't tested. The table test compares all three functions with the scalar twin at every length from 0 to 300, so every tail size is covered:
+
+```go
+// simdlab_test.go — vector paths must agree with the scalar reference at every length
+package simdlab
+
+import (
+	"bytes"
+	"math"
+	"math/rand/v2"
+	"testing"
+)
+
+func TestAgainstScalar(t *testing.T) {
+	t.Logf("path: %s", Path())
+	r := rand.New(rand.NewPCG(1, 2))
+	for n := 0; n <= 300; n++ {
+		a, b := make([]float32, n), make([]float32, n)
+		for i := range a {
+			a[i], b[i] = r.Float32()*2-1, r.Float32()*2-1
+		}
+		got, want := Dot(a, b), dotScalar(a, b)
+		if math.Abs(float64(got-want)) > 1e-4*float64(n+1) {
+			t.Fatalf("Dot n=%d: got %v want %v", n, got, want)
+		}
+
+		s := make([]byte, n)
+		for i := range s {
+			s[i] = byte(r.IntN(4))
+		}
+		if got, want := Count(s, 2), countScalar(s, 2); got != want {
+			t.Fatalf("Count n=%d: got %d want %d", n, got, want)
+		}
+
+		d1, d2 := make([]byte, n), make([]byte, n)
+		ReverseBits(d1, s)
+		reverseScalar(d2, s)
+		if !bytes.Equal(d1, d2) {
+			t.Fatalf("ReverseBits n=%d differs", n)
+		}
+	}
+}
+
+var sinkF float32
+var sinkI int
+
+func BenchmarkDot(b *testing.B) {
+	a, c := make([]float32, 4096), make([]float32, 4096)
+	for i := range a {
+		a[i], c[i] = float32(i%7), float32(i%5)
+	}
+	b.Run("scalar", func(b *testing.B) {
+		for b.Loop() {
+			sinkF = dotScalar(a, c)
+		}
+	})
+	b.Run("archsimd", func(b *testing.B) {
+		for b.Loop() {
+			sinkF = Dot(a, c)
+		}
+	})
+}
+
+func BenchmarkCount(b *testing.B) {
+	s := bytes.Repeat([]byte("the quick brown fox\n"), 3277) // ~64 KiB
+	b.Run("scalar", func(b *testing.B) {
+		for b.Loop() {
+			sinkI = countScalar(s, '\n')
+		}
+	})
+	b.Run("archsimd", func(b *testing.B) {
+		for b.Loop() {
+			sinkI = Count(s, '\n')
+		}
+	})
+	b.Run("bytes.Count", func(b *testing.B) {
+		for b.Loop() {
+			sinkI = bytes.Count(s, []byte{'\n'})
+		}
+	})
+}
+
+func BenchmarkReverseBits(b *testing.B) {
+	src, dst := make([]byte, 64<<10), make([]byte, 64<<10)
+	for i := range src {
+		src[i] = byte(i)
+	}
+	b.Run("scalar", func(b *testing.B) {
+		for b.Loop() {
+			reverseScalar(dst, src)
+		}
+	})
+	b.Run("archsimd", func(b *testing.B) {
+		for b.Loop() {
+			ReverseBits(dst, src)
+		}
+	})
+}
+```
+
+The runtime honours `GODEBUG=cpu.<feature>=off`, and `archsimd.X86` reports what the runtime believes. That lets you force each branch without leaving your desk:
+
+```bash
+GOEXPERIMENT=simd go test -count=1 -v -run TestAgainstScalar .
+GOEXPERIMENT=simd GODEBUG=cpu.avx512f=off go test -count=1 -v -run TestAgainstScalar .
+GOEXPERIMENT=simd GODEBUG=cpu.avx512f=off,cpu.avx2=off go test -count=1 -v -run TestAgainstScalar .
+go test -count=1 -v -run TestAgainstScalar .
+```
+
+```
+=== RUN   TestAgainstScalar
+    simdlab_test.go:12: path: avx512
+--- PASS: TestAgainstScalar (0.00s)
+PASS
+ok  	example.com/simdlab	0.004s
+    simdlab_test.go:12: path: avx2+fma
+--- PASS: TestAgainstScalar (0.00s)
+PASS
+ok  	example.com/simdlab	0.004s
+    simdlab_test.go:12: path: scalar
+--- PASS: TestAgainstScalar (0.00s)
+PASS
+ok  	example.com/simdlab	0.004s
+    simdlab_test.go:12: path: scalar (no GOEXPERIMENT=simd)
+--- PASS: TestAgainstScalar (0.00s)
+PASS
+ok  	example.com/simdlab	0.004s
+```
+
+(First block shown in full, the rest trimmed to the interesting lines.) Put all four invocations in CI. Also add `GOARCH=arm64 go vet ./...` so a missing build constraint fails the build before a user on another architecture finds it.
+
+### Case 4: measure, and compare with what you already have
+
+```bash
+GOEXPERIMENT=simd go test -run '^$' -bench . -benchmem -count=3 .
+```
+
+```
+goos: linux
+goarch: amd64
+pkg: example.com/simdlab
+cpu: Intel(R) Xeon(R) Processor
+BenchmarkDot/scalar-8    	  409718	      2886 ns/op	       0 B/op	       0 allocs/op
+BenchmarkDot/scalar-8    	  444223	      2813 ns/op	       0 B/op	       0 allocs/op
+BenchmarkDot/scalar-8    	  446895	      2701 ns/op	       0 B/op	       0 allocs/op
+BenchmarkDot/archsimd-8  	 2400464	       504.0 ns/op	       0 B/op	       0 allocs/op
+BenchmarkDot/archsimd-8  	 2398826	       498.4 ns/op	       0 B/op	       0 allocs/op
+BenchmarkDot/archsimd-8  	 2377718	       508.5 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCount/scalar-8  	   31746	     38770 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCount/scalar-8  	   30878	     38341 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCount/scalar-8  	   31382	     38393 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCount/archsimd-8         	 1222172	       963.8 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCount/archsimd-8         	 1384680	       881.7 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCount/archsimd-8         	 1445408	       848.3 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCount/bytes.Count-8      	  955839	      1126 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCount/bytes.Count-8      	 1000000	      1126 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCount/bytes.Count-8      	 1000000	      1538 ns/op	       0 B/op	       0 allocs/op
+BenchmarkReverseBits/scalar-8     	   27670	     44528 ns/op	       0 B/op	       0 allocs/op
+BenchmarkReverseBits/scalar-8     	   24739	     45573 ns/op	       0 B/op	       0 allocs/op
+BenchmarkReverseBits/scalar-8     	   26042	     43831 ns/op	       0 B/op	       0 allocs/op
+BenchmarkReverseBits/archsimd-8   	  755580	      1684 ns/op	       0 B/op	       0 allocs/op
+BenchmarkReverseBits/archsimd-8   	  748688	      1646 ns/op	       0 B/op	       0 allocs/op
+BenchmarkReverseBits/archsimd-8   	  703843	      1606 ns/op	       0 B/op	       0 allocs/op
+```
+
+This box is a shared VM, so treat these as one machine's numbers and use `benchstat` with `-count=10` before quoting them. The shape is still clear:
+
+| Kernel (input) | Scalar | `archsimd` | Comment |
+|----------------|--------|-----------|---------|
+| Dot, 4096 `float32` | ~2.8 µs | ~0.50 µs | ~5.6×, AVX-512 FMA |
+| Count `'\n'`, 64 KiB | ~38 µs | ~0.87 µs | …but `bytes.Count` is already ~1.1 µs |
+| ReverseBits, 64 KiB | ~44 µs | ~1.6 µs | ~27×, one GFNI instruction per 64 bytes |
+
+The `Count` row is the lesson. A naive byte loop is slow, but nobody should be running one. `bytes.Count` already has hand-written vector assembly, and beating it by 20% on one CPU family is not worth an experimental dependency. `ReverseBits` is the opposite case: no library function does it, and the instruction that does it isn't reachable any other way.
+
+For plain arithmetic, the portable layer usually does as well. The same dot product written with `simd.Float32s` (which picked 512-bit vectors on this CPU, or 256-bit under `GODEBUG=cpu.avx512f=off`) ran at the same speed:
+
+```go
+// portable_simd.go — the same inner product with the portable simd package (any GOARCH)
+//go:build goexperiment.simd
+
+package simdlab
+
+import "simd"
+
+// DotPortable uses whatever vector width this machine has (or an emulation).
+func DotPortable(a, b []float32) float32 {
+	b = b[:len(a)]
+	var acc simd.Float32s
+	w := acc.Len()
+	i := 0
+	for ; i < len(a)-w+1; i += w {
+		acc = simd.LoadFloat32s(a[i:i+w]).MulAdd(simd.LoadFloat32s(b[i:i+w]), acc)
+	}
+	if i < len(a) {
+		x, _ := simd.LoadFloat32sPart(a[i:])
+		y, _ := simd.LoadFloat32sPart(b[i:])
+		acc = x.MulAdd(y, acc)
+	}
+	lanes := make([]float32, w)
+	acc.Store(lanes)
+	var s float32
+	for _, v := range lanes {
+		s += v
+	}
+	return s
+}
+
+// VectorBits reports the width the portable package picked.
+func VectorBits() (int, bool) { return simd.VectorBitSize(), simd.Emulated() }
+```
+
+```
+    portable_simd_test.go:13: simd.VectorBitSize()=512 Emulated()=false
+BenchmarkDotPortable-8   	 2316738	       507.0 ns/op	       0 B/op	       0 allocs/op
+BenchmarkDotPortable-8   	 2410382	       498.2 ns/op	       0 B/op	       0 allocs/op
+BenchmarkDotPortable-8   	 2385348	       503.1 ns/op	       0 B/op	       0 allocs/op
+```
+
+That version needs no `amd64` constraint, no feature checks and no per-width copies. Reach for `archsimd` only when `simd` can't express the operation or can't reach the speed you have measured you need.
+
+## The trap
+
+### Importing `archsimd` without a build constraint
+
+```go
+// main.go — imports archsimd with no build constraint
+package main
+
+import (
+	"fmt"
+	"simd/archsimd"
+)
+
+func main() {
+	v := archsimd.BroadcastFloat32x8(1.5)
+	fmt.Println(v.Add(v))
+}
+```
+
+```bash
+go build .
+GOEXPERIMENT=simd go run .
+GOEXPERIMENT=simd GOARCH=arm64 go build .
+```
+
+```
+package example.com/naive
+	imports simd/archsimd: build constraints exclude all Go files in /home/box/sdk/go1.27.1/src/simd/archsimd
+{3,3,3,3,3,3,3,3}
+# example.com/naive
+./main.go:10:16: undefined: archsimd.BroadcastFloat32x8
+```
+
+It fails twice. Without the experiment the package does not exist. With the experiment on arm64 the package exists, but 256-bit types don't. The rule is mechanical: every file that imports `simd/archsimd` carries `//go:build goexperiment.simd && <arch>`, and a sibling file with the negated constraint provides the same API.
+
+### Expecting bit-identical floating-point results
+
+The vector dot product keeps 16 partial sums and adds them at the end. The loop keeps one. Floating-point addition is not associative, so `7.3820782` vs `7.3820772` is correct behaviour, not a bug. Compare float kernels against the scalar twin with a tolerance scaled to the input length, as the test does. Never use `==`. If a caller truly needs reproducible results across machines, the vector path can't be used for that value.
+
+### Writing the loop bound the "obvious" way
+
+The Go team calls this out explicitly, and the compiler's bounds-check debug flag shows why:
+
+```go
+// bce.go — the same loop, two ways of writing the bound
+//go:build goexperiment.simd && amd64
+
+package bce
+
+import "simd/archsimd"
+
+func SumA(s []float32) archsimd.Float32x8 { // i+8 <= len(s): i+8 might overflow
+	var acc archsimd.Float32x8
+	for i := 0; i+8 <= len(s); i += 8 {
+		acc = acc.Add(archsimd.LoadFloat32x8(s[i : i+8]))
+	}
+	return acc
+}
+
+func SumB(s []float32) archsimd.Float32x8 { // i < len(s)-8+1: provably in range
+	var acc archsimd.Float32x8
+	for i := 0; i < len(s)-8+1; i += 8 {
+		acc = acc.Add(archsimd.LoadFloat32x8(s[i : i+8]))
+	}
+	return acc
+}
+```
+
+```bash
+GOEXPERIMENT=simd go build -gcflags='-d=ssa/check_bce/debug=1' .
+```
+
+```
+# example.com/bce
+./bce.go:11:41: Found IsSliceInBounds
+```
+
+Only `SumA` (line 11) keeps a bounds check inside the loop. The compiler cannot rule out `i+8` overflowing, so it cannot prove `s[i:i+8]` is in range. In a scalar loop that is noise. In a loop whose body is one or two instructions, it is a large part of the work.
+
+### Vectors in arrays and structs
+
+`archsimd` values are 16–64 bytes. Go's register allocator currently keeps them in registers only as plain locals and parameters. Put eight of them in a `[8]archsimd.Int32x8` or a struct and the compiler spills them to the stack on every access. That is why the Go team's 8×8 transpose takes eight separate parameters. Keep vectors as locals in hot loops, and don't store them in heap objects. The package documentation says so explicitly.
+
+## The boring rule
+
+- Profile first. If the hot loop is a search, a hash or crypto, the standard library has probably vectorized it already.
+- Prefer `simd` (portable) for arithmetic. Use `archsimd` when you need a specific instruction or have measured that `simd` is not enough.
+- Every `archsimd` file: `//go:build goexperiment.simd && amd64` (or `arm64` / `wasm`), plus a negated-constraint fallback with the same API.
+- Every exported entry point checks CPU features first and falls back to a scalar twin. Never call a vector helper that hasn't been guarded.
+- Test against the scalar twin at every tail length, under `GODEBUG=cpu.avx512f=off` and `cpu.avx2=off`, and without the experiment. Use tolerances for floats.
+- Treat the API as unstable. Go 1.27 already renamed `Merge` → `IfElse` and replaced the `As*` casts with `ToBits` / `BitsTo*` / `ReshapeTo*` (the old names still compile, marked *Deprecated*). Pin the Go version in CI and expect to edit this code when you upgrade.
+
+## Try this
+
+1. Add a `CountAVX2` path using `Uint8x32` and `Mask8x32.ToBits()`, wire it into `Count` for CPUs without AVX-512, and prove it runs with `GODEBUG=cpu.avx512f=off`.
+2. Change `dot16` to keep **four** accumulators. Benchmark it with `-count=10` and `benchstat`. Does it help on your CPU, and is the kernel limited by FMA latency or by memory?
+3. Write `ReverseBits` with the portable `simd` package. What operation is missing, and how fast is the best portable version you can write compared with GFNI?
+4. Build the module with `GOEXPERIMENT=simd GOOS=wasip1 GOARCH=wasm` and add a `wasm` build tag to a 128-bit `Float32x4` version of `dot`. Run the tests under a WASI runtime.
+5. Look up `go doc simd/archsimd.Float32x8.Merge` and `AsUint32x8` in your toolchain and replace any deprecated calls in the code you write.
+
+## Sources
+
+- Go blog, "Arch-specific SIMD in Go" (Junyang Shao and David Chase, 2026-10-02): <https://go.dev/blog/archsimd>
+- Go blog, "Platform-independent SIMD in Go": <https://go.dev/blog/simd-experiment>
+- Go 1.27 release notes, `simd` and `simd/archsimd`: <https://go.dev/doc/go1.27>
+- Proposal and tracking issue #73787, "simd/archsimd: architecture-specific SIMD intrinsics under a GOEXPERIMENT": <https://github.com/golang/go/issues/73787>
+- Package docs, `go doc simd/archsimd` and `go doc simd` with `GOEXPERIMENT=simd` (Go 1.27.1)
