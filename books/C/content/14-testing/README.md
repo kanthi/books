@@ -28,6 +28,7 @@ By the end of this module you should be able to:
 | 3 | [Error Handling](03-error-handling.md) | Return codes, enums, `errno`, cleanup on failure, partial-success pitfalls |
 | 4 | [Code Quality](04-code-quality.md) | Warning archaeology, early-return design, `_Static_assert`, load/ownership patterns, CI-style local gates |
 | 5 | [Compiler Sanitizers](05-sanitizers.md) | ASan, UBSan, TSan, brief MSan: flags, reports, CI matrix, false friends |
+| 6 | [Memory-Safe C in Practice](06-memory-safe-c.md) | Fil-C vs ASan vs `_FORTIFY_SOURCE=3`, `counted_by` + `-fsanitize=bounds`, `-fbounds-safety` status, costs and blind spots |
 
 ## Suggested order
 
@@ -36,6 +37,7 @@ By the end of this module you should be able to:
 3. **Error Handling** — make APIs fail loudly and cleanly.  
 4. **Code Quality** — lock in habits that keep the above sustainable (`-Werror`, checklists, scripts).
 5. **Compiler Sanitizers** — deepen ASan/UBSan and add TSan/MSan operator practice beyond the harness chapter.
+6. **Memory-Safe C in Practice** — move from finding memory bugs in tests to stopping them in production.
 
 ## Tooling cheat sheet
 
