@@ -19,6 +19,7 @@ Measure subsystem health over time and debug *why* a host is slow or stuck: virt
 | `perf` | perf is Linux’s primary performance analysis suite. |
 | `btop` | btop is a modern, interactive resource monitor with a polished TUI: CPU (often per-core with clocks/temps when… |
 | `ltrace` | ltrace intercepts and prints dynamic library calls of a process (similar to how strace prints syscalls). |
+| `pmap` | pmap prints a process's memory map (size, RSS, dirty per mapping); the first step in hunting native leaks that heap profilers miss. |
 
 
 ## Suggested starting points
@@ -27,6 +28,7 @@ Measure subsystem health over time and debug *why* a host is slow or stuck: virt
 2. Who holds a file or port: `lsof`.
 3. Why a process fails: `strace` (syscalls), `ltrace` (library calls).
 4. Hotspots: `perf` (and interactive `btop` for a dashboard).
+5. RSS keeps growing: `pmap` (which mapping?), then `strace`/`bpftrace` and `gdb` (who maps it?).
 
 ## Related parts
 
