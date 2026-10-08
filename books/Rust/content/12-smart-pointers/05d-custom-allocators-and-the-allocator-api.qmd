@@ -1,0 +1,589 @@
+---
+title: "Custom Allocators and the Allocator API"
+author:
+  - name: "K19G"
+  - name: "grok-bot"
+---
+
+# Custom Allocators and the Allocator API
+
+## Thesis
+
+Every `Box` and `Vec` you have written so far got its memory from one place: the **global allocator**. You could swap that allocator for the whole program with `#[global_allocator]`, but you could not say "*this* vector lives in *that* arena". The `Allocator` trait that would let you do so has existed since 2016, behind the nightly-only `allocator_api` feature, and arena crates have shipped nightly-only allocator-aware APIs for years because of it.
+
+**Rust 1.100** (scheduled for 2026-11-12) stabilizes a deliberately small slice of that design: the `std::alloc::Allocator` trait, the `Global` and `System` allocators as implementors, and allocator-aware constructors on exactly two containers, `Box<T, A>` and `Vec<T, A>`. Everything else (`Rc::new_in`, fallible `try_*_in` constructors, allocator-aware `String` and `HashMap`) stays unstable under a new feature name, `allocator_ext`.
+
+This chapter builds two allocators on the stable surface, a counting wrapper and a bump arena. It then walks through the places where the type system and the abort-on-failure policy catch people out. Everything was compiled with the current beta, which is what becomes 1.100.
+
+## Mental model
+
+```text
+                 Vec<T, A>  /  Box<T, A>          (A defaults to Global)
+                        │  holds an A by value
+                        ▼
+   ┌──────────────────── unsafe trait Allocator ─────────────────────┐
+   │ allocate(&self, Layout)        -> Result<NonNull<[u8]>, AllocError>
+   │ deallocate(&self, NonNull<u8>, Layout)            (unsafe)
+   │ grow / grow_zeroed / shrink / allocate_zeroed     (provided)
+   └──────────────────────────────────────────────────────────────────┘
+          ▲                 ▲                    ▲
+        Global            System           your type, or &YourType
+   (#[global_allocator]) (the OS heap)     (arena, pool, counter…)
+```
+
+Four facts carry the chapter:
+
+| Fact | Consequence |
+|------|-------------|
+| The allocator is a **type parameter** with a default: `Vec<T, A = Global>` | `Vec<u32>` and `Vec<u32, System>` are *different types*. Code written for one does not accept the other |
+| The container **stores** an `A` | A zero-sized allocator (`Global`, `System`) costs nothing; `&Arena` costs one pointer; `&dyn Allocator` costs two |
+| Methods take `&self` | Implement `Allocator` on `&Arena` (blanket impl provided) to share one arena among many containers. Interior mutability (`Cell`) does the bookkeeping |
+| The trait is `unsafe` to implement | You promise that returned blocks are valid until deallocated, that blocks don't overlap, and that no method unwinds. The compiler cannot check any of it |
+
+`allocate` returns `NonNull<[u8]>`, a *slice* pointer, so an allocator can report that it handed back more than was asked for. `AllocError` is a zero-sized "no" with no further detail.
+
+## Worked examples
+
+All listings were compiled and run on the box with **rustc 1.100.0-beta.4 (2026-10-04)** and, for comparison, **rustc 1.99.0** stable, both installed with `rustup`. Until 1.100 reaches stable, use `+beta`:
+
+```bash
+rustup toolchain install beta --profile minimal
+rustc +beta --version
+```
+
+```text
+rustc 1.100.0-beta.4 (a2eb6097d 2026-10-04)
+```
+
+### Case 1: a counting allocator and a bump arena
+
+```bash
+cargo +beta new alloc-demo && cd alloc-demo
+```
+
+`Counting` wraps any other allocator and records each call. `Arena<N>` hands out slices of a fixed buffer by bumping a cursor, and its `deallocate` does nothing: the whole region is released at once when the arena is dropped. Note that neither needs a `#![feature]` line.
+
+```rust
+// src/main.rs — a counting allocator and a bump arena on the stable Allocator API (Rust 1.100)
+use std::alloc::{AllocError, Allocator, Global, Layout};
+use std::cell::{Cell, UnsafeCell};
+use std::mem::MaybeUninit;
+use std::ptr::NonNull;
+
+/// Wraps another allocator and counts what passes through it.
+struct Counting<A: Allocator = Global> {
+    inner: A,
+    allocs: Cell<usize>,
+    grows: Cell<usize>,
+    frees: Cell<usize>,
+    live_bytes: Cell<usize>,
+}
+
+impl Counting {
+    const fn new() -> Self {
+        Counting { inner: Global, allocs: Cell::new(0), grows: Cell::new(0), frees: Cell::new(0), live_bytes: Cell::new(0) }
+    }
+    fn report(&self, label: &str) {
+        println!(
+            "{label:<22} allocs={} grows={} frees={} live_bytes={}",
+            self.allocs.get(), self.grows.get(), self.frees.get(), self.live_bytes.get()
+        );
+    }
+}
+
+// SAFETY: every method forwards to `inner` with the caller's arguments unchanged,
+// so blocks stay valid until deallocated and are freed by the allocator that made them.
+unsafe impl<A: Allocator> Allocator for Counting<A> {
+    fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
+        self.allocs.set(self.allocs.get() + 1);
+        self.live_bytes.set(self.live_bytes.get() + layout.size());
+        self.inner.allocate(layout)
+    }
+    unsafe fn deallocate(&self, ptr: NonNull<u8>, layout: Layout) {
+        self.frees.set(self.frees.get() + 1);
+        self.live_bytes.set(self.live_bytes.get() - layout.size());
+        unsafe { self.inner.deallocate(ptr, layout) }
+    }
+    unsafe fn grow(&self, ptr: NonNull<u8>, old: Layout, new: Layout) -> Result<NonNull<[u8]>, AllocError> {
+        self.grows.set(self.grows.get() + 1);
+        self.live_bytes.set(self.live_bytes.get() - old.size() + new.size());
+        unsafe { self.inner.grow(ptr, old, new) }
+    }
+}
+
+/// A fixed-size bump arena: allocation moves a cursor, deallocation does nothing,
+/// and all memory comes back at once when the arena itself is dropped.
+struct Arena<const N: usize> {
+    buf: UnsafeCell<[MaybeUninit<u8>; N]>,
+    used: Cell<usize>,
+}
+
+impl<const N: usize> Arena<N> {
+    fn new() -> Self {
+        Arena { buf: UnsafeCell::new([MaybeUninit::uninit(); N]), used: Cell::new(0) }
+    }
+    fn used(&self) -> usize {
+        self.used.get()
+    }
+}
+
+// SAFETY: blocks are carved from `buf` without overlap and stay valid while `self`
+// is alive; borrowing the arena (`&Arena`) ties every collection to that lifetime.
+unsafe impl<const N: usize> Allocator for Arena<N> {
+    fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
+        let base = self.buf.get() as *mut u8;
+        let start = self.used.get();
+        let pad = base.wrapping_add(start).align_offset(layout.align());
+        let begin = start.checked_add(pad).ok_or(AllocError)?;
+        let end = begin.checked_add(layout.size()).ok_or(AllocError)?;
+        if end > N {
+            return Err(AllocError);
+        }
+        self.used.set(end);
+        let ptr = unsafe { NonNull::new_unchecked(base.add(begin)) };
+        Ok(NonNull::slice_from_raw_parts(ptr, layout.size()))
+    }
+    unsafe fn deallocate(&self, _ptr: NonNull<u8>, _layout: Layout) {
+        // Bump arenas free everything at once, when the arena is dropped.
+    }
+}
+
+#[derive(Debug)]
+struct Token<'a> {
+    kind: &'static str,
+    text: &'a str,
+}
+
+fn tokenize<'s, A: Allocator>(src: &'s str, alloc: A) -> Vec<Token<'s>, A> {
+    let mut out = Vec::new_in(alloc);
+    for word in src.split_whitespace() {
+        let kind = if word.chars().all(|c| c.is_ascii_digit()) { "num" } else { "word" };
+        out.push(Token { kind, text: word });
+    }
+    out
+}
+
+fn main() {
+    // 1. Counting: watch Vec's growth policy through the allocator.
+    let counter = Counting::new();
+    {
+        let mut v: Vec<u64, &Counting> = Vec::new_in(&counter);
+        counter.report("after new_in");
+        for i in 0..100 {
+            v.push(i);
+        }
+        counter.report("after 100 pushes");
+        let b = Box::new_in([0u8; 256], &counter);
+        counter.report("plus a Box");
+        println!("capacity = {}, box len = {}", v.capacity(), b.len());
+    }
+    counter.report("after drop");
+
+    let counter2 = Counting::new();
+    {
+        let mut v: Vec<u64, &Counting> = Vec::with_capacity_in(100, &counter2);
+        for i in 0..100 {
+            v.push(i);
+        }
+    }
+    counter2.report("with_capacity_in(100)");
+
+    // 2. Arena: many small values, one region, no per-object free.
+    let arena: Arena<4096> = Arena::new();
+    let toks = tokenize("let x = 42 + y * 7", &arena);
+    println!("{} tokens, arena used = {} bytes", toks.len(), arena.used());
+    println!("first = {:?}, last = {:?}", toks[0], toks[toks.len() - 1]);
+    let nums: Vec<&str> = toks.iter().filter(|t| t.kind == "num").map(|t| t.text).collect();
+    println!("numbers = {nums:?}");
+
+    let pair = Box::new_in((1u32, 2u32), &arena);
+    println!("boxed pair = {:?}, arena used = {}", *pair, arena.used());
+    println!("Vec allocator is the arena: {}", std::ptr::eq(*toks.allocator(), &arena));
+}
+```
+
+```bash
+cargo +beta run -q
+```
+
+```text
+after new_in           allocs=0 grows=0 frees=0 live_bytes=0
+after 100 pushes       allocs=1 grows=5 frees=0 live_bytes=1024
+plus a Box             allocs=2 grows=5 frees=0 live_bytes=1280
+capacity = 128, box len = 256
+after drop             allocs=2 grows=5 frees=2 live_bytes=0
+with_capacity_in(100)  allocs=1 grows=0 frees=1 live_bytes=0
+8 tokens, arena used = 384 bytes
+first = Token { kind: "word", text: "let" }, last = Token { kind: "num", text: "7" }
+numbers = ["42", "7"]
+boxed pair = (1, 2), arena used = 392
+Vec allocator is the arena: true
+```
+
+What to notice:
+
+- **`Vec::new_in` allocates nothing.** The first `push` makes one allocation (4 × `u64`), and then the vector *grows* five times (8, 16, 32, 64, 128) to hold 100 items. `with_capacity_in(100)` makes one allocation and no growth. The counter turns a growth policy you normally take on faith into numbers you can see.
+- **`live_bytes` returns to 0** after the scope ends, so every byte allocated was deallocated with the layout it was allocated with. That is the contract `Vec` and `Box` keep on their side.
+- **The arena used 384 bytes for 8 tokens of 32 bytes each.** The provided `grow` method allocates a new, larger block, copies, and calls `deallocate` on the old block. In a bump arena that call is a no-op, so the 4-token block (128 bytes) is simply abandoned. Arenas reward `with_capacity_in` far more than the heap does.
+- `tokenize` is generic over `A: Allocator` and returns `Vec<Token<'s>, A>`. The caller, not the function, decides where the tokens live.
+- `toks.allocator()` gives back the allocator the vector holds. Here that is the `&Arena` reference.
+
+On 1.99 stable the same crate is rejected at the first import:
+
+```bash
+cargo +stable build -q
+```
+
+```text
+error[E0658]: use of unstable library feature `allocator_api`
+ --> src/main.rs:2:18
+  |
+2 | use std::alloc::{AllocError, Allocator, Global, Layout};
+  |                  ^^^^^^^^^^
+  |
+  = note: see issue #32838 <https://github.com/rust-lang/rust/issues/32838> for more information
+...
+```
+
+### Case 2: what the allocator parameter costs
+
+The allocator is stored inside the container, so its size shows up in the container's size. The trait is also `dyn`-compatible, so you can choose an allocator at run time.
+
+```rust
+// dynalloc.rs — choosing an allocator at run time with &dyn Allocator
+use std::alloc::{Allocator, Global, System};
+
+fn pick(use_system: bool) -> &'static dyn Allocator {
+    if use_system { &System } else { &Global }
+}
+
+fn main() {
+    for flag in [false, true] {
+        let alloc = pick(flag);
+        let mut v: Vec<u32, &dyn Allocator> = Vec::with_capacity_in(4, alloc);
+        v.extend([10, 20, 30]);
+        let sum: u32 = v.iter().sum();
+        println!("system={flag} sum={sum} size_of::<Vec<u32, &dyn Allocator>>()={}",
+                 std::mem::size_of_val(&v));
+    }
+    println!("size_of::<Vec<u32>>() = {}", std::mem::size_of::<Vec<u32>>());
+    println!("size_of::<Vec<u32, System>>() = {}", std::mem::size_of::<Vec<u32, System>>());
+}
+```
+
+```bash
+rustc +beta --edition 2024 dynalloc.rs && ./dynalloc
+```
+
+```text
+system=false sum=60 size_of::<Vec<u32, &dyn Allocator>>()=40
+system=true sum=60 size_of::<Vec<u32, &dyn Allocator>>()=40
+size_of::<Vec<u32>>() = 24
+size_of::<Vec<u32, System>>() = 24
+```
+
+`Global` and `System` are zero-sized, so a `Vec` that uses them is still three words. A `&Arena` adds one word, and a `&dyn Allocator` adds two (data pointer and vtable) plus an indirect call on every allocation. Reach for `dyn` only when the choice really is made at run time.
+
+### Case 3: an allocator says no
+
+Every allocating method you already know (`push`, `extend`, `Box::new_in`) is **infallible**. When the allocator returns `AllocError`, they call `handle_alloc_error`, which aborts the process. The global heap almost never says no, so this hardly matters there. A 256-byte arena says no quickly.
+
+```rust
+// exhaust.rs — what happens when a custom allocator says no
+use std::alloc::{AllocError, Allocator, Layout};
+use std::cell::{Cell, UnsafeCell};
+use std::mem::MaybeUninit;
+use std::ptr::NonNull;
+
+struct Arena<const N: usize> {
+    buf: UnsafeCell<[MaybeUninit<u8>; N]>,
+    used: Cell<usize>,
+}
+
+impl<const N: usize> Arena<N> {
+    fn new() -> Self {
+        Arena { buf: UnsafeCell::new([MaybeUninit::uninit(); N]), used: Cell::new(0) }
+    }
+}
+
+// SAFETY: non-overlapping blocks carved from `buf`, valid while the arena lives.
+unsafe impl<const N: usize> Allocator for Arena<N> {
+    fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
+        let base = self.buf.get() as *mut u8;
+        let start = self.used.get();
+        let pad = base.wrapping_add(start).align_offset(layout.align());
+        let begin = start.checked_add(pad).ok_or(AllocError)?;
+        let end = begin.checked_add(layout.size()).ok_or(AllocError)?;
+        if end > N {
+            return Err(AllocError);
+        }
+        self.used.set(end);
+        let ptr = unsafe { NonNull::new_unchecked(base.add(begin)) };
+        Ok(NonNull::slice_from_raw_parts(ptr, layout.size()))
+    }
+    unsafe fn deallocate(&self, _: NonNull<u8>, _: Layout) {}
+}
+
+fn main() {
+    let mode = std::env::args().nth(1).unwrap_or_default();
+    let arena: Arena<256> = Arena::new();
+    let mut v: Vec<u64, &Arena<256>> = Vec::new_in(&arena);
+
+    if mode == "try" {
+        for i in 0.. {
+            if v.len() == v.capacity() {
+                if let Err(e) = v.try_reserve(1) {
+                    println!("stopped at len={} cap={}: {e}", v.len(), v.capacity());
+                    break;
+                }
+            }
+            v.push(i);
+        }
+        println!("arena used = {} of 256", arena.used.get());
+    } else {
+        for i in 0..64u64 {
+            v.push(i); // infallible API: allocation failure aborts the process
+            println!("len={} cap={} used={}", v.len(), v.capacity(), arena.used.get());
+        }
+    }
+}
+```
+
+```bash
+rustc +beta --edition 2024 -O exhaust.rs
+./exhaust; echo "exit=$?"
+./exhaust try; echo "exit=$?"
+```
+
+```text
+len=1 cap=4 used=32
+len=2 cap=4 used=32
+len=3 cap=4 used=32
+len=4 cap=4 used=32
+len=5 cap=8 used=96
+len=6 cap=8 used=96
+len=7 cap=8 used=96
+len=8 cap=8 used=96
+len=9 cap=16 used=224
+len=10 cap=16 used=224
+len=11 cap=16 used=224
+len=12 cap=16 used=224
+len=13 cap=16 used=224
+len=14 cap=16 used=224
+len=15 cap=16 used=224
+len=16 cap=16 used=224
+memory allocation of 256 bytes failed
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+Aborted
+exit=134
+stopped at len=16 cap=16: memory allocation failed because the memory allocator returned an error
+arena used = 224 of 256
+exit=0
+```
+
+(`Aborted` is the shell reporting `SIGABRT`; its exact wording differs between shells.) The abort is not a panic. `catch_unwind` cannot stop it, and destructors do not run. `Vec::try_reserve` *is* available on `Vec<T, A>` (it has been stable since 1.57 and works with any allocator), so the fallible path is to reserve before you push and handle the `TryReserveError`. Note too that 128 bytes of real data cost 224 bytes of arena, because the 32- and 64-byte blocks left behind by each growth step are never reused.
+
+### Case 4: what is *not* stable yet
+
+The stabilization is an MVP on purpose. Three things people reach for straight away still fail on 1.100 beta:
+
+```rust
+// not_yet.rs — allocator-aware APIs that are still unstable in Rust 1.100
+use std::alloc::{AllocError, Allocator, Global, Layout};
+use std::ptr::NonNull;
+use std::rc::Rc;
+
+struct Pool;
+unsafe impl Allocator for Pool {
+    fn allocate(&self, l: Layout) -> Result<NonNull<[u8]>, AllocError> { Global.allocate(l) }
+    unsafe fn deallocate(&self, p: NonNull<u8>, l: Layout) { unsafe { Global.deallocate(p, l) } }
+}
+
+fn main() {
+    let r = Rc::new_in(5u8, Pool);                              // shared ownership in a custom allocator
+    let v = Vec::<u8, Pool>::try_with_capacity_in(8, Pool);     // fallible constructor
+    let p = Box::into_pin(Box::new_in(1u8, Pool));              // pinning a custom-allocated box
+    println!("{r} {:?} {p}", v.map(|v| v.len()));
+}
+```
+
+```bash
+rustc +beta --edition 2024 not_yet.rs
+```
+
+```text
+error[E0658]: use of unstable library feature `allocator_ext`
+  --> not_yet.rs:13:13
+   |
+13 |     let r = Rc::new_in(5u8, Pool);                              // shared ownership in a custom allocator
+   |             ^^^^^^^^^^
+   |
+   = note: see issue #163177 <https://github.com/rust-lang/rust/issues/163177> for more information
+
+error[E0658]: use of unstable library feature `allocator_ext`
+  --> not_yet.rs:14:13
+   |
+14 |     let v = Vec::<u8, Pool>::try_with_capacity_in(8, Pool);     // fallible constructor
+   |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: see issue #163177 <https://github.com/rust-lang/rust/issues/163177> for more information
+
+error[E0277]: the trait bound `Pool: StaticAllocator` is not satisfied
+  --> not_yet.rs:15:27
+   |
+15 |     let p = Box::into_pin(Box::new_in(1u8, Pool));              // pinning a custom-allocated box
+   |             ------------- ^^^^^^^^^^^^^^^^^^^^^^ unsatisfied trait bound
+   |             |
+   |             required by a bound introduced by this call
+   |
+help: the nightly-only, unstable trait `StaticAllocator` is not implemented for `Pool`
+...
+```
+
+- **`Rc::new_in` / `Arc::new_in`** remain under `allocator_ext` (tracking issue #163177). What *is* stable is `impl Allocator for Rc<A>` / `Arc<A>`, so a shared allocator can be passed around by `Rc`, but the reference-counted *values* cannot live in a custom allocator yet.
+- **`try_with_capacity_in`** and the other fallible constructors are unstable. Use `new_in` plus `try_reserve`, as in Case 3.
+- **`Box::into_pin`** needs the unstable `StaticAllocator` marker. `Global`, `System`, `&A` and `&mut A` have it, and your own types cannot opt in on stable. This is a soundness fix from the stabilization work: a box whose allocator can be dropped early must not promise `Pin`'s "never moves, never freed without drop" guarantee.
+- **`String`, `HashMap`, `BTreeMap`, `VecDeque`** have no allocator parameter on stable. `String<System>` is `error[E0107]: struct takes 0 generic arguments`. If you need allocator-aware text, hold a `Vec<u8, A>` and validate it with `std::str::from_utf8`.
+
+## The trap
+
+### A collection outlives its arena
+
+`&Arena` implements `Allocator`, and the borrow checker treats it like any other borrow. Returning a vector that borrows a local allocator fails to compile:
+
+```rust
+// outlive.rs — a collection cannot outlive the arena it borrows
+use std::alloc::{AllocError, Allocator, Global, Layout};
+use std::ptr::NonNull;
+
+struct Pool; // stand-in: forwards to Global
+unsafe impl Allocator for Pool {
+    fn allocate(&self, l: Layout) -> Result<NonNull<[u8]>, AllocError> { Global.allocate(l) }
+    unsafe fn deallocate(&self, p: NonNull<u8>, l: Layout) { unsafe { Global.deallocate(p, l) } }
+}
+
+fn build() -> Vec<u32, &'static Pool> {
+    let pool = Pool;
+    let mut v = Vec::new_in(&pool);
+    v.push(1);
+    v
+}
+
+fn main() {
+    println!("{:?}", build());
+}
+```
+
+```bash
+rustc +beta --edition 2024 outlive.rs
+```
+
+```text
+error[E0515]: cannot return value referencing local variable `pool`
+  --> outlive.rs:15:5
+   |
+13 |     let mut v = Vec::new_in(&pool);
+   |                             ----- `pool` is borrowed here
+14 |     v.push(1);
+15 |     v
+   |     ^ returns a value referencing data owned by the current function
+
+error: aborting due to 1 previous error
+```
+
+This error is the feature working. It is the reason an arena in Rust can be safe without a garbage collector. The fix is structural: create the arena in the caller and pass `&arena` down, as `tokenize` does in Case 1.
+
+### `Vec<T, A>` does not fit where `Vec<T>` is expected
+
+```rust
+// mismatch.rs — Vec<T, A> is a different type from Vec<T>
+use std::alloc::System;
+
+fn total(v: &Vec<u32>) -> u32 {
+    v.iter().sum()
+}
+
+fn main() {
+    let mut v = Vec::new_in(System);
+    v.extend([1, 2, 3]);
+    println!("{}", total(&v));
+}
+```
+
+```text
+error[E0308]: mismatched types
+  --> mismatch.rs:11:26
+   |
+11 |     println!("{}", total(&v));
+   |                    ----- ^^ expected `&Vec<u32>`, found `&Vec<{integer}, System>`
+   |                    |
+   |                    arguments to this function are incorrect
+   |
+   = note: expected reference `&Vec<u32, std::alloc::Global>`
+              found reference `&Vec<{integer}, System>`
+```
+
+Every API in your codebase that names `&Vec<T>` or `Box<T>` quietly means `Global`. Read-only functions should take `&[T]`, which every `Vec<T, A>` derefs to. Functions that grow the vector should be generic over the allocator:
+
+```rust
+// mismatch_fixed.rs — accept slices, or be generic over the allocator
+use std::alloc::{Allocator, System};
+
+fn total(v: &[u32]) -> u32 {
+    v.iter().sum()
+}
+
+fn push_twice<A: Allocator>(v: &mut Vec<u32, A>, x: u32) {
+    v.push(x);
+    v.push(x);
+}
+
+fn main() {
+    let mut v = Vec::new_in(System);
+    v.extend([1, 2, 3]);
+    push_twice(&mut v, 10);
+    println!("{}", total(&v));
+    let plain = vec![4u32, 5];
+    println!("{}", total(&plain));
+}
+```
+
+```text
+26
+9
+```
+
+### Implementing the trait is a safety contract
+
+`unsafe impl Allocator` is a promise the compiler cannot check. The ways to break it are the classic C allocator bugs: handing out overlapping blocks (a bump cursor that forgets alignment padding), returning memory that dies before the container does (an allocator that owns its buffer by value and gets *moved*), or panicking inside `allocate`. The stabilized contract explicitly forbids unwinding out of any `Allocator` method, from its clones, or from its drop. Keep the `unsafe impl` small, put the bookkeeping in plain safe code, and test it under Miri (`cargo +nightly miri test`), which catches the use-after-free, out-of-bounds, and aliasing violations that a broken allocator causes in the containers using it.
+
+## Choosing an approach
+
+| Need | Use |
+|------|-----|
+| Replace the heap for the whole program | `#[global_allocator]` with a `GlobalAlloc` (stable since 1.28) |
+| Many short-lived objects freed together (parsers, per-request scratch) | A bump arena passed as `&Arena` to `Vec::new_in` / `Box::new_in` |
+| Measure or limit what one subsystem allocates | A wrapper like `Counting<A>` around `Global` |
+| Pick the allocator at run time | `&dyn Allocator` (two extra words per container) |
+| Shared ownership, maps, strings in a custom allocator | Not on stable yet (`allocator_ext`), so keep a third-party collection for now |
+| MSRV below 1.100 | Keep using nightly-gated code or the arena crate's own types; don't half-adopt |
+
+## The boring rule
+
+Pass the allocator in, don't hide it: `fn f<A: Allocator>(…, alloc: A) -> Vec<T, A>`. Take `&[T]` when you only read. Reserve capacity up front in arenas, and use `try_reserve` wherever running out is a normal outcome rather than a bug. Write `unsafe impl Allocator` only after you've measured a reason, and run it under Miri.
+
+## Try this
+
+1. Change `Counting` to also override `shrink`, call `v.shrink_to_fit()` after the 100 pushes, and confirm the new counter moves while `live_bytes` drops to 800.
+2. Give `Arena` a `reset(&mut self)` that sets `used` back to 0. Why does it have to take `&mut self`, and what does the borrow checker say if a `Vec<_, &Arena>` is still alive when you call it?
+3. Make `Arena::deallocate` reclaim space when the block being freed is the most recent one (`ptr + size == cursor`). Re-run Case 1 and compare `arena used` before and after.
+4. Rewrite `tokenize` to call `Vec::with_capacity_in(src.split_whitespace().count(), alloc)` and predict the new `arena used` value before running it.
+5. Wrap `System` in `Counting<System>` and verify that `Box::into_pin` fails to compile for it even though it compiles for plain `System`. Which unstable trait is missing, and why can't you implement it yourself?
+
+## Sources
+
+- rust-lang/rust PR #156882, "alloc: stabilise `Allocator`" (stabilization report, merged 2026-09-23, milestone 1.100.0): <https://github.com/rust-lang/rust/pull/156882>
+- Draft release notes for 1.100.0: <https://github.com/rust-lang/rust/issues/163811>
+- Tracking issue `allocator_api` #32838 and the remaining-surface issue `allocator_ext` #163177
+- RFC 1398, "Kinds of allocators": <https://rust-lang.github.io/rfcs/1398-kinds-of-allocators.html>
+- std docs: `std::alloc::Allocator`, `Vec::new_in`, `Box::new_in`, `Vec::try_reserve`, `handle_alloc_error`
