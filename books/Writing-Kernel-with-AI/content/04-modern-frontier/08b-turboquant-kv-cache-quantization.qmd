@@ -1,0 +1,704 @@
+---
+title: "TurboQuant: Rotate-then-Quantize KV Caches at 3 Bits"
+author:
+  - name: "K19G"
+  - name: "grok-bot"
+---
+
+# TurboQuant: Rotate-then-Quantize KV Caches at 3 Bits
+
+Long-context decode is a bandwidth problem that turns into a capacity problem. Every generated token reads the whole KV cache of its sequence, and every concurrent sequence keeps its own cache in HBM. FP8 caches halve the bill. Going below 8 bits is harder: keys carry **outlier channels**, a handful of dimensions whose magnitude is ten or twenty times the rest, and a naive 3-bit quantizer spends all its levels on them.
+
+**TurboQuant** (Zandieh, Daliri, Hadian, Mirrokni; arXiv April 2025, ICLR 2026) handles outliers by changing the basis instead of fighting them. Multiply each vector by a random orthogonal matrix and every coordinate starts to look like a draw from one known distribution, the same for every vector and every channel. A single precomputed scalar codebook is then close to optimal everywhere. You store a few bits per coordinate and one norm per vector, with no per-block scales or zero points and no calibration data.
+
+This chapter builds the quantizer in NumPy and checks the paper's distortion numbers. It also shows the result that decides how TurboQuant gets deployed: the unbiased inner-product variant (with QJL) loses to the plain MSE variant inside softmax attention. After that come the kernel-side algebra that makes decode cheap, where the method runs in production today, and the prior-art dispute around it.
+
+Everything here runs on a CPU. The listings were run on Debian 13.7 with Python 3.13.5, NumPy 2.5.3 and SciPy 1.18.1, and the outputs are pasted unedited. GPU throughput numbers are quoted from their sources and labeled as such.
+
+---
+
+## 1. Why the KV cache is the thing to compress
+
+For a GQA model, each token stores one key and one value vector per KV head per layer:
+
+$$\text{bytes/token} = 2 \cdot L \cdot H_{kv} \cdot d \cdot \tfrac{b}{8}.$$
+
+Weights are a fixed cost. The KV cache grows with context length times batch size, and decode reads all of it for every token. Compressing it buys capacity (more sequences or longer contexts) and bandwidth (fewer bytes per decode step) at once.
+
+```python
+# file: kv_budget.py
+# KV-cache bytes per token, and what a bit budget buys, for two GQA models.
+GiB = 1024**3
+
+models = {  # name: (layers, kv_heads, head_dim)
+    "Llama-3.1-8B": (32, 8, 128),
+    "Llama-3.1-70B": (80, 8, 128),
+}
+
+def kv_bytes_per_token(layers, kv_heads, head_dim, bits_per_coord, overhead_bits_per_vec=0):
+    vectors = 2 * layers * kv_heads                     # one K and one V per head per layer
+    return vectors * (head_dim * bits_per_coord + overhead_bits_per_vec) / 8
+
+budget = 40 * GiB  # memory left for KV after weights, say
+print(f"{'model':14} {'format':26} {'KiB/token':>9} {'x vs bf16':>9} {'tokens in 40 GiB':>17}")
+for name, (L, H, d) in models.items():
+    base = kv_bytes_per_token(L, H, d, 16)
+    for label, bits, ovh in [("bf16", 16, 0),
+                             ("fp8", 8, 0),
+                             ("4-bit + fp16 norm", 4, 16),
+                             ("3.5-bit + fp16 norm", 3.5, 16),
+                             ("3-bit + fp16 norm", 3, 16),
+                             ("2.5-bit + fp16 norm", 2.5, 16)]:
+        b = kv_bytes_per_token(L, H, d, bits, ovh)
+        print(f"{name:14} {label:26} {b / 1024:9.1f} {base / b:9.2f} {budget / b:17,.0f}")
+```
+
+```bash
+python kv_budget.py
+```
+
+Output:
+
+```text
+model          format                     KiB/token x vs bf16  tokens in 40 GiB
+Llama-3.1-8B   bf16                           128.0      1.00           327,680
+Llama-3.1-8B   fp8                             64.0      2.00           655,360
+Llama-3.1-8B   4-bit + fp16 norm               33.0      3.88         1,271,001
+Llama-3.1-8B   3.5-bit + fp16 norm             29.0      4.41         1,446,312
+Llama-3.1-8B   3-bit + fp16 norm               25.0      5.12         1,677,722
+Llama-3.1-8B   2.5-bit + fp16 norm             21.0      6.10         1,997,288
+Llama-3.1-70B  bf16                           320.0      1.00           131,072
+Llama-3.1-70B  fp8                            160.0      2.00           262,144
+Llama-3.1-70B  4-bit + fp16 norm               82.5      3.88           508,400
+Llama-3.1-70B  3.5-bit + fp16 norm             72.5      4.41           578,525
+Llama-3.1-70B  3-bit + fp16 norm               62.5      5.12           671,089
+Llama-3.1-70B  2.5-bit + fp16 norm             52.5      6.10           798,915
+```
+
+The 16-bit norm per vector is real overhead: at 3 bits it adds $16/128 = 0.125$ bits per coordinate. Google's announcement of "at least 6x" KV memory reduction corresponds to the 2.5-bit row. The paper's own claim is narrower and more useful: **quality neutrality at 3.5 bits per channel, marginal degradation at 2.5 bits**, on LongBench and needle-in-a-haystack with Llama-3.1-8B and Ministral-7B.
+
+---
+
+## 2. Mental model: make every coordinate look the same, then use one codebook
+
+```text
+ key k (d=128, outlier channels)        rotated  y = Π k/||k||           stored
+ ┌─────────────────────────────┐       ┌─────────────────────────────┐   ┌──────────────────┐
+ │ ▁▁█▁▁▁▁▁▁▁▁▆▁▁▁▁▁▁▁▁▁▁▇▁▁▁▁ │  Π    │ ▃▄▂▅▃▂▄▃▅▂▃▄▂▃▅▄▂▃▄▃▂▅▃▄▂▃ │ Q │ idx: b bits × d  │
+ │ few huge channels, rest tiny│ ────► │ every coord ≈ N(0, 1/d)     │──►│ ||k||: one fp16  │
+ └─────────────────────────────┘       └─────────────────────────────┘   └──────────────────┘
+ dequant:  k̂ = ||k|| · Πᵀ c[idx]          c = Lloyd-Max centroids for N(0,1/d), fixed per (d, b)
+```
+
+Three facts carry the method.
+
+1. **A random rotation spreads energy.** If $\Pi$ is a uniformly random orthogonal matrix and $u$ a unit vector, $\Pi u$ is uniform on the sphere $S^{d-1}$, whatever $u$ was. One coordinate of a uniform point on the sphere has density proportional to $(1-x^2)^{(d-3)/2}$ on $[-1, 1]$, which is very close to $\mathcal N(0, 1/d)$ for $d \ge 64$. The outliers are gone, smeared across all 128 coordinates.
+2. **In high dimension the coordinates are nearly independent.** That makes per-coordinate scalar quantization nearly as good as vector quantization. The paper proves the MSE quantizer's distortion is within a factor $\sqrt{3}\pi/2 \approx 2.7$ of the information-theoretic lower bound $4^{-b}$ for *every* input, and much closer at low bit-widths.
+3. **The codebook is data-independent.** The distribution in (1) depends only on $d$, so the optimal $2^b$ levels (Lloyd-Max for that density) are computed once, offline. Nothing is learned from the model, and quantization is online: one vector in, one code out, so it works token by token during decode.
+
+A dense Haar rotation costs $O(d^2)$ per vector. Production code uses a **randomized Hadamard transform** $y = H D x$ ($D$ a random $\pm 1$ diagonal, $H$ the orthonormal Walsh–Hadamard matrix). It costs $O(d \log d)$, is exactly orthogonal, and is close enough to Haar for this purpose. Section 8 shows what happens when you drop $D$.
+
+---
+
+## 3. The quantizer in NumPy
+
+`tq_core.py` contains everything: the Hadamard butterfly, the two rotations, the Lloyd-Max solver for the sphere-coordinate density, the MSE quantizer, and the inner-product quantizer that adds a 1-bit QJL sketch of the residual.
+
+```python
+# file: tq_core.py
+# The pieces of a TurboQuant-style vector quantizer, in plain NumPy:
+#   randomized Hadamard rotation, a Lloyd-Max codebook for the coordinates of a
+#   random unit vector, the MSE quantizer, and the QJL residual sketch.
+import numpy as np
+
+
+def fwht(x):
+    """Orthonormal fast Walsh-Hadamard transform along the last axis (length 2^m)."""
+    x = np.array(x, dtype=np.float64, copy=True)
+    shape, n = x.shape, x.shape[-1]
+    assert n & (n - 1) == 0, "Hadamard length must be a power of two"
+    x = x.reshape(-1, n)
+    h = 1
+    while h < n:
+        x = x.reshape(-1, n // (2 * h), 2, h)
+        a = x[:, :, 0, :].copy()
+        b = x[:, :, 1, :]
+        x[:, :, 0, :] = a + b
+        x[:, :, 1, :] = a - b
+        x = x.reshape(-1, n)
+        h *= 2
+    return x.reshape(shape) / np.sqrt(n)
+
+
+class RandomizedHadamard:
+    """y = H D x with D a fixed random +-1 diagonal. Orthogonal, O(d log d), and its own
+    transpose up to D: x = D H y."""
+
+    def __init__(self, d, rng):
+        self.signs = rng.choice([-1.0, 1.0], size=d)
+
+    def forward(self, x):
+        return fwht(x * self.signs)
+
+    def inverse(self, y):
+        return fwht(y) * self.signs
+
+
+def lloyd_max_sphere(d, bits, grid=400_001, iters=300):
+    """Optimal scalar codebook for one coordinate of a uniform random unit vector in R^d.
+    That coordinate has density proportional to (1 - x^2)^((d - 3) / 2) on [-1, 1]."""
+    x = np.linspace(-1, 1, grid)
+    w = np.clip(1 - x * x, 0, None) ** ((d - 3) / 2)
+    w /= w.sum()
+    k = 2**bits
+    sd = 1 / np.sqrt(d)
+    c = np.linspace(-2 * sd, 2 * sd, k)                  # start near the bulk of the mass
+    for _ in range(iters):
+        edges = (c[1:] + c[:-1]) / 2                     # nearest-centroid boundaries
+        cell = np.searchsorted(edges, x)
+        mass = np.bincount(cell, weights=w, minlength=k)
+        c = np.bincount(cell, weights=w * x, minlength=k) / mass   # centroid = conditional mean
+    edges = (c[1:] + c[:-1]) / 2
+    mse_per_coord = np.sum(w * (x - c[np.searchsorted(edges, x)]) ** 2)
+    return c, edges, d * mse_per_coord                  # last value: E||u - Q(u)||^2 for unit u
+
+
+class HaarRotation:
+    """A dense uniformly random orthogonal matrix (QR of a Gaussian, signs fixed). O(d^2)."""
+
+    def __init__(self, d, rng):
+        q, r = np.linalg.qr(rng.standard_normal((d, d)))
+        self.Q = q * np.sign(np.diag(r))
+
+    def forward(self, x):
+        return x @ self.Q.T
+
+    def inverse(self, y):
+        return y @ self.Q
+
+
+class TurboQuantMSE:
+    """Store b-bit indices per coordinate plus one norm per vector."""
+
+    def __init__(self, d, bits, rng, norm_correction=False, rotation=RandomizedHadamard):
+        self.rot = rotation(d, rng)
+        self.centroids, self.edges, self.theory_mse = lloyd_max_sphere(d, bits)
+        self.norm_correction = norm_correction
+
+    def quantize(self, x):
+        norm = np.linalg.norm(x, axis=-1, keepdims=True)
+        y = self.rot.forward(x / norm)
+        return np.searchsorted(self.edges, y).astype(np.uint8), norm.astype(np.float16)
+
+    def dequantize(self, idx, norm):
+        y = self.centroids[idx]
+        if self.norm_correction:                         # put the codeword back on the sphere
+            y = y / np.linalg.norm(y, axis=-1, keepdims=True)
+        return norm.astype(np.float64) * self.rot.inverse(y)
+
+
+class TurboQuantProd:
+    """(b-1)-bit MSE quantizer, then a 1-bit QJL sketch of the residual: an unbiased
+    estimator of inner products <q, x>."""
+
+    def __init__(self, d, bits, rng):
+        self.mse = TurboQuantMSE(d, bits - 1, rng)
+        self.S = rng.standard_normal((d, d))
+        self.d = d
+
+    def quantize(self, x):
+        idx, norm = self.mse.quantize(x)
+        r = x - self.mse.dequantize(idx, norm)
+        return idx, norm, np.sign(r @ self.S.T).astype(np.int8), np.linalg.norm(r, axis=-1, keepdims=True)
+
+    def dequantize(self, idx, norm, qjl, rnorm):
+        corr = np.sqrt(np.pi / 2) / self.d * rnorm * (qjl @ self.S)
+        return self.mse.dequantize(idx, norm) + corr
+```
+
+A few details matter:
+
+- **Normalize, then rotate.** The codebook is designed for coordinates of a *unit* vector. Storing $\lVert x \rVert$ separately is what lets one codebook serve every token. (vLLM stores it as fp16.)
+- **Indices are searched against midpoints.** With sorted centroids, nearest-centroid assignment is a binary search over $2^b - 1$ boundaries. vLLM's Triton store kernel does exactly that.
+- **`norm_correction`** rescales the decoded codeword back to unit length before un-rotating. Quantization shrinks vectors (the centroids are conditional means, which sit inside the sphere), and the correction undoes that radial bias. vLLM's `_nc` presets turn it on, and its docs report about 0.8% perplexity gain at 4 bits.
+- **QJL** (Zandieh, Daliri, Han; AAAI 2025) stores $\operatorname{sign}(S r)$ for a Gaussian matrix $S$ and the residual $r$, plus $\lVert r \rVert$. The estimator $\sqrt{\pi/2}\,/\,d \cdot \lVert r\rVert\, S^\top \operatorname{sign}(S r)$ is unbiased for inner products with $r$. Spending one of the $b$ bits on it makes $\langle q, \hat x\rangle$ unbiased.
+
+---
+
+## 4. Check the codebook against the paper
+
+```python
+# file: tq_codebook.py
+# Lloyd-Max codebooks for the coordinates of a random unit vector, and the distortion
+# they buy, next to the numbers in the TurboQuant paper and its upper/lower bounds.
+import numpy as np
+
+from tq_core import HaarRotation, RandomizedHadamard, TurboQuantMSE, lloyd_max_sphere
+
+d = 128
+paper = {1: 0.36, 2: 0.117, 3: 0.03, 4: 0.009}
+print(f"d = {d}")
+for b in (1, 2):
+    c, _, _ = lloyd_max_sphere(d, b)
+    print(f"{b}-bit centroids x sqrt(d): {np.round(c * np.sqrt(d), 3)}")
+print(f"{'bits':>4} {'D_mse (ours)':>12} {'paper':>6} {'lower 4^-b':>10} {'upper sqrt(3)pi/2 4^-b':>23}")
+for b in (1, 2, 3, 4):
+    _, _, D = lloyd_max_sphere(d, b)
+    print(f"{b:>4} {D:12.4f} {paper[b]:6.3f} {4.0**-b:10.4f} {np.sqrt(3) * np.pi / 2 * 4.0**-b:23.4f}")
+
+# Same quantizer on real vectors. Two input families, two rotations.
+rng = np.random.default_rng(0)
+iso = rng.standard_normal((20_000, d))
+spiky = iso * np.r_[np.full(4, 25.0), np.ones(d - 4)]       # 4 channels carry ~95% of the energy
+for b in (2, 3):
+    for rot in (HaarRotation, RandomizedHadamard):
+        tq = TurboQuantMSE(d, b, rng, rotation=rot)
+        res = []
+        for x in (iso, spiky):
+            xh = tq.dequantize(*tq.quantize(x))
+            res.append(np.mean(np.sum((x - xh) ** 2, 1) / np.sum(x**2, 1)))
+        print(f"{b}-bit {rot.__name__:18} isotropic {res[0]:.4f}  spiky {res[1]:.4f}  "
+              f"(model {tq.theory_mse:.4f})")
+```
+
+```bash
+python tq_codebook.py
+```
+
+Output:
+
+```text
+d = 128
+1-bit centroids x sqrt(d): [-0.799  0.799]
+2-bit centroids x sqrt(d): [-1.505 -0.452  0.452  1.505]
+bits D_mse (ours)  paper lower 4^-b  upper sqrt(3)pi/2 4^-b
+   1       0.3609  0.360     0.2500                  0.6802
+   2       0.1160  0.117     0.0625                  0.1700
+   3       0.0340  0.030     0.0156                  0.0425
+   4       0.0093  0.009     0.0039                  0.0106
+2-bit HaarRotation       isotropic 0.1159  spiky 0.1086  (model 0.1160)
+2-bit RandomizedHadamard isotropic 0.1161  spiky 0.0880  (model 0.1160)
+3-bit HaarRotation       isotropic 0.0339  spiky 0.0331  (model 0.0340)
+3-bit RandomizedHadamard isotropic 0.0340  spiky 0.0301  (model 0.0340)
+```
+
+How to read it:
+
+- The 1-bit centroids are $\pm\sqrt{2/\pi}/\sqrt d \approx \pm 0.798/\sqrt d$, and the 2-bit ones are $\pm 0.453/\sqrt d$ and $\pm 1.51/\sqrt d$. Both match the paper's closed forms.
+- The distortions $0.36, 0.116, 0.034, 0.0093$ match the paper's $\approx 0.36, 0.117, 0.03, 0.009$. The paper rounds the 3-bit value. Each extra bit buys a bit less than the ideal factor of 4.
+- The **model assumes a fresh random rotation per vector**. In practice one rotation is shared by every token of a layer, and keys with strong structure (four channels holding about 95% of the energy) do not land exactly on the model. Here they land *below* it: rotated, they spread over a few coordinates more evenly than a sphere sample would. Isotropic inputs land on the model, as they should. The guarantee is about the worst case in expectation over the rotation. On real keys, measure.
+
+---
+
+## 5. Against the obvious 3-bit baselines
+
+The comparison that matters for attention is the error in the logits $q \cdot k / \sqrt d$, not reconstruction MSE. This listing builds keys with four hot channels and a per-channel offset (the pattern KIVI and KVQuant reported in real K caches), plus queries that lean on the same channels, and tries six 3-bit schemes.
+
+```python
+# file: tq_vs_naive.py
+# 3-bit keys with channel outliers: naive per-token scaling vs per-channel scaling
+# vs rotate-then-quantize. Error measured on the keys and on attention logits q.k/sqrt(d).
+import numpy as np
+
+from tq_core import RandomizedHadamard, TurboQuantMSE
+
+rng = np.random.default_rng(1)
+n, d, bits = 4096, 128, 3
+scale = np.ones(d)
+scale[[3, 17, 64, 101]] = [18.0, 12.0, 9.0, 15.0]    # a few hot channels, same for every token
+K = rng.standard_normal((n, d)) * scale + 0.5 * scale  # plus a per-channel offset
+Q = rng.standard_normal((64, d)) * np.sqrt(scale)      # queries lean on the same channels
+
+
+def uniform_absmax(x, bits, axis):
+    """Symmetric round-to-nearest with one fp16 scale per slice along `axis`."""
+    qmax = 2 ** (bits - 1) - 1
+    s = np.abs(x).max(axis=axis, keepdims=True) / qmax
+    return np.clip(np.round(x / s), -qmax - 1, qmax) * s
+
+
+def uniform_minmax(x, bits, axis):
+    """Asymmetric round-to-nearest with fp16 scale and zero point per slice."""
+    lo, hi = x.min(axis=axis, keepdims=True), x.max(axis=axis, keepdims=True)
+    s = (hi - lo) / (2**bits - 1)
+    return np.round((x - lo) / s) * s + lo
+
+
+rht = RandomizedHadamard(d, rng)
+tq = TurboQuantMSE(d, bits, rng)
+tq_nc = TurboQuantMSE(d, bits, rng, norm_correction=True)
+schemes = {
+    "per-token absmax": uniform_absmax(K, bits, axis=1),
+    "per-token min-max": uniform_minmax(K, bits, axis=1),
+    "per-channel min-max": uniform_minmax(K, bits, axis=0),
+    "RHT + per-token min-max": rht.inverse(uniform_minmax(rht.forward(K), bits, axis=1)),
+    "TurboQuant-MSE": tq.dequantize(*tq.quantize(K)),
+    "TurboQuant-MSE + norm fix": tq_nc.dequantize(*tq_nc.quantize(K)),
+}
+L = Q @ K.T / np.sqrt(d)
+print(f"n={n} keys, d={d}, {bits} bits/coord, logit std {L.std():.2f}")
+print(f"{'scheme':27} {'key rel. MSE':>12} {'logit RMSE':>10} {'top-1 match':>11}")
+for name, Kh in schemes.items():
+    rel = np.sum((K - Kh) ** 2) / np.sum(K**2)
+    Lh = Q @ Kh.T / np.sqrt(d)
+    top1 = np.mean(L.argmax(1) == Lh.argmax(1))
+    print(f"{name:27} {rel:12.4f} {np.sqrt(np.mean((L - Lh) ** 2)):10.3f} {top1:11.2%}")
+```
+
+```bash
+python tq_vs_naive.py
+```
+
+Output:
+
+```text
+n=4096 keys, d=128, 3 bits/coord, logit std 11.50
+scheme                      key rel. MSE logit RMSE top-1 match
+per-token absmax                  0.1439      1.721      67.19%
+per-token min-max                 0.2198      1.488      54.69%
+per-channel min-max               0.0725      3.080      53.12%
+RHT + per-token min-max           0.0307      0.621      79.69%
+TurboQuant-MSE                    0.0297      0.631      73.44%
+TurboQuant-MSE + norm fix         0.0294      0.601      81.25%
+```
+
+Three lessons:
+
+1. **Per-token scaling fails on outlier channels.** The scale is set by the hottest channel, so the 120 ordinary channels round to one or two levels.
+2. **Per-channel scaling wins on key MSE and loses on logits.** Per-channel scaling (what KIVI does for keys) spreads the *absolute* error evenly. The hot channels have huge ranges, so their absolute error is large, and those are exactly the channels the queries weight. Reconstruction MSE is the wrong metric.
+3. **The rotation does most of the work.** At 3 bits, a randomized Hadamard followed by a plain per-token min-max quantizer is already within noise of TurboQuant-MSE. The Lloyd-Max codebook and norm storage add a little accuracy and remove the per-token scale and zero point (one fp16 instead of two). The top-1 column is computed over 64 queries, so treat differences of a few percent as noise.
+
+---
+
+## 6. The trap: unbiased is not the same as better
+
+The paper offers two quantizers. TurboQuant-MSE minimizes $\lVert x - \hat x\rVert^2$. TurboQuant-prod spends one bit on QJL so that $\mathbb E\,\langle q, \hat x\rangle = \langle q, x\rangle$ exactly. Inner products are what attention computes, so the unbiased one looks like the right choice for keys. Check it against softmax.
+
+```python
+# file: tq_prod.py
+# Biased-but-tight (MSE) vs unbiased-but-noisy (MSE + QJL) inner products, and what
+# each does to a peaked softmax over 4096 keys.
+import numpy as np
+
+from tq_core import TurboQuantMSE, TurboQuantProd
+
+rng = np.random.default_rng(2)
+d, n = 128, 4096
+
+# Part 1: <q, k^> against <q, k> for unit vectors. Slope 1 = unbiased.
+k = rng.standard_normal((n, d))
+k /= np.linalg.norm(k, axis=1, keepdims=True)
+q = k[:512] + 0.6 * rng.standard_normal((512, d)) / np.sqrt(d)   # queries correlated with keys
+q /= np.linalg.norm(q, axis=1, keepdims=True)
+true = np.sum(q * k[:512], 1)
+print("inner products, 512 correlated (q, k) pairs")
+print(f"{'quantizer':22} {'slope':>6} {'resid std':>9}")
+for bits in (2, 3, 4):
+    for name, tq in ((f"MSE {bits}-bit", TurboQuantMSE(d, bits, rng)),
+                     (f"MSE {bits - 1}-bit + QJL", TurboQuantProd(d, bits, rng))):
+        est = np.sum(q * tq.dequantize(*tq.quantize(k[:512])), 1)
+        slope = np.dot(est, true) / np.dot(true, true)
+        print(f"{name:22} {slope:6.3f} {np.std(est - slope * true):9.4f}")
+
+# Part 2: attention with one relevant key (logit ~ 9 above the crowd).
+print("\nattention, 3 bits per key coordinate, 200 trials")
+print(f"{'keys':18} {'p(needle)':>9} {'TV distance':>11} {'output rel err':>14}")
+quants = {"fp32": None, "MSE 3-bit": TurboQuantMSE(d, 3, rng),
+          "MSE 2-bit + QJL": TurboQuantProd(d, 3, rng)}
+stats = {name: [] for name in quants}
+for t in range(200):
+    K = rng.standard_normal((n, d))
+    V = rng.standard_normal((n, d))
+    qv = rng.standard_normal(d)
+    K[7] = 9.0 * np.sqrt(d) * qv / (qv @ qv) + 0.3 * K[7]       # the needle: logit ~ 9
+    p_ref = None
+    for name, tq in quants.items():
+        Kh = K if tq is None else tq.dequantize(*tq.quantize(K))
+        logits = Kh @ qv / np.sqrt(d)
+        p = np.exp(logits - logits.max())
+        p /= p.sum()
+        if p_ref is None:
+            p_ref, o_ref = p, p @ V
+        o = p @ V
+        stats[name].append((p[7], 0.5 * np.abs(p - p_ref).sum(),
+                            np.linalg.norm(o - o_ref) / np.linalg.norm(o_ref)))
+for name, rows in stats.items():
+    m = np.mean(rows, axis=0)
+    print(f"{name:18} {m[0]:9.3f} {m[1]:11.3f} {m[2]:14.3f}")
+```
+
+```bash
+python tq_prod.py
+```
+
+Output:
+
+```text
+inner products, 512 correlated (q, k) pairs
+quantizer               slope resid std
+MSE 2-bit               0.883    0.0331
+MSE 1-bit + QJL         1.003    0.0620
+MSE 3-bit               0.967    0.0231
+MSE 2-bit + QJL         1.001    0.0355
+MSE 4-bit               0.991    0.0125
+MSE 3-bit + QJL         1.001    0.0200
+
+attention, 3 bits per key coordinate, 200 trials
+keys               p(needle) TV distance output rel err
+fp32                   0.534       0.000          0.000
+MSE 3-bit              0.473       0.081          0.123
+MSE 2-bit + QJL        0.509       0.118          0.126
+```
+
+Part 1 shows the trade:
+
+- MSE quantizers **shrink** inner products. The slope is 0.88 at 2 bits and 0.97 at 3 bits, the same radial shrinkage that `norm_correction` fixes. At 1 bit the shrinkage is exactly $2/\pi$.
+- MSE + QJL has slope 1.00 at every width, but its residual noise is roughly 1.5 to 2 times larger at the same total bits, because QJL gets one sign bit per coordinate while the MSE stage loses a bit of resolution.
+
+Part 2 is what the model feels. The unbiased keys get the needle's probability closer to the truth (0.509 against 0.534), but their noise lands on all 4095 other logits. The exponential in softmax turns zero-mean logit noise into a biased, heavier tail of spurious attention mass. Total-variation distance gets worse (0.118 against 0.081) and the output error is no better. A uniform shrinkage of every logit by the same factor is close to a temperature change, which softmax tolerates well. Independent noise per key is not.
+
+This is not just a toy effect. vLLM's TurboQuant integration **omits QJL on purpose**. Its documentation says the omission follows "community consensus (5+ independent groups)" that QJL "hurts attention quality by amplifying variance through softmax". The RaBitQ authors' comparison note (Section 10) cites the same observation. The paper's own KV-cache experiments use the outlier-split bit allocation from Section 7. When you implement this for attention, start with the MSE variant plus norm correction.
+
+---
+
+## 7. Fractional bits and the outlier split
+
+The paper's "2.5-bit" and "3.5-bit" settings come from running **two TurboQuant instances per head** with different widths. For 2.5 bits, 32 outlier channels get 3 bits and the other 96 get 2: $(32 \cdot 3 + 96 \cdot 2)/128 = 2.5$. Rotation spreads outliers, but it does not make the extra bits worthless. Channels that are hot across the whole sequence are known ahead of time, and giving them more resolution is cheap. Each instance needs its own rotation over its own channel subset, and its own norm.
+
+Values are a different problem. Keys meet a query in a dot product and then a softmax. Values are averaged with softmax weights, which already averages out independent errors. vLLM keeps keys on the rotate-and-Lloyd-Max path and stores **values with plain uniform 3- or 4-bit quantization** (scale and zero point per vector). Its `turboquant_k8v4` preset goes further: FP8 keys with no rotation, and 4-bit values.
+
+---
+
+## 8. Kernel view: never un-rotate a key
+
+A naive integration dequantizes the cache back to bf16 and calls the normal attention kernel. That spends HBM bandwidth on the decompressed copy, which defeats the point. The algebra allows something much better. With orthogonal $\Pi$:
+
+$$\langle q, \hat k\rangle = \lVert k\rVert\,\langle q, \Pi^\top c_{\text{idx}}\rangle = \lVert k\rVert\,\langle \Pi q, c_{\text{idx}}\rangle.$$
+
+Rotate the **query** once per head. Then each key's score is a table lookup ($2^b$ centroids fit in registers) times the rotated query, times a norm. Values work the same way in reverse: accumulate $\sum_i p_i \lVert v_i\rVert\, c_{\text{idx}_i}$ in the rotated basis and apply $\Pi^\top$ once at the end.
+
+```python
+# file: tq_rotated_domain.py
+# Decode-time attention never has to un-rotate a key: rotate the query once instead.
+# Values: accumulate the weighted codewords in the rotated domain, un-rotate once at the end.
+import numpy as np
+
+from tq_core import TurboQuantMSE
+
+rng = np.random.default_rng(3)
+n, d = 4096, 128
+K, V, q = rng.standard_normal((n, d)), rng.standard_normal((n, d)), rng.standard_normal(d)
+tqk, tqv = TurboQuantMSE(d, 3, rng), TurboQuantMSE(d, 3, rng)
+k_idx, k_norm = tqk.quantize(K)
+v_idx, v_norm = tqv.quantize(V)
+
+# Reference: dequantize every key and value to full vectors (n inverse transforms each).
+Kh, Vh = tqk.dequantize(k_idx, k_norm), tqv.dequantize(v_idx, v_norm)
+s_ref = Kh @ q / np.sqrt(d)
+p = np.exp(s_ref - s_ref.max())
+p /= p.sum()
+o_ref = p @ Vh
+
+# Kernel form: one forward transform of q, table lookups per key, one inverse transform.
+q_rot = tqk.rot.forward(q)                                   # once per (query, head)
+s = k_norm[:, 0].astype(np.float64) * (tqk.centroids[k_idx] @ q_rot) / np.sqrt(d)
+p2 = np.exp(s - s.max())
+p2 /= p2.sum()
+acc_rot = (p2 * v_norm[:, 0].astype(np.float64)) @ tqv.centroids[v_idx]   # stays rotated
+o = tqv.rot.inverse(acc_rot)                                 # once per (query, head)
+
+print(f"max |logit diff|  {np.abs(s - s_ref).max():.2e}")
+print(f"max |output diff| {np.abs(o - o_ref).max():.2e}")
+print(f"transforms per head: reference {2 * n}, rotated-domain 2")
+```
+
+```bash
+python tq_rotated_domain.py
+```
+
+Output:
+
+```text
+max |logit diff|  1.55e-15
+max |output diff| 1.53e-16
+transforms per head: reference 8192, rotated-domain 2
+```
+
+The two paths agree to machine precision. vLLM's fused Triton decode kernel (`triton_turboquant_decode.py`) has this shape: it takes a precomputed `Q_rot` and scores packed 3- or 4-bit key indices against the centroid table inside the split-KV loop from the flash-decoding chapter. It does not rotate the value side, because its values are uniformly quantized.
+
+The sign diagonal $D$ is worth a look. vLLM's current backend uses a **plain Sylvester Hadamard**, shared across layers. A code comment argues that random sign flips do not improve a symmetric Lloyd-Max quantizer. That is true for sign flips applied *after* the transform: a sign change mirrors a coordinate onto the mirror-image centroid. Signs applied *before* $H$ are a different thing. They are what turns "works on typical inputs" into "works on every input":
+
+```python
+# file: tq_signs.py
+# Plain Hadamard H x versus randomized Hadamard H D x in front of a 3-bit Lloyd-Max
+# quantizer. On ordinary keys they tie. On inputs that line up with Walsh functions,
+# the plain transform concentrates all the energy in one coordinate.
+import numpy as np
+from scipy.linalg import hadamard
+
+from tq_core import fwht, lloyd_max_sphere
+
+rng = np.random.default_rng(4)
+d, bits = 128, 3
+c, edges, model = lloyd_max_sphere(d, bits)
+signs = rng.choice([-1.0, 1.0], size=d)
+
+
+def rel_err(x, randomize):
+    u = x / np.linalg.norm(x, axis=1, keepdims=True)
+    y = fwht(u * signs) if randomize else fwht(u)
+    yh = c[np.searchsorted(edges, y)]
+    uh = fwht(yh) * signs if randomize else fwht(yh)
+    return np.mean(np.sum((u - uh) ** 2, 1))
+
+
+scale = np.ones(d)
+scale[[3, 17, 64, 101]] = [18.0, 12.0, 9.0, 15.0]
+ordinary = rng.standard_normal((4096, d)) * scale
+H = hadamard(d).astype(float)
+walshy = H[rng.integers(0, d, 4096)] * 3.0 + 0.3 * rng.standard_normal((4096, d))
+
+print(f"3-bit relative error (model {model:.4f})")
+print(f"{'input':28} {'H x':>8} {'H D x':>8}")
+for name, x in (("Gaussian + outlier channels", ordinary), ("near Walsh rows", walshy)):
+    print(f"{name:28} {rel_err(x, False):8.4f} {rel_err(x, True):8.4f}")
+```
+
+```bash
+python tq_signs.py
+```
+
+Output:
+
+```text
+3-bit relative error (model 0.0340)
+input                             H x    H D x
+Gaussian + outlier channels    0.0300   0.0300
+near Walsh rows                0.6813   0.0309
+```
+
+On ordinary keys the two transforms tie, which is why dropping $D$ is a reasonable engineering choice. On inputs that correlate with Walsh functions, the plain transform maps nearly all the energy into one coordinate, and a codebook designed for $\mathcal N(0, 1/d)$ clips it. A sign vector costs $d$ bits per layer and one multiply per element. If you write your own kernel, keep it unless you have measured that your model's keys never look like this.
+
+Kernel checklist for a fused TurboQuant decode path:
+
+| Step | Where it runs | Cost |
+|------|---------------|------|
+| Rotate new K (and V if rotated) | KV store kernel, once per token | $O(d \log d)$ butterfly, or a $d \times d$ GEMM on tensor cores |
+| Normalize, binary-search midpoints, pack bits, write fp16 norm | same store kernel | $2^b - 1$ compares per element |
+| Rotate query | once per (token, head) before attention | one small GEMM |
+| Score: unpack index → centroid → FMA with $q_{rot}$, scale by norm | split-KV attention inner loop | register table lookup, no HBM traffic beyond the packed bytes |
+| Values: uniform dequant (vLLM), or rotated-domain accumulate | same loop | scale/zero FMA |
+| Inverse-rotate output (rotated values only) | once per (token, head) | one small GEMM |
+
+Packed slots have awkward sizes. A 128-dim 3-bit key is 48 bytes plus a 2-byte norm, so alignment and vector-load width have to be designed rather than assumed. vLLM pads slot sizes to even byte counts for this reason.
+
+---
+
+## 9. Where it runs today
+
+As of October 2026:
+
+- **vLLM** merged TurboQuant KV-cache support in PR #38479 (April 2026). It is selected with `--kv-cache-dtype` presets. The table is the vLLM documentation's own; the quality column is perplexity change versus an unquantized cache:
+
+  | Preset | Keys | Values | Compression | PPL change |
+  |---|---|---|---|---|
+  | `turboquant_k8v4` | FP8 | 4-bit uniform | 2.6x | +1.17% |
+  | `turboquant_4bit_nc` | 4-bit Lloyd-Max + norm correction | 4-bit uniform | 3.8x | +2.71% |
+  | `turboquant_k3v4_nc` | 3-bit Lloyd-Max + norm correction | 4-bit uniform | ~3.5x | +10.63% |
+  | `turboquant_3bit_nc` | 3-bit Lloyd-Max + norm correction | 3-bit uniform | 4.9x | +20.59% |
+
+  It has Triton and (on ROCm) FlyDSL decode kernels, CI evaluation jobs per configuration, and boundary-layer protection (a configurable set of boundary layers skips compression). A follow-up PR for grouped 3/4-bit modes (#39890) was closed without merging. Note how fast the PPL cost grows below 4 bits on these presets. That is the honest version of "near-lossless at 3.5 bits": it depends on outlier handling, the model, and the metric.
+- **SGLang** has had several TurboQuant PRs (#21419, #21617, #22048, #23135, and a ROCm variant #21628). All were closed without merging, so there is no upstream support in SGLang 0.5.21.
+- **Speed claims.** Google's blog reports up to 8x faster attention-logit computation for 4-bit TurboQuant keys against 32-bit unquantized keys on H100. That is a kernel micro-benchmark against an fp32 baseline, not end-to-end decode against a bf16 or FP8 cache. Expect the end-to-end gain to come mostly from capacity (bigger batches, longer contexts) and from fewer HBM bytes in bandwidth-bound decode.
+
+---
+
+## 10. Credit where it is due: RaBitQ and the older rotation literature
+
+Rotate-then-quantize is older than TurboQuant, and the paper's treatment of prior work is disputed. State it plainly:
+
+- **RaBitQ** (Gao and Long, SIGMOD 2024, arXiv May 2024) and **extended RaBitQ** (arXiv September 2024, SIGMOD 2025) apply a random rotation and then quantize, with unbiased inner-product estimators and an error bound shown to be asymptotically optimal. On 27 March 2026, after Google's blog post, RaBitQ's first author said publicly that TurboQuant misdescribes RaBitQ's method and guarantees, and that this had been raised with the authors before submission. He posted a public comment on the ICLR OpenReview page.
+- The RaBitQ authors' technical note "Revisiting RaBitQ and TurboQuant" (arXiv:2604.19528) reruns both methods with their public code. On KV-cache tasks it reports clear RaBitQ gains at 2.5 bits and comparable results at 3.5 bits. For example, on needle-in-a-haystack with Llama-3.1-8B: full cache 0.987, RaBitQ 3.5-bit 0.977, TurboQuant-MSE 3.5-bit 0.962, RaBitQ 2.5-bit 0.951, TurboQuant-MSE 2.5-bit 0.709. It also reports that the paper's runtime comparison ran the RaBitQ baseline single-threaded on a CPU, and that the speed claims did not reproduce. These are one party's measurements. The code is public (`VectorDB-NTU/rabitq-turboquant-comparison`) so you can check them.
+- vLLM's own module docstring credits **DRIVE** (NeurIPS 2021) and **EDEN** (ICML 2022) for the Hadamard-rotation-plus-scalar-quantization pattern. It notes the scheme is mathematically equivalent to the scalar case of **HIGGS** (NAACL 2025), and that "Cache Me If You Must" (ICML 2025) applied it to KV caches first. In weight and activation quantization, QuaRot, QuIP# and SpinQuant use the same rotation idea.
+
+For a kernel engineer the practical takeaway is that the algorithm is a well-understood family, not one paper's invention. Choose the variant by measured attention quality and kernel cost, and cite the lineage when you write it up.
+
+---
+
+## 11. Verification plan
+
+### Functional (CPU)
+
+1. `tq_codebook.py` reproduces the distortion table. If 3-bit D is not about 0.034 at $d=128$, the density or Lloyd iteration is wrong.
+2. Round-trip on Gaussian vectors: relative error matches the model within 1%. Then on recorded keys from your model (dump one layer's K cache).
+3. `tq_rotated_domain.py`-style equivalence between the fused rotated-domain path and dequantize-then-attend, to about 1e-6 in fp32.
+4. Bit packing: random indices → pack → unpack is the identity for every slot size and head dimension you support (64, 96, 128, 256; non-power-of-two dims need a padded or block Hadamard).
+
+### Quality (GPU)
+
+- Perplexity on a fixed corpus, needle-in-a-haystack at several depths and lengths, and a LongBench subset, against bf16 and FP8 caches. Report per-preset, as vLLM does.
+- Attention-level diagnostics on real activations: logit RMSE, top-k overlap, and TV distance of attention distributions per layer. Layers that degrade most are candidates for boundary protection or more bits.
+
+### Performance (GPU)
+
+- Decode throughput at fixed batch versus context length (where the cache dominates), and maximum batch at fixed memory.
+- Profile the store kernel separately. A slow quantize path shows up as prefill time, not decode time.
+
+---
+
+## Pitfalls
+
+| Pitfall | Symptom | Fix |
+|---|---|---|
+| Measuring key reconstruction MSE only | Per-channel or QJL variants look good, attention gets worse | Measure logits, attention distributions, task metrics |
+| Using TurboQuant-prod (QJL) for keys by default | Noisy, diffuse attention, worse long-context recall | MSE variant + norm correction; evaluate QJL explicitly |
+| Dequantizing the whole cache to bf16 before attention | No decode speedup, extra memory traffic | Rotate the query; score packed indices in the attention loop |
+| Codebook built for the wrong $d$ | Error well above the model | Codebook is per head dimension; regenerate for 64/96/256 |
+| Different rotations for store and query | Garbage logits | One rotation per layer (or shared), versioned with the cache format |
+| Dropping the sign diagonal without measuring | Rare catastrophic vectors | Keep $D$, or verify on recorded keys |
+| Non-power-of-two head dim | Hadamard undefined | Pad, or use a block-diagonal Hadamard on power-of-two blocks |
+| Comparing to an fp32 baseline | Inflated speedups | Compare to bf16 and FP8 caches end to end |
+
+---
+
+## Checkpoint
+
+- Explain why a random rotation makes a single fixed codebook near-optimal for every vector.
+- Derive the 1-bit centroid $\pm\sqrt{2/\pi}/\sqrt d$ from the Gaussian approximation.
+- State why per-channel quantization can win on key MSE but lose on attention logits.
+- Explain why an unbiased inner-product estimator can make softmax attention worse.
+- Write the identity that lets a decode kernel avoid inverse-rotating keys.
+- Describe what the sign diagonal in $HD$ protects against.
+
+---
+
+## Try this
+
+1. Add the paper's outlier split to `tq_vs_naive.py`: choose the 32 channels with the largest mean $|k|$ and give them 3 bits, the rest 2. Compare 2.5-bit split against uniform 3-bit TurboQuant-MSE on logit RMSE.
+2. Apply `norm_correction` to the 2-bit quantizer in `tq_prod.py` and measure the slope again. How close to 1 does it get without QJL?
+3. Replace the synthetic keys with real ones: run a small model on CPU with Hugging Face `transformers`, capture `past_key_values` for one layer, and rerun `tq_vs_naive.py` and `tq_signs.py`.
+4. Make the attention test harder: put 4 needles at logit gaps of 3, 5, 7 and 9 and record which quantizer loses the weakest needle first.
+5. Write the score loop of section 8 in Triton (unpack 3-bit indices, gather centroids, dot with `q_rot`) and check it with `TRITON_INTERPRET=1` against `tq_rotated_domain.py`.
+
+---
+
+## Summary
+
+TurboQuant quantizes each KV vector by normalizing it, rotating it with a random orthogonal transform (a randomized Hadamard in practice), and rounding every coordinate with one Lloyd-Max codebook computed offline for the coordinate distribution of a random unit vector. The rotation removes outlier channels, and the fixed codebook removes per-block scales and calibration. The paper's distortion numbers reproduce in a few lines of NumPy. The unbiased QJL variant is the wrong default inside softmax: shrinkage behaves like a temperature change, while per-key noise spreads attention mass, and production code (vLLM) omits QJL for that reason. A good decode kernel never decompresses the cache. It rotates the query and scores packed indices against a register-resident centroid table. vLLM ships 3- and 4-bit presets whose perplexity cost rises quickly below 4 bits, and SGLang has no merged implementation. The rotate-then-quantize idea comes from a lineage (DRIVE, EDEN, RaBitQ, HIGGS) whose credit is contested, so measure the variants yourself.
+
+---
+
+## Sources (for further reading)
+
+- Zandieh, Daliri, Hadian, Mirrokni, "TurboQuant: Online Vector Quantization with Near-optimal Distortion Rate", arXiv:2504.19874 (ICLR 2026). Distortion table, centroids, bounds, outlier split, KV-cache results.
+- Google Research blog, "TurboQuant: Redefining AI efficiency with extreme compression" (24 March 2026), https://research.google/blog/turboquant-redefining-ai-efficiency-with-extreme-compression/. Source of the 6x and 8x claims. Also covers PolarQuant (AISTATS 2026).
+- Zandieh, Daliri, Han, "QJL: 1-Bit Quantized JL Transform for KV Cache Quantization with Zero Overhead" (AAAI 2025, arXiv:2406.03482).
+- vLLM documentation, `vllm.model_executor.layers.quantization.turboquant` (presets, QJL omission, lineage note), and source: `vllm/v1/attention/backends/turboquant_attn.py`, `vllm/v1/attention/ops/triton_turboquant_decode.py`, `triton_turboquant_store.py`. PR vllm-project/vllm#38479.
+- SGLang PRs sgl-project/sglang#21419, #21617, #21628, #22048, #23135 (all closed unmerged).
+- Gao, Long, "RaBitQ: Quantizing High-Dimensional Vectors with a Theoretical Error Bound for Approximate Nearest Neighbor Search" (SIGMOD 2024, arXiv:2405.12497). Gao et al., extended RaBitQ (arXiv:2409.09913, SIGMOD 2025).
+- Gao et al., "Revisiting RaBitQ and TurboQuant: A Symmetric Comparison of Methods, Theory, and Experiments" (arXiv:2604.19528), code at https://github.com/VectorDB-NTU/rabitq-turboquant-comparison. ICLR 2026 OpenReview forum for TurboQuant (public comments).
+- Vargaftik et al., DRIVE (NeurIPS 2021) and EDEN (ICML 2022). Malinovskii et al., HIGGS (NAACL 2025, arXiv:2411.17525). Shutova et al., "Cache Me If You Must" (ICML 2025, arXiv:2501.19392).
+- Liu et al., KIVI (ICML 2024). Hooper et al., KVQuant (NeurIPS 2024). Per-channel key outliers.
+- Ashkboos et al., QuaRot (NeurIPS 2024). Tseng et al., QuIP# (ICML 2024). Liu et al., SpinQuant (ICLR 2025).
+
+**Inspiration (not a source):** Google Research's post on X announcing TurboQuant, https://x.com/GoogleResearch/status/2036533564158910740, and the public RaBitQ discussion that followed. Facts above are taken from the papers, documentation, and code listed, not from the posts.
