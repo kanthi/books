@@ -521,6 +521,60 @@ exit=1
 
 `exit()` never returns to `work`, so the deferred `puts` never runs. The same is true of `abort`, `_Exit`, `longjmp` over the frame, and a fatal signal. Memory and file descriptors are reclaimed by the kernel anyway. A temporary file that should have been `unlink`ed, or a lock file, is not. Process-wide cleanup still belongs in `atexit` handlers or the caller.
 
+### A homegrown `defer` macro meets `<stddefer.h>`
+
+Plenty of codebases already have a function-like macro called `defer`, usually a runtime cleanup stack like the one in the advanced-preprocessor chapter. `<stddefer.h>` is a system header. Its `#define defer _Defer` replaces yours without a redefinition warning, and every old call site still parses:
+
+```c
+// clash.c
+#include <stdio.h>
+#include <stdlib.h>
+
+static void defer_cleanup(void (*func)(void *), void *arg) {
+    puts("registered with the old runtime stack");
+    (void)func; (void)arg;
+}
+#define defer(func, arg) defer_cleanup(func, arg)   /* legacy macro */
+
+#include <stddefer.h>                                /* added later */
+
+static void free_ptr(void *p) { free(*(void **)p); puts("freed"); }
+
+int main(void) {
+    void *buf = malloc(64);
+    defer(free_ptr, &buf);
+    puts("body");
+    return 0;
+}
+```
+
+```console
+$ clang -std=c23 -fdefer-ts -Wall -Wextra clash.c -o clash
+clash.c:17:11: warning: left operand of comma operator has no effect [-Wunused-value]
+   17 |     defer(free_ptr, &buf);
+      |           ^~~~~~~~
+clash.c:17:21: warning: expression result unused [-Wunused-value]
+   17 |     defer(free_ptr, &buf);
+      |                     ^~~~
+clash.c:5:13: warning: unused function 'defer_cleanup' [-Wunused-function]
+    5 | static void defer_cleanup(void (*func)(void *), void *arg) {
+      |             ^~~~~~~~~~~~~
+3 warnings generated.
+$ ./clash
+body
+$ clang -std=c23 -fdefer-ts -g -fsanitize=address clash.c -o clash_asan && ./clash_asan
+
+=================================================================
+==460033==ERROR: LeakSanitizer: detected memory leaks
+
+Direct leak of 64 byte(s) in 1 object(s) allocated from:
+    #0 0x55607c97db94 in malloc /home/runner/work/llvm-project/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:109:3
+    #1 0x55607c9bf7d8 in main /workspace/scratch/cdefer/clash.c:16:17
+...
+```
+
+`defer(free_ptr, &buf);` is now `_Defer (free_ptr, &buf);`. That defers a comma expression that does nothing. The old runtime never sees the registration and the buffer leaks. The only clues are `-Wunused-value` and `-Wunused-function`. Before you include `<stddefer.h>`, rename the legacy macro (`git grep -n 'define defer'`), or use only the `_Defer` keyword and leave the header out.
+
 ### Mutating the result from a deferred block
 
 Case 2's `/dev/full` run is the trap. A deferred block that assigns to the variable being returned looks like Go's named-result trick, but C has no named results. `return rc;` copies the value before the deferred blocks run. If a cleanup step can fail in a way the caller must hear about, it isn't cleanup. Do it explicitly on the success path (Case 3).
