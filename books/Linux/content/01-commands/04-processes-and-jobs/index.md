@@ -29,6 +29,7 @@ List, prioritize, signal, and background work. Covers classic job control in the
 | `nice` | nice starts a command with a modified CPU niceness — a soft priority bias for the scheduler. |
 | `renice` | The renice command alters the scheduling priority of running processes. |
 | `ionice` | ionice sets or queries the I/O scheduling class and priority of a process (Linux CFQ/BFQ-oriented interface;… |
+| `taskset` | taskset reads and sets CPU affinity: which CPUs a process, or every one of its threads, may run on. |
 | `fuser` | fuser lists PIDs using a file, mount point, or network port. |
 | `ulimit` | ulimit is a shell builtin (bash/zsh/etc.) that shows or sets resource limits for the current shell and its child… |
 | `ipcs` | ipcs lists System V IPC objects: message queues, shared memory segments, and semaphore arrays. |
@@ -41,7 +42,7 @@ List, prioritize, signal, and background work. Covers classic job control in the
 1. Inventory: `ps`, `pstree`, then interactive `top`/`htop`/`btop`.
 2. Select by name: `pgrep` / `pidof` before `kill`/`killall`.
 3. Job control in one shell: `jobs`, `fg`, `bg`, `nohup`.
-4. Priority and I/O class: `nice`, `renice`, `ionice`.
+4. Priority, I/O class, and CPU placement: `nice`, `renice`, `ionice`, `taskset`.
 5. Limits and IPC: `ulimit`, `ipcs`/`ipcrm`, `fuser`.
 6. Mutual exclusion for jobs and scripts: `flock`.
 
