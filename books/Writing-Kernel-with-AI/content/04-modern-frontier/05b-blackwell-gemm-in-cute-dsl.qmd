@@ -1,0 +1,701 @@
+---
+title: "A Blackwell GEMM by Hand in CuTe DSL: TMA, mbarriers, TMEM, and tcgen05"
+author:
+  - name: "K19G"
+  - name: "grok-bot"
+---
+
+# A Blackwell GEMM by Hand in CuTe DSL: TMA, mbarriers, TMEM, and tcgen05
+
+On Blackwell (B200, GB200, `sm_100a`) the tensor core no longer accumulates into registers. A single thread issues `tcgen05.mma`, which reads both operands from shared memory and accumulates into **Tensor Memory (TMEM)**, a 256 KB per-SM scratchpad owned by the tensor core. Operands arrive by **TMA**, an asynchronous copy engine driven by one thread and a descriptor. Everything is coordinated by **mbarriers** whose phase bits you track by hand. To write a fast GEMM, you have to keep this asynchronous machinery fed.
+
+This chapter builds that GEMM from the raw primitives in NVIDIA's CuTe DSL (the Python front end to CUTLASS's CuTe), without the pipeline helper classes, so that every barrier and phase flip is visible. It uses a public step-by-step optimization ladder on a B200, from 164 to about 1400 TFLOP/s on a 4096³ FP16 problem (97% of cuBLAS), as a map. The ladder shows which steps mattered and why three of them did nothing.
+
+**What was and was not run.** No Blackwell GPU was available for this chapter. Everything that can run without one did run: the kernel below is cross-compiled for `sm_100a` on a CPU-only machine, and the generated PTX, SASS and register counts are inspected. Shared-memory bank behavior is modeled in Python, and the roofline and budget arithmetic is computed. **The kernel has not been executed**, and every timing in this chapter is a measurement *reported* by the write-up's author, labeled as such. Treat the kernel as a compile-verified teaching listing and check it against a GPU before relying on it. NVIDIA's tutorial `fp16_gemm_0.py` is the tested reference with the same structure.
+
+Toolchain used: Debian 13.7, Python 3.13.5, `nvidia-cutlass-dsl` 4.8.0, and the `ptxas`/`nvdisasm` shipped with Triton 3.8.0 (CUDA 13.3 tools).
+
+---
+
+## 1. Two regimes: prefill and decode
+
+A GEMM $C_{M\times N} = A_{M\times K} B_{N\times K}^\top$ does $2MNK$ FLOPs and moves at least $2(MK + NK + MN)$ bytes in FP16. When $N$ and $K$ are large the ratio is about $M$ FLOP per byte. In LLM inference, $M$ is the number of tokens in the batch: thousands in prefill, tens to hundreds in decode. That single number decides the bottleneck.
+
+```python
+# file: gemm_math.py
+# Back-of-envelope numbers for an FP16 GEMM on a B200-class GPU: roofline per shape,
+# shared-memory stage budget, pipeline depth from latency, and wave counts.
+# Kernel/cuBLAS times are the ones REPORTED in the write-up that inspired this chapter
+# (B200, fp16, CUDA events); they were not measured here.
+PEAK_TFLOPS = 1500        # cuBLAS-achievable fp16 dense, as reported; not the datasheet peak
+HBM_TBS = 7.7             # achievable HBM bandwidth, as reported
+SMS = 148
+SMEM_MAX = 227 * 1024     # max dynamic shared memory per block on sm_100 (CuTe DSL capacity map)
+
+shapes = {  # name: (M, N, K, reported_us_kernel, reported_us_cublas)
+    "square 4096^3":         (4096, 4096, 4096, 98.0, 94.9),
+    "prefill attn-out":      (8192, 8192, 8192, 816, 741),
+    "prefill MLP up":        (8192, 28672, 8192, 2934, 2407),
+    "decode MLP up":         (256, 28672, 8192, 113, 111),
+    "decode MLP down":       (256, 8192, 28672, 138, 112),
+    "decode fused QKV":      (256, 10240, 8192, 52, 38),
+    "decode attn-out":       (256, 8192, 8192, 48, 32),
+}
+print("1) roofline (bytes = A + B + C once, fp16)")
+print(f"{'shape':18} {'FLOP/B':>7} {'bound':>7} {'floor us':>8} {'kernel us':>9} {'TFLOP/s':>7} "
+      f"{'TB/s':>5} {'cuBLAS us':>9} {'ratio':>5} {'CTAs':>5} {'waves':>5}")
+for name, (M, N, K, t, tc) in shapes.items():
+    flop, byt = 2 * M * N * K, 2 * (M * K + N * K + M * N)
+    t_c, t_m = flop / PEAK_TFLOPS / 1e6, byt / HBM_TBS / 1e6       # microseconds
+    ctas = (M // 128) * (N // 256)                                  # 128x256 tile per CTA
+    print(f"{name:18} {flop / byt:7.0f} {'compute' if t_c > t_m else 'memory':>7} {max(t_c, t_m):8.1f} "
+          f"{t:9.1f} {flop / t / 1e6:7.0f} {byt / t / 1e6:5.2f} {tc:9.1f} {tc / t:5.2f} "
+          f"{ctas:5d} {ctas / SMS:5.2f}")
+print(f"ridge point: {PEAK_TFLOPS / HBM_TBS:.0f} FLOP/B")
+
+print("\n2) shared memory per pipeline stage (tile_k = 64, fp16)")
+for label, a_rows, b_rows in (("1-CTA 128x256", 128, 256), ("2-CTA 256x256, per CTA", 128, 128)):
+    stage = (a_rows + b_rows) * 64 * 2
+    flop = 2 * 128 * 256 * 64                  # each CTA still accumulates 128x256 per k-step
+    print(f"{label:24} {stage // 1024:3d} KiB/stage  {flop / stage:5.1f} FLOP per SMEM byte  "
+          f"max stages in 227 KiB: {SMEM_MAX // stage}")
+
+print("\n3) stages needed to cover load latency (Little's law), 1-CTA 128x256x64 k-step")
+t_step = 2 * 128 * 256 * 64 / (PEAK_TFLOPS * 1e12 / SMS) * 1e6     # us per k-step at peak
+for lat in (0.5, 1.0, 2.0):
+    print(f"  latency {lat:3.1f} us: k-step {t_step:.2f} us -> need >= {1 + lat / t_step:4.1f} stages")
+
+print("\n4) the reported ladder at 4096^3 (cuBLAS 94.9 us)")
+ladder = [("1 K-loop, 1 stage, tile_k 16", 840), ("2 4-stage ring", 448),
+          ("3 warp specialization", 449), ("4 tile_k 64 + 128B swizzle", 110),
+          ("5 pipelined epilogue", 110), ("6 TMA multicast 2x2", 109.4),
+          ("7 2-CTA MMA (256-row)", 107.3), ("8 persistent + 2 TMEM slots", 98.0)]
+prev = None
+for name, us in ladder:
+    tf = 2 * 4096**3 / us / 1e6
+    step = "" if prev is None else f"{prev / us:5.2f}x"
+    print(f"  {name:30} {us:6.1f} us {tf:6.0f} TFLOP/s {94.9 / us:5.2f} of cuBLAS {step}")
+    prev = us
+```
+
+```bash
+python gemm_math.py
+```
+
+Output:
+
+```text
+1) roofline (bytes = A + B + C once, fp16)
+shape               FLOP/B   bound floor us kernel us TFLOP/s  TB/s cuBLAS us ratio  CTAs waves
+square 4096^3         1365 compute     91.6      98.0    1402  1.03      94.9  0.97   512  3.46
+prefill attn-out      2731 compute    733.0     816.0    1347  0.49     741.0  0.91  2048 13.84
+prefill MLP up        3584 compute   2565.5    2934.0    1312  0.37    2407.0  0.82  7168 48.43
+decode MLP up          246 compute     80.2     113.0    1064  4.32     111.0  0.98   224  1.51
+decode MLP down        246 compute     80.2     138.0     871  3.54     112.0  0.81    64  0.43
+decode fused QKV       242 compute     28.6      52.0     826  3.41      38.0  0.73    80  0.54
+decode attn-out        241 compute     22.9      48.0     716  2.97      32.0  0.67    64  0.43
+ridge point: 195 FLOP/B
+
+2) shared memory per pipeline stage (tile_k = 64, fp16)
+1-CTA 128x256             48 KiB/stage   85.3 FLOP per SMEM byte  max stages in 227 KiB: 4
+2-CTA 256x256, per CTA    32 KiB/stage  128.0 FLOP per SMEM byte  max stages in 227 KiB: 7
+
+3) stages needed to cover load latency (Little's law), 1-CTA 128x256x64 k-step
+  latency 0.5 us: k-step 0.41 us -> need >=  2.2 stages
+  latency 1.0 us: k-step 0.41 us -> need >=  3.4 stages
+  latency 2.0 us: k-step 0.41 us -> need >=  5.8 stages
+
+4) the reported ladder at 4096^3 (cuBLAS 94.9 us)
+  1 K-loop, 1 stage, tile_k 16    840.0 us    164 TFLOP/s  0.11 of cuBLAS 
+  2 4-stage ring                  448.0 us    307 TFLOP/s  0.21 of cuBLAS  1.88x
+  3 warp specialization           449.0 us    306 TFLOP/s  0.21 of cuBLAS  1.00x
+  4 tile_k 64 + 128B swizzle      110.0 us   1249 TFLOP/s  0.86 of cuBLAS  4.08x
+  5 pipelined epilogue            110.0 us   1249 TFLOP/s  0.86 of cuBLAS  1.00x
+  6 TMA multicast 2x2             109.4 us   1256 TFLOP/s  0.87 of cuBLAS  1.01x
+  7 2-CTA MMA (256-row)           107.3 us   1281 TFLOP/s  0.88 of cuBLAS  1.02x
+  8 persistent + 2 TMEM slots      98.0 us   1402 TFLOP/s  0.97 of cuBLAS  1.09x
+```
+
+Read part 1 together with the cuBLAS column. The shapes are Llama 3 70B projections: attention output $8192\times8192$, fused QKV $10240\times8192$, MLP up $28672\times8192$, MLP down $8192\times28672$.
+
+- **Prefill** is deep in compute-bound territory (1300–3600 FLOP/B against a ridge near 195). The game is keeping the tensor pipe busy.
+- **Decode at M=256** sits right at the ridge (about 245 FLOP/B), so both bandwidth and compute matter. The decisive column is **waves**. Decode attention-output launches 64 CTAs on 148 SMs, 0.43 waves, so more than half the machine idles no matter how good the inner loop is. The reported 2.97 TB/s against roughly 4.4 TB/s for cuBLAS is what that looks like.
+- Decode batches below 256 are worse still for this kernel: its 2-CTA tile is 256 rows tall, so M must be padded to 256.
+
+---
+
+## 2. The data path and the four primitives
+
+```text
+          TMA (1 thread, async)          tcgen05.mma (1 thread, async)        tcgen05.ld (4 warps)
+ GMEM ──────────────────────────► SMEM ring ────────────────────────► TMEM ─────────────────────► RF ──► GMEM
+ A[M,K], B[N,K]            stage 0 │ stage 1 │ … │ stage S-1          128 lanes × 512 cols      fp32 → fp16
+                            ▲ full[s] (tx bytes)   empty[s] ▲           (accumulator)
+                            └──── producer warp ◄──────────┘ MMA warp ── commit ──► acc_full ──► epilogue
+```
+
+**TMA.** One thread passes a descriptor (built on the host from the tensor's shape, strides and the SMEM layout) and tile coordinates. The hardware copies the tile and decrements a byte count on an attached mbarrier as data lands. Address arithmetic, bounds and swizzling live in the descriptor, not in registers.
+
+**mbarrier.** A 64-bit SMEM object holding an expected arrival count, a pending count, a transaction (byte) count and a **phase bit**. When arrivals and bytes both reach zero the phase flips and waiters are released. A wait names the phase it is waiting to see complete. A barrier reused once per lap around an $S$-stage ring therefore alternates phase 0, 1, 0, 1 by lap, and the code must track that parity. A wrong parity hangs the kernel on the second lap, or worse, passes early and reads stale data.
+
+**TMEM.** 128 lanes × 512 columns of 32-bit cells per SM. A 128×256 FP32 accumulator uses 256 columns, so two fit. One warp allocates with `tcgen05.alloc`, which takes a power of two of at least 32 columns and writes the TMEM address to SMEM, and the same warp frees it at the end. The epilogue reads TMEM with `tcgen05.ld`, and each warp can reach only its own 32-lane quarter.
+
+**tcgen05.mma (UMMA).** One thread issues an MMA of up to 128×256×16 (FP16) for one CTA, or 256×256×16 for a CTA pair. It reads SMEM through matrix descriptors and accumulates in TMEM. It is asynchronous. `tcgen05.commit` makes an mbarrier arrive when all previously issued MMAs have completed, which is how the MMA warp tells the producer "this stage is free" and the epilogue "the accumulator is final".
+
+---
+
+## 3. The kernel
+
+The listing below is a complete warp-specialized GEMM: a 128×256 output tile per CTA, a ring of `STAGES` shared-memory stages each `TILE_K` deep, warp 0 as the TMA producer, warp 1 as the MMA issuer, and all four warps in the epilogue. The three knobs are environment variables so that one file can be compiled in several configurations. The structure follows NVIDIA's CuTe DSL Blackwell tutorial; the pipeline is written out with raw mbarrier calls.
+
+```python
+# file: bw_gemm.py
+# A warp-specialized Blackwell (sm_100a) FP16 GEMM in CuTe DSL, written against
+# the raw primitives: TMA loads, mbarriers with explicit phases, tcgen05 MMA into
+# Tensor Memory, and a TMEM -> register -> global epilogue.
+#
+#   C[M, N] = A[M, K] @ B[N, K]^T     (A and B both K-major, FP16 in, FP32 accumulate)
+#
+# Knobs (module-level, read by the host function at trace time):
+#   STAGES    shared-memory ring depth for A/B tiles
+#   TILE_K    K depth of one stage (16 = one MMA instruction, 64 = four)
+#   ATOM      "sw128" (128-byte XOR swizzle) or "inter" (no swizzle)
+import os
+
+import cutlass
+import cutlass.cute as cute
+import cutlass.utils as utils
+from cutlass.cute.nvgpu import cpasync, tcgen05
+
+STAGES = int(os.environ.get("STAGES", 4))
+TILE_K = int(os.environ.get("TILE_K", 64))
+ATOM = os.environ.get("ATOM", "sw128")
+
+io_dtype, acc_dtype = cutlass.Float16, cutlass.Float32
+MMA_INST = (128, 256, 16)          # one tcgen05.mma.cta_group::1 kind::f16 instruction
+TILER = (128, 256, TILE_K)         # one CTA's output tile and the K depth of a stage
+THREADS = 128                      # 4 warps: 0 = TMA producer, 1 = MMA issuer, all = epilogue
+TMEM_COLS = 256                    # FP32 128x256 accumulator = 256 TMEM columns
+
+
+@cute.struct
+class Barriers:
+    full: cute.struct.MemRange[cutlass.Int64, STAGES]   # stage s holds fresh A/B bytes
+    empty: cute.struct.MemRange[cutlass.Int64, STAGES]  # MMAs reading stage s have retired
+    acc_full: cutlass.Int64                             # accumulator complete in TMEM
+    tmem_slot: cutlass.Int32                            # tcgen05.alloc writes the TMEM address here
+
+
+@cute.kernel
+def gemm_kernel(tiled_mma: cute.TiledMma,
+                tma_a: cute.CopyAtom, mA: cute.Tensor,
+                tma_b: cute.CopyAtom, mB: cute.Tensor,
+                mC: cute.Tensor,
+                sA_layout: cute.ComposedLayout, sB_layout: cute.ComposedLayout,
+                tx_bytes: cutlass.Constexpr):
+    tidx, _, _ = cute.arch.thread_idx()
+    warp = cute.arch.make_warp_uniform(cute.arch.warp_idx())
+    bm, bn, _ = cute.arch.block_idx()
+
+    # ---- shared memory: barriers, then the swizzled A/B ring (1024 B aligned for SW128)
+    smem = utils.SmemAllocator()
+    bars = smem.allocate(Barriers)
+    sA = smem.allocate_tensor(io_dtype, sA_layout.outer, byte_alignment=1024, swizzle=sA_layout.inner)
+    sB = smem.allocate_tensor(io_dtype, sB_layout.outer, byte_alignment=1024, swizzle=sB_layout.inner)
+    full, empty = bars.full.data_ptr(), bars.empty.data_ptr()
+    acc_full = bars.acc_full.ptr
+
+    if warp == 0:
+        with cute.arch.elect_one():
+            for s in cutlass.range_constexpr(STAGES):
+                cute.arch.mbarrier_init(full + s, 1)    # one arrive (the producer) + tx bytes
+                cute.arch.mbarrier_init(empty + s, 1)   # one arrive (tcgen05.commit)
+                cute.arch.mbarrier_arrive(empty + s)    # pre-arm: every slot starts empty
+            cute.arch.mbarrier_init(acc_full, 1)
+        cpasync.prefetch_descriptor(tma_a)
+        cpasync.prefetch_descriptor(tma_b)
+        cute.arch.alloc_tmem(TMEM_COLS, bars.tmem_slot.ptr)   # warp-wide; result lands in SMEM
+    cute.arch.mbarrier_init_fence()
+    cute.arch.sync_threads()
+    tmem_ptr = cute.arch.retrieve_tmem_ptr(acc_dtype, alignment=16,
+                                           ptr_to_buffer_holding_addr=bars.tmem_slot.ptr)
+
+    # ---- partition global tiles for this CTA and build MMA fragments over SMEM / TMEM
+    coord = (bm, bn, None)
+    gA = cute.local_tile(mA, TILER, coord, proj=(1, None, 1))     # (128, TILE_K, k_tiles)
+    gB = cute.local_tile(mB, TILER, coord, proj=(None, 1, 1))     # (256, TILE_K, k_tiles)
+    gC = cute.local_tile(mC, TILER, coord, proj=(1, 1, None))     # (128, 256)
+    thr = tiled_mma.get_slice(0)
+    tCgA, tCgB, tCgC = thr.partition_A(gA), thr.partition_B(gB), thr.partition_C(gC)
+    tCrA, tCrB = tiled_mma.make_fragment_A(sA), tiled_mma.make_fragment_B(sB)
+    acc = tiled_mma.make_fragment_C(tiled_mma.partition_shape_C(TILER[:2]))
+    acc = cute.make_tensor(tmem_ptr, acc.layout)                  # the accumulator lives in TMEM
+
+    tAsA, tAgA = cpasync.tma_partition(tma_a, 0, cute.make_layout(1),
+                                       cute.group_modes(sA, 0, 3), cute.group_modes(tCgA, 0, 3))
+    tBsB, tBgB = cpasync.tma_partition(tma_b, 0, cute.make_layout(1),
+                                       cute.group_modes(sB, 0, 3), cute.group_modes(tCgB, 0, 3))
+    k_tiles = cute.size(gA, mode=[2])
+
+    if warp == 0:
+        # ---- producer: wait for an empty slot, arm its full barrier with the byte count, issue TMA
+        stage, phase = cutlass.Int32(0), cutlass.Int32(0)
+        for k in cutlass.range(k_tiles, unroll=1):
+            cute.arch.mbarrier_wait(empty + stage, phase)
+            with cute.arch.elect_one():
+                cute.arch.mbarrier_arrive_and_expect_tx(full + stage, tx_bytes)
+            cute.copy(tma_a, tAgA[(None, k)], tAsA[(None, stage)], tma_bar_ptr=full + stage)
+            cute.copy(tma_b, tBgB[(None, k)], tBsB[(None, stage)], tma_bar_ptr=full + stage)
+            stage += 1
+            if stage == STAGES:                  # wrapped the ring: the next wait is one phase later
+                stage = cutlass.Int32(0)
+                phase ^= 1
+    elif warp == 1:
+        # ---- MMA issuer: wait for a full slot, run TILE_K/16 MMAs, commit the slot back as empty
+        stage, phase = cutlass.Int32(0), cutlass.Int32(0)
+        tiled_mma.set(tcgen05.Field.ACCUMULATE, False)            # first MMA overwrites TMEM
+        for k in cutlass.range(k_tiles, unroll=1):
+            cute.arch.mbarrier_wait(full + stage, phase)
+            for kb in cutlass.range_constexpr(cute.size(tCrA, mode=[2])):
+                cute.gemm(tiled_mma, acc, tCrA[(None, None, kb, stage)],
+                          tCrB[(None, None, kb, stage)], acc)
+                tiled_mma.set(tcgen05.Field.ACCUMULATE, True)     # every later MMA adds
+            with cute.arch.elect_one():
+                tcgen05.commit(empty + stage)    # arrives when these MMAs have read the slot
+            stage += 1
+            if stage == STAGES:
+                stage = cutlass.Int32(0)
+                phase ^= 1
+        with cute.arch.elect_one():
+            tcgen05.commit(acc_full)             # arrives when every MMA has finished
+
+    # ---- epilogue (all 128 threads): TMEM -> registers (32 lanes per warp) -> FP16 -> global
+    cute.arch.mbarrier_wait(acc_full, 0)
+    epi = ((cute.size(acc, mode=[0, 0]), cute.size(acc, mode=[0, 1]) // 4),)
+    acc_epi, gC_epi = cute.zipped_divide(acc, epi), cute.zipped_divide(tCgC, epi)
+    t2r = tcgen05.make_tmem_copy(cute.make_copy_atom(tcgen05.Ld32x32bOp(tcgen05.Repetition.x64),
+                                                     acc_dtype), acc_epi[None, 0])
+    t2r_thr = t2r.get_slice(tidx)
+    src, dst = t2r_thr.partition_S(acc_epi), t2r_thr.partition_D(gC_epi)
+    r_acc = cute.make_rmem_tensor(dst[None, None, 0].shape, acc_dtype)
+    r_out = cute.make_rmem_tensor(dst[None, None, 0].shape, io_dtype)
+    for i in cutlass.range_constexpr(cute.size(src, mode=[2])):
+        cute.copy(t2r, src[None, None, i], r_acc)
+        r_out.store(r_acc.load().to(io_dtype))
+        cute.autovec_copy(r_out, dst[None, None, i])
+
+    cute.arch.sync_threads()
+    if warp == 0:
+        cute.arch.relinquish_tmem_alloc_permit()
+        cute.arch.dealloc_tmem(tmem_ptr, TMEM_COLS)
+
+
+def smem_atom():
+    kind = {"sw128": tcgen05.SmemLayoutAtomKind.K_SW128,
+            "inter": tcgen05.SmemLayoutAtomKind.K_INTER}[ATOM]
+    return tcgen05.make_smem_layout_atom(kind, io_dtype)
+
+
+@cute.jit
+def gemm(a: cute.Tensor, b: cute.Tensor, c: cute.Tensor):
+    op = tcgen05.MmaF16BF16Op(io_dtype, acc_dtype, MMA_INST, tcgen05.CtaGroup.ONE,
+                              tcgen05.OperandSource.SMEM,
+                              tcgen05.OperandMajorMode.K, tcgen05.OperandMajorMode.K)
+    tiled_mma = cute.make_tiled_mma(op)
+    a_shape = cute.append(tiled_mma.partition_shape_A(cute.dice(TILER, (1, None, 1))), STAGES)
+    b_shape = cute.append(tiled_mma.partition_shape_B(cute.dice(TILER, (None, 1, 1))), STAGES)
+    sA_layout = tcgen05.tile_to_mma_shape(smem_atom(), a_shape, order=(1, 2, 3))
+    sB_layout = tcgen05.tile_to_mma_shape(smem_atom(), b_shape, order=(1, 2, 3))
+    one_a, one_b = cute.select(sA_layout, mode=[0, 1, 2]), cute.select(sB_layout, mode=[0, 1, 2])
+    tma_op = cpasync.CopyBulkTensorTileG2SOp(tcgen05.CtaGroup.ONE)
+    tma_a, tA = cute.nvgpu.make_tiled_tma_atom_A(tma_op, a, one_a, TILER, tiled_mma)
+    tma_b, tB = cute.nvgpu.make_tiled_tma_atom_B(tma_op, b, one_b, TILER, tiled_mma)
+    tx_bytes = cute.size_in_bytes(io_dtype, one_a) + cute.size_in_bytes(io_dtype, one_b)
+    gemm_kernel(tiled_mma, tma_a, tA, tma_b, tB, c, sA_layout, sB_layout, tx_bytes).launch(
+        grid=cute.ceil_div((*c.layout.shape, 1), TILER[:2]), block=(THREADS, 1, 1))
+```
+
+The parts worth slowing down for:
+
+1. **Pre-armed empty barriers.** Each `empty[s]` is initialized with count 1 and immediately arrived on once, which completes its phase 0. On the first lap the producer waits for phase 0 and passes straight through, so no separate prologue loop is needed. On lap 2 it waits for phase 1, which completes only when `tcgen05.commit(empty + s)` fires after the MMAs that read stage `s`.
+2. **`arrive_and_expect_tx` before the copies.** The producer arrives on `full[s]` and announces `tx_bytes` (A tile + B tile) in one call. The two TMA copies then count those bytes down. The consumer's wait on `full[s]` cannot succeed until both the arrival and every byte have landed. If the byte count is wrong in either direction, the kernel hangs or races.
+3. **Phase flips on wrap, not per iteration.** `stage` and `phase` advance together, and `phase ^= 1` happens only when the ring wraps. Producer and consumer keep identical counters, which is what makes the protocol easy to reason about.
+4. **ACCUMULATE off for the first MMA only.** TMEM is not zeroed. The first `cute.gemm` must overwrite and every later one must add, and the DSL does not toggle this for you.
+5. **The epilogue waits on one barrier.** `acc_full` completes once, at phase 0, after the final commit. All 128 threads then pull 32 lanes per warp out of TMEM in four 64-column chunks, convert to FP16 and store. A production kernel stages through SMEM and uses a TMA store. This one stays short.
+6. **The swizzle rides on the pointer.** `allocate_tensor(..., swizzle=layout.inner)` attaches the XOR function to the SMEM pointer and keeps the affine part (with the stage mode) as the layout, and the base is 1024-byte aligned. Passing a composed layout where the MMA fragment builder expects an affine one is rejected.
+
+---
+
+## 4. Compile for `sm_100a` without a GPU
+
+CuTe DSL can JIT-compile against **fake tensors** (shape, dtype, alignment, no memory) for a named architecture and dump the PTX and cubin. That catches a large class of errors (layout mismatches, illegal swizzle/tile combinations, type errors) and lets you read what the kernel will do.
+
+```python
+# file: compile_check.py
+# Cross-compile bw_gemm.py for sm_100a on a machine with no GPU and report what the
+# compiler produced. Run once per configuration (the knobs are environment variables).
+import os
+import pathlib
+import re
+import sys
+
+import cutlass
+import cutlass.cute as cute
+from cutlass.cute.runtime import make_fake_compact_tensor
+
+import bw_gemm as g
+
+M = N = K = 4096
+out = pathlib.Path("build") / f"s{g.STAGES}_k{g.TILE_K}_{g.ATOM}"
+out.mkdir(parents=True, exist_ok=True)
+fake = lambda r, c: make_fake_compact_tensor(cutlass.Float16, (r, c), stride_order=(1, 0),
+                                             assumed_align=32)
+try:
+    cute.compile(g.gemm, fake(M, K), fake(N, K), fake(M, N),
+                 options=f"--gpu-arch sm_100a --keep-ptx --keep-cubin --dump-dir {out}")
+except Exception as e:  # noqa: BLE001 - report the compiler's verdict, whatever it is
+    lines = [l.strip() for l in str(e).splitlines() if "error" in l] or [str(e).strip()]
+    print(f"STAGES={g.STAGES} TILE_K={g.TILE_K:<2} ATOM={g.ATOM:<5}  REJECTED:\n    {lines[0][:150]}")
+    sys.exit(0)
+
+ptx = next(out.glob("*.ptx")).read_text()
+count = lambda pat: len(re.findall(pat, ptx))
+stage_bytes = (128 + 256) * g.TILE_K * 2
+print(f"STAGES={g.STAGES} TILE_K={g.TILE_K:<2} ATOM={g.ATOM:<5}  ok  "
+      f"smem/stage={stage_bytes // 1024} KiB ring={g.STAGES * stage_bytes // 1024} KiB  "
+      f"tcgen05.mma={count(r'tcgen05\.mma')} tma.load={count(r'cp\.async\.bulk\.tensor')} "
+      f"try_wait={count(r'mbarrier\.try_wait')} tcgen05.ld={count(r'tcgen05\.ld')}")
+```
+
+```bash
+pip install nvidia-cutlass-dsl==4.8.0
+for cfg in "1 16 inter" "1 16 sw128" "4 16 inter" "4 64 inter" "4 64 sw128" "6 64 sw128"; do
+  set -- $cfg; STAGES=$1 TILE_K=$2 ATOM=$3 python compile_check.py
+done
+```
+
+Output:
+
+```text
+STAGES=1 TILE_K=16 ATOM=inter  ok  smem/stage=12 KiB ring=12 KiB  tcgen05.mma=1 tma.load=4 try_wait=3 tcgen05.ld=4
+STAGES=1 TILE_K=16 ATOM=sw128  REJECTED:
+    error: unknown: expected top-level shape equivalence between the SMEM layout and the CTA V-map, but got '!cute.composed_layout<"S<3,4,3> o 0 o ((128,1
+STAGES=4 TILE_K=16 ATOM=inter  ok  smem/stage=12 KiB ring=48 KiB  tcgen05.mma=1 tma.load=4 try_wait=3 tcgen05.ld=4
+STAGES=4 TILE_K=64 ATOM=inter  ok  smem/stage=48 KiB ring=192 KiB  tcgen05.mma=4 tma.load=16 try_wait=3 tcgen05.ld=4
+STAGES=4 TILE_K=64 ATOM=sw128  ok  smem/stage=48 KiB ring=192 KiB  tcgen05.mma=4 tma.load=2 try_wait=3 tcgen05.ld=4
+STAGES=6 TILE_K=64 ATOM=sw128  ok  smem/stage=48 KiB ring=288 KiB  tcgen05.mma=4 tma.load=2 try_wait=3 tcgen05.ld=4
+```
+
+What the compiler is telling you:
+
+- **The 128-byte swizzle cannot be used with a 16-deep tile.** The SW128 atom is 8 rows × 64 FP16 (128 bytes) in K. A 16-deep stage cannot hold one, and layout algebra rejects the combination while building the TMA atom. This matches the write-up's account that the swizzle "needs `tile_k >= 64`" and that tile_k 64 alone changed nothing. Each half of the winning change looks useless when tested alone.
+- **Without swizzling, TMA moves 16-byte-wide boxes.** The non-swizzled ("interleaved") canonical layout is built from 8-row × 16-byte core matrices, so each operand's 64-deep slice becomes eight narrow TMA boxes: 16 `cp.async.bulk.tensor` per stage against 2 with SW128.
+- **MMA count per stage = TILE_K / 16**: 1 at depth 16, 4 at depth 64. That is the work available to overlap each wait.
+- **Six 48 KiB stages compile fine and cannot launch.** 288 KiB exceeds the 227 KiB per-block limit on `sm_100`. Dynamic shared memory is sized at launch, so nothing at compile time objects. CuTe DSL inserts a launch-time check that prints an error, and the driver refuses the launch.
+
+Then look at register use and the SASS:
+
+```bash
+NV=$(python -c "import os, triton; print(os.path.dirname(triton.__file__) + '/backends/nvidia/bin')")
+B=build/s4_k64_sw128
+$NV/ptxas-blackwell -arch=sm_100a -v $B/*.ptx -o /tmp/k.cubin 2>&1 | grep -E "registers|spill"
+$NV/nvdisasm -c $B/*.cubin \
+  | grep -oE '\b(UTCHMMA|UTMALDG|UTCBAR|LDTM\.x64|SYNCS\.[A-Z]+(\.[A-Z0-9]+)*)' | sort | uniq -c
+```
+
+Output:
+
+```text
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas-blackwell info    : Used 78 registers, used 1 barriers
+      4 LDTM.x64
+      1 SYNCS.ARRIVE.TRANS64
+      4 SYNCS.ARRIVE.TRANS64.ART0
+      9 SYNCS.EXCH.64
+      3 SYNCS.PHASECHK.TRANS64
+      6 SYNCS.PHASECHK.TRANS64.TRYWAIT
+      2 UTCBAR
+      4 UTCHMMA
+      2 UTMALDG
+```
+
+78 registers and no spills, because the accumulator is not in registers. The four `UTCHMMA` are the four `tcgen05.mma` per stage, `UTMALDG` are the two TMA loads, `UTCBAR` are the two commits (stage-empty and accumulator-full), `LDTM.x64` are the four TMEM reads, and the `SYNCS.*` family is mbarrier init, arrive and try-wait. SASS opcode names are not documented by NVIDIA. This mapping is inferred by matching counts against the PTX.
+
+---
+
+## 5. The ladder: what moved the number (reported)
+
+Part 4 of `gemm_math.py` converts the write-up's reported 4096³ timings into TFLOP/s. Condensed, with the write-up's Nsight Compute observations:
+
+| Step | Change | Reported µs | Why it did or did not help |
+|---|---|---|---|
+| 1 | K-loop, one stage, tile_k 16 | 840 | Strict load→wait→MMA→wait; tensor pipe 7.5% busy |
+| 2 | 4-stage ring | 448 | Loads overlap MMAs; but L1/TEX hits 98.9% with DRAM at 2.3% |
+| 3 | Warp specialization | 449 | **Null.** The single warp was never stuck *issuing* (all ops are async), it was stuck *waiting*; L1/TEX was the limit |
+| 4 | tile_k 64 + 128B swizzle | 110 | **4.1x.** Load-path bottleneck removed; tensor pipe 13.7% → 63.7% |
+| 5 | Pipelined epilogue | ~110 | **Null.** `ptxas` had already overlapped the unrolled chunks; the epilogue was ≤13 µs of 109 |
+| 6 | TMA multicast (2×2) | 109.4 | **Null** (6% worse at 8192³). L2 traffic was not the limit once compute-bound |
+| 7 | 2-CTA MMA (256-row tile) | 107.3 | Small on square; larger on decode (54→48 µs attn-out): each pair fetches the weight tile once |
+| 8 | Persistent + two TMEM accumulator slots | 98.0 | Epilogue of tile *i* overlaps mainloop of tile *i+1*; tensor pipe 61.7% → 74.5% |
+
+Three things generalize beyond this kernel:
+
+- **One change did most of the work, and it was a data-layout change.** No amount of pipelining or specialization helps if the load path is serialized.
+- **The nulls were predictable from the profile.** At step 3, L1/TEX was at 98% and specialization does not reduce L1/TEX traffic. At step 6 the kernel was compute-bound, so cutting L2 reads could not help. Before each step, ask which counter the change will move and whether that counter is the binding one.
+- **"L1TEX scoreboard" stalls in these kernels are mostly mbarrier waits.** `mbarrier.try_wait` polls an SMEM word through the L1TEX pipe. In a healthy warp-specialized kernel every role waits for the role before it, so this stall *grows* as the kernel gets faster. Watch tensor-pipe utilization instead.
+
+---
+
+## 6. The swizzle
+
+Shared memory has 32 banks of 4 bytes, so a 128-byte row covers each bank exactly once. If a tile's row pitch is 128 bytes, the same column of every row falls in the same banks. A 128B swizzle (`Swizzle<3,4,3>` on byte addresses) XORs the 16-byte chunk index (address bits 4–6) with the row index mod 8 (bits 7–9). Rows keep their bytes, but chunks are permuted within each row so that a column hits eight different bank groups.
+
+```python
+# file: swizzle_model.py
+# Shared memory: 32 banks x 4 bytes. A 16-byte access covers 4 consecutive banks, so
+# 8 such accesses can be served together if they hit 8 different 4-bank groups.
+# Count how many serialized passes ("wavefronts") 8 rows x 16 bytes at the same logical
+# column need, for plain and 128B-swizzled layouts, at two row pitches.
+def sw128(addr):
+    """CuTe Swizzle<3,4,3> on byte addresses: XOR bits [7,10) (row mod 8) into bits [4,7)
+    (16-byte chunk within a 128-byte row)."""
+    return addr ^ (((addr >> 7) & 0b111) << 4)
+
+
+def passes(addrs):
+    words_per_bank = {}
+    for a in addrs:
+        for w in range(4):                       # a 16-byte chunk = 4 consecutive 4-byte words
+            word = a // 4 + w
+            words_per_bank.setdefault(word % 32, set()).add(word)
+    return max(len(s) for s in words_per_bank.values())
+
+
+print(f"{'tile_k (fp16)':>13} {'row pitch':>9} {'layout':>8}  passes for 8 rows x 16 B, per column chunk")
+for tile_k in (16, 64):
+    pitch = tile_k * 2
+    for name, f in (("plain", lambda a: a), ("sw128", sw128)):
+        if name == "sw128" and pitch < 128:
+            print(f"{tile_k:13d} {pitch:7d} B {name:>8}  n/a: needs 128-byte rows (tile_k >= 64)")
+            continue
+        per_col = [passes([f(r * pitch + c * 16) for r in range(8)]) for c in range(pitch // 16)]
+        print(f"{tile_k:13d} {pitch:7d} B {name:>8}  {per_col}")
+
+print("\nsw128 permutation of the eight 16-byte chunks, rows 0..7:")
+for r in range(8):
+    print(f"  row {r}: " + " ".join(str((sw128(r * 128 + c * 16) - r * 128) // 16) for c in range(8)))
+```
+
+```bash
+python swizzle_model.py
+```
+
+Output:
+
+```text
+tile_k (fp16) row pitch   layout  passes for 8 rows x 16 B, per column chunk
+           16      32 B    plain  [2, 2]
+           16      32 B    sw128  n/a: needs 128-byte rows (tile_k >= 64)
+           64     128 B    plain  [8, 8, 8, 8, 8, 8, 8, 8]
+           64     128 B    sw128  [1, 1, 1, 1, 1, 1, 1, 1]
+
+sw128 permutation of the eight 16-byte chunks, rows 0..7:
+  row 0: 0 1 2 3 4 5 6 7
+  row 1: 1 0 3 2 5 4 7 6
+  row 2: 2 3 0 1 6 7 4 5
+  row 3: 3 2 1 0 7 6 5 4
+  row 4: 4 5 6 7 0 1 2 3
+  row 5: 5 4 7 6 1 0 3 2
+  row 6: 6 7 4 5 2 3 0 1
+  row 7: 7 6 5 4 3 2 1 0
+```
+
+With 128-byte rows and no swizzle, reading or writing one 16-byte column across 8 rows takes 8 serialized passes. With SW128 it takes 1. The write-up isolated the load path (no MMA) and reported 3.85 TB/s unswizzled against 18.5 TB/s swizzled, a 4.8x difference on TMA writes into SMEM. The exact access pattern TMA uses internally is not documented, so treat the model as the reason the canonical layouts exist, not a prediction of the exact ratio. Section 4 adds a second effect: the non-swizzled canonical layout forces TMA into eight 16-byte-wide boxes per operand per stage, many small requests where one large one would do. Both effects point the same way.
+
+Rules that fall out of this: the K-major SW128 atom needs `tile_k * sizeof(T)` to be a multiple of 128 bytes (64 FP16 or BF16, 128 FP8). The SMEM base must be 1024-byte aligned (8 rows × 128 B, one full swizzle period). The TMA descriptor and the UMMA descriptor must agree on the swizzle mode. CuTe derives both from the same layout, which is the main reason to let it.
+
+---
+
+## 7. Stages: the budget and the regime
+
+Part 2 of `gemm_math.py` gives the hard limit. A 1-CTA 128×256×64 stage is 48 KiB, so at most 4 stages fit in 227 KiB. A 2-CTA tile halves each CTA's B operand to 32 KiB, so up to 7 fit. NVIDIA's tutorial `fp16_gemm_1.py` makes the same calculation in its docstring. Part 3 is Little's law. At peak, one 64-deep k-step takes about 0.41 µs per SM, so the ring must hold $1 + \text{latency}/0.41\,\mu s$ stages to hide load latency. That is 3–6 stages for 1–2 µs of loaded-system latency.
+
+The write-up's stage sweeps show why this has to be re-measured. At step 3 (16-deep stages), 4, 8 and 12 stages were flat (451.7, 454.6, 454.1 µs reported), because the kernel was not latency-bound. On the step-7 kernel (32 KiB stages) the same sweep went from 166.9 µs at 2 stages to a best of 105.9 µs at 5, and the shipped value of 6 was within noise. A sweep result holds only for the bottleneck that was active when you ran it.
+
+---
+
+## 8. Two CTAs, then persistence
+
+The last two rungs are where hand-written kernels usually stop matching the tutorials, and where the official examples are the best reference. Cross-compiling NVIDIA's tutorial ladder shows the features appearing:
+
+```python
+# file: official_check.py
+# Cross-compile NVIDIA's CuTe DSL tutorial GEMMs (CUTLASS examples, BSD-3) for sm_100a
+# and count the instructions that mark each feature: 1-CTA vs 2-CTA MMA, multicast TMA,
+# cluster barriers, and TMA stores.
+import inspect
+import pathlib
+import re
+import sys
+
+import cutlass
+import cutlass.cute as cute
+from cutlass.cute.runtime import make_fake_compact_tensor
+
+TUT = pathlib.Path(sys.argv[1])  # .../examples/python/CuTeDSL/cute/blackwell/tutorial/tutorial_gemm
+sys.path.insert(0, str(TUT))
+fake = lambda r, c: make_fake_compact_tensor(cutlass.Float16, (r, c), stride_order=(1, 0),
+                                             assumed_align=32)
+pats = {"mma cta_group::1": r"tcgen05\.mma\.cta_group::1", "mma cta_group::2": r"tcgen05\.mma\.cta_group::2",
+        "TMA multicast": r"cp\.async\.bulk\.tensor[^;]*multicast", "cluster barrier": r"barrier\.cluster",
+        "tcgen05.alloc": r"tcgen05\.alloc", "TMA store": r"cp\.async\.bulk\.tensor\.\dd\.global\.shared"}
+print(f"{'tutorial':12} " + " ".join(f"{k:>16}" for k in pats))
+for name in sys.argv[2:]:
+    mod = __import__(name)
+    out = pathlib.Path("build_official") / name
+    out.mkdir(parents=True, exist_ok=True)
+    M = N = K = 8192
+    extra = (74,) if "max_active_clusters" in inspect.signature(mod.host_function).parameters else ()
+    cute.compile(mod.host_function, fake(M, K), fake(N, K), fake(M, N), *extra,   # 74 = 148 SMs / 2
+                 options=f"--gpu-arch sm_100a --keep-ptx --dump-dir {out}")
+    ptx = next(out.glob("*.ptx")).read_text()
+    print(f"{name:12} " + " ".join(f"{len(re.findall(p, ptx)):16d}" for p in pats.values()))
+```
+
+```bash
+git clone --depth 1 https://github.com/NVIDIA/cutlass
+python official_check.py cutlass/examples/python/CuTeDSL/cute/blackwell/tutorial/tutorial_gemm \
+    fp16_gemm_0 fp16_gemm_1 fp16_gemm_2 fp16_gemm_3
+```
+
+Output (CUTLASS at commit `0b55a2f`):
+
+```text
+tutorial     mma cta_group::1 mma cta_group::2    TMA multicast  cluster barrier    tcgen05.alloc        TMA store
+fp16_gemm_0                 8                0                0                0                1                0
+fp16_gemm_1                 0                8               14                4                1                0
+fp16_gemm_2                 0                8                8                4                1                1
+fp16_gemm_3                 0                8                8                6                1                1
+```
+
+- **2-CTA MMA (`fp16_gemm_1`).** `tcgen05.mma.cta_group::2` replaces `cta_group::1`. A cluster of two CTAs on neighboring SMs issues one 256-row MMA; each CTA supplies half of A, half of B and holds half the accumulator. Cluster barriers appear because the pair has to agree that both are initialized. The pair is **not symmetric**: the leader CTA alone waits on the full barrier, issues the MMA and commits, and `tcgen05.commit` signals only the CTAs named in its multicast mask. The write-up's hang at this step came from a commit that never reached the follower's empty barrier. It completed at K=192, where no stage is recycled, and hung at K=1024. Shrinking K until the hang disappears is a fast way to tell "stage reuse is broken" apart from "something else is broken".
+- **Warp specialization + TMA store (`fp16_gemm_2`).** Same MMA, epilogue through SMEM and a TMA store.
+- **Persistent (`fp16_gemm_3`).** Launch one CTA (pair) per SM and loop over tiles with a tile scheduler. On its own that only removes launch and tail overhead. The real gain comes from **two TMEM accumulator slots**, 2 × 256 = all 512 columns. The MMA warp fills slot `i % 2` while the epilogue drains the other, with an `acc_full[s]`/`acc_empty[s]` barrier pair per slot mirroring the A/B ring. The epilogue should release `acc_empty[s]` as soon as its `tcgen05.ld`s complete, before converting and storing, so that the MMA warp gets the slot back early. Limits: N ≤ 256 per slot, the overlap only helps if the epilogue is shorter than the mainloop, and the first mainloop and last epilogue are never hidden.
+
+The later tutorials add dynamic cluster-launch-control scheduling (`fp16_gemm_3_1`), preferred clusters (`_4`), TMA prefetch (`_5`) and programmatic dependent launch (`_6`). The write-up's reported threadblock-swizzle experiment (grouping 8 tile rows so neighboring CTAs share B tiles in L2) reached parity with cuBLAS on a 4096×4096×16384 problem and did nothing at 4096³, where 512 CTAs is too few waves for ordering to matter.
+
+---
+
+## 9. Why decode loses, and what to do about it
+
+The final reported comparison (part 1 of `gemm_math.py`) is 0.97x of cuBLAS on the square problem, 0.82–0.91x on prefill, and 0.67–0.98x on decode. The decode pattern follows the waves column:
+
+- **MLP up (224 CTAs, 1.5 waves): 0.98x.** Enough tiles to fill the machine. The kernel reads 478 MB from HBM, about the size of the 470 MB weight, so each weight is read once, at about 61% of peak DRAM bandwidth (reported).
+- **Attention output and MLP down (64 CTAs, 0.43 waves): 0.67x and 0.81x.** Fewer tiles than SMs. Persistence cannot help with less than one tile per CTA: the reported attention-output time was 47 µs before and after step 8.
+
+The standard fixes:
+
+| Fix | What it does | Cost |
+|---|---|---|
+| Smaller N tiles (128 or 64) | More CTAs: 128 for N=8192 with 128-wide tiles | Lower arithmetic intensity per CTA; still ≥ ridge at M=256 |
+| Split-K | Each CTA reduces a K slice; a second pass or atomics combine | Extra FP32 partial traffic; nondeterminism with atomics |
+| Stream-K | Persistent CTAs take equal shares of the *total* MAC-loop iterations, crossing tile boundaries | Fix-up logic for partial tiles; best general answer for odd shapes |
+| 1-CTA MMA for small M | Avoid padding M up to 256 | Gives up the 2-CTA weight-tile sharing |
+
+cuBLAS picks among these per shape with heuristics. A hand-written kernel that only has one tiling will lose somewhere, which is why production libraries ship families of kernels and why the shape list should come from your model, not from the square.
+
+---
+
+## 10. Driving an AI assistant through a ladder like this
+
+The source write-up's experiments were run by an AI coding agent under the author's direction. That works well when the human enforces the method:
+
+1. **One change per step, timed on fixed shapes, with a correctness check in every run.** The write-up's threadblock-swizzle sweep produced a fake 1.13x speedup at `swizzle_m=32`, and its maximum error was 772: CTAs had walked off the end of M and skipped work. Any speedup without a passing comparison against `torch.matmul` is a bug report.
+2. **Size the prize before optimizing a stage.** "The epilogue is at most 13 µs of 109" would have cancelled step 5 in advance. Ask the assistant to time each stage in isolation first: MMA-only (no loads), loads-only, epilogue-only. The write-up's MMA-only ablation ran at 96.4 µs (cuBLAS speed) while loads-only took 417 µs, and that pair of numbers identified the bottleneck.
+3. **Make the assistant name the counter its change should move**, and reject changes aimed at a counter that is not saturated.
+4. **Re-sweep knobs when the bottleneck moves.** Stage count, tile shape and cluster shape all interact with it.
+5. **Have it compile for the target first.** The cross-compile in Section 4 costs seconds and catches illegal layouts, shared-memory overflows and register spills before you pay for GPU time.
+
+A prompt skeleton that encodes this:
+
+```text
+You are optimizing a CuTe DSL GEMM for sm_100a. Current kernel: <file>. Shapes: <list>.
+Rules: change ONE thing per step. Before editing, state which Nsight Compute metric you
+expect to move and why it is the binding constraint now. After editing: cross-compile,
+report registers/spills and SMEM bytes, then run the correctness check against torch
+(state the max abs error and the tolerance; the reference write-up saw 0 for K<=8192 and 0.5 at K=28672) and time 50 iterations with CUDA events.
+Report "no change" for differences under 2%. Never report a speedup without the error.
+```
+
+---
+
+## 11. Verification and benchmark plan
+
+### On a CPU (done here)
+
+- Cross-compile every configuration you intend to run. Reject anything over 227 KiB of SMEM, and check `ptxas -v` for spills.
+- Count PTX/SASS instructions per stage (MMAs, TMA loads, commits) against what the design says.
+
+### On a Blackwell GPU (not done here)
+
+- **Correctness:** random FP16 inputs, compare against `torch.matmul` with FP32 accumulation, for K ∈ {64, 192, 1024, 8192}. K=192 never recycles a 4-stage ring; K=1024 does, so it exposes phase bugs. Also test M and N not divisible by the tile and expect either a clean rejection or correct predication.
+- **Timing:** CUDA events around 20–50 iterations after warm-up, with `torch.matmul` on the same tensors in the same process. The write-up measured about 1.7 µs run-to-run spread, so treat differences under 2% as noise.
+- **Profiling:** Nsight Compute `sm__pipe_tensor_op_*` utilization, L1/TEX and DRAM throughput, waves per SM, and the stall breakdown. On cloud containers that cannot lock clocks, use `--clock-control none` and compare percentages across kernel versions, not absolutes.
+
+---
+
+## Pitfalls
+
+| Pitfall | Symptom | Fix |
+|---|---|---|
+| Phase flipped every iteration on a ring barrier | Hang on lap 2, or stale data | Flip parity only when the stage index wraps |
+| Byte count in `expect_tx` ≠ bytes TMA delivers | Hang (too many) or race (too few) | Compute from the same SMEM layouts the TMA atoms use |
+| Forgetting to pre-arm empty barriers | Producer deadlocks on lap 1 | Arrive once at init, or start the producer at phase 1 |
+| ACCUMULATE left on for the first MMA | Garbage from uninitialized TMEM | Clear for the first MMA of each tile |
+| SW128 with a 16-deep FP16 tile | Layout rejected at compile time | tile_k ≥ 64 (FP16/BF16) |
+| Unaligned SMEM base for SW128 | Corrupt operands | 1024-byte alignment |
+| Stage count chosen by "more is better" | Launch failure above 227 KiB; no gain when not latency-bound | Budget per stage, then sweep in the current regime |
+| 2-CTA commit without the peer in the mask | Hang once stages recycle | Name both CTAs in the commit mask |
+| Benchmarking only square shapes | Decode regressions go unnoticed | Use your model's (M, N, K) list, including small M |
+| Speedup without a correctness check | Fake wins from skipped tiles | Max-error check in every timing run |
+
+---
+
+## Checkpoint
+
+- Explain why one thread can issue a Blackwell MMA, and where the accumulator lives.
+- Write the producer and consumer loops of an $S$-stage TMA→UMMA ring, including the phase arithmetic.
+- State the two conditions that complete an mbarrier phase when TMA is involved.
+- Explain why warp specialization did not help at step 3, and why multicast did not help at step 6.
+- Show with bank arithmetic why 128-byte rows conflict, and how `Swizzle<3,4,3>` removes the conflict.
+- Compute the SMEM per stage and the maximum stage count for 1-CTA and 2-CTA 64-deep tiles.
+- Explain why decode attention-output stays at 0.67x of cuBLAS even after persistence, and name two fixes.
+
+---
+
+## Try this
+
+1. Add a fourth knob for the N tile (128 or 256) to `bw_gemm.py`, cross-compile, and record TMEM columns, SMEM per stage and maximum stages. Recompute the waves column for the decode shapes.
+2. Change the epilogue to stage through SMEM and use a TMA store (follow `fp16_gemm_2.py`). Compare SASS: a `UTMASTG` (TMA store) should appear, as it does in the cross-compiled `fp16_gemm_2`, and the direct global stores should disappear.
+3. Implement the two-slot TMEM accumulator: allocate 512 columns, add `acc_full[2]`/`acc_empty[2]`, and loop over two tiles per CTA. Cross-compile and confirm `tcgen05.alloc` asks for 512 columns.
+4. Extend `swizzle_model.py` to 32-byte and 64-byte swizzles (`Swizzle<1,4,3>`, `Swizzle<2,4,3>`) at 32- and 64-byte row pitches, and find which pitch each one makes conflict-free.
+5. On a B200: run `bw_gemm.py` against `torch.matmul` for K ∈ {64, 192, 1024, 4096}. Then time `STAGES ∈ {2, 3, 4}` × `ATOM ∈ {inter, sw128}` at 4096³ and compare with the reported ladder.
+
+---
+
+## Summary
+
+A Blackwell GEMM is a small asynchronous system. TMA moves tiles into a shared-memory ring, mbarriers with explicit phases hand stages between a producer warp and a single-thread MMA issuer, `tcgen05.mma` accumulates in TMEM, and the epilogue drains TMEM through registers. The kernel in this chapter writes all of that out in CuTe DSL and is verified by cross-compiling for `sm_100a`. Its PTX and SASS contain exactly the MMAs, TMA loads, commits and TMEM loads the design calls for, with no spills. The ladder's lessons are about method more than primitives. One layout change (tile_k 64 with a 128-byte swizzle) delivered a 4x gain, three plausible optimizations were null because they targeted counters that were not binding, and the final 2-CTA and persistent double-buffered steps closed the gap to cuBLAS on large shapes. Decode shapes are decided by waves, not by the inner loop, and need split-K, stream-K or smaller tiles. Compile for the target first, check correctness in every timing run, and re-measure whenever the bottleneck moves.
+
+---
+
+## Sources (for further reading)
+
+- NVIDIA CUTLASS, CuTe DSL documentation (`media/docs/pythonDSL/`) and Blackwell tutorial `examples/python/CuTeDSL/cute/blackwell/tutorial/tutorial_gemm/fp16_gemm_0.py` … `fp16_gemm_6.py` (BSD-3-Clause), https://github.com/NVIDIA/cutlass. Persistent kernels: `examples/python/CuTeDSL/cute/blackwell/kernel/dense_gemm/dense_gemm_persistent.py`.
+- NVIDIA PTX ISA: `tcgen05` family (`tcgen05.alloc`, `tcgen05.mma`, `tcgen05.commit`, `tcgen05.ld`), `cp.async.bulk.tensor`, `mbarrier` (expect-tx, phase completion), tensor-map swizzle modes.
+- NVIDIA CUDA C++ Programming Guide: Tensor Memory Accelerator, asynchronous barriers, thread block clusters, shared memory banks.
+- CuTe DSL capacity map (`cutlass_dsl/cutlass.py`, `SMEM_CAPACITY_MAP`): 227 KiB per block on `sm_100`.
+- Osama, Merrill, Cecka, Garland, Owens, "Stream-K: Work-centric Parallel Decomposition for Dense Matrix-Matrix Multiplication on the GPU" (PPoPP 2023, arXiv:2301.03598).
+- Meta Llama 3 model card / `config.json` (70B: hidden 8192, intermediate 28672, 8 KV heads × 128) for the shapes.
+
+**Inspiration (not a source):** KyrieBlunders' post on X, https://x.com/KyrieBlunders/status/2106058102374375890, and the linked article "Hand-writing a Blackwell GEMM: 164 to 1400 TFLOP/s", https://x.com/i/article/2104938399052480512. All timings, Nsight Compute figures and ablation results in Sections 5–10 are that article's *reported* B200 measurements and were not reproduced here. The kernel in this chapter is original and does not reuse the article's code.
