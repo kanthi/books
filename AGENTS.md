@@ -70,13 +70,15 @@ Shared behaviour (Template + every live book): nested sections, `humanize_dir_ti
 
 ## Critical rules
 
-1. **Ignore `_quarto.yml` entirely**: Do not hand-edit, manually regenerate, or commit `_quarto.yml` (neither in content PRs nor after merging on `main`). Regeneration is handled automatically by the repository's build scripts and CI pipelines.
-2. **Strict content naming conventions**: Follow content naming conventions based on existing files (`01-*`, `02-*`, etc.) to ensure correct automatic collation. Commit **only** content files (`.qmd` / `.md`) and assets (`images/`). Bot-authored PRs carry the `bot-content` label.
-4. **Primary CI** is `incremental.yml` (push-triggered, per-book). Full-rebuild fallback is `main.yml` (manual only).
-5. **Full-build script** is `books/renderpub.sh`. Single-book: `indipub.sh`. Preview: `indiprev.sh`. Portal-only: `scripts/gen-portal.sh`.
-6. `published_books/` and `_book/` are build artifacts — do not commit them.
-7. Older full-library scripts live under **`_archive/scripts/`** (not used by CI). Do not restore them to `books/` without a reason.
-8. Live books under `books/` share the **Template shell**: `scripts/update-index.sh` (GitHub link, `date-modified` + “Updated” label, `epub.css`), monorepo README, no per-book `.github/`.
+1. **Never hand-edit `_quarto.yml`**: It is generated config overwritten by `scripts/update-index.sh`. Regenerate it only via `update-index.sh`.
+2. **Content PRs / branches**: When submitting PRs or new chapters, commit **only** content files (`.qmd` / `.md`) and assets (`images/`). **Do not commit `_quarto.yml` in content PRs** to avoid cross-branch merge conflicts and collation churn. Bot-authored PRs carry the `bot-content` label.
+3. **Synchronize on `main`**: After merging content PRs or adding/moving chapters on `main`, regenerate `_quarto.yml` using `scripts/update-index.sh` to keep sidebar indexes synchronized.
+4. **Strict content naming conventions**: Follow content naming conventions based on existing files (`01-*`, `02-*`, etc.) to ensure correct automatic collation.
+5. **Primary CI** is `incremental.yml` (push-triggered, per-book). Full-rebuild fallback is `main.yml` (manual only).
+6. **Full-build script** is `books/renderpub.sh`. Single-book: `indipub.sh`. Preview: `indiprev.sh`. Portal-only: `scripts/gen-portal.sh`.
+7. `published_books/` and `_book/` are build artifacts — do not commit them.
+8. Older full-library scripts live under **`_archive/scripts/`** (not used by CI). Do not restore them to `books/` without a reason.
+9. Live books under `books/` share the **Template shell**: `scripts/update-index.sh` (GitHub link, `date-modified` + “Updated” label, `epub.css`), monorepo README, no per-book `.github/`.
 
 ## Content conventions
 
@@ -274,5 +276,5 @@ On the next full CI run (or local `renderpub.sh`), the new book appears on the p
 - Resolve **book vs volume** using **Book vs volume naming** above; ask if "Go" / "NixOS" / "Maths" is ambiguous.
 - **Diagrams:** follow `includes/diagrams/STANDARD.md` and the reference topology SVGs; dual light/dark files for illustrated figures.
 - Do not re-explain this pipeline unless the user asks; assume it is known.
-- Do not touch, regenerate, or commit `_quarto.yml` — repository build scripts and CI handle generation automatically.
+- Do not hand-edit `_quarto.yml`. Regenerating `_quarto.yml` via `scripts/update-index.sh` is supported and expected on `main` when syncing new content.
 - Follow existing file naming conventions strictly for deterministic chapter discovery and collation.
