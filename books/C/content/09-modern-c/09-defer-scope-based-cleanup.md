@@ -563,13 +563,14 @@ clash.c:5:13: warning: unused function 'defer_cleanup' [-Wunused-function]
 $ ./clash
 body
 $ clang -std=c23 -fdefer-ts -g -fsanitize=address clash.c -o clash_asan && ./clash_asan
+body
 
 =================================================================
-==460033==ERROR: LeakSanitizer: detected memory leaks
+==460565==ERROR: LeakSanitizer: detected memory leaks
 
 Direct leak of 64 byte(s) in 1 object(s) allocated from:
-    #0 0x55607c97db94 in malloc /home/runner/work/llvm-project/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:109:3
-    #1 0x55607c9bf7d8 in main /workspace/scratch/cdefer/clash.c:16:17
+    #0 0x563937b29b94 in malloc /home/runner/work/llvm-project/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:109:3
+    #1 0x563937b6b7d8 in main /workspace/scratch/cdefer/clash.c:16:17
 ...
 ```
 
