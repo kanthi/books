@@ -1,0 +1,257 @@
+---
+title: "Frame Pointers by Default (PEP 831)"
+author:
+  - name: "K19G"
+  - name: "grok-bot"
+---
+
+# Frame Pointers by Default (PEP 831)
+
+## Thesis
+
+A native profiler such as `perf`, or an eBPF tool, sees a Python process as a pile of C functions. To say *who called whom*, it has to walk the machine stack. The cheapest way to walk it is the **frame-pointer chain**: every function saves the caller's `%rbp` and points `%rbp` at its own frame, so the walk is "read, follow, repeat". Compilers drop that chain by default at `-O1` and above. For years CPython did the same, so native stacks through Python stopped at `_PyEval_EvalFrameDefault`.
+
+Starting with **Python 3.15**, [PEP 831](https://peps.python.org/pep-0831/) (status *Final*) builds CPython with `-fno-omit-frame-pointer -mno-omit-leaf-frame-pointer`. It also writes those flags into `sysconfig`, so **C extensions built against 3.15 inherit them**. The chain only helps if it has no gaps. This chapter shows how to check that a given interpreter and a given extension actually keep it.
+
+Version note: the listings were run on **CPython 3.15.0rc3** from `uv` (python-build-standalone, Linux x86-64, GCC 14.2 for the extension builds). 3.15.0 final shipped on 2026-10-09. Its changelog lists *no changes* since rc3, so the output is the same. The comparison interpreter is Debian's system **3.13.5**.
+
+## Mental model
+
+```text
+ stack (grows down)                 what an unwinder does with frame pointers
+┌──────────────────────────┐
+│ main                     │◄──┐    1. start at %rbp of the sampled thread
+│   saved %rbp → bottom    │   │    2. [%rbp+8] is the return address → caller
+├──────────────────────────┤   │    3. [%rbp]   is the caller's %rbp   → repeat
+│ _PyEval_EvalFrameDefault │   │
+│   saved %rbp ────────────┼───┘    one missing link (a function that never
+├──────────────────────────┤        did `push %rbp; mov %rsp,%rbp`) and the
+│ your_extension_func      │◄─%rbp  walk skips or stops at that frame
+└──────────────────────────┘
+```
+
+| Piece of the process | Who decides its flags | Covered by PEP 831? |
+|----------------------|-----------------------|---------------------|
+| `python`, `libpython`, stdlib extension modules | CPython `configure` (`BASECFLAGS`) | Yes, on by default; `--without-frame-pointers` opts out |
+| C extensions built with setuptools / `pip` against 3.15 | `sysconfig` `CFLAGS` | Yes, inherited |
+| Rust (PyO3/maturin), C++ with CMake, vendored native libs | their own build systems | **No**. The PEP only *recommends* the flags |
+| Python before 3.15 | whoever built it | Depends on the builder |
+
+Three facts to hold on to:
+
+- **Overhead is small and measured.** The PEP reports a 0.1–2.3 % geometric-mean slowdown across eight machines on pyperformance. It comes from about 6,000 small C helpers gaining a two-instruction prologue, not from the eval loop.
+- **The flags travel through `sysconfig`.** That is why they live in `BASECFLAGS` and not `CFLAGS_NODIST`: a chain with a gap at the extension boundary is as broken as no chain at all.
+- **Nothing changes for Python code.** No API, no behaviour, no ABI change. Only native tooling sees the difference.
+
+## Worked examples
+
+### Case 1: ask the interpreter what it was built with
+
+Save as `fp_audit.py`. The first half reads `sysconfig`. The second half disassembles a shared object and counts functions whose prologue links `%rbp`.
+
+```python
+# fp_audit.py - does this interpreter (and a given .so) keep the frame-pointer chain?
+import re
+import subprocess
+import sys
+import sysconfig
+
+FLAGS = ("-fno-omit-frame-pointer", "-mno-omit-leaf-frame-pointer")
+
+
+def interpreter_report() -> None:
+    cflags = sysconfig.get_config_var("CFLAGS") or ""
+    print(f"python   {sys.version.split()[0]}  ({sys.executable})")
+    for flag in FLAGS:
+        print(f"  {flag:32} {'yes' if flag in cflags.split() else 'NO'}")
+
+
+def prologues(path: str) -> tuple[int, int, list[str]]:
+    """Count text functions whose first instructions set up %rbp as frame pointer."""
+    asm = subprocess.run(
+        ["objdump", "-d", "--no-show-raw-insn", path],
+        capture_output=True, text=True, check=True,
+    ).stdout
+    funcs = re.split(r"\n(?=[0-9a-f]+ <)", asm)
+    total, with_fp, missing = 0, 0, []
+    for block in funcs:
+        m = re.match(r"[0-9a-f]+ <([^>]+)>:", block)
+        if not m or m.group(1).startswith((".", "_init", "_fini", "deregister", "register_tm", "frame_dummy", "__do_global")):
+            continue
+        if "@" in m.group(1):  # PLT stubs are not our code
+            continue
+        insns = [l.split("\t")[-1].strip() for l in block.splitlines()[1:8]]
+        total += 1
+        # the compiler may schedule other instructions between the two
+        pushed = any(re.fullmatch(r"push\s+%rbp", i) for i in insns[:4])
+        linked = any(re.fullmatch(r"mov\s+%rsp,%rbp", i) for i in insns)
+        if pushed and linked:
+            with_fp += 1
+        else:
+            missing.append(m.group(1))
+    return total, with_fp, missing
+
+
+if __name__ == "__main__":
+    interpreter_report()
+    for so in sys.argv[1:]:
+        total, ok, missing = prologues(so)
+        print(f"{so.rsplit('/', 1)[-1]}: {ok}/{total} functions keep %rbp")
+        print(f"  without: {missing[:4] or '-'}{' ...' if len(missing) > 4 else ''}")
+```
+
+```console
+$ python3.15 fp_audit.py
+python   3.15.0rc3  (/home/box/.local/bin/python3.15)
+  -fno-omit-frame-pointer          yes
+  -mno-omit-leaf-frame-pointer     yes
+
+$ /usr/bin/python3 fp_audit.py
+python   3.13.5  (/usr/bin/python3)
+  -fno-omit-frame-pointer          NO
+  -mno-omit-leaf-frame-pointer     NO
+```
+
+On this box `sysconfig.get_config_var("CFLAGS")` for 3.15 actually lists each flag **twice**. Upstream's PEP 831 default adds one copy, and python-build-standalone, which had already turned frame pointers on for its Linux builds in early 2026, adds the other. Duplicates are harmless. The `uv`-installed **3.14.8** on the same box also reports both flags, because of python-build-standalone and not because of CPython. The Debian 3.13 build reports neither. The flags depend on **who built the interpreter**, not only on its version number.
+
+### Case 2: audit the interpreter's own code
+
+```console
+$ python3.15 fp_audit.py ~/.local/share/uv/python/cpython-3.15.0rc3-linux-x86_64-gnu/lib/libpython3.15.so.1.0
+python   3.15.0rc3  (/home/box/.local/bin/python3.15)
+  -fno-omit-frame-pointer          yes
+  -mno-omit-leaf-frame-pointer     yes
+libpython3.15.so.1.0: 30967/32952 functions keep %rbp
+  without: ['_PyPegen_get_expr_name', '_PyPegen_nonparen_genexp_in_call', '_get_interpolation_conversion', '_warn_relative_import_of_lazy'] ...
+
+$ python3.15 fp_audit.py /usr/bin/python3.13
+...
+python3.13: 0/0 functions keep %rbp
+  without: -
+```
+
+About 94 % of `libpython`'s functions set up a frame. Most of the rest are functions that never touch the stack, or that end in a tail jump (see Case 4). The Debian binary gives `0/0` because it is **stripped**: `objdump` has no symbols to split on. An empty audit means "no evidence either way", not "fine".
+
+### Case 3: an extension inherits the flags, and can opt out
+
+Save the extension as `fpcheck.c`. `leaf_sum` is marked `noinline` so that it survives as its own function.
+
+```c
+/* fpcheck.c - a tiny extension with a leaf and a non-leaf function */
+#define PY_SSIZE_T_CLEAN
+#include <Python.h>
+
+__attribute__((noinline)) static long leaf_sum(long n) {            /* leaf: calls nothing */
+    long s = 0;
+    for (long i = 0; i < n; i++) s += i;
+    return s;
+}
+
+static PyObject *total(PyObject *self, PyObject *arg) {
+    long n = PyLong_AsLong(arg);
+    if (n == -1 && PyErr_Occurred()) return NULL;
+    return PyLong_FromLong(leaf_sum(n));
+}
+
+static PyMethodDef methods[] = {
+    {"total", total, METH_O, "sum of range(n)"},
+    {NULL, NULL, 0, NULL},
+};
+
+static struct PyModuleDef mod = {PyModuleDef_HEAD_INIT, "fpcheck", NULL, -1, methods};
+
+PyMODINIT_FUNC PyInit_fpcheck(void) { return PyModule_Create(&mod); }
+```
+
+```python
+# setup.py - build fpcheck with whatever flags this interpreter's sysconfig reports
+import os
+from setuptools import Extension, setup
+
+extra = os.environ.get("FP_EXTRA", "").split()
+setup(
+    name="fpcheck",
+    version="0",
+    ext_modules=[Extension("fpcheck", ["fpcheck.c"], extra_compile_args=extra)],
+)
+```
+
+Build it in a 3.15 virtual environment and look at the compiler line setuptools runs:
+
+```console
+$ uv venv -p 3.15 .v315 && uv pip install -p .v315 setuptools
+$ .v315/bin/python setup.py build_ext --inplace 2>&1 | grep '^cc' | head -1
+cc -pthread -fno-omit-frame-pointer -mno-omit-leaf-frame-pointer -fno-strict-overflow ... -O3 ... -fno-omit-frame-pointer -mno-omit-leaf-frame-pointer -fPIC -fPIC -I... -c fpcheck.c -o build/temp.linux-x86_64-cpython-315/fpcheck.o
+$ .v315/bin/python -c "import fpcheck; print(fpcheck.total(10))"
+45
+$ .v315/bin/python fp_audit.py fpcheck.cpython-315-x86_64-linux-gnu.so
+python   3.15.0rc3  (/workspace/scratch/fp/.v315/bin/python)
+  -fno-omit-frame-pointer          yes
+  -mno-omit-leaf-frame-pointer     yes
+fpcheck.cpython-315-x86_64-linux-gnu.so: 1/3 functions keep %rbp
+  without: ['leaf_sum', 'PyInit_fpcheck']
+```
+
+The extension author did nothing, yet `total` (the function that calls back into CPython) got a frame. That is the propagation PEP 831 is about. To opt one extension out, add the opposite flag. On GCC and Clang the last flag on the command line wins:
+
+```console
+$ rm -rf build *.so
+$ FP_EXTRA=-fomit-frame-pointer .v315/bin/python setup.py -q build_ext --inplace
+$ .v315/bin/python fp_audit.py fpcheck.cpython-315-x86_64-linux-gnu.so
+...
+fpcheck.cpython-315-x86_64-linux-gnu.so: 0/3 functions keep %rbp
+  without: ['leaf_sum', 'total', 'PyInit_fpcheck']
+```
+
+### Case 4: read the "without" list before panicking
+
+Two names stayed in the list even with the flags on. Disassemble them:
+
+```console
+$ objdump -d --no-show-raw-insn fpcheck.cpython-315-x86_64-linux-gnu.so | grep -A3 -E '<(leaf_sum|PyInit_fpcheck)>:'
+0000000000001140 <leaf_sum>:
+    1140:	test   %rdi,%rdi
+    1143:	jle    1178 <leaf_sum+0x38>
+    1145:	xor    %eax,%eax
+--
+00000000000011d0 <PyInit_fpcheck>:
+    11d0:	mov    $0x3f5,%esi
+    11d5:	lea    0x2e44(%rip),%rdi        # 4020 <mod>
+    11dc:	jmp    1050 <PyModule_Create2@plt>
+```
+
+- `PyInit_fpcheck` is a **tail call**. It sets up arguments and *jumps* to `PyModule_Create2`, which returns straight to `PyInit`'s caller. There is no frame of its own to lose, so the chain is intact.
+- `leaf_sum` is a leaf that uses no stack at all. GCC 14.2 on this box emits no prologue for it even with `-mno-omit-leaf-frame-pointer`. The same happens in a plain C file compiled with `gcc -O2 -fno-omit-frame-pointer -mno-omit-leaf-frame-pointer`. A sample that lands *inside* `leaf_sum` still has the right `%rbp` (the caller's), so the walk loses at most the immediate caller for that one sample. That is a compiler detail. Check your own compiler before you write it off.
+
+Look at what the missing functions actually are. Fix the ones that call other functions without a frame, which `total` did in Case 3 once it was opted out.
+
+## The trap
+
+**"We're on 3.15, so our flame graphs are complete."** Not necessarily. PEP 831 covers the interpreter and what builds through `sysconfig`. A typical service also loads:
+
+- a **Rust extension** built by maturin, which uses Rust's own codegen defaults. Add `-C force-frame-pointers=yes` through `RUSTFLAGS`.
+- a **C++ library** with its own CMake. It needs `-fno-omit-frame-pointer -mno-omit-leaf-frame-pointer` in its own `CMAKE_C(XX)_FLAGS`.
+- a **vendored `.so`** from a wheel built years ago, against an older Python, by someone else.
+
+One frameless function that calls others in the hot path, and every stack through it gets cut. Since the native unwinder in `bpf_get_stackid()` has no DWARF fallback, eBPF profilers show these as truncated one- or two-frame stacks. They don't error. Audit every native component on the hot path, not only `python`.
+
+The mirror trap is **assuming an older Python lacks frame pointers**. Here, `uv`'s 3.14.8 already had them and Debian's 3.13 didn't. Check `sysconfig`. Don't infer from the version.
+
+## The boring rule
+
+> On 3.15+, leave frame pointers on. Before trusting a native profile, run `sysconfig` plus a prologue audit over every `.so` on the hot path, and turn the flags on in each build system CPython does not control. Opt out per extension with `-fomit-frame-pointer` only after you have measured a regression, and write the measurement down.
+
+## Try this
+
+1. Run `fp_audit.py` on the `.so` files inside one of your project's virtual environments (`find .venv -name '*.so'`). Which packages have no frames, and which are stripped (`0/0`)?
+2. Build `fpcheck` against 3.14 from a non-`uv` source (a distro package or `pyenv`) and compare the compiler line with Case 3.
+3. Remove `noinline` from `leaf_sum`, rebuild, and explain why the function disappears from the audit.
+4. If your machine allows `perf` (`perf_event_paranoid ≤ 1`), record `python3.15 -X perf -c '...'` with `--call-graph fp`, then with `--call-graph dwarf`, and compare the size of `perf.data`.
+
+## Sources
+
+- [PEP 831: Frame Pointers Everywhere](https://peps.python.org/pep-0831/) (Final, Python 3.15): build flags, `BASECFLAGS` versus `CFLAGS_NODIST`, `--without-frame-pointers`, performance table.
+- [Python 3.15.0 final release notes](https://blog.python.org/2026/10/python-3150-final-is-here/) and [changelog](https://docs.python.org/3/whatsnew/changelog.html) (3.15.0: "no new changes" since rc3).
+- [python-build-standalone issue #992](https://github.com/astral-sh/python-build-standalone/issues/992): frame pointers in `uv`-distributed Linux builds.
+- [Python perf profiling HOWTO](https://docs.python.org/3.15/howto/perf_profiling.html): `-X perf`, `-X perf_jit`.
+- [GCC optimize options: `-fomit-frame-pointer`](https://gcc.gnu.org/onlinedocs/gcc/Optimize-Options.html#index-fomit-frame-pointer).
