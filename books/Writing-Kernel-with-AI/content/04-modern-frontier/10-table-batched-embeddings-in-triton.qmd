@@ -1,0 +1,435 @@
+---
+title: "Table-Batched Embeddings in Triton: Gather, Pool, and Run-Length Backward"
+author:
+  - name: "K19G"
+  - name: "grok-bot"
+---
+
+# Table-Batched Embeddings in Triton: Gather, Pool, and Run-Length Backward
+
+Recommendation models spend their accelerator time in two places: dense MLPs, which are GEMMs and therefore familiar ground, and **embedding lookups**, which are not. A ranking model may carry hundreds of sparse features ("pages liked", "videos watched"), each with its own table of millions of rows. Every request turns into a few thousand row gathers, a sum per feature, and, in training, a sparse gradient that has to be folded back into exactly the rows it came from. There is almost no arithmetic. The job is memory traffic and bookkeeping.
+
+The production operator for this is **TBE**, the *table-batched embedding*: one launch performs the lookups and pooling for **all** tables. In October 2026 the PyTorch/Meta team described replacing FBGEMM's templated CUDA TBE kernels with **FBTriton** kernels. They reported a median 1.28× forward speedup over 307 shard configurations on GB200 and up to 2× in backward. Their analysis attributes most of the backward win to *where the code switches strategies*, not to clever instructions.
+
+This chapter builds a small TBE in Triton that you can verify on a laptop: a pooled forward kernel with a tunable **gather width**, and a backward that sorts lookups into **runs** (one per unique row), sends short and long runs to different kernels, and applies exactly one optimizer step per row. Every listing runs under `TRITON_INTERPRET=1` on CPU, and the kernels are then compiled for `sm_90` and `sm_100` without a GPU.
+
+Versions used: **Triton 3.8.0**, **PyTorch 2.14.1+cpu**, Python 3.13.5, Debian 13 x86-64 (no GPU). Timings in the interpreter mean nothing, so this chapter makes no speed claims of its own. The performance numbers quoted are FBTriton's.
+
+---
+
+## 1. Mental model: what TBE computes
+
+Notation follows the FBTriton write-up: **T** tables, each with **E** rows of width **D**. **B** is the batch size (bags per table), and **L** is the pooling factor (lookups per bag, varying from bag to bag).
+
+```text
+ inputs (flattened, table-major)                 one output row per sample
+ offsets: [t0b0 | t0b1 | ... | t1b0 | ... ]      out[b] = [ pool_t0(b) | pool_t1(b) | ... ]   (B × T·D)
+ indices:  3 9 9 │ 1 │ ... │ 4 4 7 2 │ ...
+                                                 pool_t(b) = Σ_{i ∈ bag(t,b)}  psw_i · W_t[idx_i]
+ W: all tables concatenated, table_off[t] = first row of table t
+```
+
+| Pass | Work per lookup | Hard part |
+|------|-----------------|-----------|
+| Forward | read one D-wide row, add | latency of dependent loads (`idx` → row address → row) |
+| Backward | add one D-wide gradient into its row | many lookups hit the **same** row, and the counts are skewed by orders of magnitude |
+
+The backward is a **scatter-add with duplicates**. Its shape depends on the data. With real IDs, a handful of rows (the popular item, the default token) appear in thousands of bags, and most rows appear once. The FBTriton post cites a batch with 83 M lookups, 3 M unique rows, and a hottest row hit 125 K times. Its central variable is the **segment length (SL)**, the number of lookups that touch one row.
+
+---
+
+## 2. The kernels
+
+Save as `tbe_triton.py`. The file holds four kernels, the host-side planning for the backward, a batch generator with skewed IDs, and a reference built on `torch.nn.functional.embedding_bag`.
+
+```python
+# tbe_triton.py - table-batched embedding (sum pooling) forward + fused-SGD backward in Triton
+# GPU:  python tbe_triton.py        CPU correctness:  TRITON_INTERPRET=1 python tbe_triton.py
+import os
+
+import torch
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def tbe_fwd_kernel(W, TABLE_OFF, IDX, OFFS, PSW, OUT, B, T,
+                   D: tl.constexpr, BLOCK_D: tl.constexpr, GATHER: tl.constexpr,
+                   BAGS: tl.constexpr, HAS_PSW: tl.constexpr):
+    # one program = BAGS consecutive samples; it walks every table for them (no B x T grid)
+    cols = tl.arange(0, BLOCK_D)
+    cmask = cols < D
+    g = tl.arange(0, GATHER)
+    for bb in range(BAGS):
+        b = tl.program_id(0) * BAGS + bb
+        if b < B:
+            for t in range(T):
+                start = tl.load(OFFS + t * B + b)
+                end = tl.load(OFFS + t * B + b + 1)
+                row0 = tl.load(TABLE_OFF + t)
+                acc = tl.zeros([BLOCK_D], dtype=tl.float32)          # accumulate in fp32
+                for j in range(start, end, GATHER):                   # GATHER independent row loads
+                    lmask = (j + g) < end
+                    rows = row0 + tl.load(IDX + j + g, mask=lmask, other=0).to(tl.int64)
+                    tile = tl.load(W + rows[:, None] * D + cols[None, :],
+                                   mask=lmask[:, None] & cmask[None, :], other=0.0).to(tl.float32)
+                    if HAS_PSW:
+                        tile *= tl.load(PSW + j + g, mask=lmask, other=0.0)[:, None]
+                    acc += tl.sum(tile, axis=0)
+                tl.store(OUT + b * (T * D) + t * D + cols, acc.to(OUT.dtype.element_ty), mask=cmask)
+
+
+@triton.jit
+def short_run_kernel(W, GRAD_OUT, RUN_ROW, RUN_START, RUN_LEN, SORTED_POS, POS_BAG, POS_TABLE,
+                     SHORT_IDS, lr, T, D: tl.constexpr, BLOCK_D: tl.constexpr):
+    # one program owns one run (= one unique row): gather grads, sum, update. Plain store, no atomics.
+    r = tl.load(SHORT_IDS + tl.program_id(0))
+    cols = tl.arange(0, BLOCK_D)
+    cmask = cols < D
+    start = tl.load(RUN_START + r)
+    n = tl.load(RUN_LEN + r)
+    acc = tl.zeros([BLOCK_D], dtype=tl.float32)
+    for k in range(n):
+        p = tl.load(SORTED_POS + start + k)
+        b = tl.load(POS_BAG + p).to(tl.int64)
+        t = tl.load(POS_TABLE + p)
+        acc += tl.load(GRAD_OUT + b * (T * D) + t * D + cols, mask=cmask, other=0.0).to(tl.float32)
+    row = tl.load(RUN_ROW + r).to(tl.int64)
+    w = tl.load(W + row * D + cols, mask=cmask).to(tl.float32)
+    tl.store(W + row * D + cols, (w - lr * acc).to(W.dtype.element_ty), mask=cmask)
+
+
+@triton.jit
+def long_run_accum_kernel(GRAD_OUT, WS, CHUNK_SLOT, CHUNK_START, CHUNK_END,
+                          SORTED_POS, POS_BAG, POS_TABLE, T, D: tl.constexpr, BLOCK_D: tl.constexpr):
+    # one program = one fixed-size chunk of a long run (split-K); partials meet in a workspace row
+    c = tl.program_id(0)
+    cols = tl.arange(0, BLOCK_D)
+    cmask = cols < D
+    acc = tl.zeros([BLOCK_D], dtype=tl.float32)
+    for k in range(tl.load(CHUNK_START + c), tl.load(CHUNK_END + c)):
+        p = tl.load(SORTED_POS + k)
+        b = tl.load(POS_BAG + p).to(tl.int64)
+        t = tl.load(POS_TABLE + p)
+        acc += tl.load(GRAD_OUT + b * (T * D) + t * D + cols, mask=cmask, other=0.0).to(tl.float32)
+    slot = tl.load(CHUNK_SLOT + c).to(tl.int64)
+    tl.atomic_add(WS + slot * D + cols, acc, mask=cmask)
+
+
+@triton.jit
+def long_run_apply_kernel(W, WS, LONG_ROW, lr, D: tl.constexpr, BLOCK_D: tl.constexpr):
+    s = tl.program_id(0)
+    cols = tl.arange(0, BLOCK_D)
+    cmask = cols < D
+    row = tl.load(LONG_ROW + s).to(tl.int64)
+    g = tl.load(WS + s * D + cols, mask=cmask)
+    w = tl.load(W + row * D + cols, mask=cmask).to(tl.float32)
+    tl.store(W + row * D + cols, (w - lr * g).to(W.dtype.element_ty), mask=cmask)
+
+
+def tbe_forward(W, table_off, idx, offs, B, T, D, psw=None, gather=4, bags=2):
+    out = torch.empty(B, T * D, dtype=torch.float32, device=W.device)
+    grid = (triton.cdiv(B, bags),)
+    tbe_fwd_kernel[grid](W, table_off, idx, offs, psw if psw is not None else W, out, B, T,
+                         D=D, BLOCK_D=triton.next_power_of_2(D), GATHER=gather, BAGS=bags,
+                         HAS_PSW=psw is not None)
+    return out
+
+
+def tbe_backward_sgd(W, grad_out, table_off, idx, offs, B, T, D, lr, threshold=8, chunk=8):
+    """Sum gradients per unique (table,row), apply one SGD step per row. Returns path stats."""
+    dev = W.device
+    lengths = offs[1:] - offs[:-1]                                    # length of each (t, b) bag
+    seg = torch.arange(T * B, device=dev).repeat_interleave(lengths)  # which bag each lookup is in
+    pos_table = (seg // B).to(torch.int32)
+    pos_bag = (seg % B).to(torch.int32)
+    linear = table_off[pos_table.long()] + idx.long()                 # global row id per lookup
+    # "transpose": sort lookups by row and run-length encode -> one run per unique row
+    sorted_rows, sorted_pos = torch.sort(linear, stable=True)
+    run_row, run_len = torch.unique_consecutive(sorted_rows, return_counts=True)
+    run_start = torch.cumsum(run_len, 0) - run_len
+    is_long = run_len >= threshold
+    short_ids = torch.nonzero(~is_long).flatten().to(torch.int32)
+    long_ids = torch.nonzero(is_long).flatten()
+    BLOCK_D = triton.next_power_of_2(D)
+    sp = sorted_pos.to(torch.int32)
+    if len(short_ids):
+        short_run_kernel[(len(short_ids),)](W, grad_out, run_row, run_start, run_len.to(torch.int32),
+                                            sp, pos_bag, pos_table, short_ids, lr, T,
+                                            D=D, BLOCK_D=BLOCK_D)
+    n_chunks = 0
+    if len(long_ids):
+        lens, starts = run_len[long_ids], run_start[long_ids]
+        per = (lens + chunk - 1) // chunk                               # chunks per long run
+        slot = torch.arange(len(long_ids), device=dev).repeat_interleave(per)
+        k = torch.arange(int(per.sum()), device=dev) - (torch.cumsum(per, 0) - per).repeat_interleave(per)
+        c_start = starts.repeat_interleave(per) + k * chunk
+        c_end = torch.minimum(c_start + chunk, (starts + lens).repeat_interleave(per))
+        n_chunks = len(c_start)
+        ws = torch.zeros(len(long_ids), D, dtype=torch.float32, device=dev)
+        long_run_accum_kernel[(n_chunks,)](grad_out, ws, slot,
+                                           c_start, c_end, sp, pos_bag, pos_table, T,
+                                           D=D, BLOCK_D=BLOCK_D)
+        long_run_apply_kernel[(len(long_ids),)](W, ws, run_row[long_ids], lr, D=D, BLOCK_D=BLOCK_D)
+    return dict(lookups=len(idx), unique_rows=len(run_row), short_runs=len(short_ids),
+                long_runs=len(long_ids), long_chunks=n_chunks, max_run=int(run_len.max()))
+
+
+def make_batch(T, E, B, D, max_L, dtype, dev, seed=0):
+    g = torch.Generator().manual_seed(seed)
+    table_off = torch.arange(T, dtype=torch.int64) * E
+    W = (torch.randn(T * E, D, generator=g) * 0.1).to(dtype)
+    lengths = torch.randint(0, max_L + 1, (T * B,), generator=g)      # table-major: t*B + b
+    offs = torch.zeros(T * B + 1, dtype=torch.int64)
+    offs[1:] = torch.cumsum(lengths, 0)
+    # skewed ids: a few rows are very hot, like real recommendation features
+    u = torch.rand(int(offs[-1]), generator=g)
+    idx = torch.clamp((-torch.log1p(-u) / 0.15).long(), max=E - 1).to(torch.int32)  # Exp(0.15)
+    to = lambda x: x.to(dev)
+    return to(W), to(table_off), to(idx), to(offs)
+
+
+def reference(W, table_off, idx, offs, B, T, D, psw=None):
+    outs = []
+    for t in range(T):
+        o = offs[t * B: (t + 1) * B + 1]
+        rows = W[table_off[t]: table_off[t] + (table_off[1] - table_off[0])]
+        outs.append(torch.nn.functional.embedding_bag(
+            idx[o[0]:o[-1]].long(), rows, (o[:-1] - o[0]), mode="sum",
+            per_sample_weights=None if psw is None else psw[o[0]:o[-1]]))
+    return torch.cat(outs, dim=1)
+
+
+if __name__ == "__main__":
+    dev = "cpu" if os.environ.get("TRITON_INTERPRET") == "1" else "cuda"
+    torch.manual_seed(0)
+    T, E, B, D, L = 3, 50, 16, 24, 12
+    for dtype in (torch.float32, torch.float16):
+        W, toff, idx, offs = make_batch(T, E, B, D, L, dtype, dev)
+        psw = torch.rand(len(idx), device=dev)
+        out = tbe_forward(W, toff, idx, offs, B, T, D)
+        ref = reference(W.float(), toff, idx, offs, B, T, D)
+        outw = tbe_forward(W, toff, idx, offs, B, T, D, psw=psw)
+        refw = reference(W.float(), toff, idx, offs, B, T, D, psw=psw)
+        print(f"{str(dtype):14s} fwd max|err| = {(out - ref).abs().max():.2e}   "
+              f"weighted = {(outw - refw).abs().max():.2e}")
+
+    # backward + SGD against autograd
+    W, toff, idx, offs = make_batch(T, E, B, D, L, torch.float32, dev, seed=1)
+    Wref = W.clone().requires_grad_(True)
+    grad_out = torch.randn(B, T * D, device=dev)
+    reference(Wref, toff, idx, offs, B, T, D).backward(grad_out)
+    lr = 0.05
+    expected = Wref.detach() - lr * Wref.grad
+    stats = tbe_backward_sgd(W, grad_out, toff, idx, offs, B, T, D, lr)
+    print("bwd+SGD max|err| =", f"{(W - expected).abs().max():.2e}", stats)
+```
+
+What to notice in the forward:
+
+- **Grid.** `cdiv(B, BAGS)` programs, and each program loops over all T tables, as in FBTriton's generic path. There is no `B × T` grid, so there are fewer, longer-lived programs, and offsets for the same sample are read close together.
+- **Gather width.** Each loop iteration loads `GATHER` indices and then a `[GATHER, BLOCK_D]` tile of rows: `GATHER` independent row loads in flight. That hides the latency of the dependent `idx → row` chain. The cost is registers, because the pointer tile `rows[:, None] * D + cols[None, :]` holds `GATHER × BLOCK_D` 64-bit addresses. FBTriton measured this exact cliff on B200: dropping the width from 8 to 2 cut registers from 184 to 64 and roughly quadrupled occupancy in its short-run backward tier. The right width is a per-target **config value**.
+- **Accumulate in FP32.** The table can be FP16 or BF16, but `acc` is FP32. FBTriton goes further and accumulates FP32 tables in FP64 for large D.
+
+What to notice in the backward:
+
+- **The transpose.** `torch.sort` plus `unique_consecutive` turns "lookups in batch order" into **runs**: one unique row, plus the positions of every lookup that touched it. FBTriton calls this `transpose_embedding_input`, and in one optional mode it hoists the step into the forward pass.
+- **Short runs** (`SL < threshold`): one program owns the whole run. It sums the gradients in registers, applies the update, and does a **plain store**. No atomics are needed, because no other program touches that row.
+- **Long runs**: split into fixed-size chunks (split-K). Each chunk program writes its partial sum with `tl.atomic_add` into a per-run workspace row, and a second kernel applies the update. FBTriton uses 256-lookup chunks and a threshold of `SL ≥ 256`. On Blackwell it fuses the two kernels with a device-scope fence and a countdown, so that the last chunk applies the update.
+
+---
+
+## 3. Verify on CPU
+
+```bash
+pip install torch triton            # CPU wheels are enough for interpreter mode
+TRITON_INTERPRET=1 python tbe_triton.py
+```
+
+```text
+torch.float32  fwd max|err| = 1.79e-07   weighted = 1.19e-07
+torch.float16  fwd max|err| = 0.00e+00   weighted = 5.96e-08
+bwd+SGD max|err| = 1.79e-07 {'lookups': 313, 'unique_rows': 67, 'short_runs': 54, 'long_runs': 13, 'long_chunks': 26, 'max_run': 20}
+```
+
+Forward results match `embedding_bag(mode="sum")` table by table, with and without per-sample weights, for FP32 and FP16 tables. The backward is checked the strict way: autograd computes the gradient of the reference forward, and `W - lr * grad` is compared with what the Triton kernels wrote into `W`. The skewed generator produced 313 lookups but only 67 unique rows, with the hottest row touched 20 times.
+
+The split point must not change the answer. `thresholds.py` runs the same batch with every lookup sent through the short path, a mixed split, a fine split, and every lookup sent through the atomic path:
+
+```python
+# thresholds.py - same batch, different short/long split points; the answer must not change
+import os
+
+import torch
+
+from tbe_triton import make_batch, reference, tbe_backward_sgd
+
+dev = "cpu" if os.environ.get("TRITON_INTERPRET") == "1" else "cuda"
+T, E, B, D, L, lr = 3, 50, 16, 24, 12, 0.05
+W0, toff, idx, offs = make_batch(T, E, B, D, L, torch.float32, dev, seed=1)
+grad_out = torch.randn(B, T * D, device=dev, generator=torch.Generator().manual_seed(2))
+Wref = W0.clone().requires_grad_(True)
+reference(Wref, toff, idx, offs, B, T, D).backward(grad_out)
+expected = Wref.detach() - lr * Wref.grad
+
+for threshold, chunk in [(10**9, 8), (8, 8), (4, 2), (1, 1)]:
+    W = W0.clone()
+    s = tbe_backward_sgd(W, grad_out, toff, idx, offs, B, T, D, lr, threshold=threshold, chunk=chunk)
+    print(f"threshold={threshold:<10} chunk={chunk}  short={s['short_runs']:<3} long={s['long_runs']:<3} "
+          f"chunks={s['long_chunks']:<4} max|err|={(W - expected).abs().max():.1e}")
+```
+
+```text
+threshold=1000000000 chunk=8  short=67  long=0   chunks=0    max|err|=1.8e-07
+threshold=8          chunk=8  short=54  long=13  chunks=26   max|err|=2.4e-07
+threshold=4          chunk=2  short=39  long=28  chunks=132  max|err|=2.4e-07
+threshold=1          chunk=1  short=0   long=67  chunks=313  max|err|=1.8e-07
+```
+
+All four routings agree to FP32 rounding. On a GPU the four runs differ only in speed, and the threshold becomes a **tuning knob**. That is the FBTriton result in miniature. Their CUDA baseline switched to a cooperative CTA-per-row kernel at `SL = 32`, while the Triton version kept simple streaming programs up to `SL = 256`. In that band Triton measured 3,948 GB/s against CUDA's 678 GB/s on the same shape.
+
+---
+
+## 4. Compile for GPUs you do not have
+
+The interpreter checks semantics, not lowering. Lower the kernels for Hopper and Blackwell ahead of time:
+
+```python
+# compile_check.py - lower the TBE kernels to cubin for GPUs this machine does not have
+import triton
+from triton.backends.compiler import GPUTarget
+from triton.compiler import ASTSource
+
+from tbe_triton import long_run_accum_kernel, short_run_kernel, tbe_fwd_kernel
+
+fwd_sig = {"W": "*fp16", "TABLE_OFF": "*i64", "IDX": "*i32", "OFFS": "*i64", "PSW": "*fp32",
+           "OUT": "*fp32", "B": "i32", "T": "i32", "D": "constexpr", "BLOCK_D": "constexpr",
+           "GATHER": "constexpr", "BAGS": "constexpr", "HAS_PSW": "constexpr"}
+short_sig = {"W": "*fp32", "GRAD_OUT": "*fp32", "RUN_ROW": "*i64", "RUN_START": "*i64",
+             "RUN_LEN": "*i32", "SORTED_POS": "*i32", "POS_BAG": "*i32", "POS_TABLE": "*i32",
+             "SHORT_IDS": "*i32", "lr": "fp32", "T": "i32", "D": "constexpr", "BLOCK_D": "constexpr"}
+accum_sig = {"GRAD_OUT": "*fp32", "WS": "*fp32", "CHUNK_SLOT": "*i64",
+             "CHUNK_START": "*i64", "CHUNK_END": "*i64", "SORTED_POS": "*i32", "POS_BAG": "*i32",
+             "POS_TABLE": "*i32", "T": "i32", "D": "constexpr", "BLOCK_D": "constexpr"}
+
+for cc in (90, 100):
+    target = GPUTarget("cuda", cc, 32)
+    for name, fn, sig, ce in [
+        ("fwd gather=4", tbe_fwd_kernel, fwd_sig, dict(D=128, BLOCK_D=128, GATHER=4, BAGS=2, HAS_PSW=False)),
+        ("fwd gather=8", tbe_fwd_kernel, fwd_sig, dict(D=128, BLOCK_D=128, GATHER=8, BAGS=2, HAS_PSW=False)),
+        ("short_run", short_run_kernel, short_sig, dict(D=128, BLOCK_D=128)),
+        ("long_run_accum", long_run_accum_kernel, accum_sig, dict(D=128, BLOCK_D=128)),
+    ]:
+        k = triton.compile(ASTSource(fn=fn, signature=sig, constexprs=ce), target=target)
+        ptx = k.asm["ptx"]
+        atomics = ptx.count("red.global") + ptx.count("atom.global")
+        print(f"sm_{cc:<3} {name:15s} stages={','.join(k.asm.keys())}  atomics_in_ptx={atomics}")
+```
+
+```text
+sm_90  fwd gather=4    stages=source,ttir,ttgir,llir,ptx,cubin  atomics_in_ptx=0
+sm_90  fwd gather=8    stages=source,ttir,ttgir,llir,ptx,cubin  atomics_in_ptx=0
+sm_90  short_run       stages=source,ttir,ttgir,llir,ptx,cubin  atomics_in_ptx=0
+sm_90  long_run_accum  stages=source,ttir,ttgir,llir,ptx,cubin  atomics_in_ptx=1
+sm_100 fwd gather=4    stages=source,ttir,ttgir,llir,ptx,cubin  atomics_in_ptx=0
+sm_100 fwd gather=8    stages=source,ttir,ttgir,llir,ptx,cubin  atomics_in_ptx=0
+sm_100 short_run       stages=source,ttir,ttgir,llir,ptx,cubin  atomics_in_ptx=0
+sm_100 long_run_accum  stages=source,ttir,ttgir,llir,ptx,cubin  atomics_in_ptx=1
+```
+
+Every kernel reaches a cubin for both targets. The PTX of the long-run accumulator contains its atomic reduction, and the other three contain none, which is a cheap structural check that the short-run path really is atomic-free. An agent loop can run this file in seconds as a gate before any GPU time is spent.
+
+---
+
+## 5. The trap: one optimizer step per **row**, not per lookup
+
+A tempting shortcut is a backward that skips the sort and the runs: one program per lookup, each applying its own gradient to its row. With **SGD** it even passes tests (setting the race aside), because the SGD update is linear in the gradient. With any stateful optimizer it is wrong, even with perfect atomics. FBTriton's production configuration uses exact **row-wise Adagrad**:
+
+```python
+# adagrad_trap.py - why TBE backward sums per row *before* the optimizer step
+import torch
+
+torch.manual_seed(0)
+D, lr, eps = 4, 0.1, 1e-8
+w0 = torch.randn(D)
+grads = [torch.randn(D) for _ in range(5)]      # 5 bags in one batch touched the same row
+
+def rowwise_adagrad(w, state, g):
+    state = state + (g * g).mean()              # row-wise: one accumulator per row
+    return w - lr * g / (state.sqrt() + eps), state
+
+# correct: one update with the summed gradient (what autograd + optimizer.step() does)
+w_ok, _ = rowwise_adagrad(w0, torch.tensor(0.0), sum(grads))
+
+# wrong: one update per lookup, as a naive "scatter the optimizer" kernel would do
+w_bad, s = w0, torch.tensor(0.0)
+for g in grads:
+    w_bad, s = rowwise_adagrad(w_bad, s, g)
+
+print("one step, summed grad :", w_ok)
+print("five per-lookup steps :", w_bad)
+print("max |difference|      :", f"{(w_ok - w_bad).abs().max():.3f}")
+
+# with plain SGD the two agree (the update is linear in g), which is why SGD tests hide the bug
+sgd_ok = w0 - lr * sum(grads)
+sgd_bad = w0.clone()
+for g in grads:
+    sgd_bad -= lr * g
+print("SGD max |difference|  :", f"{(sgd_ok - sgd_bad).abs().max():.1e}")
+```
+
+```text
+one step, summed grad : tensor([ 1.7126, -0.3612, -2.1057,  0.5439])
+five per-lookup steps : tensor([ 1.7876, -0.2906, -2.0869,  0.5086])
+max |difference|      : 0.075
+SGD max |difference|  : 3.0e-08
+```
+
+The fix is the structure of Section 2: **reduce first, then update once**. That is why the run-length transpose is not optional bookkeeping. It defines the semantics. The same reasoning applies to the long-run path. The update may run only after *every* chunk's partial has landed, so the two-kernel split here (or a fence plus countdown in a fused kernel) is a correctness requirement, not a performance detail. Validate a TBE backward with a stateful optimizer, never with SGD alone.
+
+---
+
+## 6. Prompting an AI assistant for a TBE kernel
+
+Kernels in this family fail in data-dependent ways, so put the data in the prompt and the checks in the harness:
+
+1. **State the semantics exactly.** Give the layout (table-major `offsets` of length `T·B+1`, `table_off`, the output shape `B × T·D`), the pooling mode, per-sample weights, and the accumulation dtype.
+2. **Give the reference.** `embedding_bag` per table for the forward, and autograd plus the *real* optimizer for the backward.
+3. **Demand skew in the tests.** Uniform random IDs produce runs of length 1 and never exercise the long path. Use a heavy-tailed generator and assert that both paths ran (`short_runs > 0 and long_runs > 0`).
+4. **Ask for config knobs**, not constants: gather width, bags per program, threshold, chunk size. They are what you will tune per GPU.
+5. **Gate on the CPU first.** Interpreter equivalence, then the threshold sweep, then the cross-target compile. Only then benchmark on hardware.
+
+---
+
+## Pitfalls
+
+- **Index overflow.** `row * D` in int32 overflows once a table holds more than 2³¹ elements. Cast row ids to int64 before multiplying (the kernels above do). Int32 *indices* are fine and halve index traffic when the linearized row range fits.
+- **Masked-lane waste.** `BLOCK_D` is a `constexpr` set to `next_pow2(max D)`. When tables have mixed widths, narrow tables waste most of each tile. FBTriton buckets runs by `next_pow2(D)` and launches each bucket with its own block size.
+- **Host syncs.** Asking "how many long runs?" with `.item()` costs a stream synchronize on every backward. Production code classifies runs on the device and passes the counts to the next kernels as device pointers. The host-side planning here keeps the chapter readable.
+- **Out-of-range ids.** A bad index reads another table's row without a word. Validate in a bounds-check step (FBTriton fuses it into an eligible forward), or at least in debug builds.
+- **Testing only SGD.** See Section 5.
+
+## Checkpoint
+
+1. Why can the short-run kernel use a plain store while the long-run path needs `atomic_add`?
+2. What does `GATHER` trade against, and why is its best value target-specific?
+3. Show that per-lookup SGD equals per-row SGD, and identify the exact step that fails for row-wise Adagrad.
+4. Why does uniform random test data give false confidence in a TBE backward?
+
+## Try this
+
+- Add mean pooling (divide by the bag length, and define what an empty bag returns), then compare with `embedding_bag(mode="mean")`.
+- Implement row-wise Adagrad in `short_run_kernel` and `long_run_apply_kernel` (one FP32 state per row) and check it against `torch.optim.Adagrad` applied to the reference's gradient.
+- Fuse the long path. Have `long_run_accum_kernel` decrement a per-run counter after its `atomic_add`, and let the program that sees `1` apply the update. Then explain why, on real hardware, that program needs a device-scope memory fence before reading the workspace.
+- On a GPU, sweep `GATHER ∈ {1, 2, 4, 8}` and `threshold ∈ {32, 64, 128, 256}` on a skewed batch with D = 128, and plot GB/s.
+
+## Summary
+
+TBE is a gather-and-reduce problem whose difficulty lives in the data: dependent loads in the forward, and skewed duplicate rows in the backward. The forward hides latency with several independent row loads per iteration and accumulates in FP32. The backward sorts lookups into per-row runs, sends short runs to atomic-free programs and long runs to split-K chunks with an atomic merge, and applies exactly one optimizer update per row. Every strategy switch is a config value, which is where FBTriton found its speedups. The interpreter plus a threshold sweep plus a cross-target compile verifies all of this before a GPU is involved.
+
+## Sources (for further reading)
+
+- PyTorch blog, "Modernizing Table Batched Embeddings with FBTriton" (2026-10-06): <https://pytorch.org/blog/modernizing-table-batched-embeddings-with-fbtriton/>. Grid, gather width, run routing at SL 256, register/occupancy table, GB200 results, analysis versus CUDA at SL 32.
+- FBGEMM documentation, Table Batched Embedding operators: <https://pytorch.org/FBGEMM/>.
+- PyTorch documentation, `torch.nn.functional.embedding_bag`: <https://docs.pytorch.org/docs/stable/generated/torch.nn.functional.embedding_bag.html>.
+- Triton documentation: `tl.atomic_add`, interpreter mode (`TRITON_INTERPRET=1`): <https://triton-lang.org/main/python-api/triton.language.html>.
