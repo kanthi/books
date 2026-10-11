@@ -34,6 +34,7 @@ Block devices, partitions, filesystems, mounts, LVM, encryption, integrity check
 | `tune2fs` | tune2fs adjusts tunable parameters on ext2/ext3/ext4 filesystems: labels, UUID, mount-count checks, reserved blocks,… |
 | `ncdu` | ncdu (NCurses Disk Usage) is an interactive du for finding what consumes space. |
 | `RWF_DONTCACHE` | RWF_DONTCACHE is the preadv2/pwritev2/io_uring flag for uncached buffered I/O: bulk reads and writes that do not flood the page cache (XFS 6.15+, ext4 6.17+, NFS 6.18+, block devices 7.3+). |
+| `io_uring` | io_uring is the shared-ring asynchronous I/O interface: batch many reads and writes into one syscall, tag completions, and fall back when `kernel.io_uring_disabled` or seccomp blocks it. |
 
 
 ## Suggested starting points
@@ -45,6 +46,7 @@ Block devices, partitions, filesystems, mounts, LVM, encryption, integrity check
 5. Encryption: `cryptsetup`.
 6. Space: `duf`/`dust`/`ncdu`; health: `smartctl`.
 7. Bulk I/O without flushing the page cache: `RWF_DONTCACHE` (and its `fadvise` fallback).
+8. Batched async I/O and its host policy: `io_uring` (with a synchronous fallback).
 
 ## Related parts
 
