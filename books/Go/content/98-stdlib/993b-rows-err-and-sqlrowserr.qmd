@@ -1,0 +1,251 @@
+---
+title: "rows.Err(): The Error a rows.Next() Loop Hides"
+author:
+  - name: "K19G"
+  - name: "grok-bot"
+---
+
+# `rows.Err()`: The Error a `rows.Next()` Loop Hides
+
+## Thesis
+
+`for rows.Next() { ... }` has one exit and two meanings. `Next` returns `false` when the result set is finished, and it also returns `false` when reading the next row **failed**: the connection dropped, the server cancelled the query, the context expired, or the driver could not decode a row. The loop cannot tell these apart. Only `rows.Err()`, called after the loop, can. Skip that call and a function that read 3 rows out of 3,000 returns a partial total with a `nil` error, and nothing in the logs says anything went wrong.
+
+`go vet` does not catch this. As of July 2026 there is a dedicated analyzer for it, `sqlrowserr`, which ships in gopls v0.23.0 and in `golang.org/x/tools`. This page reproduces the failure deterministically with a twenty-line fake driver, fixes it, and wires the analyzer into CI.
+
+## Mental model
+
+```text
+ rows.Next() ──true──▶ Scan, use row ──┐
+     ▲                                  │
+     └──────────────────────────────────┘
+     │
+   false ──▶ why?   driver returned io.EOF       → rows.Err() == nil   (complete)
+                    driver returned anything else → rows.Err() != nil   (partial!)
+                    ctx cancelled / deadline      → rows.Err() == context error
+```
+
+| Fact | Consequence |
+|------|-------------|
+| `Next` reports failure as `false` | A failed read looks exactly like the end of the data |
+| `rows.Err()` returns the error that stopped iteration, or `nil` after a clean `io.EOF` | It is the only signal of a partial read. Check it after every loop |
+| `rows.Close()` does not return the iteration error | `defer rows.Close()` is necessary but not sufficient |
+| `QueryContext` errors only cover *starting* the query | Failures while streaming rows appear later, in `rows.Err()` |
+| `go vet` has no check for it | Use the `sqlrowserr` analyzer (gopls v0.23.0+, or standalone) |
+
+## Worked examples
+
+Tested with Go 1.27.2 and `golang.org/x/tools` v0.52.0 on Linux. No database server is needed: the program registers its own driver.
+
+### Case 1: A loop that silently loses rows
+
+The driver below returns three rows and then fails the way a dropped connection would. `sumIDs` is the shape found in most codebases. `sumIDsChecked` adds one `if`.
+
+```go
+// main.go — a for rows.Next() loop that silently loses rows
+package main
+
+import (
+	"context"
+	"database/sql"
+	"database/sql/driver"
+	"errors"
+	"fmt"
+	"log"
+)
+
+// flaky is a tiny database/sql driver: its result set yields `ok` rows,
+// then fails the way a dropped connection or a server-side error would.
+type flaky struct{ ok int }
+
+func (d flaky) Open(string) (driver.Conn, error) { return conn(d), nil }
+
+type conn flaky
+
+func (c conn) Prepare(string) (driver.Stmt, error) { return stmt(c), nil }
+func (conn) Close() error                          { return nil }
+func (conn) Begin() (driver.Tx, error)             { return nil, errors.ErrUnsupported }
+
+type stmt conn
+
+func (stmt) Close() error  { return nil }
+func (stmt) NumInput() int { return -1 }
+func (stmt) Exec([]driver.Value) (driver.Result, error) {
+	return nil, errors.ErrUnsupported
+}
+func (s stmt) Query([]driver.Value) (driver.Rows, error) { return &rows{ok: s.ok}, nil }
+
+type rows struct{ ok, n int }
+
+func (*rows) Columns() []string { return []string{"id"} }
+func (*rows) Close() error      { return nil }
+func (r *rows) Next(dest []driver.Value) error {
+	if r.n == r.ok { // a clean end would return io.EOF; anything else is an error
+		return errors.New("connection reset by peer")
+	}
+	r.n++
+	dest[0] = int64(r.n)
+	return nil
+}
+
+// sumIDs is the common shape: scan every row, return the total.
+func sumIDs(ctx context.Context, db *sql.DB) (int64, int, error) {
+	rs, err := db.QueryContext(ctx, "SELECT id FROM orders")
+	if err != nil {
+		return 0, 0, err
+	}
+	defer rs.Close()
+	var sum int64
+	var n int
+	for rs.Next() {
+		var id int64
+		if err := rs.Scan(&id); err != nil {
+			return 0, 0, err
+		}
+		sum += id
+		n++
+	}
+	return sum, n, nil // BUG: never asked rs.Err()
+}
+
+// sumIDsChecked is the same loop with the one line that matters.
+func sumIDsChecked(ctx context.Context, db *sql.DB) (int64, int, error) {
+	rs, err := db.QueryContext(ctx, "SELECT id FROM orders")
+	if err != nil {
+		return 0, 0, err
+	}
+	defer rs.Close()
+	var sum int64
+	var n int
+	for rs.Next() {
+		var id int64
+		if err := rs.Scan(&id); err != nil {
+			return 0, 0, err
+		}
+		sum += id
+		n++
+	}
+	if err := rs.Err(); err != nil {
+		return 0, n, fmt.Errorf("orders: after %d rows: %w", n, err)
+	}
+	return sum, n, nil
+}
+
+func main() {
+	sql.Register("flaky", flaky{ok: 3})
+	db, err := sql.Open("flaky", "")
+	if err != nil {
+		log.Fatal(err)
+	}
+	ctx := context.Background()
+
+	sum, n, err := sumIDs(ctx, db)
+	fmt.Printf("unchecked: sum=%d rows=%d err=%v\n", sum, n, err)
+
+	sum, n, err = sumIDsChecked(ctx, db)
+	fmt.Printf("checked:   sum=%d rows=%d err=%v\n", sum, n, err)
+}
+```
+
+```bash
+go mod init example.com/rowserr
+go run .
+```
+
+```text
+unchecked: sum=6 rows=3 err=<nil>
+checked:   sum=0 rows=3 err=orders: after 3 rows: connection reset by peer
+```
+
+The unchecked function returned a confident, wrong answer. The checked one says how far it got and why it stopped, and it refuses to return the partial sum. Whether a caller should ever see partial results is a design decision. It must not be an accident.
+
+```bash
+go vet ./... && echo "vet: clean"
+```
+
+```text
+vet: clean
+```
+
+### Case 2: Let a tool find the missing check
+
+`sqlrowserr` is a regular `go/analysis` pass, so a five-line program turns it into a standalone checker:
+
+```go
+// main.go — run the sqlrowserr analyzer as a standalone checker
+package main
+
+import (
+	"golang.org/x/tools/go/analysis/passes/sqlrowserr"
+	"golang.org/x/tools/go/analysis/singlechecker"
+)
+
+func main() { singlechecker.Main(sqlrowserr.Analyzer) }
+```
+
+```bash
+mkdir rowserrcheck && cd rowserrcheck
+go mod init example.com/rowserrcheck
+# paste main.go from above
+go get golang.org/x/tools@v0.52.0 && go mod tidy
+go build -o sqlrowserr .
+cd ../rowserr && ../rowserrcheck/sqlrowserr ./...; echo "exit=$?"
+```
+
+```text
+/workspace/scratch/gorows/main.go:49:13: sql.Rows "rs" is used in Next loop at line 56 without final check of rs.Err()
+exit=3
+```
+
+It flagged `sumIDs` and left `sumIDsChecked` alone. Exit status 3 means "diagnostics reported", so the checker fails a CI step with no extra scripting. In an editor, gopls v0.23.0 and later report the same diagnostic as you type.
+
+### Case 3: The helper that makes the check impossible to forget
+
+When a codebase has dozens of query loops, put the loop in one place:
+
+```go
+// collect.go — scan every row with fn, and always report how iteration ended
+package store
+
+import "database/sql"
+
+func Collect[T any](rows *sql.Rows, scan func(*sql.Rows) (T, error)) ([]T, error) {
+	defer rows.Close()
+	var out []T
+	for rows.Next() {
+		v, err := scan(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, v)
+	}
+	return out, rows.Err()
+}
+```
+
+Callers write `ids, err := store.Collect(rs, func(r *sql.Rows) (int64, error) { var id int64; return id, r.Scan(&id) })`. There is only one loop left to get right, and it is right.
+
+## The trap
+
+**Returning early from inside the loop is fine. Breaking out of it is not the same thing.** After a `break` (say, you stop at the first match), `rows.Err()` returns `nil` even if the *next* read would have failed, because iteration did not fail; you stopped it. That is correct, but it means `rows.Err()` is not an "everything was read" check. If the caller needs a complete result (a total, an export, a migration), the code must read to the end **and** check `rows.Err()`, or use a query that already does the work (`SELECT sum(id) ...`) so there is nothing to stream.
+
+The second half of the trap is the reverse: code that checks `rows.Err()` but returns the partial slice along with the error. Callers that log the error and keep the data reintroduce the bug one level up. Return `nil` data with a non-nil error unless partial results are a documented feature.
+
+## The boring rule
+
+> Every `for rows.Next()` loop is followed by `if err := rows.Err(); err != nil { return nil, err }`, or lives inside one shared helper that does it. Run the `sqlrowserr` analyzer in CI and keep gopls current, because `go vet` will not catch the missing check.
+
+## Try this
+
+1. Change the driver to return `io.EOF` after three rows and confirm both functions now agree, with `err=<nil>`.
+2. Make the driver block in `Next` and call `sumIDsChecked` with a context that times out after 10 ms. What does `rows.Err()` return, and does `errors.Is(err, context.DeadlineExceeded)` hold?
+3. Rewrite `sumIDs` and `sumIDsChecked` with `Collect` and run the checker again.
+4. Add the checker to a `Makefile` target next to `go vet` and make CI run both.
+
+## Sources
+
+- [`database/sql`: `Rows.Next`, `Rows.Err`, `Rows.Close`](https://pkg.go.dev/database/sql#Rows.Next) (Go 1.27)
+- [`database/sql/driver`: `Rows.Next`](https://pkg.go.dev/database/sql/driver#Rows) (`io.EOF` means no more rows)
+- [Gopls release v0.23.0 (July 2026)](https://go.dev/gopls/release/v0.23.0): `sqlrowserr` analyzer
+- [`golang.org/x/tools/go/analysis/passes/sqlrowserr`](https://pkg.go.dev/golang.org/x/tools/go/analysis/passes/sqlrowserr) and [`singlechecker`](https://pkg.go.dev/golang.org/x/tools/go/analysis/singlechecker)
+- Go wiki: [SQL interface — handling errors](https://go.dev/wiki/SQLInterface)
