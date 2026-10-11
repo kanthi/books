@@ -1,0 +1,184 @@
+---
+title: "Stable ABI for Free-Threaded Builds (PEP 803 / abi3t)"
+author:
+  - name: "K19G"
+  - name: "grok-bot"
+---
+
+# Stable ABI for Free-Threaded Builds (PEP 803 / abi3t)
+
+## Thesis
+
+Free-threading (PEP 703) broke a quiet assumption of the Stable ABI: an extension built once against `abi3` could ride every later GIL-enabled CPython. Free-threaded interpreters have a different object layout, so those wheels either refuse to load or crash. Shipping a separate `cp3XXt` wheel for every free-threaded minor version restores multi-core Python at the cost of the Stable ABI's whole reason for existing — O(1) artefacts per platform.
+
+**PEP 803** (Final, resolved 2026-03-30) answers with a second Stable ABI: **`abi3t`**, the Stable ABI for free-threaded builds, available from **CPython 3.15**. It keeps the forward-compatibility promise, but makes `PyObject` opaque and requires the PEP 793 module-export hook. One correctly tagged wheel (`cp315-abi3.abi3t-…`) loads on both GIL-enabled and free-threaded 3.15+. The free-threading chapter next door covers the *runtime*; this chapter is the *extension / wheel* story.
+
+Version note: PEP 803 is *Final*. Canonical docs are now [Stable Application Binary Interfaces](https://docs.python.org/3.15/c-api/stable.html) and [Migrating to Stable ABI for free threading (abi3t)](https://docs.python.org/3.15/howto/abi3t-migration.html). Every probe below was run on **CPython 3.15.0rc3** (Linux x86-64) with the system `cc` (GCC 14.2).
+
+## Mental model
+
+```text
+                    GIL-enabled 3.15+          free-threaded 3.15+
+                    ─────────────────          ───────────────────
+cp315-cp315         ✅ this build only         ❌
+cp315-cp315t        ❌                         ✅ this build only
+cp315-abi3          ✅ 3.15+ GIL               ❌ (refused / unsafe)
+cp315-abi3t         ❌ (FT only)               ✅ 3.15+ FT
+cp315-abi3.abi3t    ✅ 3.15+ GIL               ✅ 3.15+ FT   ← prefer this
+```
+
+| Fact | Consequence |
+|------|-------------|
+| `abi3t` is a **separate** ABI tag from `abi3` | Tag wheels `abi3.abi3t` (compressed) when you compile for both; do not assume tools infer one from the other |
+| The structural change is **opaque `PyObject`** | No `PyObject_HEAD` in your structs, no `sizeof(PyObject)`, no static `PyModuleDef`. Use PEP 697 type data + PEP 793 `PyModExport_` |
+| Opt-in macro is **`Py_TARGET_ABI3T=0x030f0000`** | Distinct from `Py_LIMITED_API`. Headers may also set `Py_GIL_DISABLED` when targeting `abi3t` |
+| Filename on Linux/macOS is **`.abi3t.so`** | GIL builds load `.abi3.so` *and* `.abi3t.so` (preferring `.abi3.so` if both exist). Free-threaded 3.15+ loads `.abi3t.so` only — not `.abi3.so` |
+| Runtime `Py_mod_abi` slot is mandatory with the export hook | Mis-tagged wheels fail at import with a clear error instead of a mysterious crash |
+
+**Why free-threading stressed Stable ABI.** The classic Limited API still exposed enough of `PyObject` / `PyModuleDef` for extensions to bake layout into their `.so`. Free-threading changed that layout (biased refcounts, immortal objects, different module init). Keeping `PyObject` visible in a "stable" free-threaded ABI would freeze today's layout forever — the mistake PEP 803 refused to repeat.
+
+## Worked examples
+
+### Case 1: Prove the knob exists
+
+```c
+/* abi3t_probe.c — confirm Py_TARGET_ABI3T and opaque PyObject on 3.15 */
+#define Py_TARGET_ABI3T 0x030f0000
+#include <Python.h>
+#include <stdio.h>
+
+int main(void) {
+    printf("Py_TARGET_ABI3T=%#x\n", (unsigned)Py_TARGET_ABI3T);
+#ifdef Py_GIL_DISABLED
+    printf("Py_GIL_DISABLED=defined (headers force it for abi3t)\n");
+#else
+    printf("Py_GIL_DISABLED=absent\n");
+#endif
+    return 0;
+}
+```
+
+```bash
+PYINC=$(python3.15 -c 'import sysconfig; print(sysconfig.get_path("include"))')
+cc -I"$PYINC" abi3t_probe.c -o abi3t_probe && ./abi3t_probe
+```
+
+```text
+Py_TARGET_ABI3T=0x30f0000
+Py_GIL_DISABLED=defined (headers force it for abi3t)
+```
+
+Now ask for `sizeof(PyObject)` under the same define:
+
+```c
+/* abi3t_opaque.c — sizeof(PyObject) must fail under abi3t */
+#define Py_TARGET_ABI3T 0x030f0000
+#include <Python.h>
+size_t bad(void) { return sizeof(PyObject); }
+```
+
+```bash
+cc -c -I"$PYINC" abi3t_opaque.c
+```
+
+```text
+abi3t_opaque.c: In function ‘bad’:
+abi3t_opaque.c:3:34: error: invalid application of ‘sizeof’ to incomplete type ‘PyObject’ {aka ‘struct _object’}
+```
+
+The same `sizeof` under classic Limited API still works (layout is part of `abi3` 3.15's contract for GIL builds):
+
+```c
+/* abi3_size.c — classic abi3 still exposes PyObject size */
+#define Py_LIMITED_API 0x030f0000
+#include <Python.h>
+#include <stdio.h>
+int main(void) {
+    printf("sizeof(PyObject)=%zu\n", sizeof(PyObject));
+    return 0;
+}
+```
+
+```bash
+cc -I"$PYINC" abi3_size.c -o abi3_size && ./abi3_size
+```
+
+```text
+sizeof(PyObject)=16
+```
+
+That contrast *is* the mental model: `abi3t` buys free-threaded Stable ABI by taking away static layout.
+
+### Case 2: Module export hook sketch (PEP 793)
+
+Under `abi3t` you cannot keep a static `PyModuleDef` and `PyInit_spam()`. Replace them with a slots array and `PyModExport_spam()`:
+
+```c
+/* spam_export.c — shape only; link against libpython to load */
+#define Py_TARGET_ABI3T 0x030f0000
+#include <Python.h>
+
+PyABIInfo_VAR(abi_info);
+
+static int spam_exec(PyObject *module) {
+    return PyModule_AddStringConstant(module, "hello", "abi3t");
+}
+
+static PyModuleDef_Slot spam_mod_slots[] = {
+    {Py_mod_exec, spam_exec},
+    {0, NULL},
+};
+
+static PySlot spam_slots[] = {
+    PySlot_STATIC_DATA(Py_mod_abi, &abi_info),
+    PySlot_STATIC_DATA(Py_mod_name, "spam"),
+    PySlot_STATIC_DATA(Py_mod_doc, "minimal abi3t module"),
+    PySlot_STATIC_DATA(Py_mod_slots, spam_mod_slots),
+    PySlot_END
+};
+
+PyMODEXPORT_FUNC
+PyModExport_spam(void)
+{
+    return spam_slots;
+}
+```
+
+Build tools that already understand `abi3t` (meson-python, scikit-build-core, Maturin — check each project's current docs) set `Py_TARGET_ABI3T` and name the artefact `spam.abi3t.so`. Hand-rolled builds must do both themselves.
+
+### Case 3: One wheel vs two — the trap table
+
+| What you ship | GIL 3.15+ | FT 3.15+ | Maintenance |
+|---------------|-----------|----------|-------------|
+| Only `cp315-abi3` | works | **rejected** | Cheap, but free-threaded users get nothing |
+| Only `cp315-cp315t` (and friends) | n/a | works for that minor | O(n) free-threaded wheels forever |
+| Only `cp315-abi3t` | often fails runtime ABI check | works | Discouraged: FT-only Stable ABI |
+| **`cp315-abi3.abi3t`** (compile for both) | works | works | **Preferred**: one artefact, both interpreters |
+| Keep old `abi3` *and* per-version `cp3XXt` | works | works | Valid interim if you cannot port to opaque `PyObject` yet |
+
+Cryptography-style projects that already ship many `abi3` wheels were explicit in the PEP discussion: they will not accept O(n) free-threaded builds. `abi3t` is the path that keeps their release process O(1).
+
+## The trap
+
+1. **Shipping `.abi3.so` into a free-threaded install.** On 3.15t the import machinery will not pick `.abi3.so`. If a tool drops one there anyway, `PyModuleDef_Init` path raises rather than silently corrupting the heap — but users still see "extension failed to load". Tag and name correctly.
+2. **Embedding `PyObject` at the start of your type struct.** Under `abi3t` the type is incomplete. Use a data-only struct, negative `basicsize`, and `PyObject_GetTypeData()`. Subclassable types must not pass `Py_TYPE(obj)` into `PyObject_GetTypeData` — use a type token.
+3. **Assuming `Py_GIL_DISABLED` means "we are running free-threaded".** Under `abi3t` the macro is always defined at compile time. The GIL can still be enabled at run time. Use the free-threading chapter's runtime checks (`sys._is_gil_enabled()`) for behaviour, not the compile-time macro alone.
+4. **Building `abi3t` for 3.14.** PEP 803 does not provide a supported `cp314-abi3t`. Experimental shims exist outside CPython; do not put them in production wheels.
+5. **Forgetting to test both builds.** Stable ABI promises ABI compatibility, not identical behaviour. Run the test suite on `python3.15` *and* `python3.15t`.
+
+## The boring rule
+
+If you publish a C/C++/Rust/Cython extension and care about free-threaded CPython 3.15+: compile once with `Py_TARGET_ABI3T` (and `Py_LIMITED_API` for the dual tag), emit `*.abi3t.so`, tag the wheel `cp315-abi3.abi3t`, and keep a version-specific wheel only for platforms where Limited API performance is unacceptable. Until binding tools you depend on (PyO3, Cython, …) document `abi3t` support, wait for them rather than hand-rolling half a port.
+
+## Try this
+
+1. On a project that already builds `abi3`, add `-DPy_TARGET_ABI3T=0x030f0000` and count the compile errors. Each error is one site that assumed object layout.
+2. Compare `EXTENSION_SUFFIXES` on `python3.15` vs `python3.15t` (from `importlib.machinery`) and confirm `.abi3t.so` appears on both, while `.abi3.so` disappears on the free-threaded build.
+3. Read the migration HOWTO section on module tokens and replace one `PyModule_GetDef` call if you have one.
+
+## Sources
+
+- [PEP 803 – “abi3t”: Stable ABI for Free-Threaded Builds](https://peps.python.org/pep-0803/) (Final)
+- [Migrating to Stable ABI for free threading (abi3t)](https://docs.python.org/3.15/howto/abi3t-migration.html) — Python 3.15 docs
+- [PEP 793 – PyModExport](https://peps.python.org/pep-0793/), [PEP 697 – Limited C API for Extending Opaque Types](https://peps.python.org/pep-0697/)
+- Discourse: [PEP 803 discussion](https://discuss.python.org/t/106181) (inspiration for this chapter)
