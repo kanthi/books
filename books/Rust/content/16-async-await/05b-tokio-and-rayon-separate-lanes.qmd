@@ -1,0 +1,260 @@
+---
+title: "Tokio and Rayon: Separate Lanes for I/O and CPU Work"
+author:
+  - name: "K19G"
+  - name: "grok-bot"
+---
+
+# Tokio and Rayon: Separate Lanes for I/O and CPU Work
+
+## Thesis
+
+Tokio and Rayon are both thread pools, and both size themselves to "one thread per CPU" by default. They do opposite jobs. Tokio's workers **wait** for many things at once and must come back to the scheduler quickly, at every `.await`. Rayon's workers **compute** and are expected to stay busy until the job is done. Call `par_iter()` from inside an async handler and a Tokio worker stops polling futures until Rayon finishes. Do that on enough workers at the same time and the whole service freezes. Timers fire late, health checks time out, and connection pools look exhausted even though the database is idle.
+
+The fix is not to avoid either library. Give each its own lane: async code hands CPU work to Rayon with `rayon::spawn`, awaits the result on a `tokio::sync::oneshot` channel, and limits how many batches are in flight with a `Semaphore`. This chapter measures the difference with a heartbeat timer, shows how the thread budget changes under a CPU limit, and covers the panic case that turns a bad request into a dead process.
+
+## Mental model
+
+```text
+ inline (wrong)                              separate lanes (right)
+
+ Tokio worker 1: [handler ── par_iter ──────]   Tokio worker 1: [handler] await ... [reply]
+ Tokio worker 2: [handler ── par_iter ──────]   Tokio worker 2: [tick][tick][tick][tick]
+ ...  every worker blocked: no polling,                 │ rayon::spawn      ▲ oneshot
+      timers late, sockets unread                       ▼                   │
+                                                Rayon pool:   [evaluate ─────────────]
+```
+
+| Fact | Consequence |
+|------|-------------|
+| A Tokio worker runs one task until it returns `Poll::Pending` | Synchronous work between two `.await`s blocks every other task queued on that worker |
+| `par_iter()` called outside the Rayon pool **blocks the calling thread** until the work is done | Inline Rayon in a handler is blocking code, however parallel it looks |
+| `rayon::spawn` queues a job and returns immediately | The handler can `.await` a channel and give its worker back to Tokio |
+| Both pools default to `available_parallelism()` threads | Two default pools mean 2× oversubscription. `available_parallelism` honours CPU affinity and cgroup quotas, so it shrinks under a container CPU limit |
+| Rayon's queue has no limit | Without a semaphore, a traffic burst becomes an ever-growing queue of CPU work |
+
+## Worked examples
+
+Tested with rustc 1.99.0, tokio 1.53.2 and rayon 1.12.0 on an 8-CPU Linux machine. Release builds throughout.
+
+```toml
+# Cargo.toml (dependencies)
+[dependencies]
+rayon = "1.12.0"
+tokio = { version = "1.53.2", features = ["rt-multi-thread", "macros", "time", "sync"] }
+```
+
+### Case 1: Same throughput, very different latency
+
+The program runs 64 CPU-heavy "requests" twice: once calling Rayon inline in the handler and once offloaded. Meanwhile a task ticks every 5 ms, standing in for everything else the service must keep doing, and reports the worst lateness of any tick.
+
+```rust
+// src/main.rs — CPU work inside Tokio: blocking the workers vs. a separate Rayon lane
+use rayon::prelude::*;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+use tokio::sync::{oneshot, Semaphore};
+
+/// Stand-in for a CPU-heavy request: pure computation, parallelised with Rayon.
+fn evaluate(batch: &[u64]) -> u64 {
+    batch
+        .par_iter()
+        .map(|&x| (0..20_000u64).fold(x, |a, i| a.wrapping_mul(6364136223846793005).wrapping_add(i)))
+        .sum()
+}
+
+/// Wrong: call Rayon directly on a Tokio worker thread.
+async fn handle_inline(batch: Arc<Vec<u64>>) -> u64 {
+    evaluate(&batch)
+}
+
+/// Right: bound in-flight batches, hand the work to Rayon, await a oneshot.
+async fn handle_offloaded(batch: Arc<Vec<u64>>, permits: Arc<Semaphore>) -> u64 {
+    let _permit = permits.acquire_owned().await.expect("semaphore closed");
+    let (tx, rx) = oneshot::channel();
+    rayon::spawn(move || {
+        let _ = tx.send(evaluate(&batch));
+    });
+    rx.await.expect("rayon job dropped its sender")
+}
+
+/// A 5 ms ticker standing in for health checks and socket polling.
+/// Returns the worst lateness of any tick until `stop` is set.
+async fn ticker(stop: Arc<AtomicBool>) -> Duration {
+    let mut worst = Duration::ZERO;
+    let mut next = tokio::time::Instant::now();
+    while !stop.load(Ordering::Relaxed) {
+        next += Duration::from_millis(5);
+        tokio::time::sleep_until(next).await;
+        worst = worst.max(tokio::time::Instant::now() - next);
+    }
+    worst
+}
+
+#[tokio::main]
+async fn main() {
+    let batch = Arc::new((0..2_000u64).collect::<Vec<_>>());
+    let requests = 64;
+    println!(
+        "available_parallelism: {}, tokio workers: {}, rayon threads: {}",
+        std::thread::available_parallelism().unwrap(),
+        tokio::runtime::Handle::current().metrics().num_workers(),
+        rayon::current_num_threads()
+    );
+
+    for mode in ["inline", "offloaded"] {
+        let stop = Arc::new(AtomicBool::new(false));
+        let tick = tokio::spawn(ticker(stop.clone()));
+        let permits = Arc::new(Semaphore::new(2));
+        let start = Instant::now();
+
+        let mut set = tokio::task::JoinSet::new();
+        for _ in 0..requests {
+            let (b, p) = (batch.clone(), permits.clone());
+            set.spawn(async move {
+                match mode {
+                    "inline" => handle_inline(b).await,
+                    _ => handle_offloaded(b, p).await,
+                }
+            });
+        }
+        while set.join_next().await.is_some() {}
+
+        let elapsed = start.elapsed();
+        stop.store(true, Ordering::Relaxed);
+        let lag = tick.await.unwrap();
+        println!(
+            "{mode:>9}: {requests} requests in {:>4} ms, worst tick lag {:>3} ms",
+            elapsed.as_millis(),
+            lag.as_millis()
+        );
+    }
+}
+```
+
+```bash
+cargo run --release
+```
+
+```text
+available_parallelism: 8, tokio workers: 8, rayon threads: 8
+   inline: 64 requests in   62 ms, worst tick lag  52 ms
+offloaded: 64 requests in   61 ms, worst tick lag   2 ms
+```
+
+Two more runs gave 55/2 ms and 47/2 ms. Total work time is the same either way, because the same CPUs do the same arithmetic. What changes is whether the runtime stays responsive. Inline, the 5 ms ticker was blocked for most of the batch: in a real service, that is a health check or a socket read waiting 50 ms. Offloaded, it never slipped more than 2 ms.
+
+### Case 2: Under a CPU limit
+
+Restrict the process to two CPUs, as a container limit or `taskset` would:
+
+```bash
+taskset -c 0-1 ./target/release/lanes
+```
+
+```text
+available_parallelism: 2, tokio workers: 2, rayon threads: 2
+   inline: 64 requests in  210 ms, worst tick lag 204 ms
+offloaded: 64 requests in  212 ms, worst tick lag   3 ms
+```
+
+With two workers, inline Rayon froze the runtime for the **entire** batch. Both pools shrank to two threads because `available_parallelism()` follows the affinity mask (and on Linux the cgroup CPU quota, too). That is usually what you want, but it is computed from the *limit*, not the *request*. In Kubernetes, a pod with `requests: 2, limits: 8` will start eight threads per pool and get throttled in bursts. Set both pools explicitly:
+
+```rust
+// pools.rs — explicit thread budget for both lanes
+fn main() {
+    let cpus = std::env::var("CPU_BUDGET").ok().and_then(|v| v.parse().ok()).unwrap_or(2);
+
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(cpus)                       // compute lane: all of the budget
+        .thread_name(|i| format!("rayon-{i}"))
+        .build_global()
+        .expect("rayon pool already initialised");
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads((cpus / 2).max(1))       // I/O lane: mostly parked in .await
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async { /* serve */ });
+}
+```
+
+Mild oversubscription (Rayon gets the whole budget, Tokio half) is fine because Tokio's workers spend most of their time parked.
+
+### Case 3: Bound the work in flight
+
+`handle_offloaded` takes a permit from a `Semaphore::new(2)` before it spawns. Rayon itself never refuses work, so the semaphore is the only thing that turns a burst into **async waiting** (cheap, cancellable, visible as a queue length you can measure and time out) instead of a growing pile of CPU jobs. Add a timeout around the whole handler to shed load:
+
+```rust
+match tokio::time::timeout(Duration::from_millis(250), handle_offloaded(b, p)).await {
+    Ok(v) => Ok(v),
+    Err(_) => Err("busy, try again"), // the permit was never taken or is released on drop
+}
+```
+
+Small batches should skip Rayon entirely. Below a few hundred items, the cost of splitting and joining is larger than the work. Measure the threshold for your own data.
+
+## The trap
+
+**A panic in a `rayon::spawn` job is not your request's error.** With `tokio::spawn`, a panic becomes a `JoinError` for that one task. With `rayon::spawn`, the default is that Rayon **aborts the process**. Run this without a panic handler and the output ends with `Rayon: detected unexpected panic; aborting`. In a server, that kills every in-flight request.
+
+```rust
+// examples/panic.rs — what a panic inside rayon::spawn looks like from the async side
+use tokio::sync::oneshot;
+
+#[tokio::main]
+async fn main() {
+    // Without a panic handler, a panic in rayon::spawn aborts the whole process.
+    // Production pools install one; this is the usual "log and carry on" handler.
+    rayon::ThreadPoolBuilder::new()
+        .panic_handler(|_| eprintln!("rayon: job panicked"))
+        .build_global()
+        .unwrap();
+
+    let (tx, rx) = oneshot::channel::<u64>();
+    rayon::spawn(move || {
+        let batch: Vec<u64> = Vec::new();
+        let first = batch[0]; // bad input: index out of bounds
+        let _ = tx.send(first);
+    });
+
+    match rx.await {
+        Ok(v) => println!("result: {v}"),
+        Err(e) => println!("request failed: {e}"),
+    }
+}
+```
+
+```bash
+cargo run --release --example panic
+```
+
+```text
+thread '<unnamed>' (379384) panicked at examples/panic.rs:16:26:
+index out of bounds: the len is 0 but the index is 0
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+rayon: job panicked
+request failed: channel closed
+```
+
+With a `panic_handler` installed, the process survives. The sender is dropped while the job unwinds, so the handler sees `RecvError` ("channel closed") and can return a 500 for that one request. The handler must not use `.expect()` on the receiver, as Case 1's demo code does, because that just moves the panic into the Tokio task. The alternative is to catch the panic inside the job (`std::panic::catch_unwind`) and send a `Result` over the channel.
+
+## The boring rule
+
+> Async handlers never call Rayon (or any long CPU loop) directly. They take a semaphore permit, `rayon::spawn` the work, and await a oneshot whose closed state is an error, not a panic. Both pools get explicit thread counts from the CPU *request*, Rayon has a panic handler, and small batches stay sequential.
+
+## Try this
+
+1. Add a sequential threshold to `handle_offloaded` (`if batch.len() < 200 { return evaluate_seq(&batch) }`) and measure tick lag with 20-item batches. Is it acceptable to run that much work inline?
+2. Replace `rayon::spawn` with `tokio::task::spawn_blocking(move || evaluate(&batch))`. Compare tick lag and total time, and count threads with `ls /proc/$(pidof lanes)/task | wc -l` during the run.
+3. Set the semaphore to 64 permits and then to 1. Record total time and tick lag for each, and explain why neither number moves much while per-request latency does.
+4. Wrap the job body in `catch_unwind` and send `Result<u64, String>` so the handler can report *which* input failed.
+
+## Sources
+
+- Alice Ryhl, [Async: What is blocking?](https://ryhl.io/blog/async-what-is-blocking/) (Tokio maintainer; the `rayon::spawn` + oneshot pattern)
+- Tokio docs: [`tokio::task` — blocking and yielding](https://docs.rs/tokio/latest/tokio/task/index.html), [`runtime::Builder::worker_threads`](https://docs.rs/tokio/latest/tokio/runtime/struct.Builder.html#method.worker_threads), [`sync::Semaphore`](https://docs.rs/tokio/latest/tokio/sync/struct.Semaphore.html), [`sync::oneshot`](https://docs.rs/tokio/latest/tokio/sync/oneshot/index.html)
+- Rayon docs: [`rayon::spawn`](https://docs.rs/rayon/latest/rayon/fn.spawn.html) (panic behaviour), [`ThreadPoolBuilder::panic_handler`](https://docs.rs/rayon/latest/rayon/struct.ThreadPoolBuilder.html#method.panic_handler), [`num_threads`](https://docs.rs/rayon/latest/rayon/struct.ThreadPoolBuilder.html#method.num_threads)
+- Rust std: [`std::thread::available_parallelism`](https://doc.rust-lang.org/std/thread/fn.available_parallelism.html) (affinity and cgroup quotas)
