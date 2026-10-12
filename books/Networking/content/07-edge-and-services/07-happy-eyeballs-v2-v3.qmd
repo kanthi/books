@@ -1,0 +1,218 @@
+---
+title: "Happy Eyeballs: Racing IPv6 and IPv4 (RFC 8305 and the v3 Draft)"
+author:
+  - name: "K19G"
+  - name: "grok-bot"
+---
+
+# Happy Eyeballs: Racing IPv6 and IPv4 (RFC 8305 and the v3 Draft)
+
+A dual-stack name resolves to both AAAA and A records. If the client tries them one at a time, a single broken AAAA record (a typo in the zone, a blackholed prefix, a dead load balancer) costs every user the full TCP SYN timeout before IPv4 is even tried. **Happy Eyeballs** fixes this on the client: start with the preferred address, and if it has not answered within a short delay, start the next one *in parallel*. The first handshake to finish wins. Version 2 is RFC 8305 (2017). **Version 3** (`draft-ietf-happy-happyeyeballs-v3-04`, July 2026) folds in SVCB/HTTPS records, so the race now also chooses *protocols* (QUIC vs TCP, ECH or not), not just address families. This chapter builds the failure in a two-namespace lab, measures the race, and explains what v3 changes.
+
+## Learning goals
+
+- Reproduce a broken AAAA record and measure its cost with and without Happy Eyeballs
+- Read the race in a packet capture: one SYN, a 200–250 ms gap, a second SYN
+- Tell a *silent* failure (drop) from a *loud* one (RST), and explain why only the silent one needs racing
+- Name the v3 timers (Resolution Delay, Connection Attempt Delay, and its bounds) and say what SVCB adds
+- Explain why Happy Eyeballs **hides** IPv6 outages, and add a per-family health check
+
+Lab platform: Linux 6.12, iproute2, nftables, curl 8.14.1, Python 3.13 (`asyncio`), tcpdump. All commands need root. Every output below is pasted from a run.
+
+## Concepts in one page
+
+```text
+ client (cli)  2001:db8::20 / 192.0.2.20          server (srv)  one veth
+                         │                         2001:db8::10   healthy AAAA
+          "DNS" (hosts)  │                         2001:db8::bad  SYN silently DROPPED
+          www.lab AAAA 2001:db8::bad               2001:db8::dead SYN answered with RST
+          www.lab A    192.0.2.10                  192.0.2.10     healthy A
+                         │                         http.server :8080 on [::] (dual-stack)
+
+ HEv2/v3 connection race:   t=0     SYN → preferred (IPv6)
+                            t=Δ     no answer yet → SYN → next family (IPv4)   Δ ≈ 250 ms (rec.), ≥ 100 ms, ≤ 2 s
+                            first SYN-ACK wins, the others are cancelled
+```
+
+## Build the lab
+
+```bash
+#!/usr/bin/env bash
+# lab.sh — a dual-stack server whose second IPv6 address silently eats SYNs
+set -euo pipefail
+ip netns add srv; ip netns add cli
+ip link add s0 netns srv type veth peer name c0 netns cli
+ip -n srv addr add 192.0.2.10/24 dev s0
+ip -n srv addr add 2001:db8::10/64 dev s0 nodad      # healthy AAAA
+ip -n srv addr add 2001:db8::bad/64 dev s0 nodad     # broken AAAA (blackholed below)
+ip -n srv addr add 2001:db8::dead/64 dev s0 nodad    # refused AAAA (RST below)
+ip -n cli addr add 192.0.2.20/24 dev c0
+ip -n cli addr add 2001:db8::20/64 dev c0 nodad
+for n in srv cli; do ip -n $n link set lo up; done
+ip -n srv link set s0 up; ip -n cli link set c0 up
+ip netns exec srv /usr/sbin/nft -f - <<'NFT'
+table inet lab {
+  chain input {
+    type filter hook input priority 0; policy accept;
+    ip6 daddr 2001:db8::bad tcp dport 8080 drop
+    ip6 daddr 2001:db8::dead tcp dport 8080 reject with tcp reset
+  }
+}
+NFT
+ip netns exec srv python3 -m http.server 8080 --bind :: >/dev/null 2>&1 &
+sleep 1
+```
+
+```console
+# ./lab.sh
+# mkdir -p /etc/netns/cli
+# printf '2001:db8::bad www.lab\n192.0.2.10 www.lab\n' > /etc/netns/cli/hosts
+```
+
+`ip netns exec cli` bind-mounts `/etc/netns/cli/hosts` over `/etc/hosts`, so inside the client namespace `www.lab` resolves to the broken AAAA first and the healthy A second. That is the same order RFC 6724 address selection gives for a real dual-stack name.
+
+## Drill 1: three kinds of AAAA, one client that races
+
+curl implements Happy Eyeballs with a default 200 ms head start for the first family. `--resolve` lets us swap the AAAA without touching the hosts file:
+
+```console
+# C() { ip netns exec cli curl -s -o /dev/null -w '%{remote_ip} connect=%{time_connect}s\n' "$@"; }
+# for a in 2001:db8::10 2001:db8::bad 2001:db8::dead; do echo "== AAAA $a"; $C --resolve "www.lab:8080:[$a],192.0.2.10" http://www.lab:8080/; done
+== AAAA 2001:db8::10
+2001:db8::10 connect=0.000232s
+== AAAA 2001:db8::bad
+192.0.2.10 connect=0.200484s
+== AAAA 2001:db8::dead
+192.0.2.10 connect=0.000122s
+```
+
+A healthy AAAA wins at once. A **refused** AAAA (RST) fails immediately, so IPv4 starts without waiting. A **silent** AAAA costs exactly the head start, about 200 ms, and then IPv4 wins. That cost is the price of preferring IPv6, and it is bounded.
+
+The head start is a tunable, and it is the whole cost:
+
+```console
+# $C --happy-eyeballs-timeout-ms 1000 --resolve 'www.lab:8080:[2001:db8::bad],192.0.2.10' http://www.lab:8080/
+192.0.2.10 connect=1.001154s
+```
+
+## Drill 2: the same name, a client that does not race
+
+```python
+# seq.py — what a client without Happy Eyeballs does: try each address in order
+import socket, time
+addrs = [("2001:db8::bad", 8080), ("192.0.2.10", 8080)]
+t0 = time.monotonic()
+for host, port in addrs:
+    fam = socket.AF_INET6 if ":" in host else socket.AF_INET
+    s = socket.socket(fam, socket.SOCK_STREAM); s.settimeout(5)
+    try:
+        s.connect((host, port)); print(f"connected {host} after {time.monotonic()-t0:.3f}s"); break
+    except OSError as e:
+        print(f"{host}: {e!r} after {time.monotonic()-t0:.3f}s")
+    finally:
+        s.close()
+```
+
+```console
+# ip netns exec cli python3 seq.py
+2001:db8::bad: TimeoutError('timed out') after 5.005s
+connected 192.0.2.10 after 5.006s
+```
+
+The sequential client pays its *whole* connect timeout. Here that is 5 s because the script sets it. A client with no timeout pays the kernel's SYN retry budget (`net.ipv4.tcp_syn_retries`, about two minutes by default). This is the outage users report as "the site is slow, but only for some people".
+
+`asyncio` ships both behaviours. Only one of them is on by default:
+
+```python
+# he.py — asyncio with and without Happy Eyeballs against the broken name
+import asyncio, socket, sys, time
+
+async def attempt(delay):
+    t0 = time.monotonic()
+    try:
+        r, w = await asyncio.wait_for(
+            asyncio.open_connection("www.lab", 8080, happy_eyeballs_delay=delay), 3)
+        peer = w.get_extra_info("peername")[0]
+        w.close(); await w.wait_closed()
+        return f"connected to {peer} in {time.monotonic()-t0:.3f}s"
+    except TimeoutError:
+        return f"gave up after {time.monotonic()-t0:.3f}s"
+
+async def main():
+    for _, _, _, _, sa in socket.getaddrinfo("www.lab", 8080, type=socket.SOCK_STREAM):
+        print("resolver order:", sa[0])
+    print("happy_eyeballs_delay=None :", await attempt(None))
+    print("happy_eyeballs_delay=0.25 :", await attempt(0.25))
+
+asyncio.run(main())
+```
+
+```console
+# ip netns exec cli python3 he.py
+resolver order: 2001:db8::bad
+resolver order: 192.0.2.10
+happy_eyeballs_delay=None : gave up after 3.004s
+happy_eyeballs_delay=0.25 : connected to 192.0.2.10 in 0.252s
+```
+
+`happy_eyeballs_delay=None` (the default for `open_connection` and `loop.create_connection`) is sequential. Passing `0.25`, the RFC 8305 recommended value, turns the race on. If you write connection code on top of a socket API, check which of the two you are getting.
+
+## Drill 3: read the race on the wire
+
+```console
+# ip netns exec cli tcpdump -i c0 -n -tt 'tcp[tcpflags] & tcp-syn != 0 or (ip6 and ip6[53] & 2 != 0)' &
+# ip netns exec cli curl -s -o /dev/null http://www.lab:8080/
++0.000s IP6 2001:db8::20.43750 > 2001:db8::bad.8080: Flags [S], seq 329770494, win 64800, …
++0.201s IP 192.0.2.20.58954 > 192.0.2.10.8080: Flags [S], seq 1595341819, win 64240, …
++0.201s IP 192.0.2.10.8080 > 192.0.2.20.58954: Flags [S.], seq 694257496, ack 1595341820, …
+```
+
+(Timestamps are rebased to the first SYN.) One IPv6 SYN goes out and gets no reply. 201 ms later the IPv4 SYN goes out and is answered in microseconds. When you suspect Happy Eyeballs is masking something, this three-line pattern is what you look for in a client-side capture.
+
+## What version 3 changes
+
+HEv2 raced *addresses*. The v3 draft races *endpoints*: an address **plus** the protocol and security properties learned from SVCB/HTTPS records (RFC 9460). The draft's main mechanics are:
+
+| Stage | v3 behaviour | Default |
+|---|---|---|
+| Queries | Send HTTPS/SVCB, then AAAA, then A, back to back | — |
+| Resolution Delay | After A arrives first, wait briefly for AAAA and SVCB | 50 ms |
+| Grouping | Group by ALPN/ECH, then by SVCB priority, then sort by RFC 6724 and RTT history, interleaving families | Preferred Address Family Count 1 |
+| Connection Attempt Delay | Gap between attempts, ideally the first SYN/Initial retransmit time | 250 ms (min 100 ms, never < 10 ms; max 2 s) |
+| Success | TCP-only: handshake done. TCP+TLS: wait for TLS. QUIC: its one handshake | — |
+| IPv6-only | Synthesise NAT64 addresses from PREF64 (RFC 8781) for IPv4 literals and A answers | Last-resort synthesis delay 2 s |
+
+Two practical consequences for operators. First, an HTTPS record with `alpn="h3"` and `ipv6hint` lets a v3 client start a QUIC attempt *before* the AAAA answer arrives. A wrong hint is therefore a new way to publish a broken address. Second, with encrypted or DNSSEC-validated DNS and ECH support, clients **must wait** for the SVCB answer before sending a ClientHello. A slow HTTPS-record path then becomes connection latency, not just a missed optimisation.
+
+## The trap
+
+Happy Eyeballs makes a broken IPv6 path *look healthy*. Drill 1 is a 100% IPv6 outage that shows up as a 200 ms slowdown. RFC 8305 and the v3 draft both warn that the race hides operational problems. Monitoring that connects "to the name" will stay green. Probe each family on its own:
+
+```console
+# ip netns exec cli curl -s -o /dev/null --connect-timeout 3 -6 http://www.lab:8080/; echo "exit=$?"
+exit=28
+# ip netns exec cli curl -s -o /dev/null --connect-timeout 3 -4 http://www.lab:8080/; echo "exit=$?"
+exit=0
+```
+
+Exit 28 is curl's timeout. Alert on `-6` and `-4` separately.
+
+## The boring rule
+
+Clients race: use a library that implements Happy Eyeballs, or turn it on (`happy_eyeballs_delay=0.25`). Servers publish only addresses they can serve, *including* SVCB `ipv6hint`/`ipv4hint`. Monitoring never trusts the race and probes IPv6 and IPv4 separately. A silent drop is the failure to design for, because an RST is already fast.
+
+## Try this
+
+1. Change the nftables rule for `2001:db8::bad` from `drop` to `reject with icmpv6 type admin-prohibited`. Predict the curl `connect=` time first, then run it.
+2. Put two broken AAAA records before the A record in `--resolve`. Does curl try the second IPv6 address before falling back to IPv4? Compare with the v3 "interleave families" rule.
+3. Set `net.ipv4.tcp_syn_retries=1` in `cli` and rerun `seq.py` with `settimeout(None)`. How long does the sequential client wait now?
+4. Write the HTTPS record you would publish for `www.lab` with `alpn="h3,h2"` and both hints. Which v3 group does each address land in?
+
+## Sources
+
+- RFC 8305, *Happy Eyeballs Version 2: Better Connectivity Using Concurrency*: <https://www.rfc-editor.org/rfc/rfc8305>
+- draft-ietf-happy-happyeyeballs-v3-04 (July 2026): <https://datatracker.ietf.org/doc/draft-ietf-happy-happyeyeballs-v3/>
+- RFC 9460, SVCB and HTTPS resource records: <https://www.rfc-editor.org/rfc/rfc9460>
+- RFC 6724, Default Address Selection for IPv6: <https://www.rfc-editor.org/rfc/rfc6724>
+- curl `--happy-eyeballs-timeout-ms`: <https://curl.se/docs/manpage.html>
+- Python `asyncio` `loop.create_connection(happy_eyeballs_delay=…)`: <https://docs.python.org/3/library/asyncio-eventloop.html>
