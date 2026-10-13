@@ -1,0 +1,313 @@
+---
+title: "Backpressure in Streaming APIs"
+author:
+  - name: "K19G"
+  - name: "grok-bot"
+---
+
+# Backpressure in Streaming APIs
+
+## Thesis
+
+A streaming API is only as honest as its **slowest consumer**. If the producer can run ahead without bound — unbounded channels, goroutines per message, buffering whole bodies in memory — you have a latent OOM, not a pipeline. **Backpressure** means the producer slows, blocks, or fails fast when the consumer cannot keep up. In Go the boring tools are a **bounded channel**, `io.Pipe` (writes block until reads consume), and HTTP `ResponseController.Flush` so chunks leave the process instead of piling up in a buffer.
+
+This chapter is about streaming shapes (NDJSON/SSE/body pipes), not the short throttle sketch in the neighbouring time chapter. Measure an unbounded burst, a capacity-1 channel, an `io.Pipe` handoff, and a fail-fast `select`/`default`, then wire the same idea into an SSE handler.
+
+## Mental model
+
+```text
+  producer ──▶ queue ──▶ consumer
+
+  unbounded queue:   produce_finished ≈ 0; peak_queued → N; heap grows
+  bounded(1):        produce waits; elapsed ≈ N × consume_time
+  io.Pipe:           Write blocks until Read takes the bytes; depth ≈ 1 chunk
+  fail-fast:         when full, return "busy" (no new goroutine, no silent buffer)
+```
+
+| Mechanism | Backpressure style | Typical use |
+|-----------|--------------------|-------------|
+| `make(chan T, 1)` or small N | Block the producer | In-process pipelines |
+| `io.Pipe` | Block `Write` until `Read` | Connect `io.Reader` APIs to producers (uploads, multipart) |
+| `select` + `default` | Reject / 503 | Edge APIs that must not melt |
+| `ResponseController.Flush` | Push bytes to the client | SSE / chunked responses |
+
+`io.Pipe` is documented as synchronous: there is **no internal buffer**; each `Write` blocks until one or more `Read`s have consumed the data. That is backpressure you get for free when you stream a request body into `http.NewRequest`.
+
+## Worked examples
+
+Verified with **Go 1.27.1** (`/home/box/sdk/go1.27.1`) on Linux/amd64.
+
+### Case 1: unbounded vs bounded vs pipe vs fail-fast
+
+```go
+// main.go — measure four backpressure shapes
+package main
+
+import (
+	"fmt"
+	"io"
+	"sync"
+	"sync/atomic"
+	"time"
+)
+
+func main() {
+	const n = 100
+	payload := make([]byte, 1024)
+	slow := 3 * time.Millisecond
+
+	// Large buffer ≈ "unbounded" for this burst
+	{
+		ch := make(chan []byte, n)
+		var peak atomic.Int64
+		started := make(chan struct{})
+		var wg sync.WaitGroup
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-started
+			time.Sleep(30 * time.Millisecond) // let producer fill
+			for range ch {
+				time.Sleep(slow)
+			}
+		}()
+		close(started)
+		start := time.Now()
+		for i := 0; i < n; i++ {
+			b := make([]byte, len(payload))
+			ch <- b
+			if l := int64(len(ch)); l > peak.Load() {
+				peak.Store(l)
+			}
+		}
+		prod := time.Since(start)
+		close(ch)
+		wg.Wait()
+		fmt.Printf("unbounded(cap=%d): producer_finished=%v peak_queued=%d\n",
+			n, prod.Round(time.Microsecond), peak.Load())
+	}
+
+	// Capacity 1 — producer blocks
+	{
+		ch := make(chan []byte, 1)
+		var blocked atomic.Int64
+		var wg sync.WaitGroup
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for range ch {
+				time.Sleep(slow)
+			}
+		}()
+		start := time.Now()
+		for i := 0; i < n; i++ {
+			b := make([]byte, len(payload))
+			select {
+			case ch <- b:
+			default:
+				blocked.Add(1)
+				ch <- b
+			}
+		}
+		close(ch)
+		wg.Wait()
+		fmt.Printf("bounded(1): elapsed=%v blocked_sends=%d/%d\n",
+			time.Since(start).Round(time.Millisecond), blocked.Load(), n)
+	}
+
+	// io.Pipe — Write waits for Read
+	{
+		pr, pw := io.Pipe()
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			buf := make([]byte, len(payload))
+			for {
+				_, err := io.ReadFull(pr, buf)
+				if err != nil {
+					return
+				}
+				time.Sleep(slow)
+			}
+		}()
+		start := time.Now()
+		for i := 0; i < n; i++ {
+			if _, err := pw.Write(payload); err != nil {
+				panic(err)
+			}
+		}
+		_ = pw.Close()
+		<-done
+		fmt.Printf("io.Pipe: elapsed=%v\n", time.Since(start).Round(time.Millisecond))
+	}
+
+	// Fail-fast when full
+	{
+		ch := make(chan []byte, 4)
+		ok, no := 0, 0
+		for i := 0; i < 20; i++ {
+			select {
+			case ch <- payload:
+				ok++
+			default:
+				no++
+			}
+		}
+		fmt.Printf("fail-fast(cap=4): accepted=%d rejected=%d\n", ok, no)
+	}
+}
+```
+
+```bash
+go run .
+```
+
+```text
+unbounded(cap=100): producer_finished=18µs peak_queued=100
+bounded(1): elapsed=316ms blocked_sends=99/100
+io.Pipe: elapsed=319ms
+fail-fast(cap=4): accepted=4 rejected=16
+```
+
+The unbounded producer finished in tens of microseconds with **100** messages queued — the consumer had not started draining. Bounded and `io.Pipe` both took ~300 ms (`≈ 100 × 3 ms`): the producer could not outrun the consumer. Fail-fast accepted four and rejected sixteen without spawning work.
+
+### Case 2: stream an HTTP body with `io.Pipe`
+
+```go
+// upload_pipe.go — request body is produced under backpressure
+package main
+
+import (
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
+)
+
+func main() {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n, _ := io.Copy(io.Discard, r.Body)
+		fmt.Fprintf(w, "read %d bytes\n", n)
+	}))
+	defer srv.Close()
+
+	pr, pw := io.Pipe()
+	req, err := http.NewRequest(http.MethodPost, srv.URL, pr)
+	if err != nil {
+		panic(err)
+	}
+
+	errCh := make(chan error, 1)
+	go func() {
+		defer pw.Close()
+		for i := 0; i < 8; i++ {
+			if _, err := pw.Write([]byte("chunk-\n")); err != nil {
+				errCh <- err
+				return
+			}
+		}
+		errCh <- nil
+	}()
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		panic(err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	fmt.Print(string(body))
+	if err := <-errCh; err != nil {
+		panic(err)
+	}
+}
+```
+
+```bash
+go run upload_pipe.go
+```
+
+```text
+read 56 bytes
+```
+
+If the server stops reading, `pw.Write` blocks (or returns an error after `CloseWithError` on cancel). That is the same mechanism as Case 1's pipe — now wired into `net/http`.
+
+### Case 3: SSE needs Flush
+
+Without `Flush`, a small response can sit in the server's buffer and the client sees nothing until the handler returns.
+
+```go
+// sse_flush.go
+package main
+
+import (
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"time"
+)
+
+func main() {
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		rc := http.NewResponseController(w)
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		for i := 0; i < 3; i++ {
+			fmt.Fprintf(w, "data: tick-%d\n\n", i)
+			if err := rc.Flush(); err != nil {
+				return
+			}
+		}
+	})
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	start := time.Now()
+	resp, err := http.Get(srv.URL)
+	if err != nil {
+		panic(err)
+	}
+	defer resp.Body.Close()
+	buf := make([]byte, 256)
+	n, _ := resp.Body.Read(buf)
+	fmt.Printf("httptest SSE: %d bytes in %v\n%s\n", n, time.Since(start).Round(time.Millisecond), buf[:n])
+}
+```
+
+```bash
+go run sse_flush.go
+```
+
+```text
+httptest SSE: 28 bytes in 0s
+data: tick-0
+
+data: tick-1
+```
+
+`NewResponseController` (Go 1.20+) wraps `Flush` / `FlushError` portably across ResponseWriter middleware. For HTTP/1 handlers that read the request body while writing the response, call `EnableFullDuplex()` or the second write can block on a full buffer while the client waits for a response before sending more body.
+
+## The trap
+
+**Goroutine per message into an unbounded channel.** Under load you trade a full channel for tens of thousands of runnable goroutines and the same memory cliff. Bound the channel **or** bound the worker pool (semaphore / `WaitGroup` + fixed workers). Prefer fail-fast at the edge over infinite queueing.
+
+**Closing only one end of `io.Pipe` on cancel.** If the HTTP client cancels, close the **reader** (`pr.CloseWithError(ctx.Err())`) so a blocked `Write` wakes up. Closing only the writer leaves the handler stuck until the write side notices.
+
+**Buffering the entire stream "for simplicity".** `io.ReadAll` on a client upload disables backpressure by definition. Stream with `io.Copy` / `json.Decoder` / framed reads.
+
+## The boring rule
+
+> Streaming producers use a **bounded** handoff (`chan` with small capacity or `io.Pipe`). When the handoff is full, either **block** (in-process pipelines) or **reject** (public APIs). HTTP chunked/SSE handlers `Flush` after each unit. Cancellation closes the pipe end that unblocks the other side.
+
+## Try this
+
+1. Change Case 1's bounded capacity from 1 to 8 and record `blocked_sends` and elapsed. Explain the trade-off.
+2. Add `context.WithCancel` around the pipe upload: cancel mid-write, `CloseWithError` the reader, and show the producer exit error.
+3. Build an NDJSON handler that `json.NewEncoder(w).Encode` + `Flush` per record, then slow the client with `io.CopyN` sleeps — watch handler goroutine count with and without a bounded upstream queue.
+4. Compare `httptest` without `Flush` on a large buffered writer wrapper; note when the client first sees bytes.
+
+## Sources
+
+- Go docs: [`io.Pipe`](https://pkg.go.dev/io#Pipe) — synchronous in-memory pipe, no internal buffer
+- Go docs: [`http.NewResponseController`](https://pkg.go.dev/net/http#NewResponseController), [`ResponseController.Flush`](https://pkg.go.dev/net/http#ResponseController.Flush), [`EnableFullDuplex`](https://pkg.go.dev/net/http#ResponseController.EnableFullDuplex)
+- Go wiki / blog patterns: pipelines and cancellation (`context` + `select`)
