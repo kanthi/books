@@ -1,0 +1,273 @@
+---
+title: "Sans-IO Protocol Design: State Machines Without Sockets"
+author:
+  - name: "K19G"
+  - name: "grok-bot"
+---
+
+# Sans-IO Protocol Design: State Machines Without Sockets
+
+## Thesis
+
+A network protocol is a **state machine**. Sockets, timers, and async runtimes are **drivers**. Sans-IO (without I/O) keeps those layers apart: the protocol accepts bytes, clocks, and app intents through ordinary methods, and returns transmits and events through ordinary methods. No `UdpSocket`, no `tokio::spawn`, no `Instant::now()` hidden inside the library. The driver owns the socket and the clock; the protocol owns the rules.
+
+That split buys three things operators and library authors care about. Tests run without ports or sleeps — feed a slice, advance a fake `Instant`, assert. The same crate works under Tokio, a blocking loop, or `no_std` with a custom timer. Composition becomes stacking machines (`handle_input` / `poll_transmit`) instead of colouring every call site `async`. This chapter builds a length-prefixed framer that way, proves it with byte-at-a-time reassembly and time travel, and names the traps that turn a clean machine into a busy-loop.
+
+## Mental model
+
+```text
+  application                         driver (you write)
+       │                                    │
+       │  send("ping")                      │  socket.send / recv
+       ▼                                    │  sleep / select / epoll
+  ┌─────────────────────┐                   │
+  │  protocol state     │  poll_transmit ▶──┘
+  │  (pure &mut self)   │◀── handle_input ── socket bytes
+  │                     │◀── handle_timeout ─ Instant from driver
+  │                     │  poll_event    ▶── app messages / errors
+  │                     │  poll_timeout  ▶── next wake Instant
+  └─────────────────────┘
+```
+
+| Idea | Consequence |
+|------|-------------|
+| Protocol methods never block | `&mut self` is enough; no `Mutex`, no channels inside the machine |
+| Time is an argument | Tests jump five seconds with `t0 + Duration::from_secs(5)` |
+| Output is polled, not pushed onto a socket | One event loop can multiplex many protocols on one fd |
+| Incomplete input stays in a buffer | Drivers must keep calling `handle_input` / `handle_timeout` or progress stalls |
+
+The Python community documented the pattern at [sans-io.readthedocs.io](https://sans-io.readthedocs.io/). In Rust it shows up in production stacks such as Quinn's `quinn-proto`, Cloudflare's `quiche`, Firezone's `connlib`, and the `sansio::Protocol` trait used by WebRTC.rs — different APIs, same inversion: **policy does not call I/O; I/O drives policy**.
+
+## Worked examples
+
+Tested with **rustc 1.99.0** (Edition 2024) on x86_64 Linux. No crates beyond `std`.
+
+### Case 1: a length-prefixed framer with no sockets
+
+Wire format: two big-endian length bytes, then that many payload bytes. The machine queues outbound frames, reassembles inbound chunks, and rejects declared lengths above a cap.
+
+```rust
+// src/main.rs — sans-IO length-prefixed framer
+use std::collections::VecDeque;
+use std::time::{Duration, Instant};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Transmit {
+    bytes: Vec<u8>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum Event {
+    Message(Vec<u8>),
+    ProtocolError(&'static str),
+    TimedOut,
+}
+
+struct Framer {
+    rx_buf: Vec<u8>,
+    tx: VecDeque<Transmit>,
+    events: VecDeque<Event>,
+    max_frame: usize,
+    incomplete_since: Option<Instant>,
+    stall_for: Duration,
+}
+
+impl Framer {
+    fn new(max_frame: usize) -> Self {
+        Self {
+            rx_buf: Vec::new(),
+            tx: VecDeque::new(),
+            events: VecDeque::new(),
+            max_frame,
+            incomplete_since: None,
+            stall_for: Duration::from_secs(5),
+        }
+    }
+
+    /// App intent: enqueue a framed transmit. No I/O.
+    fn send(&mut self, payload: &[u8]) -> Result<(), &'static str> {
+        if payload.len() > self.max_frame {
+            return Err("frame too large");
+        }
+        let len = u16::try_from(payload.len()).map_err(|_| "frame too large")?;
+        let mut bytes = Vec::with_capacity(2 + payload.len());
+        bytes.extend_from_slice(&len.to_be_bytes());
+        bytes.extend_from_slice(payload);
+        self.tx.push_back(Transmit { bytes });
+        Ok(())
+    }
+
+    /// Driver feeds bytes read from somewhere (socket, test, file).
+    fn handle_input(&mut self, chunk: &[u8], now: Instant) {
+        if !chunk.is_empty() {
+            self.rx_buf.extend_from_slice(chunk);
+            self.incomplete_since = Some(now);
+        }
+        self.drain_frames();
+        if self.rx_buf.is_empty() {
+            self.incomplete_since = None;
+        }
+    }
+
+    fn drain_frames(&mut self) {
+        loop {
+            if self.rx_buf.len() < 2 {
+                return;
+            }
+            let len = u16::from_be_bytes([self.rx_buf[0], self.rx_buf[1]]) as usize;
+            if len > self.max_frame {
+                self.events
+                    .push_back(Event::ProtocolError("declared length exceeds max_frame"));
+                self.rx_buf.clear();
+                return;
+            }
+            if self.rx_buf.len() < 2 + len {
+                return;
+            }
+            let payload = self.rx_buf[2..2 + len].to_vec();
+            self.rx_buf.drain(..2 + len);
+            self.events.push_back(Event::Message(payload));
+        }
+    }
+
+    fn poll_timeout(&self) -> Option<Instant> {
+        self.incomplete_since.map(|t| t + self.stall_for)
+    }
+
+    fn handle_timeout(&mut self, now: Instant) {
+        if let Some(start) = self.incomplete_since {
+            if now >= start + self.stall_for && !self.rx_buf.is_empty() {
+                self.events.push_back(Event::TimedOut);
+                self.rx_buf.clear();
+                self.incomplete_since = None;
+            }
+        }
+    }
+
+    fn poll_transmit(&mut self) -> Option<Transmit> {
+        self.tx.pop_front()
+    }
+
+    fn poll_event(&mut self) -> Option<Event> {
+        self.events.pop_front()
+    }
+}
+
+fn main() {
+    let t0 = Instant::now();
+
+    let mut a = Framer::new(64);
+    a.send(b"ping").unwrap();
+    a.send(b"pong-extra").unwrap();
+    let mut wire = Vec::new();
+    while let Some(t) = a.poll_transmit() {
+        wire.extend_from_slice(&t.bytes);
+    }
+    println!("wire bytes: {} {:?}", wire.len(), wire);
+
+    // Reassemble one byte at a time — no socket required.
+    let mut b = Framer::new(64);
+    for byte in &wire {
+        b.handle_input(&[*byte], t0);
+    }
+    while let Some(ev) = b.poll_event() {
+        match &ev {
+            Event::Message(p) => println!("event: Message({:?})", String::from_utf8_lossy(p)),
+            other => println!("event: {other:?}"),
+        }
+    }
+
+    let mut c = Framer::new(8);
+    c.handle_input(&[0x00, 0x20], t0); // claims 32 bytes; max is 8
+    println!("oversize: {:?}", c.poll_event());
+
+    // Time travel: incomplete header, then jump 5s without sleeping.
+    let mut d = Framer::new(64);
+    d.handle_input(&[0x00, 0x04], t0);
+    let deadline = d.poll_timeout().expect("waiting for rest of frame");
+    println!("poll_timeout deadline offset: {:?}", deadline - t0);
+    d.handle_timeout(t0 + Duration::from_secs(5));
+    println!("after time travel: {:?}", d.poll_event());
+}
+```
+
+```bash
+cargo run
+```
+
+```text
+wire bytes: 18 [0, 4, 112, 105, 110, 103, 0, 10, 112, 111, 110, 103, 45, 101, 120, 116, 114, 97]
+event: Message("ping")
+event: Message("pong-extra")
+oversize: Some(ProtocolError("declared length exceeds max_frame"))
+poll_timeout deadline offset: 5s
+after time travel: Some(TimedOut)
+```
+
+Eighteen wire bytes are two frames (`4` + `ping`, `10` + `pong-extra`). Feeding them one byte at a time still yields two messages. Declaring length 32 against `max_frame = 8` is a protocol error, not a panic. The stall path fires because the driver passed `t0 + 5s` — the test never slept.
+
+### Case 2: the driver loop (sketch)
+
+A blocking UDP driver is a thin shell. Replace `recv_from` with Tokio's `recv` and the protocol code stays identical.
+
+```rust
+// driver_sketch.rs — not a full program; shows the poll/handle rhythm
+fn drive(socket: &std::net::UdpSocket, proto: &mut Framer) -> std::io::Result<()> {
+    let mut buf = [0u8; 1500];
+    loop {
+        while let Some(t) = proto.poll_transmit() {
+            socket.send(&t.bytes)?;
+        }
+        while let Some(ev) = proto.poll_event() {
+            eprintln!("app event: {ev:?}");
+        }
+        socket.set_read_timeout(
+            proto
+                .poll_timeout()
+                .map(|deadline| deadline.saturating_duration_since(std::time::Instant::now())),
+        )?;
+        match socket.recv(&mut buf) {
+            Ok(n) => proto.handle_input(&buf[..n], std::time::Instant::now()),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock
+                || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                proto.handle_timeout(std::time::Instant::now());
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+```
+
+The protocol never imports `std::net`. Swap the socket for a `VecDeque<Vec<u8>>` in tests and you have a deterministic network.
+
+### Case 3: why this pairs with Rust
+
+Async Rust wants `'static` tasks once you `spawn`. Shared mutable protocol state then tends toward `Arc<Mutex<_>>` or channels — both fight the borrow checker you wanted. A sans-IO machine stays on the stack (or in one task) and mutates with `&mut self`. Firezone's write-up puts it plainly: no tasks inside the protocol means no mutexes and no cross-task copies for the hot path. You still use Tokio for the driver; you stop using Tokio as the protocol's control plane.
+
+## The trap
+
+**`poll_timeout` that never advances.** If `handle_timeout` does not clear or push the deadline forward, a Tokio `select!` or epoll loop wakes, calls `handle_timeout`, sees the same deadline, and spins the CPU. Always pair "return a deadline" with "on fire, change state so the next `poll_timeout` is `None` or later".
+
+**Calling `Instant::now()` inside the machine.** That re-couples tests to wall time and makes "five minutes idle" take five minutes. Pass `now` in; take `Instant` only in the driver.
+
+**Doing I/O in `poll_transmit`.** The method must return bytes (or a `Transmit`), not send them. The moment it touches a socket, every test needs a socket and every embedder inherits your runtime choice.
+
+## The boring rule
+
+> Protocol crates expose `handle_input` / `handle_timeout` / `poll_transmit` / `poll_event` / `poll_timeout` (or an equivalent push/pull trait). They take time as a parameter, allocate no sockets, spawn no tasks, and leave the event loop to the application. Tests feed byte slices and fake `Instant`s; production drivers bind those methods to one UDP socket or one Tokio task.
+
+## Try this
+
+1. Add a retransmission: after `send`, if no full reply frame arrives within 200 ms of fake time, enqueue the same `Transmit` again. Prove it with `handle_timeout` only — no threads.
+2. Compose two `Framer`s in one driver (two peers) by shuttling `poll_transmit` output of A into `handle_input` of B and back. Assert a round-trip message without `std::net`.
+3. Implement `max_frame` exhaustion: feed a valid length of 64 then only 63 payload bytes, jump past `stall_for`, and confirm `TimedOut` plus an empty `rx_buf`.
+4. Read Quinn's `quinn-proto` or Firezone's connlib surface and list the method names that match this chapter's poll/handle rhythm.
+
+## Sources
+
+- Firezone, [sans-IO Pattern in Rust Networking Code](https://www.firezone.dev/blog/sans-io) (primary design walkthrough; STUN example)
+- [sans-io.readthedocs.io](https://sans-io.readthedocs.io/) — pattern overview (Python-origin, language-agnostic)
+- [`sansio::Protocol`](https://docs.rs/sansio/latest/sansio/trait.Protocol.html) — push/pull trait used by WebRTC.rs
+- WebRTC.rs, [Building WebRTC's Pipeline with sansio::Protocol](https://webrtc.rs/blog/2026/01/04/building-webrtc-pipeline-with-sansio.html) (2026-01)
+- Quinn: [`quinn-proto`](https://docs.rs/quinn-proto) — sans-IO QUIC state machine
