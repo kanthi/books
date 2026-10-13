@@ -1,0 +1,695 @@
+---
+title: "QUIC Load Balancing with nftables: Routing on Connection IDs"
+author:
+  - name: "K19G"
+  - name: "grok-bot"
+---
+
+# QUIC Load Balancing with nftables: Routing on Connection IDs
+
+A TCP load balancer can lean on the kernel. Pick a backend on the SYN, DNAT it, and conntrack keeps every later segment of that 4-tuple on the same backend. QUIC breaks both assumptions behind that recipe. A QUIC connection is named by its **connection ID** (CID), not by its 4-tuple. A client can change its address and port mid-connection (migration, or a NAT rebinding it never notices). Two connections can also share one 4-tuple. A load balancer that routes on the 4-tuple sends a migrated connection to a server that has never heard of it. This chapter builds a QUIC load balancer from nothing but nftables rules: no proxy, no kernel module, no eBPF. It routes **handshakes** by client address and **established connections** by a server ID that each backend writes into every CID it issues. Then it drains a backend, deregisters it, and shows the one return-path rule that makes the whole thing look fine in a lab and fail at the edge.
+
+## Learning goals
+
+- Read the QUIC wire image a load balancer is allowed to rely on (RFC 8999) and find the CID with `@th` raw payload matches
+- Explain why the ruleset needs **conntrack zones**, not just DNAT, and show what breaks without them
+- Encode a server ID in the CID the way QUIC-LB lays it out, and route on it
+- Drain and deregister a backend with nothing but map element edits, and know what the client sees afterwards
+- Explain why every backend must share the **stateless reset** key
+- Put the return-path zone rule in the right hook, and prove it with an edge filter
+
+Lab platform: Linux 6.12, nftables 1.1.3, iproute2, Python 3.13, Go 1.27.2 with quic-go v0.63.0, tcpdump 4.99.5. All commands need root. Every output below is the captured output of one run of the listings shown.
+
+## Mental model
+
+```text
+ clients 198.51.100.10-17          load balancer (qlb)                     backends (qbe)
+ ───────────────────────  l0 ───  VIP 198.51.100.1:443  ─── l1 ───  be1 10.0.0.11:8080  server ID 0x01
+                                                                    be2 10.0.0.12:8081  server ID 0x02
+                                                                    be3 10.0.0.13:8082  server ID 0x03
+                                                                    be4 10.0.0.14:8083  (joins later)
+
+ prerouting, priority raw (-300): decide the backend, put it in the packet mark, then in a ct zone
+   long header (first byte & 0x80)       → @flows[client IP]  or  random slot → @slots → backend ID
+   short header, DCID[0] & 0xe0 == 0     → @sids[DCID[1]]  (server ID)       → backend ID
+   short header, unknown server ID       → treated like a new flow
+   from a backend (iif l1)               → @replies[saddr . sport]           → backend ID
+   ct zone = backend ID
+ prerouting, conntrack (-200): look up / create the entry *inside that zone*
+ prerouting, priority dstnat (-100): new entry → dnat to @backends[zone]
+ postrouting, srcnat (100): replies get the VIP back as their source
+```
+
+Three facts carry the design:
+
+1. **What a middlebox may parse.** RFC 8999 (QUIC invariants) fixes, for every QUIC version, the high bit of the first byte (1 = long header, 0 = short header), the long header's version and CID length fields, and the fact that a short header's Destination CID starts right after the first byte. A short header does *not* carry the CID length. RFC 9000 §5.1 says a load balancer that routes on CIDs has to agree on a fixed length or an encoding with the servers. Nothing else in the packet is readable: the rest is encrypted.
+2. **Who chooses CIDs.** The client's first Initial carries a random DCID of at least 8 bytes (RFC 9000 §7.2). The server answers with a CID *it* chose, and from then on the client sends to the server's CIDs. So handshake packets cannot be routed by CID. Everything after the handshake can be, if the server encodes "it's me" into its CIDs.
+3. **Why zones.** NAT is decided once, on the first packet of a conntrack entry. Every later packet with the same 4-tuple follows that entry, whatever its CID says. Putting each backend in its own conntrack zone gives the same 4-tuple one entry *per backend*, so the CID decides again on every packet. A reply has to be looked up in the same zone, which is why the return path needs its own rule.
+
+In nftables, `@th,OFFSET,LEN` reads raw bits relative to the transport header. A UDP header is 8 bytes (64 bits), so:
+
+| Match | Bits | What it is in a short-header packet |
+|---|---|---|
+| `@th,64,8` | UDP payload byte 0 | QUIC first byte; `& 0x80` is the header form |
+| `@th,72,8` | payload byte 1 | DCID byte 0 (QUIC-LB "first octet": 3 config rotation bits + 5 bits) |
+| `@th,80,8` | payload byte 2 | DCID byte 1: the server ID |
+
+### The CID layout
+
+QUIC-LB (`draft-ietf-quic-load-balancers-21`, the QUIC working group's draft for routable CIDs) reserves the first CID octet. Its top three bits are a **config rotation** codepoint, and `0b111` means "unroutable" (§3). The server ID follows, then a nonce of at least 4 bytes (§5.2). This lab uses the draft's *unencrypted* layout with an 8-byte CID: `[000 + 5 random bits][server ID][6 random bytes]`. The load balancer reads one byte at a fixed offset. That is exactly what nftables is good at.
+
+## Build the lab
+
+```bash
+#!/usr/bin/env bash
+# lab.sh — clients, one load balancer, and the backends, in three namespaces
+set -euo pipefail
+for n in qcli qlb qbe; do ip netns add $n; ip -n $n link set lo up; done
+ip link add c0 netns qcli type veth peer name l0 netns qlb       # client side
+ip link add l1 netns qlb  type veth peer name b0 netns qbe       # backend side
+for a in 10 11 12 13 14 15 16 17; do ip -n qcli addr add 198.51.100.$a/24 dev c0; done
+ip -n qlb addr add 198.51.100.1/24 dev l0                        # the VIP
+ip -n qlb addr add 10.0.0.1/24 dev l1
+for a in 11 12 13 14; do ip -n qbe addr add 10.0.0.$a/24 dev b0; done   # be1..be4
+ip -n qcli link set c0 up; ip -n qlb link set l0 up; ip -n qlb link set l1 up; ip -n qbe link set b0 up
+ip -n qcli route add default via 198.51.100.1
+ip -n qbe route add default via 10.0.0.1
+ip netns exec qlb sysctl -qw net.ipv4.ip_forward=1
+```
+
+The load balancer's whole configuration is one file. Six maps hold every per-backend fact, so adding, draining and removing a backend are element edits, never rule edits:
+
+```text
+# lb-quic.nft — route QUIC by connection ID with nftables alone
+table ip lb-quic {
+	map slots {                    # new connections: random slot -> backend ID
+		typeof meta mark : meta mark
+		elements = { 0 : 1, 1 : 2, 2 : 3 }
+	}
+
+	map sids {                     # server ID byte in the DCID -> backend ID
+		typeof @th,80,8 : meta mark
+		elements = { 0x01 : 1, 0x02 : 2, 0x03 : 3 }
+	}
+
+	map flows {                    # client IP -> backend ID while handshakes run
+		typeof ip saddr : meta mark
+		size 65536
+		flags dynamic,timeout
+		timeout 5s
+	}
+
+	map backends {                 # conntrack zone -> backend address
+		typeof ct zone : ip daddr . udp dport
+		elements = { 1 : 10.0.0.11 . 8080, 2 : 10.0.0.12 . 8081, 3 : 10.0.0.13 . 8082 }
+	}
+
+	map replies {                  # backend address -> backend ID (return path)
+		typeof ip saddr . udp sport : meta mark
+		elements = { 10.0.0.11 . 8080 : 1, 10.0.0.12 . 8081 : 2, 10.0.0.13 . 8082 : 3 }
+	}
+
+	map zone-of {                  # backend ID -> conntrack zone
+		typeof meta mark : ct zone
+		elements = { 1 : 1, 2 : 2, 3 : 3, 4 : 4, 5 : 5, 6 : 6 }
+	}
+
+	chain raw {
+		type filter hook prerouting priority raw; policy accept;
+		iifname "l1" meta mark set ip saddr . udp sport map @replies
+		iifname "l0" udp dport 443 @th,64,8 & 0x80 == 0x00 jump short-header
+		iifname "l0" udp dport 443 @th,64,8 & 0x80 == 0x80 jump new-flow
+		ct zone set meta mark map @zone-of
+	}
+
+	chain short-header {           # DCID = [config rotation 000|5 bits][server ID][nonce]
+		@th,72,8 & 0xe0 != 0x00 goto new-flow
+		meta mark set @th,80,8 map @sids return
+		goto new-flow
+	}
+
+	chain new-flow {               # long header, or a CID no registered backend owns
+		meta mark set ip saddr map @flows return
+		meta mark set numgen random mod 3
+		meta mark set meta mark map @slots update @flows { ip saddr : meta mark }
+	}
+
+	chain to-backend {
+		type nat hook prerouting priority dstnat; policy accept;
+		meta l4proto udp dnat ip to ct zone map @backends
+	}
+}
+```
+
+Two details are deliberate:
+
+- `short-header` starts with `goto`, not `jump`, for unroutable config rotation bits. A `jump` would return into `short-header` and keep evaluating its rules.
+- The packet mark carries the **backend ID**, and `zone-of` turns it into a zone at the end of `raw`. Handshake pins in `@flows` store the backend ID, not the random slot, so a pinned handshake keeps its backend while the slots are remapped.
+
+Two probe scripts stand in for clients and servers before real QUIC arrives. `qsend.py` sends one QUIC-shaped datagram: a long-header Initial (version 1, padded to 1200 bytes like a real client Initial) or a short header with a chosen DCID. `backend.py` answers with what it saw. They exercise the steering, not QUIC itself.
+
+```python
+# qsend.py — send one QUIC-shaped datagram to the VIP and print the reply
+#   python3 qsend.py long|short DCID_HEX [SRC_IP] [SRC_PORT]
+import socket, sys
+kind, dcid = sys.argv[1], bytes.fromhex(sys.argv[2])
+src = (sys.argv[3] if len(sys.argv) > 3 else "198.51.100.10",
+       int(sys.argv[4]) if len(sys.argv) > 4 else 0)
+if kind == "long":   # Initial, version 1, DCID, empty SCID
+    pkt = bytes([0xc0]) + (1).to_bytes(4, "big") + bytes([len(dcid)]) + dcid + b"\x00"
+else:                # 1-RTT: fixed bit set, then the DCID the server chose
+    pkt = bytes([0x40]) + dcid
+pkt += b"\x00" * (1200 - len(pkt))           # QUIC pads client Initials to 1200
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.bind(src); s.settimeout(1)
+s.sendto(pkt, ("198.51.100.1", 443))
+try:
+    data, peer = s.recvfrom(2048)
+    print(f"{s.getsockname()[1]} <- {peer[0]}:{peer[1]}  {data.decode()}")
+except TimeoutError:
+    print(f"{s.getsockname()[1]} <- (no reply)")
+```
+
+```python
+# backend.py — a UDP "QUIC server" that only reports what it received
+import socket, sys
+name, addr, port = sys.argv[1], sys.argv[2], int(sys.argv[3])
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.bind((addr, port))
+while True:
+    data, peer = s.recvfrom(2048)
+    if data[0] & 0x80:                       # long header (RFC 8999 §5.1)
+        dcid = data[6:6 + data[5]]
+        kind = "long "
+    else:                                    # short header (RFC 8999 §5.2)
+        dcid = data[1:9]
+        kind = "short"
+    s.sendto(f"{name} got {kind} dcid={dcid.hex()} from {peer[0]}:{peer[1]}".encode(), peer)
+```
+
+Real QUIC uses one Go program as backend and client. A backend generates every CID with its server ID in byte 1 and shares one stateless reset key with the others. The client can migrate to a new local port, or idle and then send again:
+
+```go
+// main.go — a quic-go backend that puts its server ID in every CID, and a client
+//
+//	qlb server ID ADDR:PORT      e.g. qlb server 1 10.0.0.11:8080
+//	qlb client [-src IP] [-migrate] [-pause 7s [-pad 200]] VIP:PORT
+package main
+
+import (
+	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"flag"
+	"fmt"
+	"io"
+	"log"
+	"math/big"
+	"net"
+	"os"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/quic-go/quic-go"
+)
+
+// QUIC-LB unencrypted layout (draft-ietf-quic-load-balancers-21 §5.2):
+// [config rotation 000 + 5 random bits][server ID][6-byte nonce]
+type lbCIDs struct{ id byte }
+
+func (g lbCIDs) ConnectionIDLen() int { return 8 }
+func (g lbCIDs) GenerateConnectionID() (quic.ConnectionID, error) {
+	b := make([]byte, 8)
+	if _, err := rand.Read(b); err != nil {
+		return quic.ConnectionID{}, err
+	}
+	b[0] &= 0x1f // config rotation codepoint 0
+	b[1] = g.id  // server ID
+	return quic.ConnectionIDFromBytes(b), nil
+}
+
+// Every backend shares this key, so any of them can reset any connection.
+var resetKey = quic.StatelessResetKey{0x6c, 0x61, 0x62}
+
+func server(id byte, addr string, ownKey bool) {
+	udp, err := net.ListenUDP("udp4", mustAddr(addr))
+	check(err)
+	key := resetKey
+	if ownKey { // the mistake: every backend invents its own reset key
+		rand.Read(key[:])
+	}
+	tr := &quic.Transport{Conn: udp, ConnectionIDGenerator: lbCIDs{id}, StatelessResetKey: &key}
+	ln, err := tr.Listen(selfSigned(), &quic.Config{})
+	check(err)
+	for {
+		conn, err := ln.Accept(context.Background())
+		check(err)
+		go func() {
+			for {
+				str, err := conn.AcceptStream(context.Background())
+				if err != nil {
+					return
+				}
+				msg, _ := io.ReadAll(str)
+				fmt.Fprintf(str, "be%d: %s (client %s)", id, msg, conn.RemoteAddr())
+				str.Close()
+			}
+		}()
+	}
+}
+
+func ask(conn *quic.Conn, msg string) string {
+	str, err := conn.OpenStreamSync(context.Background())
+	check(err)
+	str.Write([]byte(msg))
+	str.Close()
+	reply, err := io.ReadAll(str)
+	if err != nil {
+		return "error: " + err.Error()
+	}
+	return string(reply)
+}
+
+func client(vip, src string, migrate bool, pause time.Duration, pad int) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	tr := &quic.Transport{Conn: listen(src)}
+	conn, err := tr.Dial(ctx, mustAddr(vip), &tls.Config{InsecureSkipVerify: true, NextProtos: []string{"qlb"}},
+		&quic.Config{MaxIdleTimeout: 10 * time.Second})
+	check(err)
+	fmt.Printf("port %d: %s\n", port(tr), ask(conn, "hello"))
+	if migrate { // new UDP socket = new 4-tuple, same connection
+		tr2 := &quic.Transport{Conn: listen(src)}
+		path, err := conn.AddPath(tr2)
+		check(err)
+		check(path.Probe(ctx))
+		check(path.Switch())
+		fmt.Printf("port %d: %s\n", port(tr2), ask(conn, "after migration"))
+	}
+	if pause > 0 { // meanwhile the backend that owns this connection goes away
+		time.Sleep(pause)
+		t0 := time.Now()
+		reply := ask(conn, "still there?"+strings.Repeat(".", pad))
+		fmt.Printf("port %d after %v: %s (%.1fs)\n", port(tr), pause, reply, time.Since(t0).Seconds())
+	}
+	conn.CloseWithError(0, "")
+}
+
+func main() {
+	migrate := flag.Bool("migrate", false, "switch to a new local port mid-connection")
+	pause := flag.Duration("pause", 0, "wait, then use the connection again")
+	ownKey := flag.Bool("own-key", false, "server: use a private stateless reset key")
+	src := flag.String("src", "", "client: source IP")
+	pad := flag.Int("pad", 0, "client: bytes of padding on the request sent after -pause")
+	if len(os.Args) < 2 {
+		log.Fatal("usage: qlb server ID ADDR:PORT | qlb client [-src IP] [-migrate] [-pause D [-pad N]] VIP:PORT")
+	}
+	flag.CommandLine.Parse(os.Args[2:]) // flags follow the subcommand
+	a := append([]string{os.Args[1]}, flag.Args()...)
+	switch {
+	case len(a) == 3 && a[0] == "server":
+		id, err := strconv.Atoi(a[1])
+		check(err)
+		server(byte(id), a[2], *ownKey)
+	case len(a) == 2 && a[0] == "client":
+		client(a[1], *src, *migrate, *pause, *pad)
+	default:
+		log.Fatal("usage: qlb server ID ADDR:PORT | qlb client [-src IP] [-migrate] [-pause D [-pad N]] VIP:PORT")
+	}
+}
+
+func port(t *quic.Transport) int { return t.Conn.LocalAddr().(*net.UDPAddr).Port }
+
+func listen(src string) *net.UDPConn {
+	c, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.ParseIP(src)})
+	check(err)
+	return c
+}
+
+func mustAddr(s string) *net.UDPAddr {
+	a, err := net.ResolveUDPAddr("udp4", s)
+	check(err)
+	return a
+}
+
+func selfSigned() *tls.Config { // lab only: throwaway key, client skips verification
+	key, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	tmpl := &x509.Certificate{SerialNumber: big.NewInt(1), Subject: pkix.Name{CommonName: "lb.lab"},
+		NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().Add(24 * time.Hour)}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	check(err)
+	return &tls.Config{Certificates: []tls.Certificate{{Certificate: [][]byte{der}, PrivateKey: key}}, NextProtos: []string{"qlb"}}
+}
+
+func check(err error) {
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "error:", err)
+		os.Exit(1)
+	}
+}
+```
+
+```bash
+# build (quic-go v0.63.0 needs Go 1.26 or newer; GOTOOLCHAIN fetches it)
+cd qgo                                  # main.go lives here
+export GOTOOLCHAIN=go1.27.2
+go mod init qlb
+go get github.com/quic-go/quic-go@v0.63.0
+go mod tidy
+go build -o ../qlb .
+```
+
+```console
+# uname -r
+6.12.94+
+# nft --version
+nftables v1.1.3 (Commodore Bullmoose #4)
+# go version -m qlb | grep -E '^qlb|quic-go'
+qlb: go1.27.2
+	dep	github.com/quic-go/quic-go	v0.63.0	h1:LIFGHI4PFUhhw2dDD1ARHdCff143ffMHwZtbnbuJ78A=
+# python3 --version
+Python 3.13.5
+```
+
+### Why not paste the published ruleset?
+
+The design here follows Marten Seemann's April 2026 post (see Sources). He installs his rules through the Go `google/nftables` netlink library and warns that the `nft` CLI cannot display them. The CLI cannot load his listing either. Saved as `lb-udp-seemann.nft` and checked with `nft -c`:
+
+```console
+# ./lab.sh
+# ip netns exec qlb nft -c -f lb-udp-seemann.nft
+lb-udp-seemann.nft:30:78-80: Error: syntax error, unexpected map, expecting '}'
+		ct zone set meta mark map @backend-zones add @flows { ip saddr : meta mark map @backend-zones }
+		                                                                           ^^^
+lb-udp-seemann.nft:28:15-33: Error: datatype mismatch: expected integer, expression has type packet mark
+		ct zone set ip saddr map @flows return
+		~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^
+lb-udp-seemann.nft:35:33-36: Error: transport protocol mapping is only valid after transport protocol match
+		ct zone 3 dnat to 192.168.0.3:8082
+		          ~~~~                ^^^^
+lb-udp-seemann.nft:36:33-36: Error: transport protocol mapping is only valid after transport protocol match
+		ct zone 2 dnat to 192.168.0.2:8081
+		          ~~~~                ^^^^
+lb-udp-seemann.nft:37:33-36: Error: transport protocol mapping is only valid after transport protocol match
+		ct zone 1 dnat to 192.168.0.1:8080
+		          ~~~~                ^^^^
+# ip netns exec qlb nft -f lb-quic.nft
+```
+
+| Published listing (installed over netlink) | This chapter (loads with `nft -f`) | Why |
+|---|---|---|
+| maps whose value type is `mark` feeding `ct zone set` | `typeof … : ct zone` for zone-valued maps | CLI type check: "expected integer, expression has type packet mark" |
+| `add @flows { ip saddr : meta mark map @backend-zones }` | backend ID travels in the mark, `@zone-of` maps it to a zone | The CLI grammar has no map lookup inside a set element. In this lab, writing `ct zone` itself as the element value loaded fine and inserted nothing, so the mark carries it |
+| `ct zone 3 dnat to 192.168.0.3:8082`, one rule per backend | `meta l4proto udp dnat ip to ct zone map @backends` | A port in `dnat to` needs a transport-protocol match. A map turns N rules into one |
+| per-backend rules in the short-header and output chains | element maps `@sids`, `@backends`, `@replies` | Register, drain and deregister become element edits applied atomically by `nft -f` |
+| server ID in CID byte 0 | config rotation in byte 0, server ID in byte 1 | QUIC-LB reserves the first octet |
+| return path set in an `output` hook chain | return path set in `raw` prerouting, keyed on the backend address | The `output` hook only sees packets the LB host generates. Backends on their own hosts reply *through* the LB (see The trap) |
+
+## Drill 1: handshakes stick to a client address
+
+```console
+# for i in 1 2 3; do ip netns exec qbe python3 backend.py be$i 10.0.0.1$i 808$((i-1)) & done; sleep 1
+# S() { ip netns exec qcli python3 qsend.py "$@"; }
+# for i in 1 2 3; do S long $(openssl rand -hex 8); done
+55715 <- 198.51.100.1:443  be2 got long  dcid=4248938fa0c5ae57 from 198.51.100.10:55715
+34938 <- 198.51.100.1:443  be2 got long  dcid=a9807a6bd375cecc from 198.51.100.10:34938
+53655 <- 198.51.100.1:443  be2 got long  dcid=7d4a699acc7a4368 from 198.51.100.10:53655
+# for i in 1 2 3; do S long $(openssl rand -hex 8) 198.51.100.11; done
+60861 <- 198.51.100.1:443  be3 got long  dcid=19b6d724a3379218 from 198.51.100.11:60861
+45629 <- 198.51.100.1:443  be3 got long  dcid=4b1e25e33ff2ddd5 from 198.51.100.11:45629
+58044 <- 198.51.100.1:443  be3 got long  dcid=323209b7e60d3201 from 198.51.100.11:58044
+# ip netns exec qlb nft list map ip lb-quic flows
+table ip lb-quic {
+	map flows {
+		typeof ip saddr : meta mark
+		size 65536
+		flags dynamic,timeout
+		timeout 5s
+		elements = { 198.51.100.10 expires 4s872ms : 0x00000002,
+			     198.51.100.11 expires 4s940ms : 0x00000003 }
+	}
+}
+```
+
+Every long-header packet from `198.51.100.10` reached be2 and every one from `.11` reached be1, each with a fresh random DCID. The first packet from each address took the random slot, and the `update` stored the result in `@flows`. Later packets found the pin and returned early. A real handshake sends several long-header packets (Initial, Handshake) before the client switches to the server's CID, and all of them have to reach the server that holds the handshake state. The 5-second timeout is the handshake budget. It also means two clients behind one NAT address that start handshakes within 5 s land on the same backend. Every reply came from `198.51.100.1:443`: conntrack undid the DNAT on the way out.
+
+## Drill 2: established packets follow the server ID
+
+```console
+# for sid in 01 02 03; do S short 07${sid}a1b2c3d4e5f6; done
+45811 <- 198.51.100.1:443  be1 got short dcid=0701a1b2c3d4e5f6 from 198.51.100.10:45811
+44651 <- 198.51.100.1:443  be2 got short dcid=0702a1b2c3d4e5f6 from 198.51.100.10:44651
+38289 <- 198.51.100.1:443  be3 got short dcid=0703a1b2c3d4e5f6 from 198.51.100.10:38289
+# S short 0704a1b2c3d4e5f6      # server ID 4: nobody registered it
+34962 <- 198.51.100.1:443  be2 got short dcid=0704a1b2c3d4e5f6 from 198.51.100.10:34962
+# S short e702a1b2c3d4e5f6      # config rotation 0b111: unroutable by definition
+60745 <- 198.51.100.1:443  be2 got short dcid=e702a1b2c3d4e5f6 from 198.51.100.10:60745
+```
+
+The server ID byte picked the backend, regardless of source port. Server ID `0x04` has no `@sids` entry, so the `sids` lookup failed and `goto new-flow` treated the packet like a handshake. It found the pin `198.51.100.10 → be2` from Drill 1, still inside its 5 s. Config rotation `0b111` (`0xe7`) never reached the `@sids` lookup and took the same fallback. QUIC-LB defines `0b111` as unroutable (§3.2), so the load balancer falls back instead of trusting byte 1.
+
+## Drill 3: two connections, one 4-tuple, and why zones exist
+
+```console
+# S short 0701000000000001 198.51.100.10 40000
+40000 <- 198.51.100.1:443  be1 got short dcid=0701000000000001 from 198.51.100.10:40000
+# S short 0703000000000002 198.51.100.10 40000
+40000 <- 198.51.100.1:443  be3 got short dcid=0703000000000002 from 198.51.100.10:40000
+# ip netns exec qlb grep 'sport=40000 ' /proc/net/nf_conntrack
+ipv4     2 udp      17 29 src=198.51.100.10 dst=198.51.100.1 sport=40000 dport=443 src=10.0.0.13 dst=198.51.100.10 sport=8082 dport=40000 mark=0 zone=3 use=2
+ipv4     2 udp      17 29 src=198.51.100.10 dst=198.51.100.1 sport=40000 dport=443 src=10.0.0.11 dst=198.51.100.10 sport=8080 dport=40000 mark=0 zone=1 use=2
+```
+
+Same source port, same VIP, two CIDs, two backends. Conntrack holds two entries with identical original tuples, kept apart only by `zone=1` and `zone=3`. Now the same steering without zones:
+
+```text
+# nozone.nft — the same CID steering, minus conntrack zones
+table ip nozone {
+	chain raw {
+		type filter hook prerouting priority raw; policy accept;
+		iifname "l0" udp dport 443 @th,80,8 0x01 meta mark set 1
+		iifname "l0" udp dport 443 @th,80,8 0x03 meta mark set 3
+	}
+	chain to-backend {
+		type nat hook prerouting priority dstnat; policy accept;
+		meta l4proto udp meta mark 1 dnat to 10.0.0.11:8080
+		meta l4proto udp meta mark 3 dnat to 10.0.0.13:8082
+	}
+}
+```
+
+```console
+# ip netns exec qlb nft delete table ip lb-quic
+# ip netns exec qlb nft -f nozone.nft
+# S short 0701000000000001 198.51.100.10 40001
+40001 <- 198.51.100.1:443  be1 got short dcid=0701000000000001 from 198.51.100.10:40001
+# S short 0703000000000002 198.51.100.10 40001
+40001 <- 198.51.100.1:443  be1 got short dcid=0703000000000002 from 198.51.100.10:40001
+# ip netns exec qlb nft delete table ip nozone
+# ip netns exec qlb nft -f lb-quic.nft
+```
+
+The second packet carried be3's server ID and still went to be1. The mark said 3, but the 4-tuple already had a conntrack entry, and an existing entry is never handed to the NAT chain again. With zones, the CID chooses on every packet. Without them, the first packet chooses for the whole 4-tuple.
+
+## Drill 4: real QUIC, including migration
+
+The probes go away and real quic-go servers take their ports:
+
+```console
+# pkill -f backend.py
+# for i in 1 2 3; do ip netns exec qbe ./qlb server $i 10.0.0.1$i:808$((i-1)) & done; sleep 1
+# Q() { ip netns exec qcli ./qlb client "$@" 198.51.100.1:443; }
+# for a in 10 11 12 13; do Q -src 198.51.100.$a; done
+port 39756: be2: hello (client 198.51.100.10:39756)
+port 43470: be1: hello (client 198.51.100.11:43470)
+port 52985: be2: hello (client 198.51.100.12:52985)
+port 35223: be2: hello (client 198.51.100.13:35223)
+# Q -src 198.51.100.14 -migrate
+port 33196: be3: hello (client 198.51.100.14:33196)
+port 48439: be3: after migration (client 198.51.100.14:48439)
+```
+
+Each handshake was steered by `@flows`. After it, every 1-RTT packet carried a server-chosen CID with that server's ID in byte 1. The `-migrate` run opened a second UDP socket, so the connection got a new 4-tuple. It probed the path (`PATH_CHALLENGE`/`PATH_RESPONSE`, RFC 9000 §9), switched, and sent again. The new 4-tuple had no conntrack entry. `@sids` sent it to the same backend anyway, and be3 saw the client's new port.
+
+Compare the TCP recipe applied to UDP, choosing a backend per 4-tuple:
+
+```text
+# naive.nft — the TCP recipe applied to UDP: pick a backend per 4-tuple
+table ip naive {
+	map backends {
+		type mark : ipv4_addr . inet_service
+		flags constant
+		elements = { 0 : 10.0.0.11 . 8080, 1 : 10.0.0.12 . 8081, 2 : 10.0.0.13 . 8082 }
+	}
+	chain to-backend {
+		type nat hook prerouting priority dstnat; policy accept;
+		udp dport 443 dnat ip to numgen random mod 3 map @backends
+	}
+}
+```
+
+```console
+# ip netns exec qlb nft delete table ip lb-quic
+# ip netns exec qlb nft -f naive.nft
+# for a in 10 11 12 13 14 15; do Q -src 198.51.100.$a -migrate; done
+port 36487: be2: hello (client 198.51.100.10:36487)
+error: context deadline exceeded
+port 58578: be3: hello (client 198.51.100.11:58578)
+port 44403: be3: after migration (client 198.51.100.11:44403)
+port 60557: be3: hello (client 198.51.100.12:60557)
+error: context deadline exceeded
+port 57019: be2: hello (client 198.51.100.13:57019)
+error: context deadline exceeded
+port 45910: be2: hello (client 198.51.100.14:45910)
+port 41195: be2: after migration (client 198.51.100.14:41195)
+port 35883: be2: hello (client 198.51.100.15:35883)
+error: context deadline exceeded
+# ip netns exec qlb nft delete table ip naive
+# ip netns exec qlb nft -f lb-quic.nft
+```
+
+Four of six migrations failed. The new path was a new 4-tuple, so `numgen` picked a backend at random. Two times out of six it happened to be the same server. The other four times the `PATH_CHALLENGE` landed on a backend with no state for that connection, and the probe ran out of its 5 s budget. On the Internet you don't choose when this happens: a NAT rebinding changes the client's port without asking.
+
+## Drill 5: drain be3, add be4, deregister be3, reset its clients
+
+```text
+# drain-be3.nft — be4 joins; slot 2 now means be4, so be3 gets no new connections
+delete element ip lb-quic slots { 2 }
+add element ip lb-quic slots { 2 : 4 }
+add element ip lb-quic sids { 0x04 : 4 }
+add element ip lb-quic backends { 4 : 10.0.0.14 . 8083 }
+add element ip lb-quic replies { 10.0.0.14 . 8083 : 4 }
+```
+
+```text
+# deregister-be3.nft — be3 is gone: its CIDs are no longer routable
+delete element ip lb-quic sids { 0x03 }
+delete element ip lb-quic backends { 3 }
+delete element ip lb-quic replies { 10.0.0.13 . 8082 }
+```
+
+```console
+# sleep 6      # let earlier handshake pins in @flows expire
+# ip netns exec qlb nft add element ip lb-quic flows '{ 198.51.100.10 : 3 }'   # pin the next handshake to be3
+# Q -src 198.51.100.10 -pause 7s -pad 200 & qa=$!; sleep 1
+port 46079: be3: hello (client 198.51.100.10:46079)
+# ip netns exec qbe ./qlb server 4 10.0.0.14:8083 & sleep 1
+# ip netns exec qlb nft -f drain-be3.nft
+# for a in 11 12 13 14 15 16; do Q -src 198.51.100.$a; done
+port 57472: be4: hello (client 198.51.100.11:57472)
+port 37147: be2: hello (client 198.51.100.12:37147)
+port 36258: be2: hello (client 198.51.100.13:36258)
+port 58225: be2: hello (client 198.51.100.14:58225)
+port 34076: be2: hello (client 198.51.100.15:34076)
+port 49176: be1: hello (client 198.51.100.16:49176)
+# ip netns exec qlb nft -f deregister-be3.nft; pkill -f 'qlb server 3'
+# wait $qa
+port 46079 after 7s: error: received a stateless reset (0.0s)
+```
+
+The client on `198.51.100.10` was pinned to be3 before the drain (the first `add element` exists only to make the drill deterministic). `drain-be3.nft` swapped slot 2 from be3 to be4 in one transaction. The six handshakes that followed went to be1, be2 and be4, never be3, while be3 kept serving its connection. In this ruleset a client address already pinned to be3 in `@flows` would still reach it for up to 5 s, so give a drain at least the pin timeout before deregistering. Deregistering removed be3's server ID, address and return path. The pinned client's next packet then carried an unknown server ID, fell through to `new-flow`, and reached a live backend. That backend has no state for the CID, so it answered with a **stateless reset** (RFC 9000 §10.3). The client checked the reset token and closed at once: `received a stateless reset (0.0s)`.
+
+The reset token is derived from the CID and a key. quic-go computes it as HMAC-SHA256 keyed with `Transport.StatelessResetKey`, and picks a random key if none is set (`stateless_reset.go`). Another backend can only produce the right token if it has the same key. Here is the same drill with every backend inventing its own key:
+
+```console
+# pkill -f 'qlb server'; sleep 1
+# for i in 1 2 3 4; do ip netns exec qbe ./qlb server -own-key $i 10.0.0.1$i:808$((i-1)) & done; sleep 1
+# ip netns exec qlb nft delete table ip lb-quic; ip netns exec qlb nft -f lb-quic.nft
+# ip netns exec qlb nft add element ip lb-quic flows '{ 198.51.100.10 : 3 }'
+# Q -src 198.51.100.10 -pause 7s -pad 200 & qa=$!; sleep 1
+port 54876: be3: hello (client 198.51.100.10:54876)
+# ip netns exec qlb nft -f drain-be3.nft
+# ip netns exec qlb nft -f deregister-be3.nft; pkill -f 'qlb server -own-key 3'
+# wait $qa
+port 54876 after 7s: error: timeout: no recent network activity (10.0s)
+```
+
+The reset still arrived, but its token didn't verify, so the client ignored it. The client retransmitted into the void until its 10 s idle timeout. A real client would hang for the negotiated idle timeout (quic-go's default is 30 s). `-pad 200` is in both drills because quic-go v0.63.0 does not answer packets of 42 bytes or less with a reset (`MinStatelessResetSize` in `transport.go`). RFC 9000 §10.3 permits answering those with a reset one byte shorter. An unpadded 41-byte request makes the outcome depend on packet sizes rather than on the key.
+
+## The trap
+
+The return path looks optional because the lab can pass without it. Flush `@replies`, the equivalent of keeping the zone-restoring rule in an `output` chain while the backends live on other hosts:
+
+```text
+# edge.nft — BCP 38 at the upstream: nothing leaves l0 with a source we don't own
+table inet edge {
+	chain egress {                 # after srcnat, so it sees the translated source
+		type filter hook postrouting priority srcnat + 10; policy accept;
+		oifname "l0" ip saddr != 198.51.100.0/24 counter drop
+	}
+}
+```
+
+```console
+# pkill -f 'qlb server'; sleep 1
+# for i in 1 2 3; do ip netns exec qbe ./qlb server $i 10.0.0.1$i:808$((i-1)) & done; sleep 1
+# ip netns exec qlb nft delete table ip lb-quic; ip netns exec qlb nft -f lb-quic.nft
+# ip netns exec qlb nft flush map ip lb-quic replies      # "the output chain handles replies"
+# ip netns exec qcli tcpdump -tqlni c0 -c 1 'udp and src net 10.0.0.0/24' 2>/dev/null & td=$!; sleep 1
+# Q -src 198.51.100.17; wait $td
+port 50391: be2: hello (client 198.51.100.17:50391)
+IP 10.0.0.12.8081 > 198.51.100.17.50391: UDP, length 1280
+# ip netns exec qlb grep 'src=198.51.100.17 ' /proc/net/nf_conntrack | sort
+ipv4     2 udp      17 29 src=10.0.0.12 dst=198.51.100.17 sport=8081 dport=50391 [UNREPLIED] src=198.51.100.17 dst=10.0.0.12 sport=50391 dport=8081 mark=0 zone=0 use=2
+ipv4     2 udp      17 29 src=198.51.100.17 dst=198.51.100.1 sport=50391 dport=443 [UNREPLIED] src=10.0.0.12 dst=198.51.100.17 sport=8081 dport=50391 mark=0 zone=2 use=2
+# ip netns exec qlb nft -f edge.nft
+# Q -src 198.51.100.16
+error: context deadline exceeded
+# ip netns exec qlb nft add element ip lb-quic replies '{ 10.0.0.11 . 8080 : 1, 10.0.0.12 . 8081 : 2, 10.0.0.13 . 8082 : 3 }'
+# Q -src 198.51.100.16
+port 42633: be2: hello (client 198.51.100.16:42633)
+# ip netns exec qlb nft list chain inet edge egress
+table inet edge {
+	chain egress {
+		type filter hook postrouting priority srcnat + 10; policy accept;
+		oifname "l0" ip saddr != 198.51.100.0/24 counter packets 16 bytes 12520 drop
+	}
+}
+```
+
+Read it in order:
+
+1. The handshake **succeeded**, and that is the trap. The backend's reply came in on `l1` with no mark, so it was looked up in zone 0. It didn't match the zone-2 entry, so conntrack created a *new* zone-0 entry instead, `[UNREPLIED]` in both directions. Nothing undid the DNAT. The client received `10.0.0.12.8081 > 198.51.100.17`, a packet from the backend's private address. quic-go demultiplexes by CID on an unconnected socket, so it accepted the packet.
+2. On a real network, that packet leaves the load balancer with a source address the site doesn't own. Egress filtering (BCP 38 / RFC 2827), uRPF upstream, or the client's own NAT, which only admits replies from `198.51.100.1:443`, drops it. `edge.nft` models that. Its filter sits after `srcnat` in postrouting because the reply's source is only translated back to the VIP at that hook. A filter in `forward` would also drop correct replies. With the edge filter on, the same setup times out.
+3. With `@replies` restored, replies carry the request's zone, find their entry, and leave as `198.51.100.1:443`. The edge filter passes them. Its counter records the leaked replies it dropped.
+
+Rule: the zone for replies must be set before conntrack's lookup (prerouting priority −200) on the interface the replies actually *arrive* on. Backends on the LB host reply through `output`. Backends anywhere else reply through `prerouting`. Test it with an egress filter, not with a client that accepts anything.
+
+## Notes and pitfalls
+
+- **A plaintext server ID is visible to everyone.** Any observer can tell which backend owns a connection, and can link a migrating client's old and new paths by that byte. That is the linkability RFC 9000 §5.1 and §9.5 try to prevent. QUIC-LB's answer is to encrypt the server ID with AES, which nftables cannot do. Use this design where that leak is acceptable, such as internal fleets or few clients per server, or move CID decoding to software that can decrypt (a userspace or eBPF load balancer).
+- **The packet mark is now taken.** Policy routing (`ip rule fwmark`) or other firewall code that uses marks will collide with it. Mask a field of the mark if you need to share.
+- **IPv4 only.** `table ip` and `ip saddr` keys. An `inet` or `ip6` version needs IPv6-keyed `@flows`/`@replies` and IPv6 `@backends`.
+- **Server IDs are one byte.** That allows 255 backends. A 2-byte ID is `@th,80,16` and a wider `@sids` key.
+- **The flows timeout is a trade-off.** Too short and slow handshakes split across backends. Too long and a draining backend keeps receiving new handshakes from pinned addresses.
+
+## The boring rule
+
+Route handshakes by client address and everything else by a server ID the backends write into their CIDs. Separate backends with conntrack zones, and restore the zone on the path replies actually take. Keep every backend fact in a map and change it with atomic `nft -f` element edits: drain by remapping slots, wait out the pin timeout, then deregister. Give all backends one stateless reset key. Prove the return path with an egress filter.
+
+## Try this
+
+1. Change `lbCIDs` to use a 2-byte server ID (`b[1:3]`), switch the match to `@th,80,16`, and register a backend with ID `0x0102`.
+2. Run `nft monitor` in `qlb` during Drill 5 and watch the element changes land as one transaction.
+3. Put a NAT between the client and the VIP (a fourth namespace with `masquerade`). Delete its conntrack entry mid-connection (`conntrack -D`) to force a rebinding, and confirm the connection survives under `lb-quic.nft` but not under `naive.nft`.
+4. Set `@flows`' timeout to `1s` and add 400 ms of delay to `l1` with `tc qdisc add dev l1 root netem delay 400ms`. Find the point where handshakes start to fail.
+5. Rewrite the table as `table inet` with dual-stack `@flows` and `@replies`, then repeat Drill 4 over IPv6.
+
+## Sources
+
+- RFC 8999 — Version-Independent Properties of QUIC: <https://www.rfc-editor.org/rfc/rfc8999.html>
+- RFC 9000 — QUIC (§5.1 connection IDs, §7.2 negotiating CIDs, §9 migration, §9.5 privacy, §10.3 stateless reset): <https://www.rfc-editor.org/rfc/rfc9000.html>
+- QUIC-LB: Generating Routable QUIC Connection IDs, draft-ietf-quic-load-balancers-21: <https://datatracker.ietf.org/doc/draft-ietf-quic-load-balancers/>
+- nftables wiki — Netfilter hooks and priorities: <https://wiki.nftables.org/wiki-nftables/index.php/Netfilter_hooks>
+- nftables wiki — Configuring chains (priority keywords): <https://wiki.nftables.org/wiki-nftables/index.php/Configuring_chains>
+- nftables wiki — Setting packet connection tracking metainformation (`ct zone`): <https://wiki.nftables.org/wiki-nftables/index.php/Setting_packet_connection_tracking_metainformation>
+- nft(8) manual (raw payload `@th`, maps, `numgen`, dynamic sets): <https://www.netfilter.org/projects/nftables/manpage.html>
+- quic-go v0.63.0 `Transport` (`ConnectionIDGenerator`, `StatelessResetKey`, reset size floor): <https://github.com/quic-go/quic-go/blob/v0.63.0/transport.go>
+- quic-go v0.63.0 reset token derivation: <https://github.com/quic-go/quic-go/blob/v0.63.0/stateless_reset.go>
+- RFC 2827 (BCP 38) — Network Ingress Filtering: <https://www.rfc-editor.org/rfc/rfc2827.html>
+- Marten Seemann, "Using nftables for QUIC load balancing" (2026-04-08), the design this chapter adapts: <https://seemann.io/posts/2026-04-08---nftables-quic-load-balancing/>
