@@ -1,0 +1,840 @@
+---
+title: "Why a Goroutine Switch Is Cheap: The Mechanism"
+author:
+  - name: "K19G"
+  - name: "grok-bot"
+---
+
+# Why a Goroutine Switch Is Cheap: The Mechanism
+
+## Thesis
+
+A goroutine switch on Go 1.27.2 takes about **100–185 ns** on the test machine below. A blocking hand-off between two OS threads takes **0.7–3.6 µs**, between 4 and 20 times longer. The usual explanation is "Go saves fewer registers", which is true but explains only a tiny part of the gap. In the CPU profile later in this chapter, `runtime.gogo`, the routine that restores registers, accounts for **under 1%** of a channel ping-pong.
+
+The gap really comes from three things:
+
+1. **The switch is a function call.** Goroutines give up the CPU inside a runtime call (`gopark` → `mcall`). Go's internal ABI has no callee-saved registers, so the compiler has already spilled every live value to the stack before that call. Only a handful of values (SP, PC, BP, the closure context and the `g` pointer) describe where to resume.
+2. **It never enters the kernel.** Parking, readying and resuming a goroutine are loads, stores and a few atomics on runtime structures in user space. No trap, no kernel scheduler, no TLB or address-space work, and the OS thread keeps running.
+3. **Stacks are small and movable.** A parked goroutine costs about 2 KiB of stack, so a million of them fit in RAM, and growth is a prologue check plus a copy.
+
+The chapter goes through each mechanism in the Go 1.27.2 runtime source, measures it, and then shows the cases where a "goroutine switch" costs as much as a thread switch: blocking syscalls, hand-offs to idle Ps, and signal-based preemption.
+
+[Scheduler Deep Dive (GMP)](201-scheduler-gmp-deep-dive.qmd) introduces G, M and P, and [Stack Growth and Copying](215-stack-growth-copying.qmd) introduces stack growth. This chapter goes one level lower, to the instructions.
+
+Verified on **Go 1.27.2** (`linux/amd64`), Linux 6.12 on an 8-vCPU KVM guest (Intel Xeon), on 2026-10-11. All source links are pinned to the [`go1.27.2` tag](https://github.com/golang/go/blob/go1.27.2/src/runtime).
+
+## Learning goals
+
+- Name the fields in `g`, `m`, `p` and `gobuf` that a switch touches
+- Read `gogo`, `mcall`, `morestack` and `asyncPreempt` in `asm_amd64.s` / `preempt_amd64.s`
+- Explain why a cooperative switch saves only SP/PC/BP/ctxt, and why asynchronous preemption saves everything
+- Follow `gopark` → `park_m` → `schedule` → `execute` → `gogo`, and `goready` → `runnext`
+- Measure goroutine and thread hand-offs with benchmarks, `perf stat`, `getrusage` and `schedtrace`
+- Predict when a goroutine operation turns into an OS context switch
+
+## 1. The data: `g`, `m`, `p` and `gobuf`
+
+Excerpts from [`runtime2.go`](https://github.com/golang/go/blob/go1.27.2/src/runtime/runtime2.go#L303) (Go 1.27.2):
+
+```go
+type gobuf struct {          // runtime2.go:303
+	sp   uintptr
+	pc   uintptr
+	g    guintptr
+	ctxt unsafe.Pointer      // closure context (DX on amd64); a GC root
+	lr   uintptr             // link register (arm64, ppc64, …); unused on amd64
+	bp   uintptr             // frame pointer
+}
+
+type g struct {              // runtime2.go:471
+	stack        stack       // [lo, hi) of this goroutine's stack
+	stackguard0  uintptr     // compared in every function prologue
+	m            *m          // current M, nil when not running
+	sched        gobuf       // where to resume
+	atomicstatus atomic.Uint32
+	goid         uint64
+	waitreason   waitReason
+	preempt      bool
+	lockedm      muintptr    // set by runtime.LockOSThread
+	// …
+}
+
+type m struct {              // runtime2.go:616
+	g0   *g                  // goroutine with the scheduling stack
+	curg *g                  // goroutine currently running on this M
+	p    puintptr            // attached P, nil in a syscall
+	// …
+}
+
+type p struct {              // runtime2.go:774
+	runqhead uint32
+	runq     [256]guintptr   // local run queue
+	runnext  guintptr        // next G to run, inheriting the time slice
+	// …
+}
+```
+
+Some things to notice:
+
+- A paused goroutine is represented by **one `gobuf`**: six words, two of which (`g`, `lr`) are bookkeeping on amd64. Everything else the goroutine needs (locals, spilled registers, return addresses) is on its own stack, which stays where it is.
+- Every M has a **`g0`**, a goroutine with a normal-sized OS-thread stack, on which the scheduler itself runs. A switch is therefore two jumps: user G → `g0` (to run scheduler code) → next G.
+- The **current `g` lives in R14** on amd64 under ABIInternal ([ABI spec, amd64 table](https://github.com/golang/go/blob/go1.27.2/src/cmd/compile/abi-internal.md)). Restoring "which goroutine am I" is a single register move.
+
+## 2. Why so few registers: the ABI and cooperative safe-points
+
+The Go internal ABI ([`abi-internal.md`](https://github.com/golang/go/blob/go1.27.2/src/cmd/compile/abi-internal.md)) says, for amd64:
+
+> There are no callee-save registers, so a call may overwrite any register that doesn't have a fixed meaning, including argument registers.
+
+The section on clobber sets adds the reason: "As defined, the ABI does not use callee-save registers. This significantly simplifies the garbage collector and the compiler's register allocator, but at some performance cost."
+
+The consequence for switching: a goroutine always parks **inside a function call**. Channel operations, mutexes, `time.Sleep`, network I/O and `runtime.Gosched` all end up in `gopark` or `mcall`. Because no register survives a call, the compiler has already stored every live value in the caller's frame before the call instruction. The non-cooperative preemption design ([proposal 24543](https://github.com/golang/proposal/blob/master/design/24543-non-cooperative-preemption.md)) states the property directly: function-call safe-points "ensure that no registers are live", and the GC "has complete information about its entire stack" at them. So the state to save is just *where the goroutine is*:
+
+| Saved by a cooperative switch (amd64) | Why |
+|---|---|
+| SP | top of this goroutine's stack |
+| PC | the return address into the caller |
+| BP | frame pointer, so profilers and tracebacks can unwind |
+| ctxt (DX) | closure context, only non-zero on a few paths such as `morestack` |
+| g (R14, TLS) | identity of the running goroutine |
+
+Compare that with a kernel thread switch. The kernel cannot know which registers are live at an arbitrary interrupt point, so it saves the full user register file on kernel entry. The FPU/SSE/AVX state is saved with `XSAVE`-family instructions when the next task needs the FPU (on AVX-512 machines that is over 2 KiB). After that it still runs the kernel scheduler.
+
+The comparison is not "Go saves fewer registers than C". A hand-written user-space context switch in C, such as Boost.Context's `fcontext`, also saves only the callee-saved registers plus SP and PC (about 8 words on x86-64 SysV), and it is also fast. glibc's `swapcontext` is slower because it also makes an `rt_sigprocmask` system call. The expensive part of a thread switch is the **kernel path**: trap, scheduler, wakeup, mitigations. Section 6 measures this.
+
+## 3. The instructions: `mcall` and `gogo`
+
+### Going to sleep: `mcall` ([`asm_amd64.s#L425`](https://github.com/golang/go/blob/go1.27.2/src/runtime/asm_amd64.s#L425))
+
+`gopark` ends with `mcall(park_m)`. `mcall` saves the caller's resume point into `g.sched`, switches to `g0`'s stack and calls `park_m(g)` there:
+
+```text
+TEXT runtime·mcall<ABIInternal>(SB), NOSPLIT, $0-8
+	MOVQ	AX, DX	// DX = fn
+	// Save state in g->sched. The caller's SP and PC are restored by gogo to
+	// resume execution in the caller's frame (implicit return). …
+	MOVQ	SP, BX	// hide (SP) reads from vet
+	MOVQ	8(BX), BX	// caller's PC
+	MOVQ	BX, (g_sched+gobuf_pc)(R14)
+	LEAQ	fn+0(FP), BX	// caller's SP
+	MOVQ	BX, (g_sched+gobuf_sp)(R14)
+	MOVQ	(BP), BX // caller's BP
+	MOVQ	BX, (g_sched+gobuf_bp)(R14)
+
+	// switch to m->g0 & its stack, call fn
+	MOVQ	g_m(R14), BX
+	MOVQ	m_g0(BX), SI	// SI = g.m.g0
+	…
+	MOVQ	R14, AX		// AX (and arg 0) = g
+	MOVQ	SI, R14		// g = g.m.g0
+	get_tls(CX)		// Set G in TLS
+	MOVQ	R14, g(CX)
+	MOVQ	(g_sched+gobuf_sp)(R14), SP	// sp = g0.sched.sp
+	MOVQ	$0, BP	// clear frame pointer, as caller may execute on another M
+	PUSHQ	AX	// open up space for fn's arg spill slot
+	MOVQ	0(DX), R12
+	CALL	R12		// fn(g)
+```
+
+(`…` marks lines omitted here, such as the `runtimesecret` experiment and the `badmcall` check.) The whole save is **three stores**: PC, SP, BP. The stored PC is the *caller's* return address, so when the goroutine resumes it looks to the caller as though `mcall` simply returned.
+
+### Waking up: `gogo` ([`asm_amd64.s#L402`](https://github.com/golang/go/blob/go1.27.2/src/runtime/asm_amd64.s#L402))
+
+When the scheduler on `g0` has picked the next goroutine, `execute` calls `gogo(&gp.sched)`:
+
+```text
+TEXT runtime·gogo(SB), NOSPLIT, $0-8
+	MOVQ	buf+0(FP), BX		// gobuf
+	MOVQ	gobuf_g(BX), DX
+	MOVQ	0(DX), CX		// make sure g != nil
+	JMP	gogo<>(SB)
+
+TEXT gogo<>(SB), NOSPLIT, $0
+	get_tls(CX)
+	MOVQ	DX, g(CX)
+	MOVQ	DX, R14		// set the g register
+	MOVQ	gobuf_sp(BX), SP	// restore SP
+	MOVQ	gobuf_ctxt(BX), DX
+	MOVQ	gobuf_bp(BX), BP
+	MOVQ	$0, gobuf_sp(BX)	// clear to help garbage collector
+	MOVQ	$0, gobuf_ctxt(BX)
+	MOVQ	$0, gobuf_bp(BX)
+	MOVQ	gobuf_pc(BX), BX
+	JMP	BX
+```
+
+That is the whole context switch: about 15 instructions, all memory moves, ending in an indirect `JMP`. No privilege change and no system call.
+
+The related helpers in 1.27.2 are `systemstack` ([L489](https://github.com/golang/go/blob/go1.27.2/src/runtime/asm_amd64.s#L489)), which runs a function on `g0` and comes back (used by `goready`), and `gosave_systemstack_switch` ([L855](https://github.com/golang/go/blob/go1.27.2/src/runtime/asm_amd64.s#L855)), its save half. There is no longer a standalone `runtime·gosave` on amd64.
+
+## 4. The control flow: `gopark`, `goready` and `runnext`
+
+```text
+G1: ch <- v  ─ no receiver ─►  gopark ─► mcall(park_m) ─┐
+                                                        │ on g0
+                                  park_m: casgstatus(_Grunning→_Gwaiting)
+                                          dropg(); unlockf(); schedule()
+                                  schedule ─► findRunnable ─► execute(G2)
+                                  execute ─► gogo(&G2.sched)  ─► G2 runs
+
+G2: <-ch  ─ sender waiting ─► goready(G1) ─► systemstack(ready)
+                                  ready: casgstatus(_Gwaiting→_Grunnable)
+                                         runqput(pp, G1, next=true)   // runnext
+                                         wakep()   // maybe wake an idle P
+```
+
+- [`gopark`](https://github.com/golang/go/blob/go1.27.2/src/runtime/proc.go#L457) records the wait reason and unlock function on the M and calls `mcall(park_m)`.
+- [`park_m`](https://github.com/golang/go/blob/go1.27.2/src/runtime/proc.go#L4268) changes the status, detaches G from M (`dropg`), runs the unlock callback (for channels, `chanparkcommit` releases the channel lock only *after* the G is safely parked), and calls `schedule`.
+- [`goready`](https://github.com/golang/go/blob/go1.27.2/src/runtime/proc.go#L493) → [`ready`](https://github.com/golang/go/blob/go1.27.2/src/runtime/proc.go#L1133) puts the woken G in **`p.runnext`**. When the current G blocks, `schedule` finds it there first and calls `execute(gp, inheritTime=true)`.
+- `inheritTime` means the woken goroutine shares the current time slice, and [`execute`](https://github.com/golang/go/blob/go1.27.2/src/runtime/proc.go#L3346) skips `schedtick++`. A ping-pong pair therefore behaves like one goroutine to the scheduler, which is why its fairness depends on `sysmon` preemption. The comment in `runqput` explains this. You can see the effect in `schedtrace` below: millions of switches, but only hundreds of `schedticks`.
+
+### Where the time goes
+
+A CPU profile of the channel ping-pong with one P. The `pingpong` program and this `bench_test.go` are in section 6:
+
+```bash
+go test -run '^$' -bench 'Chan' -cpu 1 -count 1 -cpuprofile cpu.out .
+go tool pprof -top -nodecount=22 pingpong.test cpu.out
+```
+
+```text
+BenchmarkChan 	 3517398	       395.4 ns/op
+File: pingpong.test
+Build ID: 58a049978dfd3a0ef99c082470e52b0ec2b46c98
+Type: cpu
+Time: 2026-10-11 22:39:55 IST
+Duration: 1.74s, Total samples = 1740ms (100.14%)
+Showing nodes accounting for 1570ms, 90.23% of 1740ms total
+Showing top 22 nodes out of 51
+      flat  flat%   sum%        cum   cum%
+     200ms 11.49% 11.49%      270ms 15.52%  runtime.casgstatus
+     170ms  9.77% 21.26%      170ms  9.77%  runtime.nanotime (inline)
+     150ms  8.62% 29.89%      150ms  8.62%  runtime.unlock2
+     130ms  7.47% 37.36%      130ms  7.47%  runtime.lock2
+     120ms  6.90% 44.25%      490ms 28.16%  runtime.chanrecv
+     110ms  6.32% 50.57%      750ms 43.10%  example.com/pingpong.chanPingPong
+     100ms  5.75% 56.32%      100ms  5.75%  runtime.(*guintptr).cas (inline)
+      80ms  4.60% 60.92%       80ms  4.60%  internal/runtime/atomic.(*Int32).Add (inline)
+      70ms  4.02% 64.94%      440ms 25.29%  runtime.chansend
+      70ms  4.02% 68.97%       70ms  4.02%  runtime.pidlegetSpinning
+      60ms  3.45% 72.41%       60ms  3.45%  runtime.releaseSudog
+      50ms  2.87% 75.29%      390ms 22.41%  example.com/pingpong.chanPingPong.func1
+      50ms  2.87% 78.16%       50ms  2.87%  internal/runtime/atomic.(*Int32).CompareAndSwap (inline)
+      30ms  1.72% 79.89%      520ms 29.89%  runtime.chanrecv1
+      30ms  1.72% 81.61%      220ms 12.64%  runtime.findRunnable
+      30ms  1.72% 83.33%      580ms 33.33%  runtime.park_m
+      20ms  1.15% 84.48%       20ms  1.15%  internal/runtime/atomic.(*Uint8).Store (inline)
+      20ms  1.15% 85.63%       20ms  1.15%  runtime.(*timeHistogram).record
+      20ms  1.15% 86.78%       80ms  4.60%  runtime.chanparkcommit
+      20ms  1.15% 87.93%      460ms 26.44%  runtime.chansend1
+      20ms  1.15% 89.08%      130ms  7.47%  runtime.execute
+      20ms  1.15% 90.23%       20ms  1.15%  runtime.gopark
+```
+
+And the switch primitives themselves, further down the same profile:
+
+```bash
+go tool pprof -top -nodecount=60 pingpong.test cpu.out | grep -E 'gogo|mcall|schedule|findRunnable|systemstack|runqget|flat%'
+```
+
+```text
+      flat  flat%   sum%        cum   cum%
+     0.03s  1.72% 81.61%      0.22s 12.64%  runtime.findRunnable
+     0.01s  0.57% 98.28%      0.37s 21.26%  runtime.schedule
+     0.01s  0.57% 98.85%      0.45s 25.86%  runtime.systemstack
+         0     0%   100%      0.58s 33.33%  runtime.mcall
+         0     0%   100%      0.05s  2.87%  runtime.runqget (inline)
+```
+
+`runtime.gogo` and `gosave_systemstack_switch` do not appear at all: in 1.74 s of samples, none landed in them. An earlier run of the same benchmark gave each 0.6% flat. `mcall` shows 0 flat and 33% cumulative, because what it calls is the scheduler. The cost is in *bookkeeping*: atomic status transitions (`casgstatus`), the channel lock (`lock2`/`unlock2`), timestamps (`nanotime`, used for the scheduler-latency metrics that `casgstatus` samples) and checking for idle Ps to wake. That is why even a "cheap" switch costs ~100 ns, not the ~5 ns that 15 moves would suggest.
+
+## 5. Small, growable stacks
+
+Cheap switching only helps if you can afford many goroutines, and that depends on stack size. Every Go function prologue (except `//go:nosplit` ones) compares SP with `g.stackguard0`. Here is `deep` from the listing below, disassembled:
+
+```bash
+go build -o stacks . && go tool objdump -s 'main.deep$' stacks | head -8
+```
+
+```text
+TEXT main.deep(SB) /workspace/go127lab/sw/stacks/main.go
+  main.go:19		0x49fe00		4c8d6424f0		LEAQ -0x10(SP), R12			
+  main.go:19		0x49fe05		4d3b6610		CMPQ R12, 0x10(R14)			
+  main.go:19		0x49fe09		0f86a1000000		JBE 0x49feb0				
+  main.go:19		0x49fe0f		55			PUSHQ BP				
+  main.go:19		0x49fe10		4889e5			MOVQ SP, BP				
+  main.go:19		0x49fe13		4881ec88000000		SUBQ $0x88, SP				
+  main.go:20		0x49fe1a		488d4c2408		LEAQ 0x8(SP), CX			
+```
+
+`0x10(R14)` is `g.stackguard0` (offset 16, after `stack.lo` and `stack.hi`). The slow path at the end of the function spills the register argument, calls `morestack` and retries:
+
+```text
+  main.go:19		0x49feb0		4889442408		MOVQ AX, 0x8(SP)			
+  main.go:19		0x49feb5		e8660cfeff		CALL runtime.morestack_noctxt.abi0(SB)	
+  main.go:19		0x49feba		488b442408		MOVQ 0x8(SP), AX			
+  main.go:19		0x49febf		90			NOPL					
+  main.go:19		0x49fec0		e93bffffff		JMP main.deep(SB)			
+```
+
+[`morestack`](https://github.com/golang/go/blob/go1.27.2/src/runtime/asm_amd64.s#L597) uses the same trick as `mcall`. It saves `f`'s PC/SP/BP/ctxt into `g.sched`, switches to `g0` and calls [`newstack`](https://github.com/golang/go/blob/go1.27.2/src/runtime/stack.go#L1055). That function allocates a stack of twice the size (`newsize := oldsize * 2`, [stack.go:1179](https://github.com/golang/go/blob/go1.27.2/src/runtime/stack.go#L1179)) and calls [`copystack`](https://github.com/golang/go/blob/go1.27.2/src/runtime/stack.go#L929). `copystack` copies the old stack and uses the compiler's stack maps to adjust every pointer into it. Stacks can move because the runtime knows exactly where every pointer to them is.
+
+The same prologue check is the **cooperative preemption** hook. To preempt a goroutine, the runtime sets `stackguard0 = stackPreempt`, so the next prologue "fails", and `newstack` reschedules instead of growing (comment at the top of [`preempt.go`](https://github.com/golang/go/blob/go1.27.2/src/runtime/preempt.go)).
+
+Measure both effects:
+
+```go
+// main.go
+package main
+
+import (
+	"fmt"
+	"runtime"
+	"runtime/metrics"
+	"sync"
+	"unsafe"
+)
+
+func stackBytes() uint64 {
+	s := []metrics.Sample{{Name: "/memory/classes/heap/stacks:bytes"}}
+	metrics.Read(s)
+	return s[0].Value.Uint64()
+}
+
+//go:noinline
+func deep(n int) int {
+	var pad [128]byte // make each frame big enough to force growth
+	if n == 0 {
+		return int(pad[0])
+	}
+	return deep(n-1) + int(pad[n%128])
+}
+
+func main() {
+	// 1. What does a parked goroutine cost?
+	const N = 100_000
+	runtime.GC()
+	before := stackBytes()
+	var wg sync.WaitGroup
+	block := make(chan struct{})
+	for range N {
+		wg.Add(1)
+		go func() { wg.Done(); <-block }()
+	}
+	wg.Wait()
+	fmt.Printf("stack memory per parked goroutine: %d bytes\n", (stackBytes()-before)/N)
+	close(block)
+
+	// 2. Stacks move when they grow.
+	done := make(chan struct{})
+	go func() {
+		var x int
+		p0 := uintptr(unsafe.Pointer(&x))
+		deep(10_000) // needs well over 1 MiB of stack
+		p1 := uintptr(unsafe.Pointer(&x))
+		fmt.Printf("&x before growth: %#x\n&x after growth:  %#x\nmoved: %v\n", p0, p1, p0 != p1)
+		close(done)
+	}()
+	<-done
+}
+```
+
+```bash
+go run .
+```
+
+```text
+stack memory per parked goroutine: 2049 bytes
+&x before growth: 0x3d45a4f1bf80
+&x after growth:  0x3d45b546ff80
+moved: true
+```
+
+The minimum stack is `stackMin = 2048` ([stack.go:78](https://github.com/golang/go/blob/go1.27.2/src/runtime/stack.go#L78)). `GODEBUG=adaptivestackstart=1`, the default since Go 1.19, lets the runtime start new goroutines with a larger stack if the GC sees that goroutines usually grow. That did not happen here, since the goroutines never grew. A million parked goroutines cost about 2 GB of stack on this measurement. A million OS threads would reserve 8 GiB of virtual stack at glibc's default and would also cost kernel structures for each thread. The addresses will differ on your machine, but `moved: true` will not.
+
+## 6. Measuring: goroutine vs OS-thread hand-off
+
+One program with four ways to bounce control between two parties:
+
+- **gosched**: two goroutines alternate with `runtime.Gosched` (the bare switch, through the global run queue)
+- **chan**: two goroutines, unbuffered channels (the realistic Go case)
+- **futex**: two goroutines locked to their own OS threads (`runtime.LockOSThread`) that sleep and wake each other with raw `futex(2)`, so every hand-off is a kernel thread switch
+- **pipe**: the same, using blocking `read(2)`/`write(2)` on pipes through `syscall.Read`, which goes through the runtime's syscall path
+
+```go
+// main.go
+//
+// Ping-pong between two execution contexts and report the cost of one
+// hand-off (half a round trip). Modes:
+//
+//	gosched  two goroutines taking turns with runtime.Gosched (bare switch)
+//	chan   two goroutines, unbuffered channels (runtime switch)
+//	futex  two locked OS threads, raw futex wait/wake (kernel switch)
+//	pipe   two locked OS threads, blocking read/write on pipes
+package main
+
+import (
+	"flag"
+	"fmt"
+	"os"
+	"runtime"
+	"sync/atomic"
+	"syscall"
+	"time"
+	"unsafe"
+)
+
+const (
+	futexWait = 0 | 128 // FUTEX_WAIT | FUTEX_PRIVATE_FLAG
+	futexWake = 1 | 128 // FUTEX_WAKE | FUTEX_PRIVATE_FLAG
+)
+
+func chanPingPong(n int) {
+	ping, pong := make(chan struct{}), make(chan struct{})
+	go func() {
+		for range n {
+			<-ping
+			pong <- struct{}{}
+		}
+	}()
+	for range n {
+		ping <- struct{}{}
+		<-pong
+	}
+}
+
+// With GOMAXPROCS=1, each Gosched hands the P to the other goroutine,
+// so one call is one goroutine switch.
+func goschedPingPong(n int) {
+	done := make(chan struct{})
+	go func() {
+		for range n {
+			runtime.Gosched()
+		}
+		close(done)
+	}()
+	for range n {
+		runtime.Gosched()
+	}
+	<-done
+}
+
+// turn is 0 when it is the main thread's turn and 1 for the partner.
+func futexPingPong(n int) {
+	var turn atomic.Uint32
+	addr := uintptr(unsafe.Pointer(&turn))
+	wait := func(v uint32) { // sleep in the kernel while turn == v
+		for turn.Load() == v {
+			syscall.RawSyscall6(syscall.SYS_FUTEX, addr, futexWait, uintptr(v), 0, 0, 0)
+		}
+	}
+	wake := func(v uint32) {
+		turn.Store(v)
+		syscall.RawSyscall6(syscall.SYS_FUTEX, addr, futexWake, 1, 0, 0, 0)
+	}
+	done := make(chan struct{})
+	go func() {
+		runtime.LockOSThread()
+		for range n {
+			wait(0)
+			wake(0)
+		}
+		close(done)
+	}()
+	runtime.LockOSThread()
+	for range n {
+		wake(1)
+		wait(1)
+	}
+	<-done
+}
+
+func pipePingPong(n int) {
+	var a, b [2]int
+	must(syscall.Pipe(a[:]))
+	must(syscall.Pipe(b[:]))
+	buf := []byte{0}
+	done := make(chan struct{})
+	go func() {
+		runtime.LockOSThread()
+		x := []byte{0}
+		for range n {
+			syscall.Read(a[0], x)
+			syscall.Write(b[1], x)
+		}
+		close(done)
+	}()
+	runtime.LockOSThread()
+	for range n {
+		syscall.Write(a[1], buf)
+		syscall.Read(b[0], buf)
+	}
+	<-done
+}
+
+func must(err error) {
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+}
+
+func rusage() (vol, invol int64) {
+	var ru syscall.Rusage
+	must(syscall.Getrusage(syscall.RUSAGE_SELF, &ru))
+	return ru.Nvcsw, ru.Nivcsw
+}
+
+func main() {
+	mode := flag.String("mode", "chan", "gosched | chan | futex | pipe")
+	n := flag.Int("n", 1_000_000, "round trips")
+	flag.Parse()
+
+	run := map[string]func(int){"gosched": goschedPingPong, "chan": chanPingPong, "futex": futexPingPong, "pipe": pipePingPong}[*mode]
+	if run == nil {
+		must(fmt.Errorf("unknown mode %q", *mode))
+	}
+	run(*n / 10) // warm up threads, stacks and caches
+
+	v0, i0 := rusage()
+	start := time.Now()
+	run(*n)
+	el := time.Since(start)
+	v1, i1 := rusage()
+
+	handoffs := 2 * *n
+	fmt.Printf("mode=%-7s GOMAXPROCS=%d round-trips=%d  %6.1f ns/hand-off  ctx-switches: voluntary=%d involuntary=%d (%.2f per hand-off)\n",
+		*mode, runtime.GOMAXPROCS(0), *n, float64(el.Nanoseconds())/float64(handoffs),
+		v1-v0, i1-i0, float64(v1-v0+i1-i0)/float64(handoffs))
+}
+```
+
+```go
+// bench_test.go
+package main
+
+import "testing"
+
+// One op is one round trip (two hand-offs). The futex and pipe modes are
+// left out: with -cpu 1 the raw futex wait holds the only P and deadlocks.
+func BenchmarkGosched(b *testing.B) { goschedPingPong(b.N) }
+func BenchmarkChan(b *testing.B)    { chanPingPong(b.N) }
+```
+
+```bash
+go build -o pingpong .
+go test -run '^$' -bench . -cpu 1 -count 1 .
+```
+
+```text
+goos: linux
+goarch: amd64
+pkg: example.com/pingpong
+cpu: Intel(R) Xeon(R) Processor
+BenchmarkGosched 	 6234708	       191.6 ns/op
+BenchmarkChan    	 3524346	       349.4 ns/op
+PASS
+ok  	example.com/pingpong	2.970s
+```
+
+Those are ns per round trip, so ~96 ns and ~175 ns per hand-off, which matches the standalone runs below.
+
+### Results
+
+Goroutines with one P:
+
+```bash
+for i in 1 2 3; do GOMAXPROCS=1 ./pingpong -mode=gosched; done
+for i in 1 2 3; do GOMAXPROCS=1 ./pingpong -mode=chan; done
+```
+
+```text
+mode=gosched GOMAXPROCS=1 round-trips=1000000    98.6 ns/hand-off  ctx-switches: voluntary=20 involuntary=0 (0.00 per hand-off)
+mode=gosched GOMAXPROCS=1 round-trips=1000000   100.6 ns/hand-off  ctx-switches: voluntary=20 involuntary=1 (0.00 per hand-off)
+mode=gosched GOMAXPROCS=1 round-trips=1000000    97.2 ns/hand-off  ctx-switches: voluntary=20 involuntary=21 (0.00 per hand-off)
+mode=chan    GOMAXPROCS=1 round-trips=1000000   169.9 ns/hand-off  ctx-switches: voluntary=33 involuntary=35 (0.00 per hand-off)
+mode=chan    GOMAXPROCS=1 round-trips=1000000   182.2 ns/hand-off  ctx-switches: voluntary=38 involuntary=0 (0.00 per hand-off)
+mode=chan    GOMAXPROCS=1 round-trips=1000000   173.2 ns/hand-off  ctx-switches: voluntary=35 involuntary=1 (0.00 per hand-off)
+```
+
+Goroutines with eight Ps, and the two thread modes, unpinned:
+
+```bash
+./pingpong -mode=chan; ./pingpong -mode=futex; ./pingpong -mode=pipe
+```
+
+```text
+mode=chan    GOMAXPROCS=8 round-trips=1000000   153.7 ns/hand-off  ctx-switches: voluntary=11456 involuntary=4 (0.01 per hand-off)
+mode=futex   GOMAXPROCS=8 round-trips=1000000  3523.8 ns/hand-off  ctx-switches: voluntary=1876522 involuntary=2 (0.94 per hand-off)
+mode=pipe    GOMAXPROCS=8 round-trips=1000000  4220.0 ns/hand-off  ctx-switches: voluntary=2037623 involuntary=187 (1.02 per hand-off)
+```
+
+Thread modes pinned to **one CPU**, so the two threads switch on the same core instead of waking an idle core:
+
+```bash
+for m in futex pipe; do for i in 1 2; do GOMAXPROCS=4 taskset -c 0 ./pingpong -mode=$m -n 300000; done; done
+```
+
+```text
+mode=futex   GOMAXPROCS=4 round-trips=300000   720.0 ns/hand-off  ctx-switches: voluntary=363027 involuntary=237125 (1.00 per hand-off)
+mode=futex   GOMAXPROCS=4 round-trips=300000   741.9 ns/hand-off  ctx-switches: voluntary=359136 involuntary=241029 (1.00 per hand-off)
+mode=pipe    GOMAXPROCS=4 round-trips=300000  1095.3 ns/hand-off  ctx-switches: voluntary=368955 involuntary=248004 (1.03 per hand-off)
+mode=pipe    GOMAXPROCS=4 round-trips=300000  1348.5 ns/hand-off  ctx-switches: voluntary=384192 involuntary=236232 (1.03 per hand-off)
+```
+
+| Hand-off | ns (this VM) | OS context switches per hand-off |
+|---|---|---|
+| `Gosched`, 1 P | ~98 | 0.00 |
+| unbuffered chan, 1 P | ~170–182 | 0.00 |
+| unbuffered chan, 8 Ps | ~154–163 | 0.01 |
+| futex, threads on one CPU | ~720–850 | 1.00 |
+| pipe, threads on one CPU | ~1100–1350 | 1.03 |
+| futex, threads on different CPUs | ~3500 | 0.94 |
+| pipe, threads on different CPUs | ~4200 | 1.02 |
+
+The `perf stat` and `schedtrace` runs below are separate runs, so their ns figures differ slightly from these.
+
+How to read this:
+
+- A goroutine hand-off costs **zero OS context switches**. The kernel never sees it. The goroutine is **4–7× cheaper than the best thread case** (same core, futex) and **~20× cheaper** than the cross-core case, which is the usual one when threads block and wake each other on a multi-core machine.
+- The thread figures include a little Go overhead (the `RawSyscall` wrapper and an atomic load), so they are a close approximation of a raw kernel thread switch, not an exact measurement. In the pinned runs about 40% of the switches are involuntary. With both threads on one CPU, the kernel most likely preempts the waker in favour of the thread it just woke, and the runtime's own threads share that CPU too.
+- The cross-core thread case is the slowest because waking a sleeping thread on another CPU means an inter-processor interrupt and, on a VM, a trip through the hypervisor to wake an idle vCPU. Bare metal is usually faster in absolute terms. The ratio is what carries over.
+- `pipe` costs more than `futex` because it adds real syscalls (`read`/`write`) and the runtime's `entersyscall`/`exitsyscall` bookkeeping.
+- Treat these as one machine's numbers. Run the program on your own hardware.
+
+### `perf stat`: user time vs kernel time
+
+```bash
+sudo perf stat -e context-switches,cpu-migrations,task-clock -- env GOMAXPROCS=1 ./pingpong -mode=chan
+sudo perf stat -e context-switches,cpu-migrations,task-clock -- env GOMAXPROCS=4 taskset -c 0 ./pingpong -mode=futex -n 300000
+```
+
+```text
+mode=chan    GOMAXPROCS=1 round-trips=1000000   169.7 ns/hand-off  ctx-switches: voluntary=34 involuntary=2 (0.00 per hand-off)
+ Performance counter stats for 'env GOMAXPROCS=1 ./pingpong -mode=chan':
+               102      context-switches                 #  271.278 /sec                      
+                 0      cpu-migrations                   #    0.000 /sec                      
+            376.00 msec task-clock                       #    0.998 CPUs utilized             
+       0.376823484 seconds time elapsed
+       0.377871000 seconds user
+       0.000000000 seconds sys
+mode=futex   GOMAXPROCS=4 round-trips=300000   850.9 ns/hand-off  ctx-switches: voluntary=348742 involuntary=251452 (1.00 per hand-off)
+ Performance counter stats for 'env GOMAXPROCS=4 taskset -c 0 ./pingpong -mode=futex -n 300000':
+            660299      context-switches                 #    1.186 M/sec                     
+                 1      cpu-migrations                   #    1.796 /sec                      
+            556.73 msec task-clock                       #    0.997 CPUs utilized             
+       0.558349824 seconds time elapsed
+       0.126343000 seconds user
+       0.431310000 seconds sys
+```
+
+(Blank lines were removed from `perf`'s output.) Two million goroutine switches took **0.000 s of system time** and 102 context switches in total, all of them unrelated runtime housekeeping. The thread version spent **77% of its CPU time in the kernel** (0.431 s of 0.558 s), with one kernel context switch per hand-off. That gap in system time is the kernel transition the goroutine never makes. The `perf` here is Debian's `linux-perf` 6.12. On this box `perf_event_paranoid=2` hides kernel software events from unprivileged users, hence `sudo`.
+
+### `schedtrace`: the scheduler's view
+
+```bash
+GODEBUG=schedtrace=250 ./pingpong -mode=chan -n 3000000
+```
+
+```text
+SCHED 0ms: gomaxprocs=8 idleprocs=5 threads=4 spinningthreads=1 needspinning=0 idlethreads=0 runqueue=0 [ 1 0 0 0 0 0 0 0 ] schedticks=[ 0 0 0 0 0 0 0 0 ]
+SCHED 256ms: gomaxprocs=8 idleprocs=6 threads=5 spinningthreads=1 needspinning=0 idlethreads=2 runqueue=0 [ 0 0 0 0 0 0 0 0 ] schedticks=[ 152 0 0 0 0 183 340 340 ]
+SCHED 568ms: gomaxprocs=8 idleprocs=6 threads=5 spinningthreads=1 needspinning=0 idlethreads=2 runqueue=0 [ 0 0 0 0 0 0 0 0 ] schedticks=[ 152 0 0 0 0 484 657 640 ]
+SCHED 821ms: gomaxprocs=8 idleprocs=5 threads=5 spinningthreads=2 needspinning=0 idlethreads=1 runqueue=0 [ 0 0 0 0 0 0 0 0 ] schedticks=[ 152 0 0 0 0 805 983 968 ]
+SCHED 1073ms: gomaxprocs=8 idleprocs=6 threads=5 spinningthreads=1 needspinning=0 idlethreads=2 runqueue=0 [ 0 0 0 0 0 0 0 0 ] schedticks=[ 443 0 0 0 0 1151 999 1293 ]
+mode=chan    GOMAXPROCS=8 round-trips=3000000   163.3 ns/hand-off  ctx-switches: voluntary=33613 involuntary=3 (0.00 per hand-off)
+```
+
+Six million hand-offs ran on **five OS threads**, while `schedticks` reached at most about 1,300 per P in a little over a second. That is `runnext` with `inheritTime` at work: the pair keeps passing one time slice back and forth, and `execute` does not count those hand-offs as new scheduling rounds. `spinningthreads=1–2` is the price of eight Ps. When a goroutine is readied, `wakep` may wake an idle P that then spins looking for work. Those wakeups most likely account for the ~11,000–12,000 voluntary OS switches per million round trips in the 8-P runs. 
+
+## 7. When a goroutine switch is not cheap
+
+### Blocking system calls: `entersyscall`, `handoffp` and new threads
+
+A goroutine making a blocking syscall cannot be "switched out" in user space, because its OS thread is stuck in the kernel. The runtime detaches the P instead. [`entersyscall`](https://github.com/golang/go/blob/go1.27.2/src/runtime/proc.go#L4776) marks the P as in-syscall. If the call takes longer than one `sysmon` tick (at least 20 µs), [`retake`](https://github.com/golang/go/blob/go1.27.2/src/runtime/proc.go#L6681) takes the P and [`handoffp`](https://github.com/golang/go/blob/go1.27.2/src/runtime/proc.go#L3146) hands it to another M, starting a new thread if none is idle, whenever there is other work for that P. Goroutines that block in syscalls therefore cost threads, while goroutines parked in the runtime do not:
+
+```go
+// main.go
+package main
+
+import (
+	"bufio"
+	"fmt"
+	"os"
+	"strings"
+	"syscall"
+	"time"
+)
+
+func threads() string {
+	f, _ := os.Open("/proc/self/status")
+	defer f.Close()
+	sc := bufio.NewScanner(f)
+	for sc.Scan() {
+		if v, ok := strings.CutPrefix(sc.Text(), "Threads:"); ok {
+			return strings.TrimSpace(v)
+		}
+	}
+	return "?"
+}
+
+func main() {
+	const N = 50
+	fmt.Println("start:                         threads =", threads())
+
+	block := make(chan struct{})
+	for range N {
+		go func() { <-block }() // parks in the runtime: gopark
+	}
+	time.Sleep(100 * time.Millisecond)
+	fmt.Printf("%d goroutines parked on a chan: threads = %s\n", N, threads())
+
+	var p [2]int
+	if err := syscall.Pipe(p[:]); err != nil {
+		panic(err)
+	}
+	for range N {
+		go func() {
+			var b [1]byte
+			syscall.Read(p[0], b[:]) // blocks this OS thread in the kernel
+		}()
+	}
+	time.Sleep(100 * time.Millisecond)
+	fmt.Printf("%d goroutines blocked in read(2): threads = %s\n", N, threads())
+}
+```
+
+```bash
+go run .
+GOMAXPROCS=2 go run .
+```
+
+```text
+start:                         threads = 5
+50 goroutines parked on a chan: threads = 7
+50 goroutines blocked in read(2): threads = 53
+start:                         threads = 4
+50 goroutines parked on a chan: threads = 4
+50 goroutines blocked in read(2): threads = 53
+```
+
+Changing the read to an `*os.File` from `os.Pipe` keeps the thread count at 4 in the same experiment (`50 goroutines blocked in (*os.File).Read: threads = 4`, GOMAXPROCS=2). `os` registers pipes and sockets with the **netpoller**, so the goroutine parks with `gopark` and only one thread waits in `epoll`. Raw `syscall.Read`, cgo calls and file I/O on regular files have no such path. Each one in flight holds an OS thread, and waking it costs a thread switch plus `exitsyscall` reacquiring a P.
+
+### Hand-offs to idle Ps
+
+When `goready` makes a goroutine runnable and there is an idle P, `wakep` may wake a parked M with a futex: a real OS wakeup. This is the 0.01 OS switches per hand-off in the 8-P runs above. It is amortized, but in fan-out patterns that repeatedly wake idle workers, these wakeups can dominate.
+
+### `LockOSThread` and the futex trap
+
+A goroutine locked to a thread (`g.lockedm`) can only run on that M. Handing control to or from it means a real thread switch, as the futex and pipe numbers show. Mixing locked threads with **`syscall.RawSyscall`** is worse. A raw syscall skips `entersyscall`, so the runtime thinks the goroutine is still running and never releases its P. The futex benchmark above **deadlocks** under `taskset -c 0` without an explicit `GOMAXPROCS`. Go sets `GOMAXPROCS` from the CPU affinity mask, which gives 1 there, so the partner goroutine never gets a P to run on. The listings use `GOMAXPROCS=4` for that reason, and you should keep `RawSyscall` for calls that cannot block.
+
+### Asynchronous preemption (Go 1.14+)
+
+Cooperative safe-points are function prologues and blocking runtime calls. A loop without calls has none:
+
+```go
+// main.go
+package main
+
+import (
+	"fmt"
+	"runtime"
+	"time"
+)
+
+//go:noinline
+func spin(n *uint64) {
+	for { // no calls, no allocation: no cooperative preemption point
+		*n++
+	}
+}
+
+func main() {
+	runtime.GOMAXPROCS(1)
+	var n uint64
+	go spin(&n)
+
+	start := time.Now()
+	time.Sleep(10 * time.Millisecond) // main must get the only P back
+	fmt.Printf("main resumed after %v (asked for 10ms)\n", time.Since(start).Round(time.Millisecond))
+}
+```
+
+```bash
+go build -o preempt . && ./preempt && ./preempt
+GODEBUG=asyncpreemptoff=1 timeout 5 ./preempt; echo "exit=$?"
+```
+
+```text
+main resumed after 20ms (asked for 10ms)
+main resumed after 14ms (asked for 10ms)
+exit=124
+```
+
+With asynchronous preemption, `sysmon` notices that the spinning goroutine has run for more than `forcePreemptNS = 10ms` ([proc.go:6679](https://github.com/golang/go/blob/go1.27.2/src/runtime/proc.go#L6679)) and calls `preemptone`, which sends **`SIGURG`** to its thread (`sigPreempt = _SIGURG`, [signal_unix.go:74](https://github.com/golang/go/blob/go1.27.2/src/runtime/signal_unix.go#L74)). Without it (`asyncpreemptoff=1`) the program never prints and `timeout` kills it, giving exit 124. Here is the signal under `strace`:
+
+```bash
+strace -f -e trace=tgkill -e signal=SIGURG ./preempt 2>&1 | grep -E 'tgkill|SIGURG|main resumed'
+```
+
+```text
+[pid 513631] tgkill(513630, 513630, SIGURG <unfinished ...>
+[pid 513630] --- SIGURG {si_signo=SIGURG, si_code=SI_TKILL, si_pid=513630, si_uid=1000} ---
+[pid 513631] <... tgkill resumed>)      = 0
+main resumed after 10ms (asked for 10ms)
+```
+
+Thread 513631 (`sysmon`) signals 513630, the thread running `spin`. The signal handler checks that the interrupted PC is an *async safe-point* ([`isAsyncSafePoint`](https://github.com/golang/go/blob/go1.27.2/src/runtime/preempt.go#L390)). If it is, the handler rewrites the signal context so the thread "calls" [`asyncPreempt`](https://github.com/golang/go/blob/go1.27.2/src/runtime/preempt_amd64.s). That function is the opposite of `mcall`: because it interrupts arbitrary code, it **saves every register**, 14 general-purpose registers plus flags, then the vector register state into `p.xRegs`. The generated file has 179 lines of register `MOV`s across its save and restore halves. Then it enters the scheduler. The GC scans that innermost frame **conservatively**, since there is no register map for an arbitrary PC. The comment block in `preempt.go` describes this design.
+
+So preemption is the expensive kind of goroutine switch: a signal (a kernel round trip), a full register save, and a conservative scan. It happens at most about every 10 ms per goroutine that hogs a P, so its amortized cost is negligible. Deadlock-free fairness is its purpose, not speed.
+
+## 8. Putting it together
+
+| | Goroutine switch (cooperative) | Goroutine switch (async preempt) | OS thread switch |
+|---|---|---|---|
+| Trigger | blocking runtime call, `Gosched`, prologue check | `SIGURG` from `sysmon` after 10 ms | blocking syscall, futex, timer interrupt |
+| State saved | SP, PC, BP, ctxt, g (5 words) | all GPRs + flags + vector state | full user register file + FPU/vector state (kernel) |
+| Kernel entry | none | one signal delivery | trap + kernel scheduler |
+| Who decides next | Go scheduler on `g0` (`runnext`, local runq, global, steal, netpoll) | same | kernel scheduler |
+| Typical cost (this VM) | ~100–185 ns | rare; not on the hot path | ~0.7 µs same-core, ~3–4 µs cross-core |
+| Stack | 2 KiB+, growable, movable | same | fixed reservation (8 MiB default) |
+
+## The trap
+
+- **"Goroutines are free, so block in syscalls freely."** Each goroutine blocked in a raw syscall or cgo call holds an OS thread. Use `os`/`net` types, which use the netpoller, or bound the concurrency.
+- **Benchmarking switches with `GOMAXPROCS>1` and calling it "switch cost".** Part of what you measure is idle-P wakeups and parallelism. Measure with `GOMAXPROCS=1` and with your production setting.
+- **`RawSyscall` plus `LockOSThread`.** The P is never released. Under `taskset` or a cgroup CPU limit of 1 it can deadlock.
+- **Hot ping-pong pairs starving others.** `runnext` with `inheritTime` lets a pair share one time slice. Fairness relies on `sysmon`'s 10 ms preemption, so expect tail-latency spikes of that size for other goroutines on the P.
+- **Explaining the speed by register count.** In the profile, the switch itself is ~1%. Bookkeeping is the rest.
+
+## The boring rule
+
+Goroutine switches are cheap when goroutines block on Go things (channels, mutexes, timers, network and pipe I/O through `os`/`net`). Anything that blocks in the kernel directly is a thread switch with a goroutine wrapped around it.
+
+## Try this
+
+1. Run `pingpong` with `GOMAXPROCS=2` and pin it with `taskset -c 0,1`. Does the channel hand-off get slower or faster than with 1 P?
+2. Replace the unbuffered channels with `sync.Mutex` + `sync.Cond` and compare ns per hand-off.
+3. Add a call to an empty `//go:noinline func tick() {}` inside the spin loop and rerun with `GODEBUG=asyncpreemptoff=1`. On Go 1.27.2 it still hangs. Disassemble `tick` with `go tool objdump -s main.tick` to see why: a leaf function with no frame has no prologue check. Then make `tick` call a second `//go:noinline` function and try again. Now `tick` has a `CMPQ SP, 0x10(R14)` prologue, and the program resumes.
+4. Count threads while 50 goroutines sleep in `time.Sleep` versus `syscall.Nanosleep`.
+
+## Sources
+
+Runtime source, pinned at the `go1.27.2` tag:
+
+- `gobuf`, `g`, `m`, `p`: <https://github.com/golang/go/blob/go1.27.2/src/runtime/runtime2.go#L303>
+- `gogo`, `mcall`, `systemstack`, `morestack`: <https://github.com/golang/go/blob/go1.27.2/src/runtime/asm_amd64.s#L402>
+- `asyncPreempt` (generated by `mkpreempt.go`): <https://github.com/golang/go/blob/go1.27.2/src/runtime/preempt_amd64.s>
+- `gopark`, `goready`, `ready`, `execute`, `schedule`, `park_m`, `entersyscall`, `handoffp`, `sysmon`, `retake`, `runqput`: <https://github.com/golang/go/blob/go1.27.2/src/runtime/proc.go>
+- preemption design comment, `isAsyncSafePoint`: <https://github.com/golang/go/blob/go1.27.2/src/runtime/preempt.go>
+- `newstack`, `copystack`, `stackMin`: <https://github.com/golang/go/blob/go1.27.2/src/runtime/stack.go>
+- `sigPreempt`: <https://github.com/golang/go/blob/go1.27.2/src/runtime/signal_unix.go#L74>
+
+Design documents:
+
+- Go internal ABI specification: <https://github.com/golang/go/blob/go1.27.2/src/cmd/compile/abi-internal.md>
+- Proposal: Non-cooperative goroutine preemption (#24543): <https://github.com/golang/proposal/blob/master/design/24543-non-cooperative-preemption.md>
+- Scalable Go Scheduler Design Doc (Vyukov, 2012): <https://golang.org/s/go11sched>
+- Contiguous stacks (Go 1.3): <https://docs.google.com/document/d/1wAaf1rYoM4S4gtnPh0zOlGzWtrZFQ5suE8qr2sD8uWQ/pub>
+
+Tools: `perf stat` (linux-perf 6.12), `strace`, `GODEBUG=schedtrace`, `go tool pprof`, `go tool objdump`.
