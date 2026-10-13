@@ -1,0 +1,221 @@
+---
+title: "systemd in Stage 1: the 26.05 Initrd Default"
+author:
+  - name: "K19G"
+  - name: "grok-bot"
+---
+
+# systemd in Stage 1: the 26.05 Initrd Default
+
+**Goal:** Know what changed when NixOS 26.05 made the **systemd-based initrd** the default for stage 1. Move old `boot.initrd.*Commands` shell hooks into real initrd units, and catch the two migration traps that evaluation *cannot* catch for you (`/dev/root` and LUKS device timeouts). The scripted stage 1 still exists behind `boot.initrd.systemd.enable = false`, but it is deprecated and **scheduled for removal in 26.11**. Treat this chapter as an upgrade item for this release cycle, not a someday item.
+
+Version note: everything below was evaluated against **nixos-26.05** (`26.05.20261010.6fcc160`) with **Nix 2.35.3**. All evaluation output is pasted from those runs. The initrd's systemd is **260.5** on this channel.
+
+## Mental model
+
+Stage 1 is the small root filesystem the kernel unpacks from the initrd. It has one job: find the real root, mount it at `/sysroot`, and hand over to stage 2 (the system you log into). NixOS has had two implementations of that job:
+
+```text
+scripted stage 1 (≤ 25.11 default)          systemd stage 1 (26.05 default)
+───────────────────────────────────         ─────────────────────────────────────────
+/init = one generated bash script           /init = systemd, PID 1 in the initrd
+  preLVMCommands                              units ordered by bootup(7):
+  preDeviceCommands                             systemd-udevd → cryptsetup → *.device
+  postDeviceCommands      ◀── your hooks        → sysroot.mount → initrd-fs.target
+  postMountCommands           are spliced       → initrd-nixos-activation
+  (switch_root by hand)       into the script   → initrd-switch-root
+                                              your code = boot.initrd.systemd.services.*
+```
+
+The scripted initrd ran your strings *in sequence* inside one script. The systemd initrd has no sequence. It has a **dependency graph**, and your code becomes a unit with `Before=` / `After=` edges inside that graph. Most migration work is choosing the right edge.
+
+## Worked examples
+
+The lab is one flake with several host variants. None of them is booted. Every case is proved at evaluation time, which is where NixOS reports most of its stage-1 decisions.
+
+```nix
+# flake.nix — minimal host to inspect the stage-1 initrd that nixos-26.05 builds
+{
+  inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-26.05";
+  outputs = { nixpkgs, ... }: {
+    nixosConfigurations.box = nixpkgs.lib.nixosSystem {
+      modules = [ ./host.nix ];
+    };
+    nixosConfigurations.trap = nixpkgs.lib.nixosSystem { modules = [ ./host.nix ./trap-scripted.nix ]; };
+    nixosConfigurations.fixed = nixpkgs.lib.nixosSystem { modules = [ ./host.nix ./initrd-service.nix ]; };
+    nixosConfigurations.devroot = nixpkgs.lib.nixosSystem { modules = [ ./host.nix ./trap-devroot.nix ]; };
+    nixosConfigurations.scripted = nixpkgs.lib.nixosSystem { modules = [ ./host.nix ./opt-out.nix ]; };
+  };
+}
+```
+
+```nix
+# host.nix — the smallest bootable-looking host; nothing about initrd is set here
+{ ... }: {
+  nixpkgs.hostPlatform = "x86_64-linux";
+  boot.loader.systemd-boot.enable = true;
+  fileSystems."/" = { device = "/dev/disk/by-label/nixos"; fsType = "ext4"; };
+  system.stateVersion = "26.05";
+}
+```
+
+### Case 1: Confirm what you are running
+
+Do not assume the default from memory. Ask the configuration:
+
+```console
+$ nix eval .#nixosConfigurations.box.config.system.nixos.label
+"26.05.20261010.6fcc160"
+$ nix eval .#nixosConfigurations.box.config.boot.initrd.systemd.enable
+true
+$ nix eval .#nixosConfigurations.box.config.boot.initrd.systemd.services --apply builtins.attrNames
+[ "dbus" "initrd-find-nixos-closure" "initrd-nixos-activation" "initrd-parse-etc" "initrd-switch-root" "modprobe@" "panic-on-fail" "systemd-tmpfiles-setup" "systemd-tmpfiles-setup-sysroot" ]
+```
+
+The `initrd-*` services are the NixOS-specific part. They locate the system closure on the new root, run activation against `/sysroot`, and switch root. Everything else in the boot is upstream systemd behaviour, as documented in `bootup(7)`, and that is the point of the change. Mounting, LUKS prompts, udev and timeouts now follow the same rules as on any systemd distribution.
+
+### Case 2: An old hook fails evaluation (the good failure)
+
+A config written for the scripted initrd often carries a hook like this:
+
+```nix
+# trap-scripted.nix — a scripted-stage-1 hook carried over from an older config
+{ ... }: {
+  boot.initrd.postDeviceCommands = ''
+    echo "waiting for slow disk"; sleep 2
+  '';
+}
+```
+
+On 26.05 it does not silently vanish. It stops the build:
+
+```console
+$ nix eval .#nixosConfigurations.trap.config.system.build.toplevel.drvPath
+error:
+Failed assertions:
+- systemd stage 1 does not support `boot.initrd.postDeviceCommands`. Instead, create systemd services using the `boot.initrd.systemd.services` options, which has an API matching the stage 2 `systemd.services` options. Refer to `bootup(7)`, specifically the sections on "Bootup in the Initrd" and "System Manager Bootup", for information about when various units happen, and order services accordingly.
+
+    Definitions:
+    - /nix/store/…-source/trap-scripted.nix
+```
+
+The same assertion covers `preFailCommands`, `preDeviceCommands`, `preLVMCommands`, `postDeviceCommands` and `postMountCommands`. Grep for all of them before you upgrade:
+
+```console
+$ grep -rnE 'boot\.initrd\.(preFail|preDevice|preLVM|postDevice|postMount)Commands' /etc/nixos
+```
+
+### Case 3: Rewrite the hook as an initrd unit
+
+The replacement uses the stage-2 `systemd.services` API under `boot.initrd.systemd.services`. The work is choosing edges. "After devices, before root is mounted" becomes `Before=sysroot.mount`:
+
+```nix
+# initrd-service.nix — the same hook as a real unit inside the systemd initrd
+{ pkgs, ... }: {
+  boot.initrd.systemd.services.slow-disk-settle = {
+    description = "Give the slow disk two seconds before root is mounted";
+    wantedBy = [ "initrd.target" ];
+    before = [ "sysroot.mount" ];
+    after = [ "systemd-udev-settle.service" ];
+    unitConfig.DefaultDependencies = false;
+    serviceConfig.Type = "oneshot";
+    script = ''
+      echo "waiting for slow disk"; sleep 2
+    '';
+  };
+}
+```
+
+Read back the unit NixOS will put into the initrd:
+
+```console
+$ nix eval --raw '.#nixosConfigurations.fixed.config.boot.initrd.systemd.units."slow-disk-settle.service".text'
+[Unit]
+After=systemd-udev-settle.service
+Before=sysroot.mount
+DefaultDependencies=false
+Description=Give the slow disk two seconds before root is mounted
+
+[Service]
+Environment="LOCALE_ARCHIVE=/nix/store/dc427sjs…-glibc-locales-2.42-100/lib/locale/locale-archive"
+Environment="TZDIR=/nix/store/mkbbamyc…-tzdata-2026c/share/zoneinfo"
+ExecStart=/nix/store/yb7a6i88…-unit-script-slow-disk-settle-start/bin/slow-disk-settle-start
+Type=oneshot
+
+[Install]
+WantedBy=initrd.target
+```
+
+Two facts make this safe. First, the generated script is copied into the initrd automatically. Second, `sleep` resolves, because coreutils is in the initrd's default `PATH`:
+
+```console
+$ nix eval .#nixosConfigurations.fixed.config.boot.initrd.systemd.storePaths \
+    --apply 'ps: builtins.filter (p: builtins.match ".*slow-disk.*" (toString (p.source or p)) != null) ps'
+[ { dlopen = { features = [ ]; usePriority = "recommended"; }; enable = true; source = "/nix/store/yb7a6i88…-unit-script-slow-disk-settle-start/bin/slow-disk-settle-start"; target = null; } ]
+$ nix eval .#nixosConfigurations.fixed.config.boot.initrd.systemd.initrdBin --apply 'map (p: p.name)'
+[ "lvm2-2.03.39" "e2fsprogs-1.47.4" "coreutils-9.11" "systemd-260.5" "kmod-31" "bash-interactive-5.3p9" ]
+```
+
+Any *other* binary your hook calls must be listed in `boot.initrd.systemd.initrdBin` (on `PATH`) or `boot.initrd.systemd.storePaths` (copied only). The initrd is not your system closure.
+
+`DefaultDependencies=false` matters. Without it, systemd adds `After=sysinit.target basic.target` and the implicit shutdown conflicts. In the initrd those can create an ordering cycle with mounts that `basic.target` waits for. Early-boot units almost always want it off.
+
+### Case 4: The trap evaluation will not catch: `/dev/root`
+
+The scripted initrd created a `/dev/root` symlink from `root=` on the kernel command line. The systemd initrd does not. A config that names it still evaluates cleanly:
+
+```nix
+# trap-devroot.nix — a root filesystem named by the scripted-initrd symlink
+{ lib, ... }: { fileSystems."/".device = lib.mkForce "/dev/root"; }
+```
+
+```console
+$ nix eval .#nixosConfigurations.devroot.config.system.build.toplevel.drvPath
+"/nix/store/nc5n9p8y…-nixos-system-nixos-26.05.20261010.6fcc160.drv"
+```
+
+No warning and no assertion, and on the next boot `sysroot.mount` waits for a device that never appears. Name the root with `/dev/disk/by-label/…`, `/dev/disk/by-uuid/…` or `/dev/mapper/…`, then check:
+
+```console
+$ nix eval --json .#nixosConfigurations.box.config.fileSystems --apply 'fs: builtins.mapAttrs (_: v: v.device) fs'
+{"/":"/dev/disk/by-label/nixos"}
+```
+
+The LUKS case is in the same family. The release notes say `fileSystems."/".device` should be `/dev/mapper/<name>`, matching `boot.initrd.luks.devices.<name>`. Otherwise systemd's default device timeout can expire while you are still typing the passphrase. For LVM on LUKS, add `"x-systemd.device-timeout=infinity"` to the root's `options`. If you are already locked out, `systemd.default_device_timeout_sec=infinity` on the kernel command line gets you in.
+
+### Case 5: The escape hatch, and its warning
+
+```nix
+# opt-out.nix — reverting to the scripted stage 1 (deprecated on 26.05)
+{ ... }: { boot.initrd.systemd.enable = false; }
+```
+
+```console
+$ nix eval .#nixosConfigurations.scripted.config.system.build.toplevel.drvPath
+evaluation warning: Scripted initrd is deprecated and scheduled for removal in 26.11. See the NixOS 26.05 release notes.
+"/nix/store/cr5jdspc…-nixos-system-nixos-26.05.20261010.6fcc160.drv"
+```
+
+Use it to get a machine booting tonight. Do not use it as a destination. If you keep it, give the line a dated comment and open an issue to remove it before you move to 26.11.
+
+## The trap
+
+The dangerous migrations are the ones that **evaluate fine**. Hooks fail loudly (Case 2), and that is the easy part. `/dev/root`, a LUKS root named by UUID instead of `/dev/mapper/<name>`, and remote unlock scripts that call `cryptsetup-askpass` all build successfully and fail at the console. (`cryptsetup-askpass` no longer exists. Use `systemctl default`, and `ssh -o RequestTTY=force` if you pipe the passphrase over SSH.) Your rollback is the previous generation in the boot menu, so keep it until the new initrd has booted at least once *on that hardware*.
+
+## The boring rule
+
+Before switching a host to 26.05: grep for `*Commands` hooks and port them to `boot.initrd.systemd.services` with explicit `Before=`/`After=` and `DefaultDependencies=false`. Name every root and LUKS device by a stable path. Boot once with the old generation still in the menu. Do not ship `boot.initrd.systemd.enable = false` without a removal date.
+
+## Try this
+
+1. Change Case 3 to `before = [ "initrd-root-device.target" ]` and read the unit again. Which `bootup(7)` milestone does that correspond to, and does it still run before `sysroot.mount`?
+2. Add `pkgs.util-linux` to `boot.initrd.systemd.initrdBin`, call `blkid` from the hook, and confirm the binary appears in the initrd's `PATH`.
+3. Build `config.system.build.initialRamdisk` for `box` and `scripted` and compare their sizes with `du -h`.
+4. In a NixOS VM test (`nixosTest`), boot `fixed` and grep `journalctl -b -u slow-disk-settle` from the test script.
+
+## Sources
+
+- NixOS 26.05 release notes, "Stage 1 (a.k.a. initrd) is now based on systemd by default": `nixos/doc/manual/release-notes/rl-2605.section.md` in nixpkgs `nixos-26.05`, <https://nixos.org/manual/nixos/stable/release-notes>
+- nixpkgs `nixos/modules/system/boot/systemd/initrd.nix` (default and assertions), branch `nixos-26.05`
+- `bootup(7)`, "Bootup in the Initrd": <https://www.freedesktop.org/software/systemd/man/latest/bootup.html>
+- `systemd.unit(5)`, `DefaultDependencies=`: <https://www.freedesktop.org/software/systemd/man/latest/systemd.unit.html>
