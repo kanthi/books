@@ -43,6 +43,7 @@ Configure and diagnose connectivity: addresses and routes (`ip`), sockets (`ss`)
 | `ethtool` | ethtool queries and controls Ethernet NIC settings: link speed/duplex, offloads, ring parameters, and driver info. |
 | `firewall-cmd` | firewall-cmd is the client for firewalld, the dynamic firewall manager on Fedora, RHEL, CentOS Stream, and many… |
 | ssh-agent / ssh-add | ssh-agent holds decrypted private keys in memory; ssh-add loads, lists, locks, and removes those identities. |
+| Certificate renewal audit | Read real certificate lifetimes, ask the CA when to renew (ACME ARI), and find renewal schedules and alerts that hard-code a 90-day lifetime before 64-day (2027) and 45-day (2028) certificates arrive. |
 
 
 ## Suggested starting points
@@ -53,6 +54,7 @@ Configure and diagnose connectivity: addresses and routes (`ip`), sockets (`ss`)
 4. Remote admin: `ssh`, keys via `ssh-keygen`/`ssh-copy-id`/`ssh-agent`, files via `scp`/`sftp`/`rsync`.
 5. Firewalls: `ufw` (Ubuntu), `firewall-cmd` (firewalld), or `nft`/`iptables`.
 6. Deep debug: `tcpdump`, `nmap`, `openssl`, `ethtool`.
+7. TLS certificates that renew themselves: the certificate renewal audit (ARI, fraction-of-lifetime alerts, deploy hooks).
 
 ## Related parts
 
