@@ -1,0 +1,349 @@
+---
+title: "Jagged Flash Attention on Blackwell with TLX"
+author:
+  - name: "K19G"
+  - name: "grok-bot"
+---
+
+# Jagged Flash Attention on Blackwell with TLX
+
+Meta's ads models (GEM, Kunlun) run attention over **jagged** user sequences: lengths that differ by orders of magnitude inside one batch. Padding them to a common `L_max` can waste half the FLOPs. The training stack instead **packs** tokens contiguously and stores an `offsets` tensor that marks each sequence's boundaries. **Jagged Flash Attention (JFA)** is FlashAttention applied directly to that packed layout—never materializing padded tokens.
+
+On Blackwell (B200), hitting peak throughput has meant hand-written CuTe-DSL or CUDA. In October 2026 the PyTorch/Meta team showed that **TLX** (Triton Low-level Extensions) closes much of that gap for JFA: about 3.2K lines of Triton-level code (roughly 3× less than FA4's ~10K-line CuTe-DSL kernels), ~13% faster than FA4 (May 2026) on the forward jagged shapes that matter for ads, and ~50% faster on the backward—while staying readable enough for modeling engineers to fork into MXFP8 and block-sparse variants.
+
+This chapter builds the mental model and the host-side pieces you can verify without a GPU: packing waste, a CPU online-softmax JFA that matches padded attention, zigzag tile balancing for skewed KV lengths, and the broadcast-Q backward bottleneck. TLX primitives (warp specialization, explicit SMEM/TMEM, CLC) are explained from the primary posts; we do **not** invent B200 timings. Versions: **Python 3.13.5**, **PyTorch 2.14.1**, **Triton 3.8.0**, **ptxas** from CUDA 12.9 wheels. No GPU on this box—`TRITON_INTERPRET=1` for tiny kernels; JFA reference is pure PyTorch CPU.
+
+---
+
+## 1. Mental model: packed sequences, not padded batches
+
+```text
+ padded (waste)                         jagged / packed
+ ┌───────────────┐                      offsets: 0  7  10  29  34  45
+ │ seq0 #####....│                      tokens:  [seq0|seq1|seq2|seq3|seq4]
+ │ seq1 ##.......│                               contiguous in HBM
+ │ seq2 #########│                      JFA: FlashAttention over each
+ │ ...           │                      offsets[b]:offsets[b+1] span only
+ └───────────────┘
+```
+
+| Idea | Plain Triton attention | TLX JFA on Blackwell |
+|------|------------------------|----------------------|
+| Layout | Usually padded `(B, L, H, D)` | Packed Q/K/V + `offsets` |
+| Scheduling | Compiler-owned | Warp-specialized async tasks + explicit barriers |
+| On-chip memory | Heuristic SMEM | Hand-allocated SMEM/TMEM, pipeline depth chosen |
+| Load imbalance | Hope the grid is uniform | Host zigzag (forward) + CLC (dynamic) |
+| Code size vs FA4 | — | ~3.2K vs ~10K lines (Meta's report) |
+
+**Broadcast-Q** (Hierarchical Seed Pooling in GEM): one dense Q is shared across every sequence's jagged K/V. Forward is asymmetric (dense Q × jagged KV). Backward must **reduce-add** `dQ` across the whole batch—the contended epilogue that several TLX optimizations target.
+
+---
+
+## 2. Packing waste and a CPU JFA reference
+
+Save as `jagged_attn_ref.py`. It packs variable-length sequences, runs a blockwise online-softmax FlashAttention on the packed tensors, and checks against naïve padded attention.
+
+```python
+# jagged_attn_ref.py — jagged (packed) FlashAttention reference on CPU
+import math
+import torch
+
+torch.manual_seed(0)
+
+
+def pack_sequences(seqs):
+    offsets = [0]
+    parts = []
+    for s in seqs:
+        parts.append(s)
+        offsets.append(offsets[-1] + s.shape[0])
+    return torch.cat(parts, dim=0), torch.tensor(offsets, dtype=torch.int32)
+
+
+def attention_padded(q, k, v, lengths, causal=False):
+    B, Lmax, D = q.shape
+    scale = 1.0 / math.sqrt(D)
+    out = torch.zeros_like(q)
+    for b in range(B):
+        L = lengths[b]
+        qb, kb, vb = q[b, :L], k[b, :L], v[b, :L]
+        scores = (qb @ kb.T) * scale
+        if causal:
+            mask = torch.triu(torch.ones(L, L, dtype=torch.bool), diagonal=1)
+            scores = scores.masked_fill(mask, float("-inf"))
+        out[b, :L] = torch.softmax(scores, dim=-1) @ vb
+    return out
+
+
+def jagged_flash_attention(q_pack, k_pack, v_pack, offsets, causal=False):
+    """Online-softmax FlashAttention on packed sequences (single head)."""
+    D = q_pack.shape[1]
+    scale = 1.0 / math.sqrt(D)
+    out = torch.empty_like(q_pack)
+    B = offsets.numel() - 1
+    BLOCK = 16
+    for b in range(B):
+        s, e = int(offsets[b]), int(offsets[b + 1])
+        L = e - s
+        for i0 in range(0, L, BLOCK):
+            i1 = min(i0 + BLOCK, L)
+            qi = q_pack[s + i0 : s + i1]
+            bq = i1 - i0
+            m_i = torch.full((bq,), float("-inf"))
+            l_i = torch.zeros(bq)
+            acc = torch.zeros(bq, D)
+            for j0 in range(0, L, BLOCK):
+                j1 = min(j0 + BLOCK, L)
+                kj = k_pack[s + j0 : s + j1]
+                vj = v_pack[s + j0 : s + j1]
+                S = (qi @ kj.T) * scale
+                if causal:
+                    q_idx = torch.arange(i0, i1)[:, None]
+                    k_idx = torch.arange(j0, j1)[None, :]
+                    S = S.masked_fill(k_idx > q_idx, float("-inf"))
+                m_ij = S.max(dim=-1).values
+                m_new = torch.maximum(m_i, m_ij)
+                alpha = torch.exp(m_i - m_new)
+                P = torch.exp(S - m_new[:, None])
+                l_new = alpha * l_i + P.sum(dim=-1)
+                acc = acc * alpha[:, None] + P @ vj
+                m_i, l_i = m_new, l_new
+            out[s + i0 : s + i1] = acc / l_i[:, None]
+    return out
+
+
+def demo():
+    D = 32
+    lengths = [7, 3, 19, 5, 11]
+    B, Lmax = len(lengths), max(lengths)
+    seqs_q, seqs_k, seqs_v = [], [], []
+    q_pad = torch.zeros(B, Lmax, D)
+    k_pad = torch.zeros(B, Lmax, D)
+    v_pad = torch.zeros(B, Lmax, D)
+    for b, L in enumerate(lengths):
+        q, k, v = torch.randn(L, D), torch.randn(L, D), torch.randn(L, D)
+        seqs_q.append(q); seqs_k.append(k); seqs_v.append(v)
+        q_pad[b, :L] = q; k_pad[b, :L] = k; v_pad[b, :L] = v
+    q_pack, off = pack_sequences(seqs_q)
+    k_pack, _ = pack_sequences(seqs_k)
+    v_pack, _ = pack_sequences(seqs_v)
+
+    print("lengths:", lengths)
+    print("packed tokens:", int(off[-1]), "vs padded:", B * Lmax,
+          f"(padding waste {(1 - off[-1].item() / (B * Lmax)) * 100:.1f}%)")
+
+    for causal in (False, True):
+        ref = attention_padded(q_pad, k_pad, v_pad, lengths, causal=causal)
+        jag = jagged_flash_attention(q_pack, k_pack, v_pack, off, causal=causal)
+        jag_pad = torch.zeros_like(q_pad)
+        for b in range(B):
+            s, e = int(off[b]), int(off[b + 1])
+            jag_pad[b, : e - s] = jag[s:e]
+        err = (ref - jag_pad).abs().max().item()
+        print(f"causal={causal}: max|padded - jagged_flash| = {err:.3e}")
+
+    # broadcast-Q sketch (dense Q vs each sequence's K/V)
+    Lq, scale = 4, 1.0 / math.sqrt(D)
+    q_dense = torch.randn(Lq, D)
+    outs = []
+    for b in range(B):
+        s, e = int(off[b]), int(off[b + 1])
+        scores = (q_dense @ k_pack[s:e].T) * scale
+        outs.append(torch.softmax(scores, dim=-1) @ v_pack[s:e])
+    stacked = torch.stack(outs, dim=0)
+    print("broadcast-Q: Q", tuple(q_dense.shape),
+          "per-seq outs", tuple(stacked.shape),
+          "batch-mean", tuple(stacked.mean(0).shape))
+    print("broadcast-Q note: backward dQ reduce-adds across the batch "
+          "(contended epilogue in the TLX JFA post).")
+
+
+if __name__ == "__main__":
+    demo()
+```
+
+```console
+$ python jagged_attn_ref.py
+lengths: [7, 3, 19, 5, 11]
+packed tokens: 45 vs padded: 95 (padding waste 52.6%)
+causal=False: max|padded - jagged_flash| = 3.576e-07
+causal=True: max|padded - jagged_flash| = 4.768e-07
+broadcast-Q: Q (4, 32) per-seq outs (5, 4, 32) batch-mean (4, 32)
+broadcast-Q note: backward dQ reduce-adds across the batch (contended epilogue in the TLX JFA post).
+```
+
+Fifty percent padding waste on a mild length mix is exactly why GEM packs. Equivalence at `1e-7` says the online-softmax recurrence is doing the same math as materializing $P=\mathrm{softmax}(QK^\top)$; the GPU kernel's job is to keep tensor cores fed while doing it.
+
+---
+
+## 3. Why plain Triton stalls on Blackwell
+
+Attention reaches peak only when global loads, softmax, and matmuls overlap. A mature compiler-scheduled Triton JFA is algorithmically correct but leaves on-chip movement and warp roles to the compiler: one homogeneous warp group does loads, softmax, and MMAs, so tensor cores stall whenever that group is not issuing an MMA. Blackwell adds **TMEM**, async TMA, tcgen05 MMA, and **Cluster Launch Control (CLC)**. Plain Triton does not expose them as first-class controls.
+
+**TLX** adds explicit, hardware-aware primitives on top of Triton's tile model: SMEM/TMEM allocation, `async_task` warp specialization, barriers, async TMA/MMA, and CLC. Meta's structural rewrite splits a CTA into role-specialized tasks (TMA loads, tensor-core matmuls, softmax/correction, epilogue store, plus a dedicated dQ-reduction warp in backward), triple-buffers K/V, aliases TMEM buffers with non-overlapping lifetimes, and runs persistent CTAs (one per SM looping over tiles). That structure is what makes the §2.2 optimizations cheap to prototype in Python-level code instead of CuTe-DSL.
+
+---
+
+## 4. Host-side load balancing for jagged tiles
+
+Jagged lengths create SM imbalance: a few long sequences keep some SMs busy long after short ones finish. For the **forward** (outer loop over dense Q tiles, inner over jagged KV), tile cost ≈ KV length. Meta's host heuristic: sort tiles by KV workload descending, then hand them to SMs in a **zigzag (boustrophedon)** pattern—even passes left-to-right, odd passes right-to-left. They report ~20% forward recovery from this alone.
+
+```python
+# jagged_balance.py — zigzag vs round-robin tile assignment (host-side, no GPU)
+import numpy as np
+
+
+def zigzag_assign(workloads, n_sms):
+    order = list(np.argsort(-np.asarray(workloads)))
+    loads = np.zeros(n_sms, dtype=np.int64)
+    assign = np.empty(len(workloads), dtype=np.int32)
+    left_to_right, pos = True, 0
+    while pos < len(order):
+        indices = range(n_sms) if left_to_right else range(n_sms - 1, -1, -1)
+        for sm in indices:
+            if pos >= len(order):
+                break
+            t = order[pos]
+            assign[t] = sm
+            loads[sm] += workloads[t]
+            pos += 1
+        left_to_right = not left_to_right
+    return assign, loads
+
+
+def round_robin(workloads, n_sms):
+    loads = np.zeros(n_sms, dtype=np.int64)
+    assign = np.empty(len(workloads), dtype=np.int32)
+    for t, w in enumerate(workloads):
+        assign[t] = t % n_sms
+        loads[t % n_sms] += w
+    return assign, loads
+
+
+rng = np.random.default_rng(1)
+n_tiles, n_sms = 48, 8
+work = rng.integers(32, 512, size=n_tiles).astype(np.int64)
+work[0], work[1], work[2] = 480, 450, 40
+print("KV tile workloads: min", work.min(), "median", int(np.median(work)),
+      "max", work.max(), f" max/median={work.max()/np.median(work):.1f}x")
+_, loads_rr = round_robin(work, n_sms)
+_, loads_zz = zigzag_assign(work, n_sms)
+
+
+def stats(name, loads):
+    print(f"{name:12s}  per-SM={loads.tolist()}")
+    print(f"{'':12s}  max={loads.max()} mean={loads.mean():.1f}  "
+          f"imbalance={loads.max()/loads.mean():.3f}  range={loads.max()-loads.min()}")
+
+
+stats("round-robin", loads_rr)
+stats("zigzag", loads_zz)
+print("forward: zigzag by KV workload; backward: round-robin + CLC for residual skew.")
+```
+
+```console
+$ python jagged_balance.py
+KV tile workloads: min 40 median 242 max 502  max/median=2.1x
+round-robin   per-SM=[1937, 1604, 1087, 1569, 1485, 1493, 1468, 1913]
+              max=1937 mean=1569.5  imbalance=1.234  range=850
+zigzag        per-SM=[1604, 1563, 1569, 1573, 1583, 1557, 1545, 1562]
+              max=1604 mean=1569.5  imbalance=1.022  range=59
+forward: zigzag by KV workload; backward: round-robin + CLC for residual skew.
+```
+
+Imbalance $1.23\to 1.02$ is the whole point of the host sort. **CLC** then covers residual runtime variance: a persistent CTA steals the next tile index on demand when it finishes early. TLX exposes this as `clc_create_context` / `clc_producer` / `clc_consumer` (see the CLC+TLX post). Software balancing still matters on a CLC kernel because CLC cannot see *empty* padded tiles—host-side valid-tile precompute prunes those first.
+
+The **backward** uses a different static policy: dK/dV tiles against shared dense Q are roughly equal cost, so round-robin with block-innermost ordering (L2 reuse) plus padding to cluster size for the 2-CTA path.
+
+---
+
+## 5. Optimizations on top of the warp-specialized skeleton
+
+Once the structure exists, Meta's NCU / Triton-MPP / ptxas methodology targets specific stalls. Summarized from the primary post (numbers are theirs, on B200 bf16):
+
+| Optimization | Bottleneck | Idea |
+|--------------|------------|------|
+| Zigzag + CLC scheduling | Idle SMs on length skew | Static balance + dynamic steal |
+| Multi-stage dQ staging | Contended broadcast-Q `dQ` reduce-add (~9–11% TC loss) | Double-buffered SMEM; overlap TMEM→SMEM copy with SMEM→HBM `store_reduce=add` |
+| Early TMEM release | MMA blocked on `dq-empty` while epilogue drains | Pre-load last 1–2 slices to regs, `barrier_arrive` early, then store |
+| Loop peeling | Softmax warp register spills from per-iter mask | Branch-free bulk KV loop + tiny masked tail (`APPLY_MASK` constexpr) |
+| 2-CTA collaborative MMA | Backward matmul-heavy; one CTA under-feeds TC | Paired CTAs, DSMEM exchange of `dS` (FA4 technique, ported to jagged+CLC) |
+
+Illustrative shape of the dQ staging loop (from the post; not runnable here without TLX):
+
+```python
+# sketch only — requires TLX (tlx.local_alloc, async_descriptor_store, ...)
+NCOL = BLOCK_D // (EPILOGUE_SUBTILE * 2)
+STAGES = 2
+dq_smem = tlx.local_alloc((BLOCK_M, NCOL), dq.dtype, STAGES)
+for s in range(BLOCK_D // NCOL):
+    dq = tlx.local_load(dq_tmem[:, s * NCOL:(s + 1) * NCOL]) * LN2
+    tlx.local_store(dq_smem[s % STAGES], dq.to(dq.dtype))
+    tlx.fence_async_shared()
+    tlx.async_descriptor_store(desc_dq, dq_smem[s % STAGES], offsets, store_reduce="add")
+    tlx.async_descriptor_store_wait(STAGES - 1)
+```
+
+**Reported headline (Meta, B200, bf16, vs FA4 May 2026):** jagged broadcast-Q forward ~+13% average, backward ~+50% average; dense LLM shapes: forward ~87% of FA4, backward ~+17%. Code: `facebookresearch/ads_model_kernel_library` → `tlx_jfa`.
+
+---
+
+## 6. Variants: why TLX's readability matters
+
+Two forks reuse the same warp-specialized skeleton:
+
+1. **MXFP8 (block-scaled) attention** — swap BF16 MMAs for TLX block-scaled FP8 E4M3 with E8M0 scales; quantize $P$ on the fly into TMEM. Meta reports MXFP8 forward above FA4's FP8 kernel and backward at parity with FA4 at dense.
+2. **Block-sparse attention** — cheap pooled scoring selects top-$k$ KV blocks per Q block; the TLX attention kernel iterates only selected blocks, still with CLC and software balancing. At selection ratio 0.5, forward ~1.3–1.5× vs dense in their tests.
+
+The practical claim is development velocity: change the math (precision or sparsity), keep the plumbing.
+
+---
+
+## 7. What we verified on this box (honest)
+
+| Check | Result |
+|-------|--------|
+| Packing waste on `[7,3,19,5,11]` | 52.6% tokens padded vs packed |
+| CPU JFA vs padded attention | max abs err $3.6\times 10^{-7}$ (non-causal), $4.8\times 10^{-7}$ (causal) |
+| Zigzag vs round-robin imbalance | $1.234 \to 1.022$ on mild jagged workloads |
+| `TRITON_INTERPRET=1` tiny add kernel | max err $0$ (Triton 3.8.0) |
+| `ptxas --version` (CUDA 12.9 wheel) | available |
+| B200 / TLX JFA / NCU / FA4 A/B | **not run** — no GPU; no TLX build in this environment |
+| Performance claims in §5 | quoted from the PyTorch post only |
+
+---
+
+## Pitfalls
+
+- **Padding as the default.** If your batcher always pads to `L_max`, no attention kernel can recover the wasted FLOPs. Fix the layout first.
+- **Testing only dense equal-length shapes.** FA4 can win on long dense sequences; JFA's wins are on *jagged* broadcast-Q. Benchmark the distribution you serve.
+- **CLC without pruning empty tiles.** Dynamic steal still pays for sentinel tiles that padding introduced; host valid-tile lists remain necessary.
+- **Assuming SGD-shaped epilogues.** The broadcast-Q `dQ` path is a many-to-one reduce-add into hot HBM addresses—profile it separately (Meta's #1 backward gap).
+- **Copying FA4 CuTe into Triton without warp roles.** Without specialization and explicit TMEM lifetimes, you are back to the compiler-scheduled baseline.
+
+## Checkpoint
+
+1. Why does packing beat padding for ads-style length skew, and what tensor records boundaries?
+2. What is broadcast-Q, and why is `dQ` harder than `dK`/`dV` in that layout?
+3. Forward vs backward: which static SM policy does Meta use for each, and what does CLC add?
+4. Name two TLX-enabled variants that reused the JFA skeleton without a ground-up rewrite.
+
+## Try this
+
+- Extend `jagged_attn_ref.py` to multi-head `(n_heads, D_head)` packed tensors and compare to `torch.nn.functional.scaled_dot_product_attention` on padded inputs with an attention mask.
+- Implement GQA: fewer KV heads than Q heads; check that packing still works when KV sequences are shared across Q head groups.
+- On a machine with Blackwell + TLX, clone `tlx_jfa`, run the blog's TritonBench shapes, and reproduce one forward TFLOPS point against FA4.
+- Add a power-law length generator (`Pareto`) to `jagged_balance.py` and find when a single mega-tile makes *any* static assignment hopeless—CLC's job.
+
+## Summary
+
+Jagged Flash Attention is FlashAttention on packed variable-length sequences. On Blackwell, TLX lets a ~3.2K-line Triton kernel express the same warp specialization, TMEM/SMEM pipelining, and CLC scheduling that FA4 writes in CuTe-DSL, while winning on the jagged broadcast-Q shapes Meta's ads models actually run—and remaining forkable into MXFP8 and block-sparse variants. Without a GPU we verified packing, numerical equivalence of online softmax, and host zigzag balancing; the B200 speedups stay cited, not re-measured.
+
+## Sources (for further reading)
+
+- PyTorch blog, "Optimizing Jagged Flash Attention with TLX: The Road Toward SOTA FA4 on Blackwell" (2026-10-01): <https://pytorch.org/blog/optimizing-jagged-flash-attention-with-tlx-the-road-toward-sota-fa4-on-blackwell/>
+- PyTorch blog, "Enabling Cluster Launch Control with TLX" (2025-12-17): <https://pytorch.org/blog/enabling-cluster-launch-control-with-tlx/>
+- Code: <https://github.com/facebookresearch/ads_model_kernel_library/tree/main/tlx_jfa>
+- NVIDIA Blackwell Tuning Guide (thread-block clusters / CLC): <https://docs.nvidia.com/cuda/blackwell-tuning-guide/index.html#thread-block-clusters>
+- FlashAttention-4 paper: <https://arxiv.org/abs/2603.05451>
+- Meta GEM engineering post: <https://engineering.fb.com/2025/11/10/ml-applications/metas-generative-ads-model-gem-the-central-brain-accelerating-ads-recommendation-ai-innovation/>
