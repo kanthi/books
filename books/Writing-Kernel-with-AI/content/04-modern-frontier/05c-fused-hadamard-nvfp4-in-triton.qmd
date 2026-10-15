@@ -1,0 +1,279 @@
+---
+title: "A Fused Hadamard + NVFP4 Quantization Kernel in Triton"
+author:
+  - name: "K19G"
+  - name: "grok-bot"
+---
+
+# A Fused Hadamard + NVFP4 Quantization Kernel in Triton
+
+Every W4A4 GEMM on Blackwell starts with a small, unglamorous kernel: take BF16/FP32 activations, produce packed 4-bit E2M1 codes plus one FP8 E4M3 scale per 16 values. Outlier-aware recipes add a step in front of it, an orthogonal **Hadamard rotation** of each block, so that one huge channel is spread over its neighbours before the scale is chosen. Done as separate kernels, that is three trips through HBM (rotate, reduce for scales, quantize). Fused, it is one load and one store, and the rotation lives entirely in registers.
+
+This chapter writes that fused kernel in Triton, proves it bit-exact against a PyTorch reference, and then asks the question the kernel cannot answer for you: *does the rotation actually help NVFP4?*
+
+**What ran and what did not.** There is no GPU on the machine these listings ran on. Every output below comes from **Triton 3.8.0's interpreter** (`TRITON_INTERPRET=1`), which executes the kernel's tile semantics with NumPy on the CPU, under PyTorch 2.14.1 and Python 3.13.5 on x86-64 Linux. That is enough to verify layout, packing, rounding and error behaviour. It says **nothing** about speed: there are no timings in this chapter, and none should be inferred.
+
+---
+
+## 1. The format, precisely
+
+NVFP4, as specified in NVIDIA's Transformer Engine documentation, reconstructs each element as
+
+$$x \approx q_{e2m1} \cdot s_{block} \cdot s_{global}$$
+
+| Piece | Type | Granularity | How it is chosen |
+|-------|------|-------------|------------------|
+| `q` | E2M1 (1 sign, 2 exponent, 1 mantissa) | per element | round `x / (s_block·s_global)` to {0, 0.5, 1, 1.5, 2, 3, 4, 6} |
+| `s_block` | FP8 E4M3 | 16 consecutive elements | `(block_amax / 6) / s_global` |
+| `s_global` | FP32 | per tensor | `global_amax / (448 · 6)` |
+
+So storage is 4 bits per value plus 8 bits per 16 values: **4.5 bits/value**, 0.5625 bytes. The E4M3 block scale is what separates NVFP4 from MXFP4 (32-element blocks, power-of-two E8M0 scales): the scale can land *between* powers of two, so the block's largest value maps much closer to 6.
+
+The rotation is a 16×16 Sylvester–Hadamard matrix scaled by 1/4, so `H·Hᵀ = I`. Because it is orthogonal, a GEMM can rotate both operands and get the same product: `(xH)(HᵀW) = xW`. The weight side is rotated offline; only the activation side needs this kernel.
+
+---
+
+## 2. The kernel
+
+One program handles `ROWS` blocks of 16 values: a `[ROWS, 16]` tile. The rotation is a `tl.dot` with the 16×16 matrix (16 is the smallest `tl.dot` dimension, and conveniently also the NVFP4 block). Absmax is a row reduction, so the scale never leaves registers. Two codes are packed per byte with `tl.reshape` + `tl.split`.
+
+```python
+# hadamard_nvfp4.py: fused 16-point Hadamard rotation + NVFP4 quantization in Triton.
+# Each 16-element block: y = x @ H16 / 4, then
+#   block scale s = amax(y) / 6  (stored as FP8 E4M3, relative to a global FP32 scale)
+#   q = round_to_E2M1(y / s)     (two 4-bit codes packed per byte)
+import torch, triton, triton.language as tl
+
+def hadamard16(device="cpu"):
+    H = torch.ones(1, 1)
+    for _ in range(4):
+        H = torch.cat([torch.cat([H, H], 1), torch.cat([H, -H], 1)], 0)
+    return (H / 4.0).to(device)              # orthonormal: H @ H.T == I
+
+@triton.jit
+def _e2m1_code(v):
+    # magnitude grid {0, .5, 1, 1.5, 2, 3, 4, 6}; midpoints decide, ties go to the even code
+    a = tl.abs(v)
+    c = tl.where(a > 0.25, 1, 0) + tl.where(a >= 0.75, 1, 0) + tl.where(a > 1.25, 1, 0) \
+      + tl.where(a >= 1.75, 1, 0) + tl.where(a > 2.5, 1, 0) + tl.where(a >= 3.5, 1, 0) \
+      + tl.where(a > 5.0, 1, 0)
+    return (c + tl.where(v < 0, 8, 0)).to(tl.uint8)   # bit 3 = sign
+
+@triton.jit
+def _round_e4m3(v):
+    # round a non-negative fp32 to the nearest E4M3 value (3 mantissa bits, min normal 2^-6,
+    # max 448) explicitly, so the later cast is exact and does not depend on the backend's
+    # downcast rounding
+    e = tl.maximum(tl.floor(tl.log2(tl.maximum(v, 1e-30))), -6.0)
+    step = tl.exp2(e - 3.0)
+    return tl.minimum(tl.floor(v / step + 0.5) * step, 448.0)
+
+@triton.jit
+def hadamard_nvfp4_kernel(x_ptr, h_ptr, q_ptr, s_ptr, gscale, n_blocks,
+                          ROWS: tl.constexpr, ROTATE: tl.constexpr):
+    pid = tl.program_id(0)
+    r = pid * ROWS + tl.arange(0, ROWS)          # which 16-element blocks
+    k = tl.arange(0, 16)
+    mask = r[:, None] < n_blocks
+    x = tl.load(x_ptr + r[:, None] * 16 + k[None, :], mask=mask, other=0.0)
+    if ROTATE:
+        h = tl.load(h_ptr + k[:, None] * 16 + k[None, :])
+        x = tl.dot(x, h, input_precision="ieee")   # rotate in registers, never written back
+    amax = tl.max(tl.abs(x), axis=1)
+    s = _round_e4m3(amax / 6.0 / gscale).to(tl.float8e4nv)  # exact after rounding: E4M3 block scale
+    s_f = s.to(tl.float32) * gscale
+    y = x / tl.where(s_f == 0, 1.0, s_f)[:, None]
+    code = _e2m1_code(y)                              # [ROWS, 16] uint8 nibbles
+    pair = tl.reshape(code, (ROWS, 8, 2))
+    lo, hi = tl.split(pair)
+    packed = lo | (hi << 4)
+    j = tl.arange(0, 8)
+    tl.store(q_ptr + r[:, None] * 8 + j[None, :], packed, mask=r[:, None] < n_blocks)
+    tl.store(s_ptr + r, s, mask=r < n_blocks)
+
+def quantize(x, rotate=True, rows=16):
+    xb = x.reshape(-1, 16).contiguous().float()
+    nb = xb.shape[0]
+    # global scale so the largest block scale lands at E4M3's max (448)
+    y = xb @ hadamard16(x.device) if rotate else xb
+    gscale = float(y.abs().max() / 6.0 / 448.0) or 1.0
+    q = torch.empty(nb, 8, dtype=torch.uint8, device=x.device)
+    s = torch.empty(nb, dtype=torch.float8_e4m3fn, device=x.device)
+    hadamard_nvfp4_kernel[(triton.cdiv(nb, rows),)](xb, hadamard16(x.device), q, s, gscale, nb,
+                                                     ROWS=rows, ROTATE=rotate)
+    return q, s, gscale
+
+GRID = torch.tensor([0, .5, 1, 1.5, 2, 3, 4, 6])
+def dequantize(q, s, gscale, rotate=True):
+    codes = torch.stack([q & 0xF, q >> 4], -1).reshape(q.shape[0], 16).long()
+    mag = GRID[codes & 7]; val = torch.where(codes >= 8, -mag, mag)
+    y = val * (s.float() * gscale)[:, None]
+    return y @ hadamard16().T if rotate else y
+```
+
+Four choices worth calling out:
+
+- **The global scale is the one thing not fused.** `s_global` needs the amax of the whole (rotated) tensor before any block can be scaled, so the host wrapper computes it first. Production stacks either run a small amax reduction ahead of the kernel or reuse an amax from a previous step; the per-block work is still a single pass.
+
+- **The rotation is never stored.** `x` is loaded, multiplied, reduced and quantized in one program; the rotated tensor exists only in registers. That is the whole point of fusing.
+- **E2M1 rounding is a sum of comparisons.** Seven thresholds at the midpoints of the grid, with `>` vs `>=` alternating so exact ties go to the even code (0, 1, 2, 4 have mantissa 0). No lookup table, no branches.
+- **The E4M3 rounding is explicit.** `_round_e4m3` rounds to the nearest representable E4M3 value *before* the cast, so the cast itself is exact. Section 4 shows why.
+
+---
+
+## 3. Bit-exact against a reference
+
+The reference does the same arithmetic in PyTorch, using PyTorch's own `float8_e4m3fn` cast (round-to-nearest-even) for the scales. The test tensor is 256×64 Gaussian activations with three channels scaled by 20×, the textbook "outlier channel" pattern rotation recipes target.
+
+```python
+# run_demo.py: correctness vs a PyTorch reference, then error with/without rotation.
+import torch
+from hadamard_nvfp4 import quantize, dequantize, hadamard16, GRID
+torch.manual_seed(0)
+
+def reference(x, rotate):
+    y = x.reshape(-1, 16).float(); y = y @ hadamard16() if rotate else y
+    g = float(y.abs().max() / 6.0 / 448.0) or 1.0
+    s = (y.abs().amax(1) / 6.0 / g).to(torch.float8_e4m3fn)
+    sf = s.float() * g
+    a = (y / torch.where(sf == 0, 1.0, sf)[:, None])
+    mids = torch.tensor([.25, .75, 1.25, 1.75, 2.5, 3.5, 5.0])
+    m = a.abs()
+    c = sum((m > t) if i % 2 == 0 else (m >= t) for i, t in enumerate(mids)).to(torch.uint8)
+    c = c + (a < 0).to(torch.uint8) * 8
+    return (c[:, 0::2] | (c[:, 1::2] << 4)), s
+
+if __name__ == "__main__":
+    # activations with a few outlier channels, the case rotation exists for
+    x = torch.randn(256, 64)
+    x[:, [3, 17, 40]] *= 20.0
+    for rotate in (False, True):
+        q, s, g = quantize(x, rotate)
+        rq, rs = reference(x, rotate)
+        xr = dequantize(q, s, g, rotate).reshape_as(x)
+        rel = ((xr - x).norm() / x.norm()).item()
+        print(f"rotate={rotate!s:5}  packed bytes={q.numel():5d} scales={s.numel():4d}  "
+              f"bit-exact vs ref: q={torch.equal(q, rq)} s={torch.equal(s.view(torch.uint8), rs.view(torch.uint8))}  "
+              f"rel. L2 error={rel:.4f}")
+    print("orthonormal H16:", torch.allclose(hadamard16() @ hadamard16().T, torch.eye(16)))
+    print("bytes/value incl. E4M3 scale:", (q.numel() + s.numel()) / x.numel())
+```
+
+```bash
+TRITON_INTERPRET=1 python run_demo.py
+```
+
+```text
+rotate=False  packed bytes= 8192 scales=1024  bit-exact vs ref: q=True s=True  rel. L2 error=0.0902
+rotate=True   packed bytes= 8192 scales=1024  bit-exact vs ref: q=True s=True  rel. L2 error=0.1155
+orthonormal H16: True
+bytes/value incl. E4M3 scale: 0.5625
+```
+
+Codes and scales match the reference byte for byte, with and without rotation, and the footprint is the 0.5625 bytes/value the format promises. The rotation is exactly orthonormal at 16 points, so dequantization is just the transpose.
+
+---
+
+## 4. The trap: trusting the downcast
+
+The first version of this kernel did the obvious thing, `(amax / 6.0 / gscale).to(tl.float8e4nv)`, and was **not** bit-exact: 18 of 1,024 scales came out at half the reference value. A minimal repro:
+
+```python
+# cast_repro.py: fp32 -> float8e4nv cast of values just below a power of two
+import torch, triton, triton.language as tl
+@triton.jit
+def cast(x_ptr, y_ptr):
+    i = tl.arange(0, 4)
+    tl.store(y_ptr + i, tl.load(x_ptr + i).to(tl.float8e4nv))
+x = torch.tensor([7.9839, 31.8698, 7.0, 3.9])
+y = torch.empty(4, dtype=torch.float8_e4m3fn)
+cast[(1,)](x, y)
+print("input        ", x.tolist())
+print("triton interp", y.float().tolist())
+print("torch (RTNE) ", x.to(torch.float8_e4m3fn).float().tolist())
+```
+
+```text
+input         [7.98390007019043, 31.869800567626953, 7.0, 3.9000000953674316]
+triton interp [4.0, 16.0, 7.0, 4.0]
+torch (RTNE)  [8.0, 32.0, 7.0, 4.0]
+```
+
+In the interpreter, values that should round *up across a power of two* (7.98 → 8, 31.87 → 32) lost their carry into the exponent and landed a whole binade low; 3.9 → 4 was fine. Passing `fp_downcast_rounding="rtne"` did not change it. Whether compiled GPU code shows the same behaviour was **not tested here**; there was no GPU. The lesson does not depend on it:
+
+> A quantization kernel's scale rounding is part of its *numerical contract*. Do it explicitly, then cast a value that is already representable.
+
+A scale that is 2× too small makes every value in the block saturate at ±6 — a silent accuracy bug that a "mean error looks fine" test can miss, because it hits ~2 % of blocks.
+
+---
+
+## 5. Does the rotation help? Not by default for NVFP4
+
+```python
+# error_study.py: where does a 16-point rotation help NVFP4, and where not?
+import torch
+from hadamard_nvfp4 import quantize, dequantize
+torch.manual_seed(0)
+
+def err(x, rotate, cols=None):
+    q, s, g = quantize(x, rotate)
+    xr = dequantize(q, s, g, rotate).reshape_as(x)
+    if cols is not None: x, xr = x[:, cols], xr[:, cols]
+    return ((xr - x).norm() / x.norm()).item()
+
+cases = {}
+x = torch.randn(256, 64); out = [3, 17, 40]; x[:, out] *= 20.0
+normal = [c for c in range(64) if c not in out]
+cases["outlier channels: all values"] = (x, None)
+cases["outlier channels: normal cols"] = (x, normal)
+cases["gaussian"] = (torch.randn(256, 64), None)
+cases["student-t, 3 dof"] = (torch.distributions.StudentT(3.0).sample((256, 64)), None)
+print(f"{'case':32s} {'plain':>8s} {'hadamard':>9s}")
+for name, (t, cols) in cases.items():
+    print(f"{name:32s} {err(t, False, cols):8.4f} {err(t, True, cols):9.4f}")
+```
+
+```text
+case                                plain  hadamard
+outlier channels: all values       0.0902    0.1155
+outlier channels: normal cols      0.3942    0.4973
+gaussian                           0.0952    0.0948
+student-t, 3 dof                   0.0909    0.0985
+```
+
+On the outlier-channel tensor, the plain kernel beat the rotated one, both overall and (more tellingly) on the 61 *normal* channels the rotation was supposed to protect. On Gaussian data the two are equal; on heavy-tailed Student-t data the rotation is slightly worse.
+
+This is not a bug in the kernel, and it matches the literature. Egiazarian et al. (*Bridging the Gap Between Promise and Performance for Microscaling FP4 Quantization*, ICLR 2026) show that **NVFP4's small 16-element group provably neutralizes traditional outlier mitigation**. A block of 16 with an E4M3 scale already isolates an outlier to its own block. Rotating then smears that outlier's energy over all 16 entries, so all of them now carry it. What the paper does instead (MR-GPTQ) uses block-wise rotations *together with* GPTQ error correction and format-specific scale search, where the rotation's benefit is large for MXFP4 and modest for NVFP4.
+
+So the kernel is the easy part. Whether to switch `ROTATE` on is a model-level, measured decision.
+
+---
+
+## 6. From interpreter to hardware
+
+What would change on a Blackwell GPU, none of it run here:
+
+- **Layout.** Real NVFP4 GEMMs (CUTLASS, cuBLASLt) expect the block scales in a **swizzled** tiled layout, not the row-major `[n_blocks]` vector written here; Transformer Engine documents the swizzle as a separate step. A production kernel writes the swizzled layout directly.
+- **The FP4 store.** Recent Triton and PyTorch have native FP4 types (`torch.float4_e2m1fn_x2` exists in the PyTorch used here); the manual nibble packing is equivalent and portable.
+- **The rotation's cost.** A 16×16 `tl.dot` per tile is small next to the GEMM it feeds. QuTLASS (IST Austria) ships production fused rotate+quantize kernels for NVFP4 and MXFP4 and reports end-to-end speedups on B200 and RTX 5090; those are their numbers, measured on their hardware.
+
+---
+
+## The boring rule
+
+**Fuse rotate, absmax, scale and pack into one pass; round the scale explicitly; test bit-exact against a reference; and only turn the rotation on when a model-level eval says it helps your format.**
+
+## Try this
+
+1. Change `ROWS` to 32 and 64 and confirm the outputs are unchanged (the result must not depend on tiling).
+2. Re-run `error_study.py` with MXFP4 semantics: 32-element blocks and power-of-two scales. Does rotation start to help?
+3. Replace the Hadamard with a random orthogonal 16×16 matrix (from `torch.linalg.qr`) and compare.
+4. If you have a Blackwell GPU, drop `TRITON_INTERPRET=1`, run `cast_repro.py` compiled, and time the kernel against a three-kernel version with Triton's `do_bench`.
+
+## Sources
+
+- NVIDIA Transformer Engine documentation, NVFP4 (format, two-level scaling, swizzled scales): https://docs.nvidia.com/deeplearning/transformer-engine/features/low_precision_training/nvfp4/nvfp4.html
+- NVIDIA Technical Blog, "Introducing NVFP4 for Efficient and Accurate Low-Precision Inference": https://developer.nvidia.com/blog/introducing-nvfp4-for-efficient-and-accurate-low-precision-inference/
+- Egiazarian et al., "Bridging the Gap Between Promise and Performance for Microscaling FP4 Quantization", arXiv:2509.23202 (ICLR 2026): https://arxiv.org/abs/2509.23202
+- QuTLASS (fused rotation + quantization kernels for NVFP4/MXFP4): https://github.com/IST-DASLab/qutlass
+- Triton documentation, interpreter mode and `triton.language`: https://triton-lang.org/main/
