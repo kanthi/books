@@ -1,0 +1,702 @@
+---
+title: "\"Let the Compiler Optimize It\": Measuring netip.AddrFrom16(ip.As16())"
+author:
+  - name: "K19G"
+  - name: "grok-bot"
+---
+
+# "Let the Compiler Optimize It": Measuring `netip.AddrFrom16(ip.As16())`
+
+## Thesis
+
+`net/netip` can unmap an address (`::ffff:203.0.113.10` → `203.0.113.10` with `Addr.Unmap`) but has no method for the other direction. Proposals for one (`Addr.Map`, `Addr.To6`) were declined: the operation was judged rare, and `netip.AddrFrom16(ip.As16())` was expected to be "neither allocating nor particularly slow", something the compiler can flatten after inlining. This chapter treats that expectation as a claim to test. On Go 1.27.2 (linux/amd64) it does not hold:
+
+- The idiom costs about **8.5 ns** per call. Flipping the address-family field directly costs about **1.1 ns**.
+- Go 1.26.9 compiles the idiom to **16** instructions. Go 1.27.2 compiles it to **56**, because a new SSA rewrite rule runs before the pass that used to merge the byte loads. Wall-clock time is **the same on both**, within noise on this machine.
+- Instruction count does not explain the time. Reading the same 16 bytes from an array written long ago costs 1.8 ns. Reading them straight after writing them costs 8.5 ns. The cost is the trip through a freshly written stack array, not the arithmetic.
+
+The skills here apply to any "the compiler will handle it" advice. Write the variants, benchmark them, read the assembly with `-gcflags=-S`, read the SSA with `GOSSAFUNC` or a per-pass dump, compare two toolchains with `GOTOOLCHAIN`, and only then decide whether you need `unsafe`, an `-overlay`, or a different design.
+
+Verified on **Go 1.27.2** and **Go 1.26.9** (linux/amd64), Linux 6.12 on an 8-vCPU KVM guest (Intel Xeon), on 2026-10-15. Source links are pinned to the [`go1.27.2` tag](https://github.com/golang/go/tree/go1.27.2/src). The investigation follows Vincent Bernat's write-up (see Sources), re-run here on the current toolchain.
+
+[Compiler, SSA, Inlining, and PGO](209-compiler-ssa-pgo.qmd) and [Compiler Mid/Back: IR, SSA, Machine Code, Link](253-compiler-ir-ssa-backend.qmd) describe the pipeline in general. This chapter applies it to one function, end to end.
+
+## Learning goals
+
+- Explain how `netip.Addr` stores an address and why `As16`/`AddrFrom16` turn it into bytes and back
+- Count the instructions in a function's `-gcflags=-S` listing, and compare them across `GOAMD64` levels and toolchains
+- Dump the SSA after a single pass (`-d=ssa/memcombine/dump=`) and recognise Store / Move / Load chains
+- Explain why a rewrite rule added in Go 1.27 tripled the instruction count without changing the time
+- Separate instruction cost from memory-forwarding cost with a controlled benchmark
+- Choose between the idiom, an `unsafe` layout proxy, an `-overlay` patch, and converting at the boundary
+
+## Mental model
+
+```text
+netip.Addr (24 bytes on amd64)
+┌──────────────────────┬──────────────────────┬──────────────────────────┐
+│ addr.hi  uint64      │ addr.lo  uint64      │ z  unique.Handle (ptr)   │
+│ bytes 0..7 of the    │ bytes 8..15, big-    │ z4 = IPv4                │
+│ IPv6 form, big-endian│ endian               │ z6noz = IPv6, no zone    │
+└──────────────────────┴──────────────────────┴──────────────────────────┘
+
+An IPv4 Addr already holds ::ffff:a.b.c.d in addr. "To6" only has to change z.
+
+AddrFrom16(ip.As16()), after inlining:
+
+  hi, lo ──BEPutUint64──► a16 [16]byte ──copy──► addr [16]byte ──BEUint64──► hi, lo
+          (store, bswap)     on the stack         (Move)        (load, bswap)
+
+The compiler must prove the round trip is the identity for the whole thing to vanish.
+```
+
+| Fact | Consequence |
+|------|-------------|
+| `Addr.z` is unexported | Outside `net/netip` you can only change the family by building a new `Addr` from bytes |
+| `As16` and `AddrFrom16` are small and inline | The compiler sees the whole pack → copy → unpack sequence in your function |
+| Generic SSA rewrite rules run in the `late opt` pass, before `memcombine` | A rule that forwards individual bytes can stop `memcombine` from merging eight byte loads into one 64-bit load |
+| Writing memory and reading it back at once needs store-to-load forwarding | Reads that do not line up with the earlier writes can stall, whatever the instruction count |
+
+## Worked examples
+
+All files live in one module. `go.mod` says `go 1.26` so the same code builds with both toolchains used below.
+
+```go
+// go.mod
+module example.com/addrto6
+
+go 1.26
+```
+
+### Case 1: Three ways to write To6
+
+```go
+// addrto6.go
+package addrto6
+
+import (
+	"net/netip"
+	"unsafe"
+)
+
+// AddrTo6Safe is the idiom the netip docs point you to: round-trip
+// through the 16-byte form and let the compiler clean up.
+func AddrTo6Safe(ip netip.Addr) netip.Addr {
+	if ip.Is4() {
+		ip = netip.AddrFrom16(ip.As16())
+	}
+	return ip
+}
+
+// addrProxy mirrors netip.Addr's memory layout:
+// addr uint128 (two uint64) followed by z unique.Handle (one pointer).
+type addrProxy struct {
+	addr [2]uint64
+	z    unsafe.Pointer
+}
+
+var (
+	anyIPv6 = netip.IPv6Unspecified()
+	z6noz   = (*addrProxy)(unsafe.Pointer(&anyIPv6)).z
+)
+
+// AddrTo6Unsafe flips only the family handle, the way a method inside
+// net/netip would. It is correct only while the layout above holds.
+func AddrTo6Unsafe(ip netip.Addr) netip.Addr {
+	if !ip.Is4() {
+		return ip
+	}
+	(*addrProxy)(unsafe.Pointer(&ip)).z = z6noz
+	return ip
+}
+```
+
+The third way, a real method inside `net/netip`, is Case 7. The tests check that both functions agree, and pin the layout the unsafe version depends on:
+
+```go
+// addrto6_test.go
+package addrto6
+
+import (
+	"net/netip"
+	"testing"
+	"unsafe"
+)
+
+var inputs = []netip.Addr{
+	netip.MustParseAddr("203.0.113.10"),
+	netip.MustParseAddr("2001:db8::1"),
+	netip.MustParseAddr("::ffff:192.0.2.1"),
+	netip.MustParseAddr("fe80::1%eth0"),
+}
+
+// The unsafe version is only allowed to exist because this test pins
+// the layout it depends on. If netip.Addr changes, this fails first.
+func TestLayoutGuard(t *testing.T) {
+	if unsafe.Sizeof(netip.Addr{}) != unsafe.Sizeof(addrProxy{}) {
+		t.Fatalf("netip.Addr is %d bytes, proxy is %d",
+			unsafe.Sizeof(netip.Addr{}), unsafe.Sizeof(addrProxy{}))
+	}
+}
+
+func TestSameAnswer(t *testing.T) {
+	for _, ip := range inputs {
+		s, u := AddrTo6Safe(ip), AddrTo6Unsafe(ip)
+		if s != u {
+			t.Errorf("%v: safe=%v unsafe=%v", ip, s, u)
+		}
+		t.Logf("%-18v -> %v", ip, s)
+	}
+}
+
+var sink netip.Addr
+
+func BenchmarkAddrTo6(b *testing.B) {
+	ip := netip.MustParseAddr("203.0.113.10")
+	b.Run("safe", func(b *testing.B) {
+		for b.Loop() {
+			sink = AddrTo6Safe(ip)
+		}
+	})
+	b.Run("unsafe", func(b *testing.B) {
+		for b.Loop() {
+			sink = AddrTo6Unsafe(ip)
+		}
+	})
+}
+```
+
+```bash
+go version
+go test -v -run 'Test' .
+```
+
+```text
+go version go1.27.2 linux/amd64
+=== RUN   TestLayoutGuard
+--- PASS: TestLayoutGuard (0.00s)
+=== RUN   TestSameAnswer
+    addrto6_test.go:32: 203.0.113.10       -> ::ffff:203.0.113.10
+    addrto6_test.go:32: 2001:db8::1        -> 2001:db8::1
+    addrto6_test.go:32: ::ffff:192.0.2.1   -> ::ffff:192.0.2.1
+    addrto6_test.go:32: fe80::1%eth0       -> fe80::1%eth0
+--- PASS: TestSameAnswer (0.00s)
+PASS
+ok  	example.com/addrto6	0.002s
+```
+
+Already-IPv6 inputs, including one with a zone, pass through unchanged. Only the IPv4 address picks up the `::ffff:` form.
+
+### Case 2: The benchmark
+
+```bash
+go test -run '^$' -bench AddrTo6 -count 1 .
+```
+
+```text
+goos: linux
+goarch: amd64
+pkg: example.com/addrto6
+cpu: Intel(R) Xeon(R) Processor
+BenchmarkAddrTo6/safe-8         	141669531	         8.510 ns/op
+BenchmarkAddrTo6/unsafe-8       	1000000000	         1.090 ns/op
+PASS
+ok  	example.com/addrto6	2.306s
+```
+
+That is a factor of about 8. At one call per packet on a 10 Mpps path, 7.4 ns extra per call adds up to roughly 7% of one core. Fine for a config loader, worth fixing in a flow collector.
+
+### Case 3: Read the assembly
+
+`go build -gcflags=-S` prints the assembly for every function in the package. Two small helpers keep only the function you care about and drop the bookkeeping (`PCDATA`, `FUNCDATA`, `NOP`, and the `XCHGL AX, AX` markers the compiler leaves where calls were inlined):
+
+```sh
+#!/bin/sh
+# asm.sh FUNC - print the instructions the compiler emitted for FUNC,
+# without addresses, source positions or bookkeeping pseudo-ops.
+go build -a -gcflags=-S . 2>&1 |
+  awk -v f="addrto6.$1 STEXT" '
+    index($0, f) { p = 1; next }
+    / STEXT/     { p = 0 }
+    p && /^\t0x[0-9a-f]+ [0-9]+ \(/ &&
+      !/\tTEXT\t|PCDATA|FUNCDATA|\tNOP|XCHGL\tAX, AX/ {
+        sub(/^\t0x[0-9a-f]+ [0-9]+ \([^)]*\)\t/, "\t"); print }'
+```
+
+```sh
+#!/bin/sh
+# asmcount.sh FUNC - count real instructions the compiler emitted for FUNC
+# (skips PCDATA/FUNCDATA bookkeeping, NOP and the XCHGL inline markers).
+go build -a -gcflags=-S . 2>&1 |
+  awk -v f="addrto6.$1 STEXT" '
+    index($0, f) { p = 1; next }
+    / STEXT/     { p = 0 }
+    p && /^\t0x[0-9a-f]+ [0-9]+ \(/ &&
+      !/\tTEXT\t|PCDATA|FUNCDATA|\tNOP|XCHGL\tAX, AX/ { n++ }
+    END { print n }'
+```
+
+`GOTOOLCHAIN=go1.26.9` makes the `go` command download and run that release, so one checkout can compare two compilers. `GOAMD64=v3` allows `MOVBE` (a byte-swapping load or store), which shortens the listing:
+
+```bash
+for tc in go1.26.9 go1.27.2; do for v in v1 v3; do
+  printf "%-9s GOAMD64=%s  AddrTo6Safe=%-3s AddrTo6Unsafe=%s\n" $tc $v \
+    "$(GOTOOLCHAIN=$tc GOAMD64=$v ./asmcount.sh AddrTo6Safe)" \
+    "$(GOTOOLCHAIN=$tc GOAMD64=$v ./asmcount.sh AddrTo6Unsafe)"
+done; done
+```
+
+```text
+go1.26.9  GOAMD64=v1  AddrTo6Safe=20  AddrTo6Unsafe=5
+go1.26.9  GOAMD64=v3  AddrTo6Safe=16  AddrTo6Unsafe=5
+go1.27.2  GOAMD64=v1  AddrTo6Safe=60  AddrTo6Unsafe=5
+go1.27.2  GOAMD64=v3  AddrTo6Safe=56  AddrTo6Unsafe=5
+```
+
+The unsafe version is what a method inside `net/netip` would compile to: compare the handle with `z4`, and if it matches, load `z6noz`. The address halves never leave their registers (`AX`, `BX`; the handle is in `CX` under the register ABI).
+
+```bash
+GOAMD64=v3 ./asm.sh AddrTo6Unsafe
+```
+
+```text
+	CMPQ	net/netip.z4(SB), CX
+	JNE	18
+	MOVQ	example.com/addrto6.z6noz(SB), CX
+	RET
+	RET
+```
+
+Go 1.26.9 compiles the idiom into the three groups you would expect from the mental model: pack (two byte-swapping stores), copy (one 16-byte `MOVUPS` load and store), unpack (two byte-swapping loads):
+
+```bash
+GOTOOLCHAIN=go1.26.9 GOAMD64=v3 ./asm.sh AddrTo6Safe
+```
+
+```text
+	PUSHQ	BP
+	MOVQ	SP, BP
+	SUBQ	$32, SP
+	MOVQ	CX, example.com/addrto6.ip+64(FP)
+	CMPQ	net/netip.z4(SB), CX
+	JNE	69
+	MOVBEQ	AX, net/netip.a16+16(SP)
+	MOVBEQ	BX, net/netip.a16+24(SP)
+	MOVUPS	net/netip.a16+16(SP), X0
+	MOVUPS	X0, net/netip.addr(SP)
+	MOVQ	net/netip.z6noz(SB), CX
+	MOVBEQ	net/netip.addr(SP), AX
+	MOVBEQ	net/netip.addr+8(SP), BX
+	ADDQ	$32, SP
+	POPQ	BP
+	RET
+```
+
+Go 1.27.2 compiles the same source into this:
+
+```bash
+GOAMD64=v3 ./asm.sh AddrTo6Safe
+```
+
+```text
+	PUSHQ	BP
+	MOVQ	SP, BP
+	SUBQ	$32, SP
+	MOVQ	CX, example.com/addrto6.ip+64(FP)
+	CMPQ	net/netip.z4(SB), CX
+	JNE	219
+	MOVQ	BX, DX
+	SHRQ	$24, BX
+	MOVQ	DX, SI
+	SHRQ	$16, DX
+	MOVQ	SI, DI
+	SHRQ	$8, SI
+	MOVBLZX	DIB, R8
+	MOVBLZX	SIB, SI
+	SHLQ	$8, SI
+	ORQ	R8, SI
+	MOVBLZX	DL, DX
+	SHLQ	$16, DX
+	ORQ	SI, DX
+	MOVBLZX	BL, BX
+	SHLQ	$24, BX
+	ORQ	DX, BX
+	MOVBEQ	AX, net/netip.a16+16(SP)
+	MOVBEQ	DI, net/netip.a16+24(SP)
+	MOVUPS	net/netip.a16+16(SP), X0
+	MOVBEL	net/netip.a16+20(SP), DX
+	MOVL	DX, AX
+	MOVBLZX	net/netip.a16+19(SP), DX
+	SHLQ	$32, DX
+	ORQ	DX, AX
+	MOVBLZX	net/netip.a16+18(SP), DX
+	SHLQ	$40, DX
+	ORQ	DX, AX
+	MOVBLZX	net/netip.a16+17(SP), DX
+	SHLQ	$48, DX
+	ORQ	DX, AX
+	MOVBLZX	net/netip.a16+27(SP), DX
+	SHLQ	$32, DX
+	ORQ	DX, BX
+	MOVBLZX	net/netip.a16+26(SP), DX
+	SHLQ	$40, DX
+	ORQ	DX, BX
+	MOVBLZX	net/netip.a16+25(SP), DX
+	SHLQ	$48, DX
+	ORQ	DX, BX
+	MOVBLZX	net/netip.a16+24(SP), DX
+	MOVUPS	X0, net/netip.addr(SP)
+	MOVBLZX	net/netip.addr(SP), SI
+	SHLQ	$56, SI
+	SHLQ	$56, DX
+	MOVQ	net/netip.z6noz(SB), CX
+	ORQ	SI, AX
+	ORQ	DX, BX
+	ADDQ	$32, SP
+	POPQ	BP
+	RET
+```
+
+The pack and the copy are still there. The unpack is now split into pieces:
+
+- **`lo`, low 4 bytes:** rebuilt in registers from `BX` with shifts and masks. These bytes were *forwarded*: the compiler proved they equal what was just stored.
+- **`lo`, high 4 bytes:** read back one byte at a time from `a16+24..27`.
+- **`hi`:** bytes 4–7 come back as one 32-bit `MOVBEL`, bytes 1–3 one at a time from `a16`, and byte 0 from the copy at `addr(SP)`.
+
+Partly-forwarded bytes are the signature of the regression described next.
+
+### Case 4: Read the SSA after one pass
+
+`GOSSAFUNC=AddrTo6Safe go build` writes `ssa.html` with every pass side by side, which is the best way to browse. To diff two toolchains in a terminal, dump a single pass instead. `go tool compile -d=ssa/help` lists the pass names; `memcombine` is the one that merges byte loads and stores into wider ones.
+
+```bash
+GOAMD64=v3 go build -a -gcflags='-d=ssa/memcombine/dump=AddrTo6Safe' .
+grep -E 'Move|= Load <|= Store <' AddrTo6Safe_01__memcombine.dump
+```
+
+Go 1.26.9 (same command, with `GOTOOLCHAIN=go1.26.9`):
+
+```text
+    (+461) v17 = Load <*netip.addrDetail> v16 v1
+    (128) v161 = Store <mem> {uint64} v22 v542 v23
+    (128) v282 = Store <mem> {uint64} v173 v442 v161
+    (+13) v286 = Move <mem> {[16]byte} [16] v285 v22 v282
+    (+107) v258 = Load <*netip.addrDetail> v260 v286
+    (123) v416 = Load <uint64> v285 v286
+    (123) v174 = Load <uint64> v415 v286
+```
+
+Go 1.27.2:
+
+```text
+    (128) v161 = Store <mem> {uint64} v22 v325 v23
+    (128) v282 = Store <mem> {uint64} v173 v288 v161
+    (+13) v286 = Move <mem> {[16]byte} [16] v285 v22 v282
+    (123) v400 = Load <byte> v285 v286
+    (123) v405 = Load <byte> v537 v282
+    (123) v504 = Load <byte> v488 v282
+    (123) v14 = Load <byte> v530 v282
+    (+123) v256 = Load <byte> v244 v282
+    (+123) v232 = Load <byte> v220 v282
+    (123) v208 = Load <byte> v177 v282
+    (123) v176 = Load <byte> v163 v282
+    (122) v268 = Load <uint32> v397 v282
+```
+
+Read the last argument of each `Load`: it is the memory state the load reads from. In 1.26.9 both 64-bit loads read `v286`, the state *after* the `Move`, i.e. they read the copy. In 1.27.2 most loads read `v282`, the state *before* the `Move`: they were redirected to the source array `a16`. That redirection comes from a rule added in Go 1.27 for [issue #77720](https://github.com/golang/go/issues/77720) ("field access on struct-returning method copies entire struct"). It is in [`generic.rules`](https://github.com/golang/go/blob/go1.27.2/src/cmd/compile/internal/ssa/_gen/generic.rules#L823-L827):
+
+```text
+// Load from a region just copied by Move can read directly from the source.
+(Load <t1> op:(OffPtr [o1] p1) move:(Move [n] p2 src mem))
+	&& o1 >= 0 && o1+t1.Size() <= n && isSamePtr(p1, p2)
+	&& !isVolatile(src)
+	=> @move.Block (Load <t1> (OffPtr <op.Type> [o1] src) mem)
+```
+
+The rule is correct and usually helps. The problem is ordering. In [`compile.go`](https://github.com/golang/go/blob/go1.27.2/src/cmd/compile/internal/ssa/compile.go#L481-L488) the `late opt` pass, where generic rules run, comes before `memcombine`. At `late opt` time, `BEUint64` is still sixteen separate byte loads OR-ed together. The rule redirects each byte load to `a16`. Then the existing store-to-load forwarding rules replace some of those loads with the stored bytes (the four most recently stored ones, since those rules look back through only a few stores). When `memcombine` runs, it needs eight byte loads from consecutive addresses at the same memory state to build one 64-bit load. Some of the eight are now register values rather than loads, so it can only partly merge them. That is where the 56 instructions come from.
+
+Bernat's write-up shows that running a `memcombine` round before `late opt` (plus a no-offset variant of the rule above) brings the idiom down to the three-instruction form on a patched compiler. That is a compiler change. You cannot make it from user code.
+
+### Case 5: Instructions are not time
+
+The fair comparison is across toolchains, with enough runs for `benchstat` (`go install golang.org/x/perf/cmd/benchstat@latest`) to tell signal from noise:
+
+```bash
+for tc in go1.26.9 go1.27.2; do
+  GOTOOLCHAIN=$tc GOAMD64=v3 go test -run '^$' -bench AddrTo6 -count 8 > $tc.txt
+done
+benchstat go1.26.9.txt go1.27.2.txt
+```
+
+```text
+goos: linux
+goarch: amd64
+pkg: example.com/addrto6
+cpu: Intel(R) Xeon(R) Processor
+                 │ go1.26.9.txt │            go1.27.2.txt            │
+                 │    sec/op    │   sec/op     vs base               │
+AddrTo6/safe-8      8.397n ± 8%   8.617n ± 5%        ~ (p=0.878 n=8)
+AddrTo6/unsafe-8    1.123n ± 5%   1.308n ± 5%  +16.42% (p=0.000 n=8)
+geomean             3.071n        3.357n        +9.31%
+```
+
+The safe version went from 16 to 56 instructions with **no measurable change** (`~`, p=0.88). Do not over-read the unsafe row either: five instructions measured in a tight loop on a shared VM move with code alignment, and +0.2 ns there is not a property of the source. Bernat measured the safe version about 9% slower on 1.27 than on 1.26 on a desktop Ryzen. Different microarchitectures disagree on secondary costs. They agree on the 8x.
+
+So what is the 8x? Both toolchains write the address into a stack array and read it back a few instructions later. This benchmark keeps everything else fixed and varies only that:
+
+```go
+// forward_test.go
+package addrto6
+
+import (
+	"net/netip"
+	"testing"
+)
+
+// settled is written once, long before the benchmark reads it.
+var settled = [16]byte{10: 0xff, 11: 0xff, 12: 203, 13: 0, 14: 113, 15: 10}
+
+func BenchmarkFrom16(b *testing.B) {
+	b.Run("settled-bytes", func(b *testing.B) {
+		for b.Loop() {
+			sink = netip.AddrFrom16(settled)
+		}
+	})
+	b.Run("just-written", func(b *testing.B) {
+		raw := [4]byte{203, 0, 113, 10}
+		for b.Loop() {
+			sink = MappedFrom4(raw)
+		}
+	})
+}
+```
+
+(`MappedFrom4` is in Case 6: it fills a fresh `[16]byte` and calls `AddrFrom16`.)
+
+```bash
+GOAMD64=v3 go test -run '^$' -bench From16 -count 6 . > from16.txt && benchstat from16.txt
+```
+
+```text
+goos: linux
+goarch: amd64
+pkg: example.com/addrto6
+cpu: Intel(R) Xeon(R) Processor
+                       │ from16.txt  │
+                       │   sec/op    │
+From16/settled-bytes-8   1.790n ± 7%
+From16/just-written-8    8.477n ± 4%
+geomean                  3.895n
+```
+
+The same unpack costs 1.8 ns when the bytes have been in memory for a while and 8.5 ns when they were stored a moment earlier. The likely explanation is **store-to-load forwarding**. x86 cores can hand a just-stored value straight to a later load only if the load lines up with a single earlier store. The 16-byte `MOVUPS` copy reads across two 8-byte stores, and the 1.27 byte-wise reloads read pieces of an 8-byte store. Both are patterns that commonly fall back to a stall until the stores reach the cache. This KVM guest does not expose hardware performance counters (`perf stat -e instructions` reports `<not supported>`), so the stall could not be counted directly here. On bare metal, Try this #2 shows how to check it. Whatever the exact mechanism, the measurement is clear: **the cost is in the memory round trip, and changing the instruction count does not move it.**
+
+### Case 6: Convert at the boundary, in integers
+
+If the bytes come from a packet or a database column, you can skip the IPv4 `Addr` and build the mapped form directly:
+
+```go
+// boundary.go
+package addrto6
+
+import "net/netip"
+
+// MappedFrom4 builds ::ffff:a.b.c.d straight from the four bytes a packet
+// or a database row already hands you. One unpack, no pack.
+func MappedFrom4(b [4]byte) netip.Addr {
+	a := [16]byte{10: 0xff, 11: 0xff}
+	copy(a[12:], b[:])
+	return netip.AddrFrom16(a)
+}
+
+// ViaAddr4 is the detour: make an IPv4 Addr first, then map it.
+func ViaAddr4(b [4]byte) netip.Addr {
+	return AddrTo6Safe(netip.AddrFrom4(b))
+}
+```
+
+```go
+// boundary_test.go
+package addrto6
+
+import (
+	"net/netip"
+	"testing"
+)
+
+func TestBoundary(t *testing.T) {
+	b := [4]byte{203, 0, 113, 10}
+	want := netip.MustParseAddr("::ffff:203.0.113.10")
+	if got := MappedFrom4(b); got != want {
+		t.Fatalf("MappedFrom4 = %v", got)
+	}
+	if got := ViaAddr4(b); got != want {
+		t.Fatalf("ViaAddr4 = %v", got)
+	}
+}
+
+func BenchmarkFrom4(b *testing.B) {
+	raw := [4]byte{203, 0, 113, 10}
+	b.Run("mapped-direct", func(b *testing.B) {
+		for b.Loop() {
+			sink = MappedFrom4(raw)
+		}
+	})
+	b.Run("via-addr4", func(b *testing.B) {
+		for b.Loop() {
+			sink = ViaAddr4(raw)
+		}
+	})
+	b.Run("addr4-only", func(b *testing.B) {
+		for b.Loop() {
+			sink = netip.AddrFrom4(raw)
+		}
+	})
+}
+```
+
+```bash
+GOAMD64=v3 go test -run '^$' -bench From4 -count 6 . > from4.txt && benchstat from4.txt
+```
+
+```text
+goos: linux
+goarch: amd64
+pkg: example.com/addrto6
+cpu: Intel(R) Xeon(R) Processor
+                      │  from4.txt   │
+                      │    sec/op    │
+From4/mapped-direct-8   8.517n ±  2%
+From4/via-addr4-8       9.711n ±  2%
+From4/addr4-only-8      1.218n ± 37%
+geomean                 4.653n
+```
+
+Building the mapped form directly saves only the pack step (~1.2 ns): it still writes a `[16]byte` and reads it back. `AddrFrom4` costs 1.2 ns because it builds `addr.lo` with shifts and ORs and never touches an array. The general lesson: in `net/netip`, **integer paths are cheap and `[16]byte` paths cost a memory round trip.** Pick one representation and convert to it once, where data enters the program, rather than converting back and forth in the hot loop.
+
+### Case 7: Add the method with `-overlay`, and what it costs you
+
+`go build -overlay=file.json` makes the build see replacement or extra files at any path, including inside `GOROOT`. Adding one file to `net/netip` gives you the method the proposals asked for, without editing your Go installation:
+
+```go
+// patches/to6.go - added to net/netip through -overlay; never edit GOROOT itself.
+package netip
+
+// To6 maps an IPv4 address to an IPv4-mapped IPv6 address and returns
+// every other address unchanged.
+func (ip Addr) To6() Addr {
+	if ip.Is4() {
+		ip.z = z6noz
+	}
+	return ip
+}
+```
+
+```bash
+printf '{"Replace": {"%s/src/net/netip/to6.go": "%s/patches/to6.go"}}\n' \
+  "$(go env GOROOT)" "$PWD" > overlay.json
+```
+
+```go
+// overlay_test.go - only builds with -overlay=overlay.json
+package addrto6
+
+import (
+	"net/netip"
+	"testing"
+)
+
+var sink netip.Addr
+
+func TestTo6(t *testing.T) {
+	ip := netip.MustParseAddr("203.0.113.10")
+	if ip.To6() != AddrTo6Safe(ip) {
+		t.Fatal("To6 disagrees with AddrFrom16(As16())")
+	}
+}
+
+func BenchmarkTo6(b *testing.B) {
+	ip := netip.MustParseAddr("203.0.113.10")
+	b.Run("method", func(b *testing.B) {
+		for b.Loop() {
+			sink = ip.To6()
+		}
+	})
+	b.Run("safe", func(b *testing.B) {
+		for b.Loop() {
+			sink = AddrTo6Safe(ip)
+		}
+	})
+}
+```
+
+(This lives in its own copy of the module with `go.mod` and `addrto6.go`; the patch file sits in `patches/` so it is not mistaken for part of the `addrto6` package.)
+
+```bash
+GOAMD64=v3 go test -overlay=overlay.json -run To6 -bench To6 -count 3 .
+go test -run To6 .
+```
+
+```text
+BenchmarkTo6/method-8         	937758579	         1.260 ns/op
+BenchmarkTo6/method-8         	940058956	         1.318 ns/op
+BenchmarkTo6/method-8         	913291134	         1.262 ns/op
+BenchmarkTo6/safe-8           	131066788	         8.970 ns/op
+BenchmarkTo6/safe-8           	138935923	         8.634 ns/op
+BenchmarkTo6/safe-8           	139838676	         8.667 ns/op
+PASS
+ok  	example.com/addrto6	7.168s
+
+# example.com/addrto6 [example.com/addrto6.test]
+./overlay_test.go:13:8: ip.To6 undefined (type netip.Addr has no field or method To6)
+./overlay_test.go:22:14: ip.To6 undefined (type netip.Addr has no field or method To6)
+```
+
+It is as fast as the unsafe proxy, and it is type-safe. But every `go build`, `go test`, `go vet` and gopls invocation now needs the flag. The overlay file contains absolute paths into one specific `GOROOT`. The first build without it fails. That is acceptable in one controlled binary with a Makefile. It is a bad idea for a library other people import.
+
+## The trap
+
+- **"The compiler will optimise it" as a design argument.** It is a forecast about one compiler version on one architecture. Here a correct, well-motivated Go 1.27 rule made the idiom's code 3.5x longer. A benchmark plus an assembly check is the only way to know what your toolchain does today.
+- **Counting instructions and calling it performance.** 16 vs 56 instructions made no measurable difference. 16 vs 5 made an 8x difference. Measure time with `benchstat`, then read assembly to explain it.
+- **An unsafe layout proxy without a guard.** `addrProxy` is correct only while `netip.Addr` is `{uint128, unique.Handle}`. The size check plus `TestSameAnswer` catches most layout changes in CI. Put the proxy behind a build tag if you ship it in a library, so importers opt in knowingly.
+- **Comparing benchmarks across toolchains by eye.** Use `-count` ≥ 6 and `benchstat`. On shared or virtual machines a 1 ns function moves by 15% between runs for reasons that have nothing to do with your code.
+- **Leaving `-overlay` implicit.** If the overlay lives only in a developer's shell history, CI, IDE and `go vet` will disagree about what compiles.
+
+## The boring rule
+
+Keep `netip.AddrFrom16(ip.As16())` in code that is not hot. It is correct and portable. For a hot path, pick one representation at the boundary, ideally the integer form `AddrFrom4`/`AddrFrom16` produce once, and stop converting inside the loop. Reach for `unsafe` or `-overlay` only after a `benchstat` result shows the conversion matters, and only with a test that fails when the assumption it relies on breaks. Re-run the benchmark and `asmcount.sh` whenever you bump the Go minor version.
+
+## Try this
+
+1. Run `asmcount.sh AddrTo6Safe` with `GOARCH=arm64` (cross-compiling is fine for `-S`). Does arm64 show the same 1.26 → 1.27 jump? `REV` is arm64's byte swap.
+2. On bare-metal Intel hardware, run `perf stat -e cycles,instructions,ld_blocks.store_forward go test -run '^$' -bench 'From16/just-written' -benchtime 2s .` and compare with `settled-bytes`. If the forwarding hypothesis is right, `ld_blocks.store_forward` climbs only in the first.
+3. Rewrite `AddrTo6Safe` to call `netip.AddrFrom16(ip.As16())` twice in a row on the same input. Does the compiler share any of the work? Check with `asm.sh`.
+4. Add `BenchmarkAddrTo6/unsafe` to a CI job that fails when its time exceeds 3x `AddrFrom4`. What else would such a job need to stay quiet on noisy runners?
+5. Read the discussion on [issue #81994](https://github.com/golang/go/issues/81994) and write down which of the proposed additions (`To6`, `As2xUint64`, `Prefix.Last`) would remove a `[16]byte` round trip from your own code.
+
+## Sources
+
+Go source at the `go1.27.2` tag:
+
+- `netip.Addr`, `AddrFrom16`, `Is4`, `As16`, `z4`/`z6noz`: <https://github.com/golang/go/blob/go1.27.2/src/net/netip/netip.go#L101>
+- `BEUint64`, `BEPutUint64`: <https://github.com/golang/go/blob/go1.27.2/src/internal/byteorder/byteorder.go#L120>
+- Load-through-Move rule: <https://github.com/golang/go/blob/go1.27.2/src/cmd/compile/internal/ssa/_gen/generic.rules#L823-L827>
+- Pass order (`late opt`, `memcombine`): <https://github.com/golang/go/blob/go1.27.2/src/cmd/compile/internal/ssa/compile.go#L481-L488>
+- `memcombine` pass: <https://github.com/golang/go/blob/go1.27.2/src/cmd/compile/internal/ssa/memcombine.go>
+- SSA debugging (`GOSSAFUNC`, `-d=ssa/<pass>/dump`): <https://github.com/golang/go/blob/go1.27.2/src/cmd/compile/internal/ssa/README.md>
+
+Go documentation and issues:
+
+- `go help build` (`-overlay`, `-gcflags`) and `GOTOOLCHAIN`: <https://pkg.go.dev/cmd/go>, <https://go.dev/doc/toolchain>
+- `GOAMD64` levels: <https://go.dev/wiki/MinimumRequirements#amd64>
+- `testing.B.Loop`: <https://pkg.go.dev/testing#B.Loop>
+- benchstat: <https://pkg.go.dev/golang.org/x/perf/cmd/benchstat>
+- Release history (1.26.9 and 1.27.2, both released 2026-10-08): <https://go.dev/doc/devel/release>
+- cmd/compile: field access on struct-returning method copies entire struct (#77720, fixed in 1.27): <https://github.com/golang/go/issues/77720>
+- proposal: net/netip: add To6 (#51833, closed), add Addr.Map (#54365, closed), add Addr.To6 (#81994, open): <https://github.com/golang/go/issues/51833>, <https://github.com/golang/go/issues/54365>, <https://github.com/golang/go/issues/81994>
+
+Investigation reproduced here:
+
+- Vincent Bernat, "Hacking the Go compiler to efficiently map IPv4 to IPv6" (2026-10-04), including the patched-compiler results: <https://vincent.bernat.ch/en/blog/2026-go-netip-addrto6>
+
+Tools: Go 1.27.2 and 1.26.9 (`GOTOOLCHAIN` download), benchstat (`golang.org/x/perf`, 2026-10-09 snapshot), `go tool compile -d=ssa/help`.
