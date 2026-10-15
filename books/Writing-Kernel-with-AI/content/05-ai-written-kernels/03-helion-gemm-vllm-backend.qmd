@@ -1,0 +1,259 @@
+---
+title: "Helion GEMM as a portable vLLM linear backend"
+author:
+  - name: "K19G"
+  - name: "grok-bot"
+---
+
+# Helion GEMM as a portable vLLM linear backend
+
+## Thesis
+
+vLLM's quantized linear layers (FP8, INT8, block-scaled FP8, …) already plug into highly tuned libraries — CUTLASS, DeepGEMM, FlashInfer. Those backends win by shipping **many specialized kernels** and **hand-written dispatch heuristics** (for example: "on Hopper, if `M < 32`, use Swap-AB"). **Helion** flips that contract: one high-level GEMM written in a PyTorch-native tile DSL exposes Standard / Split-K / Swap-AB as **tunable parameters**, and an ahead-of-time autotuner picks the variant and the low-level config **per shape**.
+
+This chapter walks the PyTorch blog's Helion linear backend for vLLM on NVIDIA Hopper: what Helion is, how a unified GEMM covers algorithmic variants, why hybrid dispatch under CUDA Graphs is mandatory, and where the performance–usability–maintainability tradeoff lands for production serving. It is **not** a rewrite of DeepSeek's DeepGEMM (hand-tuned CUDA FP8 GEMM in a few hundred lines). Helion is a **DSL + autotuner** path into the same linear-backend slot.
+
+**What this machine can and cannot verify.** PyTorch 2.14.1 and Triton 3.8.0 are available in a local venv; **CUDA is not** (`torch.cuda.is_available() == False`). There is no Helion package installed here, and this run installs nothing. The Helion and vLLM listings below are therefore reproduced from the public blog and **not executed here**. One CPU listing (Case 1) checks the algebra behind Split-K and Swap-AB with plain PyTorch, and its output is real. Treat throughput numbers as citations of the blog's H100 measurements, not results from this box.
+
+## Mental model
+
+```text
+  vLLM quantized Linear  ──dispatch──▶  linear backend
+                                           │
+           ┌───────────────────────────────┼───────────────────────────────┐
+           ▼                               ▼                               ▼
+     CUTLASS / FlashInfer            Helion GEMM                    DeepGEMM
+     (library kernels +              (one DSL kernel;               (specialized
+      shape heuristics)               AOT autotune picks              CUDA GEMM)
+                                      Standard|Split-K|Swap-AB
+                                      + tile/schedule config)
+           │                               │
+           │                     hybrid by num_tokens:
+           │                     ≤ max_helion_size → Helion
+           │                       under CUDA Graph replay
+           │                     >  threshold       → default kernel
+```
+
+| Idea | Plain meaning |
+|------|----------------|
+| Tile DSL | You write loops over tiles (`hl.tile`); Helion lowers to Triton (Hopper work) or other backends |
+| Tunable fragment | `hl.register_tunable("split_k", …)` / `"swap_ab"` — search knobs, not hard-coded `if M < 32` |
+| AOT autotune | Offline search over configs; warm serving loads cached artifacts |
+| Hybrid dispatch | Only small `num_tokens` (decode-heavy) run Helion; large shapes keep the default backend |
+| Tradeoff triangle | Peak perf ↔ out-of-box usability ↔ maintainer burden of shipping configs |
+
+## Worked examples
+
+### Case 1: One GEMM, three algorithmic variants as knobs
+
+Classic authoring: implement Standard GEMM, Split-K and Swap-AB as separate kernels, benchmark them, then encode a dispatch heuristic. vLLM's Block_FP8 backend on Hopper, for example, switches to Swap-AB when `M < 32`. The Helion version keeps **one** kernel body and registers the choices as tunables. This is the plain-matmul listing from the PyTorch blog (the quantized kernels add scaling on top of the same structure). It needs the `helion` package and a CUDA GPU:
+
+```python
+# helion_matmul.py: unified Standard / Split-K / Swap-AB GEMM (listing from the PyTorch blog).
+# Needs: helion + a CUDA device. Not executed on this book's build machine (no GPU, no helion).
+import torch
+import helion
+import helion.language as hl
+from helion.autotuner import PowerOfTwoFragment, BooleanFragment
+
+@helion.kernel()
+def matmul(
+    out: torch.Tensor,  # [M, N]
+    a: torch.Tensor,    # [M, K]
+    b: torch.Tensor,    # [K, N]
+) -> None:
+    M, K = a.shape
+    N = b.shape[1]
+    hl.specialize(K)
+    hl.specialize(N)
+
+    out_dtype = out.dtype
+    acc_dtype = torch.float32
+
+    split_k = hl.register_tunable("split_k", PowerOfTwoFragment(1, 256))
+    k_block_size = helion.next_power_of_2(helion.cdiv(K, split_k))
+    if split_k > 1:
+        out.zero_()
+
+    swap_ab = hl.register_tunable("swap_ab", BooleanFragment())
+
+    for tile_m, tile_n, outer_k in hl.tile(
+        [M, N, K], block_size=[None, None, k_block_size]
+    ):
+        acc = hl.zeros([tile_m, tile_n], acc_dtype)
+        acc_t = acc.t()
+        for tile_k in hl.tile(outer_k.begin, outer_k.end):
+            if swap_ab:
+                a_blk = hl.load(a, [tile_m.index[None, :], tile_k.index[:, None]])
+                b_blk = hl.load(b, [tile_k.index[None, :], tile_n.index[:, None]])
+                acc_t = hl.dot(b_blk, a_blk, acc=acc_t, out_dtype=acc_dtype)
+            else:
+                acc = hl.dot(a[tile_m, tile_k], b[tile_k, tile_n],
+                             acc=acc, out_dtype=acc_dtype)
+
+        out_blk = acc_t.t().to(out_dtype) if swap_ab else acc.to(out_dtype)
+
+        if split_k == 1:
+            out[tile_m, tile_n] = out_blk
+        else:
+            hl.atomic_add(out, [tile_m, tile_n], out_blk)
+```
+
+The blog prints only the kernel body. The `@helion.kernel()` decorator and the imports are added here following the Helion README and the repository's `examples/matmul_split_k.py`, which imports `PowerOfTwoFragment` from `helion.autotuner`. Check them against the Helion release you install.
+
+What to notice:
+
+- `block_size=[None, None, k_block_size]`: `None` means "let the autotuner choose" for the M and N tiles. The K block size is *derived* from `split_k`, so one knob reshapes the whole iteration space.
+- **Split-K** raises parallelism when `M` and/or `N` are too small to fill the GPU. It partitions `K` across programs and combines the partial tiles with `hl.atomic_add` (hence the `out.zero_()`).
+- **Swap-AB** computes `(Bᵀ·Aᵀ)ᵀ`, so a tiny `M` lands on the dimension that tiles well.
+- `hl.specialize(K)` / `hl.specialize(N)` bake the weight dimensions into the compiled kernel. For a linear layer they are fixed per model, so only `M` (the token count) varies at runtime.
+
+The algebra the autotuner relies on is easy to check without a GPU. This CPU listing runs the three variants as plain PyTorch and compares each one against a float64 reference:
+
+```python
+# gemm_variants_cpu.py: the three GEMM variants a Helion kernel exposes as tunables,
+# written as plain PyTorch on CPU so the algebra can be checked without a GPU.
+import torch
+
+torch.manual_seed(0)
+M, K, N = 4, 4096, 1024            # decode-like shape: tiny M, large K and N
+a = torch.randn(M, K)
+b = torch.randn(K, N)
+ref = a.double() @ b.double()       # float64 reference
+
+def standard(a, b):
+    return a @ b
+
+def split_k(a, b, split):
+    # Partition K into `split` slices, compute partial products, then sum them.
+    # On a GPU each slice is a separate program; the sum is hl.atomic_add into out.
+    ks = torch.tensor_split(torch.arange(a.shape[1]), split)
+    out = torch.zeros(a.shape[0], b.shape[1])
+    for idx in ks:
+        out += a[:, idx] @ b[idx, :]
+    return out
+
+def swap_ab(a, b):
+    # A @ B == (B.T @ A.T).T : the kernel tiles over N (large) instead of M (tiny)
+    return (b.t() @ a.t()).t()
+
+for name, out in [("standard", standard(a, b)),
+                  ("split_k=8", split_k(a, b, 8)),
+                  ("split_k=64", split_k(a, b, 64)),
+                  ("swap_ab", swap_ab(a, b))]:
+    err = (out.double() - ref).abs().max().item()
+    print(f"{name:<11} shape={tuple(out.shape)} max_abs_err_vs_fp64={err:.2e}")
+```
+
+```bash
+python gemm_variants_cpu.py
+```
+
+```text
+standard    shape=(4, 1024) max_abs_err_vs_fp64=1.09e-04
+split_k=8   shape=(4, 1024) max_abs_err_vs_fp64=8.84e-05
+split_k=64  shape=(4, 1024) max_abs_err_vs_fp64=9.60e-05
+swap_ab     shape=(4, 1024) max_abs_err_vs_fp64=8.84e-05
+```
+
+All four agree with the reference to within FP32 accumulation noise (K = 4096 terms). Split-K changes the *order* of the additions, so its error differs slightly from the standard path's, but it is no worse. That is why the autotuner may pick any of them: the choice is purely about speed. On a GPU there is one more effect. Atomic adds commit in a nondeterministic order, so Split-K results can differ in the last bits from run to run. If your serving stack promises bitwise-reproducible outputs, that matters.
+
+### Case 2: Hybrid dispatch tied to CUDA Graphs
+
+Helion pays extra CPU cost on JIT / dispatch / launch if you call kernels outside graph replay. The vLLM integration therefore:
+
+1. Caps Helion to `num_tokens ≤ max_helion_size` (blog used **32**).
+2. Runs those shapes **only under CUDA Graph replay**.
+3. Falls back to CUTLASS / DeepGEMM / FlashInfer above the cap.
+
+vLLM captures graphs for a discrete set of sizes roughly like:
+
+```text
+[1, 2, 4] + range(8, 256, 8) + range(256, max_graph_size+1, 16)
+```
+
+So with `max_helion_size = 32`, Helion is autotuned for:
+
+```text
+num_tokens ∈ {1, 2, 4, 8, 16, 24, 32}
+```
+
+That is exactly the decode-heavy band where GEMM latency hurts TTFT/TPOT most, while prefill-sized batches keep the battle-tested default kernels.
+
+Server flag shape from the blog:
+
+```bash
+# Conceptual — needs a CUDA host, a quantized model weights tree, and Helion-enabled vLLM.
+vllm serve \
+  --model "$MODEL" \
+  --max-num-seqs 32 \
+  --tensor-parallel-size 1 \
+  --no-enable-prefix-caching \
+  --linear-backend helion
+```
+
+Autotune driver shape:
+
+```bash
+HELION_AUTOTUNER=LLMSeededLFBOTreeSearch \
+HELION_BENCHMARK_CUDAGRAPH=1 \
+python scripts/autotune_helion_kernels.py \
+  --kernels scaled_mm block_scaled_mm \
+  --autotune-effort "full"
+```
+
+### Case 3: What the published Hopper numbers claim
+
+On an **NVIDIA H100 80GB**, across Qwen3 dense sizes (1.7B–32B) plus Qwen3.8-27B, for FP8_Dynamic, W8A8_INT8, and Block_FP8:
+
+| Comparison (kernel-level, geo-mean) | Reported speedup |
+|-------------------------------------|------------------|
+| Helion FP8_Dynamic vs CUTLASS | ~1.11× |
+| Helion W8A8_INT8 vs CUTLASS | ~1.18× |
+| Helion Block_FP8 vs FlashInfer | ~1.15× |
+| Helion Block_FP8 vs DeepGEMM | ~1.18× |
+
+End-to-end ShareGPT serving showed **consistent** throughput gains, **>10%** on some workloads, with Helion active only in the ≤32 token band. Variance across shapes is the point: per-shape configs beat a single heuristic.
+
+### Case 4: Distinguish Helion-from-DeepGEMM (same book, different chapter)
+
+| | DeepGEMM (elsewhere in this book) | Helion linear backend (this chapter) |
+|--|-----------------------------------|--------------------------------------|
+| Artifact | Compact CUDA source specializing FP8 GEMM | DSL kernel + AOT search + vLLM dispatch glue |
+| Who picks the algorithm | Kernel author / library | Autotuner over explicit tunables |
+| Portability story | CUDA-first craftsmanship | Same source → Triton today, CuteDSL/Blackwell and other backends as they mature |
+| Ops burden | Ship the `.cu` / library | Ship integration + either pre-tuned configs or client-side autotune |
+
+Use DeepGEMM when you want a readable, fixed high-performance CUDA GEMM. Use Helion when you want **one** maintainable implementation specialized **per deployment shape** without hand-writing every variant.
+
+## The trap
+
+**Trap: "Helion always replaces CUTLASS."** Outside CUDA Graphs, launch overhead can erase kernel wins. Large `num_tokens` should keep the default backend — that is intentional hybrid design, not a failure.
+
+**Trap: "Ship every per-shape config upstream."** Fine-grained configs are large, hard to CI-validate, and rot when models change. The blog's upstream direction: keep Helion kernels + framework in-tree with a **default** config for CI; let serving operators run autotune for their models offline.
+
+**Trap: "Autotune is free."** Full per-shape search can take hours. Budget it like a release engineering step, not like `pip install`.
+
+## The boring rule
+
+For latency-critical quantized GEMM in an inference engine: express algorithmic variants as **search parameters** in one kernel, **autotune per shape** offline, execute Helion **only under CUDA Graph** for the small-token band, and fall back to the proven library backend everywhere else. Optimize for the triangle vertex your org can actually operate — peak TPS, day-one usability, or config maintenance — consciously.
+
+## Try this
+
+1. On a CUDA box with Helion-enabled vLLM, A/B `--linear-backend helion` vs default at `--max-num-seqs 32` on one FP8 model; compare throughput only after warm graphs.
+2. Inspect which `num_tokens` your deployment actually hits in decode vs prefill; decide whether `max_helion_size = 32` matches your traffic.
+3. Read the unified GEMM listing in the blog and mark every `register_tunable` — those are the decisions you are no longer hard-coding.
+
+## Verification
+
+- Primary: PyTorch Blog, *Building a High-Performance and Portable vLLM Linear Backend with Helion* (2026-10-02).
+- Local environment (2026-10-15 IST): Python 3.13.5, PyTorch 2.14.1+cu130, Triton 3.8.0 in `/workspace/venv-kernel-1015`; `torch.cuda.is_available()` is **False**; Helion not installed; **no** apt/pip installs performed for this chapter.
+- Throughput and geo-mean speedups are **quoted from the blog's H100 measurements**, not reproduced here.
+- `gemm_variants_cpu.py` (Case 1) was run on CPU with that venv; the output shown is pasted from the run.
+- Distinguishes DeepGEMM (separate chapter) by construction.
+
+## Sources
+
+- PyTorch Blog — [Building a High-Performance and Portable vLLM Linear Backend with Helion](https://pytorch.org/blog/building-a-high-performance-and-portable-vllm-linear-backend-with-helion/)
+- Helion — [pytorch/helion](https://github.com/pytorch/helion) and [helionlang.com](https://helionlang.com) (DSL, `hl.tile`, `register_tunable`, autotuner)
+- vLLM — [documentation](https://docs.vllm.ai/en/latest/) (quantized linear backends, CUDA Graph capture sizes)
