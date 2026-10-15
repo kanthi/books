@@ -1,0 +1,162 @@
+---
+title: "HTTP/1 Connection Reuse in Go 1.27"
+author:
+  - name: "K19G"
+  - name: "grok-bot"
+---
+
+# HTTP/1 Connection Reuse in Go 1.27
+
+## Thesis
+
+Through Go 1.26, a client that called `resp.Body.Close()` without reading the body to EOF **abandoned** the HTTP/1 connection. Status-only callers, and even `json.Decoder` stopping before a trailing newline, paid a fresh TCP+TLS handshake on every request. Starting in **Go 1.27**, `net/http.Transport` **asynchronously drains** an unread HTTP/1 body for up to **50 ms** or **256 KB** (and skips drain when `Connection: close` makes it useless). The boring code — get status, `defer resp.Body.Close()` — suddenly reuses connections again.
+
+This chapter is about that **1.27 change**, as described by Nicholas Husin and Damien Neil on the [go.dev blog](https://go.dev/blog/http-connection-reuse). It is *not* a repeat of connection-pool knobs (`MaxIdleConnsPerHost`, idle timeouts); those still matter, but they only help when the body contract lets the Transport keep the socket.
+
+## Mental model
+
+```text
+  HTTP/1 on one TCP socket (responses are back-to-back bytes):
+
+  [ status+headers | body₁........ | status+headers | body₂.... ]
+                         ▲
+                         └── Transport cannot find response₂ until body₁ is gone
+
+  Through 1.26:  Close() with unread body  →  drop connection
+  From 1.27:     Close() with unread body  →  background drain (≤50ms / ≤256KB)
+                                              then idle-pool reuse if drain wins
+```
+
+| Fact | Consequence |
+|------|-------------|
+| HTTP/1 is sequential on the wire | Unread body blocks the next response on that socket |
+| HTTP/2 multiplexes streams | Unread body on one stream does **not** block others — auto-drain is an HTTP/1 concern |
+| `http.Get` returns after headers | Body may still be sitting unread on the connection |
+| Manual drain was error-prone | Cap bytes, cap time, run async, avoid draining HTTP/2 "for luck" |
+| 1.27 Transport does the hard part | Prefer simple `Close()`; keep reading when you need the payload |
+
+Setup cost reminder from the blog: new HTTPS connection ≈ 1 RTT TCP + 1–2 RTT TLS before any HTTP byte. On a ~100 ms RTT path that is hundreds of milliseconds you should not pay per request.
+
+## Worked examples
+
+Verified with **`go1.27.1`** at `/home/box/sdk/go1.27.1/bin/go` on linux/amd64 (15 October 2026). Force HTTP/1 with `GODEBUG=http2client=0` so the lab exercises the path the blog measures.
+
+### Case 1: Status-only client reuses on 1.27
+
+```go
+// reuse_demo.go — Go 1.27 auto-drains unread HTTP/1 bodies
+package main
+
+import (
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"net/http/httptrace"
+	"os"
+	"runtime"
+)
+
+func main() {
+	fmt.Printf("go=%s GODEBUG=%q\n", runtime.Version(), os.Getenv("GODEBUG"))
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		// Trailing newline: classic leftover after json.Decoder
+		_, _ = w.Write([]byte(`{"ok":true}` + "\n"))
+	}))
+	defer srv.Close()
+
+	tr := &http.Transport{ForceAttemptHTTP2: false}
+	client := &http.Client{Transport: tr}
+
+	for i := 0; i < 3; i++ {
+		var gotConn httptrace.GotConnInfo
+		req, _ := http.NewRequest(http.MethodGet, srv.URL, nil)
+		req = req.WithContext(httptrace.WithClientTrace(req.Context(), &httptrace.ClientTrace{
+			GotConn: func(info httptrace.GotConnInfo) { gotConn = info },
+		}))
+		resp, err := client.Do(req)
+		if err != nil {
+			panic(err)
+		}
+		code := resp.StatusCode
+		// Status-only: never read the body. Go 1.27 should still reuse.
+		_ = resp.Body.Close()
+		fmt.Printf("req=%d status=%d reused=%v wasIdle=%v\n", i+1, code, gotConn.Reused, gotConn.WasIdle)
+	}
+
+	resp, _ := client.Get(srv.URL)
+	n, _ := io.Copy(io.Discard, resp.Body)
+	_ = resp.Body.Close()
+	fmt.Printf("explicit_drain_bytes=%d\n", n)
+}
+```
+
+```bash
+export PATH=/home/box/sdk/go1.27.1/bin:$PATH
+GODEBUG=http2client=0 go run reuse_demo.go
+```
+
+```text
+go=go1.27.1 GODEBUG="http2client=0"
+req=1 status=200 reused=false wasIdle=false
+req=2 status=200 reused=true wasIdle=false
+req=3 status=200 reused=true wasIdle=true
+explicit_drain_bytes=12
+```
+
+Request 1 dials; requests 2 and 3 show `reused=true` even though the body was never read in user code. That is the 1.27 behaviour. (`wasIdle` can flip depending on whether the async drain has already parked the socket in the idle pool — the signal that matters is `reused`.)
+
+### Case 2: Why 1.26 felt fine until it did not
+
+The blog's index.golang.org microbenchmark (HTTP/1 forced): ~**710 ms** for 100 status-only GETs on Go 1.26 versus ~**150 ms** on Go 1.27 — nearly **5×** — because 1.26 paid handshake cost over and over. Any API that returns `{"success":true,"message":"..."}` while the client only checks the status code hits the same cliff.
+
+### Case 3: The JSON trailing-newline trap
+
+`encoding/json.Decoder` stops at the closing `}` of a value. If the server appends `\n` (very common), one byte remains unread. Through 1.26 that single byte was enough to destroy reuse. In 1.27 the Transport's background drain consumes it within the 256 KB / 50 ms budget for typical API payloads.
+
+```go
+// Still fine to read what you need; Close() is enough for the rest on 1.27.
+dec := json.NewDecoder(resp.Body)
+var payload struct {
+	OK bool `json:"ok"`
+}
+_ = dec.Decode(&payload)
+_ = resp.Body.Close()
+```
+
+### Case 4: What 1.27 does that hand-rolled drain got wrong
+
+A correct manual drain needed all of:
+
+1. `io.CopyN(io.Discard, body, 256<<10)` — do not download a multi-gig body to save a handshake  
+2. A time cap (~50 ms) so a trickle cannot stall Close  
+3. Asynchronous drain so Close does not block the caller  
+4. Skip when `Connection: close` guarantees the socket dies anyway  
+5. Do **not** cargo-cult the same drain on HTTP/2
+
+Go 1.27's Transport implements that policy (details may evolve). Prefer the simple Close path unless you are on an older Go and must polyfill.
+
+## The trap
+
+1. **Assuming pool settings alone fix latency.** Raising `MaxIdleConnsPerHost` does nothing if every Close abandons the socket.  
+2. **Draining HTTP/2 bodies "because Stack Overflow said so".** Multiplexing already isolates streams; the expensive mistake was HTTP/1-specific.  
+3. **Blocking forever on `io.Copy(io.Discard, body)`** for huge responses — establishing a new connection can be cheaper; that is why the byte and time caps exist.
+
+## The boring rule
+
+On Go **1.27+**, when you are finished with a response: **`resp.Body.Close()`** (usually via `defer`). Read the body when you need the bytes; do not invent a custom drain unless you are maintaining a 1.26-era compatibility shim. Keep a shared `*http.Client` / `*http.Transport` so reuse has a pool to return to.
+
+## Try this
+
+1. Run `reuse_demo.go` under `GODEBUG=http2client=0` with go1.27.1; confirm `reused=true` from request 2.  
+2. Point the same status-only loop at a real HTTPS URL and compare wall time under Go 1.26 vs 1.27 if you have both toolchains.  
+3. Add `httptrace` `DNSStart` / `TLSHandshakeStart` hooks and watch them fire only on the first request when reuse works.  
+4. Read the upstream blog once; skim `net/http` Transport docs for any future tuning of the 50 ms / 256 KB policy.
+
+## Sources
+
+- Nicholas Husin & Damien Neil, *Better HTTP/1 connection reuse*, go.dev blog (14 October 2026): <https://go.dev/blog/http-connection-reuse>
+- Go 1.27 release notes / `net/http` package docs: <https://go.dev/doc/go1.27>, <https://pkg.go.dev/net/http>
+- Inspiration: <https://x.com/golang/status/2110451069855896047>
