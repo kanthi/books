@@ -148,6 +148,7 @@ Successful commands look like the underlying tool’s output. Failures include p
 
 - Ubuntu’s default is group-based admin (`%sudo ALL=(ALL:ALL) ALL`) — still prefer explicit command lists on hardened hosts.  
 - Lecture/insults and password prompts are configured in sudoers (`Defaults`).  
+- On Ubuntu 25.10 and later, `/usr/bin/sudo` is **sudo-rs** (C sudo stays installed as `sudo.ws`). It accepts a subset of sudoers syntax and shows `*` while you type the password. See the `sudo-rs` page in this part before upgrading hosts with custom sudoers rules.  
 - `sudo !!` re-runs the previous shell command with sudo — review `!!` expansion before Enter.  
 - Root-equivalent via misconfigured `NOPASSWD: ALL` is convenient and dangerous; scope it tightly.  
 - Containers: passwordless sudo inside images is common for convenience — treat those images as root-equivalent.
