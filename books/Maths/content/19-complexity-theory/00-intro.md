@@ -47,6 +47,7 @@ TSP optimization $\leftrightarrow$ decision TSP with threshold $k$. Binary searc
 1. Reductions and NP-completeness  
 2. Randomized and approximation complexity  
 3. Space complexity  
+4. Fine-grained complexity breaks — truly subquadratic 3SUM and subcubic APSP  
 
 Related: Algorithms part (`13`) for asymptotics and intro classes.
 
