@@ -22,11 +22,12 @@ Create and modify accounts, password aging, groups, and privilege elevation. Pre
 | `groupdel` | groupdel deletes a group from the system group database (typically /etc/group and /etc/gshadow). |
 | `getent` | getent queries Name Service Switch (NSS) databases—the same view applications get via glibc: local files, LDAP/SSSD,… |
 | `su` | su (“substitute user”) starts a shell or runs a command as another user. |
+| `sudo-rs` | sudo-rs is the Rust sudo that is `/usr/bin/sudo` on Ubuntu 25.10+; what differs from C sudo, the password-feedback default, and a sudoers preflight before upgrading. |
 
 
 ## Suggested starting points
 
-1. Elevation: `sudo`, `visudo`, `su`.
+1. Elevation: `sudo`, `visudo`, `su`. On Ubuntu 25.10 and later, read `sudo-rs` before relying on C-sudo-only sudoers syntax.
 2. Accounts: `useradd`/`usermod`/`userdel`, `passwd`, `chage`.
 3. Groups: `groupadd`/`groupmod`/`groupdel`.
 4. Lookups: `getent` (works with NSS/LDAP backends, not only local files).
