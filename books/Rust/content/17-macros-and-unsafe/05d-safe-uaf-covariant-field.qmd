@@ -1,0 +1,155 @@
+---
+title: "Safe Rust UAF via covariant field assignment (rust#164250)"
+author:
+  - name: "K19G"
+  - name: "grok-bot"
+---
+
+# Safe Rust UAF via covariant field assignment (rust#164250)
+
+Rust's type system is supposed to make use-after-free impossible in safe code. Issue [rust-lang/rust#164250](https://github.com/rust-lang/rust/issues/164250) (opened 2026-10-13, labels `I-unsound`, `P-high`, `A-variance`, `A-borrow-checker`) shows a counterexample: **no `unsafe` keyword**, yet a `Drop` impl can observe a dangling reference. A minimized form has compiled since **Rust 1.4** (2015). This chapter is the incident card next to the unsafe / FFI chapters: what breaks, how to reproduce on current stable, and what to audit in your own crates — not a claim that everyday application code is doomed.
+
+## Learning goals
+
+By the end of this chapter you can:
+
+- State the bug in one sentence: lifetime bounds on a type are not fully enforced when a **covariant field** is assigned after construction
+- Reproduce the `MyType` / `Drop` smuggling pattern on **rustc 1.99.0**
+- Separate "malicious `Drop`" exploitability from accidental UAF in ordinary code (per the Types Team note on the issue)
+- Know where to watch for fixes (Types Team / Project Zero work; do not "patch" this in user code with `unsafe`)
+
+## Thesis
+
+> If the compiler accepts a shorter-lived reference into a field whose type promised a longer lifetime, `Drop` runs with a lie. Safe code can then read freed stack memory — the soundness bug is in the type checker, not in your `unsafe` blocks.
+
+## Mental model
+
+```text
+  struct MyType<'a, 'b: 'a, 'c>(&'c mut &'a str, &'b str);
+       │                              │
+       │                              └─ field 1: covariant in 'b
+       └─ Drop assumes 'b: 'a (and related bounds) still hold
+
+  construction:  MyType(&mut me_out, "")     // '' is 'static-ish / long enough
+  later assign:  q.1 = &local_string;        // shorter 'b sneaks in
+  scope ends:    Drop runs → *me_out = dangling
+  after scope:   print(me_out) → UAF
+```
+
+| Piece | Role |
+|-------|------|
+| Covariance on a field | Allows treating a shorter lifetime as a longer one when unifying / assigning |
+| Lifetime bounds on the struct (`'b: 'a`, `'a: 'static`, …) | Documented intent; **not** re-checked thoroughly on field assignment in this bug |
+| `Drop` | Runs while the type system still believes the long lifetime |
+| No `unsafe` in the repro | The unsoundness is accepting the program, not an explicit transmute |
+
+The Types Team note on the issue: this would be `P-critical` on novelty grounds, but an 11-year-old hole that stayed unnoticed is hard to hit by accident; exploiting it generally needs an **intentionally malicious `Drop`**. Treat production risk as real but not "rewrite everything tomorrow".
+
+## Worked examples
+
+### Case 1: Minimal Drop smuggling (reproduced here)
+
+Verified on this box: **rustc 1.99.0** (`b940084d7 2026-09-28`). The program compiles; after the inner scope, `me_out` prints garbage (use-after-free of the `String` buffer).
+
+```rust
+// uaf_covariant_field.rs — safe Rust; reproduces rust#164250 shape (lcnr / theemathas)
+// rustc 1.99.0: compiles and runs; output is nondeterministic garbage / asan would trap
+
+struct MyType<'a: 'c, 'b: 'a, 'c>(&'c mut &'a str, &'b str);
+
+impl<'a: 'c, 'b: 'a, 'c> Drop for MyType<'a, 'b, 'c> {
+    fn drop(&mut self) {
+        // Type system thinks self.1 lives at least as long as 'a
+        *self.0 = self.1;
+    }
+}
+
+fn main() {
+    let mut me_out = "rarw";
+    {
+        let l = String::from("some cool string");
+        let mut q = MyType(&mut me_out, "");
+        q.1 = &l; // assigns a short-lived &str into a field that required 'b: 'a
+    } // l dropped; Drop of q already wrote &l into me_out
+    println!("me_out: {}", me_out);
+}
+```
+
+```bash
+$ rustc --version
+rustc 1.99.0 (b940084d7 2026-09-28)
+$ rustc uaf_covariant_field.rs -o uaf_covariant_field
+$ ./uaf_covariant_field
+me_out: <non-deterministic garbage bytes>
+```
+
+(Exact bytes vary; AddressSanitizer builds crash with `stack-use-after-scope` — see the Godbolt links on the issue.)
+
+### Case 2: `'static` bound bypass with a kept value
+
+The original report uses a `Mutex<Vec<Box<dyn Any + Send>>>` to keep a `T: 'static` value that was actually a short reference. On 1.99.0 here it compiled and printed the **later** stack string that reused the slot:
+
+```rust
+// uaf_kept_static.rs — original-report shape; rustc 1.99.0 prints the filler String
+use std::sync::Mutex;
+
+static KEPT: Mutex<Vec<Box<dyn std::any::Any + Send>>> = Mutex::new(Vec::new());
+
+struct Q<T: 'static + Send>(Option<T>);
+
+impl<T: 'static + Send> Drop for Q<T> {
+    fn drop(&mut self) {
+        if let Some(t) = self.0.take() {
+            KEPT.lock().unwrap().push(Box::new(t));
+        }
+    }
+}
+
+fn main() {
+    {
+        let l = String::from("hello world, this is long enough");
+        let mut q = Q(None);
+        q.0 = Some(&l); // T inferred as &'static String, but &l is not 'static
+    }
+    let _z = String::from("XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX");
+    let k = KEPT.lock().unwrap();
+    println!("{}", k[0].downcast_ref::<&'static String>().unwrap());
+}
+```
+
+```bash
+$ rustc uaf_kept_static.rs -o uaf_kept_static && ./uaf_kept_static
+XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX
+```
+
+That output is the smoking gun: the kept `&String` no longer points at `"hello world…"`.
+
+### Case 3: What to check in your code
+
+You are looking for **custom `Drop` (or drop glue that runs user code)** combined with **post-init assignment into lifetime-carrying fields**, especially where the type constructor / bounds promised `'static` or a long lifetime. Ordinary `&T` fields without clever `Drop` are the common case and are not automatically vulnerable. Do not "fix" this by sprinkling `unsafe` — wait for a compiler fix; track #164250.
+
+Miri (when available on nightly) reports UB on related reproducers (dangling reference in a spawned closure). This box did not run Miri; the stable `rustc` runs above are enough to show acceptance + observable UAF.
+
+## The trap
+
+Hearing "safe Rust UAF" and concluding the borrow checker is worthless, or conversely dismissing #164250 because it needs a malicious `Drop`. The accurate posture: the invariant *failed* in a narrow variance/bounds corner; the ecosystem still relies on that invariant; `P-high` means the Types Team treats it as urgent work.
+
+## The boring rule
+
+If you implement `Drop` and store references (or callbacks over references), construct the value with the **final** references in place when you can, and treat "assign a shorter borrow into a field that was typed longer" as a compiler bug to report — not a pattern to build on. Pin a toolchain; upgrade when the fix lands on stable.
+
+## Try this
+
+```bash
+rustc --version   # expect 1.99.x or newer until fixed
+rustc uaf_covariant_field.rs -o /tmp/uaf && /tmp/uaf
+# Optional: rustup + nightly miri on your machine (not installed here)
+```
+
+Watch [rust#164250](https://github.com/rust-lang/rust/issues/164250) for the fix PR; re-run the repro after upgrading — it should start failing to compile.
+
+## Sources
+
+- [rust-lang/rust#164250 — struct's lifetime requirements can be bypassed via covariant field assignment](https://github.com/rust-lang/rust/issues/164250)
+- Types Team context note on the issue (`P-high`, malicious `Drop`, Project Zero direction)
+- Godbolt links attached to the issue (with/without ASan)
