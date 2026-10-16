@@ -1,0 +1,219 @@
+---
+title: "NumPy Limited API and heap types (toward subinterpreters)"
+author:
+  - name: "K19G"
+  - name: "grok-bot"
+---
+
+# NumPy Limited API and heap types (toward subinterpreters)
+
+NumPy's speed lives in C extension modules that historically used the **full** CPython C API: static `PyTypeObject` layouts, macros that read struct fields at fixed offsets, one giant build matrix of wheels per OS × arch × Python version. The **Limited API** is CPython's promise that a narrower subset stays stable across minor releases, producing `abi3` wheels. Getting NumPy onto that diet means the same conversion subinterpreters also need: **heap types**, **per-module state**, and **multi-phase init**.
+
+This chapter is the bridge between "we already have subinterpreters in the stdlib" and "why `import numpy` still fails inside one." It follows Quansight's October 2026 internship write-up and NumPy's tracking issues—not a how-to ship `abi3` wheels tomorrow (NumPy does not yet). Verified locally: **Python 3.13.5**, **NumPy 2.5.3**. `concurrent.interpreters` needs **3.14+**; examples that call it are marked for 3.14 and taken from upstream docs / the Quansight post.
+
+## Learning goals
+
+By the end of this chapter you can:
+
+- State what `Py_LIMITED_API` / Stable ABI (`abi3`, and `abi3t` on free-threaded builds) buy you
+- Contrast static types with heap types built from `PyType_Spec` / `PyType_FromModuleAndSpec`
+- Explain why heap types + per-module state unlock both Limited API and subinterpreter isolation
+- Name NumPy's current stance: Limited API opt-in in Meson, `Py_MOD_MULTIPLE_INTERPRETERS_NOT_SUPPORTED` until isolation is done
+- Know what changes for SciPy-like dependents (usually nothing until *they* opt in)
+
+## Thesis
+
+> The Limited API hides `PyTypeObject`'s layout, so static types are illegal. Subinterpreters forbid sharing one static type across interpreters. Same rewrite, two payoffs: forward-compatible wheels *and* a path to `InterpreterPoolExecutor` workers that can `import numpy`.
+
+## Mental model
+
+```text
+  Full C API wheel matrix          Limited API (abi3)
+  OS × arch × Py version           OS × arch  (one wheel spans Py minors)
+         │                                    │
+         └──── both need heap types ──────────┘
+                      │
+                      ▼
+         Subinterpreters (per-interp GIL since 3.12)
+         need: multi-phase init + module state + heap types
+```
+
+| Concept | Full C API habit | Limited / isolation habit |
+|---------|------------------|---------------------------|
+| Types | `static PyTypeObject Foo_Type = { … }` | `PyType_Spec` + `PyType_FromModuleAndSpec` (heap type) |
+| Field access | `PyTuple_GET_ITEM` macro | `PyTuple_GetItem` function (checks, can fail) |
+| Module state | Process globals | `PyModule_GetState()` per module object |
+| Init | Single-phase copy-into-other-interp | Multi-phase (`Py_mod_exec`, PEP 489) |
+| Subinterp flag | Often unsupported | Goal: `Py_MOD_PER_INTERPRETER_GIL_SUPPORTED` |
+
+---
+
+## Case 1 — Why the build matrix hurts
+
+NumPy 2.5.3 ships on the order of **65 wheels** on PyPI for a band of Python versions (Quansight's count for 3.12–3.15, free-threaded columns separate). Each new CPython minor means new binaries. Macros that poke `PyObject` internals compile only against the headers they were built with.
+
+Define Limited API before `Python.h`:
+
+```c
+#define Py_LIMITED_API 0x030D0000  /* 3.13 — Py_PACK_VERSION(3, 13) */
+#include <Python.h>
+```
+
+With that define, incomplete types make field access a **compile error**. CPython documents the Stable ABI and Limited API contents in the [C API stability](https://docs.python.org/3/c-api/stable.html) page. Free-threaded builds need the stricter **`abi3t`** story (PEP 803) when you care about `--disable-gil` interpreters.
+
+---
+
+## Case 2 — Static type → heap type
+
+Simplified pattern from CPython's isolating-extensions guidance and the Quansight post:
+
+```c
+/* Before: static type — layout baked into the .so */
+static PyTypeObject Foo_Type = {
+    PyVarObject_HEAD_INIT(NULL, 0)
+    .tp_name = "mymod.Foo",
+    .tp_basicsize = sizeof(FooObject),
+    .tp_dealloc = (destructor)foo_dealloc,
+    .tp_flags = Py_TPFLAGS_DEFAULT,
+};
+
+/* After: heap type — CPython builds it at runtime */
+static PyType_Slot foo_slots[] = {
+    {Py_tp_dealloc, foo_dealloc},
+    {0, NULL},
+};
+
+static PyType_Spec foo_spec = {
+    .name = "mymod.Foo",
+    .basicsize = sizeof(FooObject),
+    .flags = Py_TPFLAGS_DEFAULT,
+    .slots = foo_slots,
+};
+
+/* in module exec / init */
+PyObject *foo_type = PyType_FromModuleAndSpec(module, &foo_spec, NULL);
+```
+
+Heap-type gotcha: instances hold a reference to their type; `tp_dealloc` must `Py_DECREF` the type after freeing the instance, or you leak.
+
+Macro → function:
+
+```c
+/* Before */
+PyObject *item = PyTuple_GET_ITEM(args, 0);
+
+/* After */
+PyObject *item = PyTuple_GetItem(args, 0);
+if (item == NULL) {
+    return NULL;
+}
+```
+
+Hot NumPy loops over raw buffers rarely pay this cost; the API surface around Python objects does.
+
+---
+
+## Case 3 — Where NumPy stands (2026-10)
+
+From the Quansight Labs post and NumPy tracking issues:
+
+- Meson option `python.allow_limited_api` defaults to **`false`** in NumPy's top-level project. Ported modules pass `limited_api: '3.13'`, but that is ignored until the option is flipped.
+- You can already build ported modules with Limited API:
+
+```bash
+# from a NumPy source checkout — not run on this box
+spin build -- -Dpython.allow_limited_api=true
+# or: pip install . -Csetup-args=-Dpython.allow_limited_api=true
+```
+
+- Many peripheral modules are ported (`numpy.random` Cython modules, FFT/linalg pieces, several `_core` test modules). **`_multiarray_umath`** (the core) remains the final boss for true `abi3` wheels.
+- Subinterpreters: `_multiarray_umath` still advertises `Py_MOD_MULTIPLE_INTERPRETERS_NOT_SUPPORTED`. Track [numpy#32451](https://github.com/numpy/numpy/issues/32451) (subinterpreters) and [numpy#31913](https://github.com/numpy/numpy/issues/31913) (Limited API adoption). Heap-type batches are landing; scalars, ufuncs, and `PyArray_Type` are the hard remainder.
+
+On **Python 3.14+**, the failure mode looks like (trimmed; Quansight / NumPy messaging):
+
+```text
+concurrent.interpreters.ExecutionFailed: ImportError:
+  module numpy._core._multiarray_umath does not support loading in subinterpreters
+```
+
+This box runs 3.13.5, so that import path was not executed here; treat the snippet as upstream-documented behavior.
+
+---
+
+## Case 4 — What you write once NumPy is ready
+
+Process pool today:
+
+```python
+# process_pool_numpy.py — works on current NumPy
+from concurrent.futures import ProcessPoolExecutor
+import numpy as np
+
+def work(seed):
+    rng = np.random.default_rng(seed)
+    return float(rng.standard_normal(1_000_000).std())
+
+if __name__ == "__main__":
+    with ProcessPoolExecutor(max_workers=4) as pool:
+        print(list(pool.map(work, range(4))))
+```
+
+Future shape with `InterpreterPoolExecutor` (stdlib since 3.14) once NumPy flips the module flag—import **inside** the worker:
+
+```python
+# interpreter_pool_numpy.py — requires NumPy subinterpreter support + Py 3.14+
+from concurrent.futures import InterpreterPoolExecutor
+
+def work(seed):
+    import numpy as np  # each interpreter loads its own NumPy
+    rng = np.random.default_rng(seed)
+    return float(rng.standard_normal(1_000_000).std())
+
+if __name__ == "__main__":
+    with InterpreterPoolExecutor(max_workers=4) as pool:
+        print(list(pool.map(work, range(4))))
+```
+
+Shared big arrays still favor free-threading (no pickle copy). Subinterpreters win on isolation-without-process for many small jobs.
+
+---
+
+## Case 5 — If you maintain SciPy-like code
+
+1. **Today:** No change. You talk to NumPy through its C API capsule (`import_array()`), independent of how NumPy compiled itself.
+2. **If NumPy ships `abi3`:** You can install NumPy on a brand-new Python sooner; your own wheels still need per-version builds until *you* adopt Limited API.
+3. **If you want `abi3` yourself:** Heap types + function APIs; Cython 3.1+ can emit Limited API code; Meson `limited_api: '3.13'` + meson-python `limited-api = true`; build against NumPy ≥ 2.0 headers that tolerate `Py_LIMITED_API`.
+
+## The trap
+
+- Believing "NumPy ported some modules" means PyPI wheels are `abi3`—they are not; the switch is off.
+- Using Limited API macros as a free-threaded ABI—`abi3` ≠ `abi3t`.
+- Forgetting that subinterpreter support needs **all** of multi-phase init, module state, and heap types—not only one.
+
+## The boring rule
+
+When you touch a C extension type in NumPy-land (or your own extension), prefer **heap types and Limited-API-safe accessors** even if you still ship version-specific wheels. You pay the rewrite once; Limited API and subinterpreters both cash the check later.
+
+## Try this
+
+1. Read CPython [Isolating Extension Modules](https://docs.python.org/3/howto/isolating-extensions.html) and skim NumPy issues #31913 / #32451.
+2. On Python 3.14+, create a subinterpreter and `import numpy`; confirm the explicit unsupported error.
+3. If you build NumPy from source, flip `-Dpython.allow_limited_api=true` and run the test suite (CI already does in a debug job).
+
+## Sources
+
+- [The things you own end up owning you](https://labs.quansight.org/blog/limited_api_numpy) — Quansight Labs, 2026-10-01 (Pratham Hole)
+- [C API and ABI Stability](https://docs.python.org/3/c-api/stable.html) — CPython docs
+- [Isolating Extension Modules](https://docs.python.org/3/howto/isolating-extensions.html)
+- NumPy tracking: [#31913 Limited API](https://github.com/numpy/numpy/issues/31913), [#32451 subinterpreters](https://github.com/numpy/numpy/issues/32451)
+- PEP 489 (multi-phase init), PEP 684 (per-interpreter GIL), PEP 734 (`concurrent.interpreters`), PEP 803 (`abi3t`)
+
+## Inspiration
+
+- Quansight / NumPy Limited API + heap-types work circulating in October 2026. Chapter cites the Quansight post and NumPy/CPython docs.
+
+## Verification
+
+- Python 3.13.5, NumPy 2.5.3 import OK on this box.
+- No Limited API rebuild of NumPy (would need a source build; skipped per no-install scout rule).
+- Subinterpreter import demo requires 3.14+; documented from upstream, not executed here.
