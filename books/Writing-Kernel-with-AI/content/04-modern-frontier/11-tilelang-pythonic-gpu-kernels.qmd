@@ -1,0 +1,180 @@
+---
+title: "TileLang: Pythonic DSL for GPU kernels on TVM"
+author:
+  - name: "K19G"
+  - name: "grok-bot"
+---
+
+# TileLang: Pythonic DSL for GPU kernels on TVM
+
+Hand-written CUDA/CUTLASS wins benchmarks and loses weekends. **TileLang** (`tile-lang`) is a Pythonic DSL for high-performance GPU/CPU/NPU kernels—GEMM, dequant GEMM, FlashAttention, linear attention—compiled through a TVM-based stack. You write tiled programs with shared/fragment memory, `T.Pipelined` copies, and `T.gemm`; the compiler lowers to CUDA, HIP, Metal, Ascend, and experimental backends.
+
+This chapter is the on-ramp: mental model, JIT GEMM+ReLU shape from upstream docs, how TileLang sits beside Triton/CuTe-DSL style work already in this book, and what you can verify without a GPU. Primary sources: [tile-ai/tilelang](https://github.com/tile-ai/tilelang) README and [Language Basics](https://tilelang.com/programming_guides/language_basics.html) (docs report TileLang **0.1.15**). No `pip install tilelang` on this scout box; listings are from upstream quickstart / docs.
+
+## Learning goals
+
+By the end of this chapter you can:
+
+- Place TileLang in the kernel-authoring landscape (Python DSL → TVM/TIRX → device codegen)
+- Read a `@tilelang.jit` GEMM: grid via `T.Kernel`, stages via `T.Pipelined`, MMA via `T.gemm`
+- Name memory scopes: global tensors, `alloc_shared`, `alloc_fragment`
+- Point at official examples for FlashAttention and architecture-specific paths (Blackwell, AMD, Metal, Ascend)
+- State verification limits when no GPU is present
+
+## Thesis
+
+> TileLang keeps the **tile program** in Python—grids, pipelines, gemm—while the compiler owns ISA-specific lowering. You debug the algorithm at tile granularity; backends compete underneath.
+
+## Mental model
+
+```text
+  Python tile program          TileLang compiler           Device
+  (@jit / @T.prim_func)   →   TIR/TIRX + passes      →   CUDA / HIP / Metal / …
+        │                         │
+        ├─ T.Kernel grid          ├─ layout / pipeline
+        ├─ T.copy / T.gemm        └─ CodeGen registry
+        └─ shared / fragment
+```
+
+| Primitive | Role |
+|-----------|------|
+| `@tilelang.jit` | Specialize on shapes / compile-time args at first call |
+| `T.Kernel(grid…, threads=…)` | Launch tile programs (blocks on CUDA) |
+| `T.alloc_shared` / `T.alloc_fragment` | On-chip tile buffers vs per-thread fragments |
+| `T.copy` | Scope-aware tile movement (global ↔ shared ↔ fragment) |
+| `T.Pipelined(..., num_stages=N)` | Software pipeline for copy/compute overlap |
+| `T.gemm` | Tile MMA lowered to tensor-core / ISA kernels |
+| `T.Parallel` | Elementwise-friendly nested parallelism (epilogues) |
+
+Backends (README support table, abbreviated): **CUDA** primary (SM70–SM120 paths), **HIP/ROCm** supported, **Ascend 950** supported (build flags), **Metal** supported, **LLVM CPU** / **CuTe DSL** / **WebGPU** experimental, plus ecosystem adapters (MetaX, MUSA, …).
+
+---
+
+## Case 1 — GEMM + ReLU quickstart
+
+Upstream quickstart (FP16 inputs, FP32 accumulate, fused ReLU). Requires a CUDA (or ROCm-as-`cuda` device name) PyTorch install to *run*; read it as the canonical shape:
+
+```python
+# tilelang_gemm_relu.py — from TileLang README quickstart (docs)
+import torch
+import tilelang
+import tilelang.language as T
+
+@tilelang.jit
+def matmul_relu(A, B, block_M: int = 128, block_N: int = 128, block_K: int = 32):
+    M, N, K = T.const("M, N, K")
+    A: T.Tensor((M, K), T.float16)
+    B: T.Tensor((K, N), T.float16)
+    C = T.empty((M, N), T.float16)
+
+    with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=128) as (bx, by):
+        A_shared = T.alloc_shared((block_M, block_K), T.float16)
+        B_shared = T.alloc_shared((block_K, block_N), T.float16)
+        C_local = T.alloc_fragment((block_M, block_N), T.float32)
+
+        T.clear(C_local)
+        for k in T.Pipelined(T.ceildiv(K, block_K), num_stages=3):
+            T.copy(A[by * block_M, k * block_K], A_shared)
+            T.copy(B[k * block_K, bx * block_N], B_shared)
+            T.gemm(A_shared, B_shared, C_local)
+
+        for i, j in T.Parallel(block_M, block_N):
+            C_local[i, j] = T.max(C_local[i, j], 0)
+
+        T.copy(C_local, C[by * block_M, bx * block_N])
+
+    return C
+
+# Host (needs GPU + tilelang installed):
+# M = N = K = 1024
+# a = torch.randn((M, K), device="cuda", dtype=torch.float16)
+# b = torch.randn((K, N), device="cuda", dtype=torch.float16)
+# c = matmul_relu(a, b)
+# torch.testing.assert_close(c, torch.relu(a @ b), rtol=1e-2, atol=1e-2)
+```
+
+What to notice:
+
+- **Compile-time tile sizes** are ordinary Python defaults on the `@jit` function.
+- **Pipeline depth** (`num_stages=3`) is an explicit algorithm choice, not a hidden heuristic.
+- **Epilogue** stays in the same kernel via `T.Parallel` + `T.max`.
+
+Install when you have a machine that allows it:
+
+```bash
+pip install tilelang
+python -c "import tilelang; print(tilelang.__version__)"
+```
+
+---
+
+## Case 2 — Language basics without the marketing layer
+
+Docs distinguish `@T.prim_func` (explicit TIR function) from the `@jit` wrapper that specializes and invokes. Dynamic dims use `T.dyn["K"]` or `T.dynamic("K")`. Prefer reading sizes from `A.shape[0]` inside the body when symbols are annotation-only.
+
+Minimal vector-add pattern (docs):
+
+```python
+# sketch — see Language Basics for full @jit wrapper
+with T.Kernel(T.ceildiv(N, block), threads=block) as bx:
+    for i in T.Parallel(block):
+        gi = bx * block + i
+        C[gi] = A[gi] + B[gi]
+```
+
+Debugging: `T.print` emits from a single thread for shared/fragment scopes to avoid log floods. Pass visualizer / IR dump / AutoDD tools exist in the examples tree for compiler archaeology.
+
+---
+
+## Case 3 — FlashAttention and the examples map
+
+TileLang's `examples/` tree (upstream) is the real curriculum after GEMM:
+
+| Area | Upstream pointer |
+|------|------------------|
+| GEMM / FP8 / dequant / block-scaled | `examples/gemm`, `gemm_fp8`, `dequantize_gemm`, `blockscaled_gemm_sm100` |
+| FlashAttention / decoding / sparse | `examples/flash_attention`, `flash_decoding`, `blocksparse_attention` |
+| Model-shaped | DeepSeek MLA / V3.2 / V4 example dirs |
+| Arch-specific | `examples/amd`, `gemm_tcgen05`, `gemm_sm120`, Ascend README |
+
+Use those when you need operator-complete references; this chapter stays on the DSL contract so you can read them.
+
+Benchmarks published by the project (MLA decode, FlashAttention, matmul on 4090/A100/H100/MI300X) live in [tilelang-benchmark](https://github.com/tile-ai/tilelang-benchmark)—cite their numbers; do not invent H100 timings here.
+
+---
+
+## Case 4 — How this differs from neighboring DSLs (conceptual)
+
+Without cross-linking other book titles: Triton-style work emphasizes Python → compiler-owned schedules; CuTe-DSL emphasizes explicit layouts and tensor cores in a C++/DSL hybrid; TileLang keeps a **tile-level Python** surface with first-class `T.gemm` / pipeline / multi-backend registry on a TVM lineage. Pick based on team fluency and which backend you must ship (e.g. Ascend or Metal paths documented upstream).
+
+## The trap
+
+- Pasting GPU quickstarts into CI without a device—the `@jit` path wants real tensors on a backend.
+- Treating README benchmark charts as reproducible on your SKU without the benchmark harness.
+- Ignoring v0.1.x compatibility notes (legacy API removals called out in release notes such as v0.1.13).
+
+## The boring rule
+
+Write the **tile algorithm** (grid, shared, pipeline, gemm, epilogue) so a reader can see data movement. Let TileLang own ISA selection. Validate with upstream examples before claiming a speedup.
+
+## Try this
+
+1. On a GPU box: `pip install tilelang`, run the README GEMM+ReLU assert.
+2. Open `examples/flash_attention` and identify Q/K/V shared tiles + online softmax structure.
+3. Flip `block_M/N/K` and `num_stages`; use upstream profiling/examples rather than guessing occupancy.
+
+## Sources
+
+- [tile-ai/tilelang](https://github.com/tile-ai/tilelang) — README, examples, releases
+- [TileLang documentation](https://tilelang.com/) — Installation, targets, language basics
+- [Language Basics](https://tilelang.com/programming_guides/language_basics.html)
+- [Apache TVM](https://tvm.apache.org/) — compiler substrate
+- [tilelang-benchmark](https://github.com/tile-ai/tilelang-benchmark)
+
+## Inspiration
+
+- TileLang as a Pythonic GPU-kernel DSL (GEMM / FlashAttention on TVM) discussed in 2026 kernel-authoring threads. Chapter cites GitHub + tilelang.com.
+
+## Verification
+
+Docs-based from TileLang README and Language Basics (fetched 2026-10-16). No GPU and no `tilelang` install on this box—quickstart was not executed; do not treat commented host code as local output. Docs site version string observed: TileLang **0.1.15**.
