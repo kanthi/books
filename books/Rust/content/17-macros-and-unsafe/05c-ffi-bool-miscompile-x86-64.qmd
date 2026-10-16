@@ -1,0 +1,166 @@
+---
+title: "FFI bool miscompile on x86_64 (Rust 1.99.0 → 1.99.1)"
+author:
+  - name: "K19G"
+  - name: "grok-bot"
+---
+
+# FFI bool miscompile on x86_64 (Rust 1.99.0 → 1.99.1)
+
+Rust's `bool` is not a C `int`. Across the `extern "C"` boundary it must follow the platform ABI: on **x86-64 SysV**, a `_Bool` / `bool` return is a byte whose **bits 1–7 are zero** (bits above that are undefined). If the compiler forgets to zero-extend, a C caller that reads the return as `bool` can observe values like `16` instead of `0` or `1`—and then every `if (flag)` in C becomes a landmine.
+
+Rust **1.99.0** shipped a regression that dropped that zero-extension for FFI `bool` returns on several x86_64 targets. **1.99.1** (2026-10-15) restored it. This chapter is the incident report you want next to the FFI chapter: what broke, how to see it in a register dump, who is affected, and what to do on a pinned toolchain.
+
+## Learning goals
+
+By the end of this chapter you can:
+
+- State the x86-64 ABI rule for returning `bool` / `_Bool`
+- Reproduce the 1.99.0 miscompile with a tiny Rust cdylib + C main
+- Recognize the missing `andb $0x1, %al` (or equivalent zero-extend) in disassembly
+- Upgrade to **1.99.1** (or pin 1.98.x / avoid `bool` at the boundary) as mitigation
+
+## Thesis
+
+> Safe Rust returning `bool` to C is only as trustworthy as codegen's ABI lowering. A missing zero-extend is a silent miscompile: the source looks right, the bit in `%al` does not.
+
+## Mental model
+
+```text
+  Rust: (flags & 1) == 1     →  i1 in LLVM
+                │
+                ▼
+  ABI: return bool in %al with bits 1–7 cleared
+                │
+     1.98.0:  mov %edi,%eax ; and $1,%al ; ret   ✓
+     1.99.0:  mov %edi,%eax ; ret                ✗  (raw 0x10 survives)
+     1.99.1:  zero-extend restored               ✓
+```
+
+| Layer | What went wrong in 1.99.0 |
+|-------|---------------------------|
+| LLVM IR | `zeroext` on `i1` returns was dropped for x86_64 SysV (related fallout from broader scalar-extension changes) |
+| Machine code | No mask/extend before `ret` |
+| C caller | `(int)ret` can print `16` when input was `0x10` |
+
+Primary tracker: [rust-lang/rust#163911](https://github.com/rust-lang/rust/issues/163911). Fix release notes: [Announcing Rust 1.99.1](https://blog.rust-lang.org/2026/10/15/Rust-1.99.1/).
+
+---
+
+## Case 1 — Minimal reproduction
+
+Save the Rust side:
+
+```rust
+// lib.rs — cdylib exporting a C ABI bool
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rust_fn_returning_bool(flags: u8) -> bool {
+    (flags & 0x1) == 0x1
+}
+```
+
+Save the C caller:
+
+```c
+/* main.c */
+#include <stdio.h>
+#include <stdbool.h>
+
+extern bool rust_fn_returning_bool(unsigned char);
+
+int main(void) {
+    bool ret = rust_fn_returning_bool(0x10);
+    printf("ret = %d\n", (int)ret);
+    return 0;
+}
+```
+
+Build and run (Linux x86_64):
+
+```bash
+rustc --crate-type cdylib -O -o librust_bool.so lib.rs
+gcc -O2 -o ffi main.c -L. -lrust_bool -Wl,-rpath,'$ORIGIN'
+./ffi
+```
+
+### Genuine output on this box (rustc 1.99.0)
+
+```text
+$ rustc --version
+rustc 1.99.0 (b940084d7 2026-09-28)
+
+$ ./ffi
+ret = 16
+```
+
+Expected on a fixed toolchain: `ret = 0` (because `0x10 & 1 == 0`).
+
+Disassembly of the export on 1.99.0 (excerpt):
+
+```text
+00000000000127cc <rust_fn_returning_bool>:
+   127cc:	89 f8                	mov    %edi,%eax
+   127ce:	c3                   	ret
+```
+
+On 1.98.0 the same function included `andb $0x1, %al` before `ret` (see the issue). The logical compare was optimized assuming LLVM would still zero-extend the `i1` at the ABI boundary—and it no longer did.
+
+---
+
+## Case 2 — Who was affected
+
+Per the issue and write-ups circulating with 1.99.1:
+
+- **Targets:** x86_64 SysV-style environments (Linux, musl, FreeBSD, Android, many bare-metal x86_64 configs). aarch64 / loongarch64 reproductions in the report masked correctly.
+- **Surface:** Rust functions with `extern "C"` (or other C-like ABIs) that **return `bool`**, especially when compiled with optimizations so LLVM folds the compare into a raw register move.
+- **Not required:** `unsafe` in the callee body beyond FFI—the export itself is the hazard. Callers in C/`bindgen` glue are where symptoms show up (wrong branch, wrong `printf`, corrupted flag packing).
+
+If you ship a cdylib / staticlib consumed by C/C++/other languages, inventory `-> bool` at the boundary.
+
+---
+
+## Case 3 — Mitigations
+
+1. **Upgrade:** `rustup update stable` → **1.99.1** or newer, then **rebuild** all Rust artifacts that cross FFI (don't assume an old `.so` is fine).
+2. **Temporary pin:** Stay on **1.98.x** until you can move, if 1.99.0 is already in CI.
+3. **ABI hygiene:** Return `u8` (0/1) or `c_int` at the boundary and convert explicitly:
+
+```rust
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rust_fn_returning_u8(flags: u8) -> u8 {
+    u8::from((flags & 0x1) == 0x1)
+}
+```
+
+4. **Test in CI:** Keep a C (or `cc` crate) smoke test that passes a non-0/1 pattern in the low byte's upper bits and asserts a clean 0/1 out—exactly the repro above.
+
+## The trap
+
+- Assuming "it compiled and linked" means ABI correctness—miscompiles return successfully.
+- Only testing `true`/`false` inputs that already clear high bits (`0` and `1`), which hide the bug.
+- Upgrading `rustc` in the developer laptop but shipping libraries built with 1.99.0 in a Docker layer.
+
+## The boring rule
+
+Treat `bool` across FFI as a **checked ABI contract**. Prefer explicit integer statuses at the boundary, pin a toolchain with a known-good 1.99.1+, and keep one C-linked regression test that would have printed `16`.
+
+## Try this
+
+1. Run the repro on your machine; note `rustc --version` and `./ffi` output.
+2. `rustup update stable` to 1.99.1+, rebuild, confirm `ret = 0`.
+3. `objdump -d` the export before/after and look for the zero-extend.
+
+## Sources
+
+- [Announcing Rust 1.99.1](https://blog.rust-lang.org/2026/10/15/Rust-1.99.1/) — official fix description
+- [rust-lang/rust#163911](https://github.com/rust-lang/rust/issues/163911) — miscompilation report, IR/`zeroext` analysis, P-critical
+- [yeslogic/rust-bool-ffi](https://github.com/yeslogic/rust-bool-ffi) — upstream minimal reproduction
+- x86-64 psABI notes on `_Bool` return zeroing (discussed in the issue thread / LLVM history)
+
+## Inspiration
+
+- Rapid response around Rust 1.99.0 FFI bool returns (issue filed 2026-10-07, point release 2026-10-15). Chapter cites the Rust blog and GitHub issue.
+
+## Verification
+
+Genuine on this box with **rustc 1.99.0** + **gcc**: `./ffi` printed `ret = 16`; `objdump` showed `mov %edi,%eax; ret` without `and`. 1.99.1 was not installed here (scout runs do not upgrade toolchains); fixed behavior is taken from the official 1.99.1 announcement and the issue resolution.
