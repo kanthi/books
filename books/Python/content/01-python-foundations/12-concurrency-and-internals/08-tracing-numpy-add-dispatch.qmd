@@ -1,0 +1,196 @@
+---
+title: "Tracing np.add: ufunc dispatch internals"
+author:
+  - name: "K19G"
+  - name: "grok-bot"
+---
+
+# Tracing `np.add`: ufunc dispatch internals
+
+## Thesis
+
+`np.add(a, b)` is one of the most executed lines in numerical Python. The working mental model — "it adds the arrays, in C, quickly" — is correct and incomplete. Between the Python call and the SIMD add there is a long, deliberate machine: a `numpy.ufunc` object, an `__array_ufunc__` escape hatch, DType promotion and a dispatch cache, a trivial-loop vs `NpyIter` choice, a GIL release, and a template-generated inner loop that may or may not take the vectorized path depending on strides.
+
+This chapter traces that path for two `float64` arrays on **NumPy 2.5.x**, so you can predict when you get the fast loop, when third-party arrays take over, and why a strided view of the same elements can be ~1.5–3× slower without ever leaving the "trivial" path. It is an internals chapter (CPython ↔ NumPy C API), not a NumPy *usage* tutorial — place it next to the VM / profiling chapters, not next to pandas.
+
+Path note: there is no `12-stdlib-and-ecosystem` folder in this book; the chapter lives under `12-concurrency-and-internals` because the subject is dispatch, caching, and the C loop boundary.
+
+## Mental model
+
+```text
+np.add(a, b)                         Python
+   │
+   ▼
+ufunc_generic_fastcall               parse args / kwargs
+   │
+   ▼
+PyUFunc_CheckOverride                __array_ufunc__? → divert
+   │
+   ▼
+promote_and_get_ufuncimpl            DType resolve + cache
+   │
+   ▼
+trivial single-output loop           OR   NpyIter + buffered chunks
+   │
+   ▼
+DOUBLE_add (CPU-dispatched)          SIMD specialization or scalar for-loop
+```
+
+| Layer | Job |
+|-------|-----|
+| `numpy.ufunc` | Bundle of typed inner loops + metadata (`nin`, `nout`, `types`) |
+| Override (NEP 13) | Let Dask / CuPy / your type compute instead |
+| Promotion / dispatch (NEP 43 ArrayMethod) | Pick `dd→d` (or promote, then pick); cache by DType classes |
+| Iteration | One call over all data if shapes/strides cooperate; else general iterator |
+| Inner loop | Template-expanded C; universal intrinsics when contiguous/scalar |
+
+## Worked examples
+
+### Case 1: `np.add` is an object, not a plain function
+
+```python
+# ufunc_object.py
+import numpy as np
+
+print("numpy", np.__version__)
+print("type", type(np.add))
+print("nin/nout", np.add.nin, np.add.nout)
+print("n_types", len(np.add.types))
+print("float family", [t for t in np.add.types if "d" in t or "f" in t][:6])
+```
+
+```bash
+python ufunc_object.py
+```
+
+```text
+numpy 2.5.3
+type <class 'numpy.ufunc'>
+nin/nout 2 1
+n_types 22
+float family ['ee->e', 'ff->f', 'dd->d', 'FF->F', 'DD->D', 'gF->F']
+```
+
+`types` lists the **classic** signatures. Loops registered the modern ArrayMethod way (for example string dtypes) live in an internal map that Python does not expose on `.types`. The signature we chase for two float64 ndarrays is `dd->d`.
+
+### Case 2: The `__array_ufunc__` escape hatch
+
+Before NumPy commits work, it asks every operand whether it wants to handle the call (NEP 13). Any non-default `__array_ufunc__` wins; none of the float64 machinery below runs.
+
+```python
+# ufunc_override.py
+import numpy as np
+
+class Diverted:
+    def __array_ufunc__(self, ufunc, method, *inputs, **kwargs):
+        return f"intercepted {ufunc.__name__}.{method}"
+
+print(np.add(np.arange(3), Diverted()))
+```
+
+```bash
+python ufunc_override.py
+```
+
+```text
+intercepted add.__call__
+```
+
+This is how `np.add(dask_array, cupy_array)` can leave NumPy entirely. Plain `ndarray` arguments continue into promotion.
+
+### Case 3: Which SIMD variant did you import?
+
+At import time NumPy selects a CPU-specialized build of the arithmetic loops (x86-64-v3 / AVX2 ladder on this box):
+
+```python
+# ufunc_simd_info.py
+from numpy.lib import introspect
+print(introspect.opt_func_info(func_name="add", signature="float64"))
+```
+
+```bash
+python ufunc_simd_info.py
+```
+
+```text
+{'add': {'ddd': {'current': 'X86_V3', 'available': 'X86_V3 baseline(X86_V2)'}}}
+```
+
+On an ARM Mac you would typically see a NEON / ASIMD baseline instead. The pointer installed into `ufunc->functions` is already the one for *your* CPU.
+
+### Case 4: Same additions, different strides — the inner loop tax
+
+Both of these calls can stay on the **trivial** path (one entry into the inner loop). Contiguous data hits the SIMD specialization; a stride of 16 bytes fails those guards and falls through to the scalar pointer-bumping loop — plus it touches more memory.
+
+```python
+# ufunc_stride_bench.py
+import time
+import numpy as np
+
+n = 10_000_000
+base_a = np.random.rand(2 * n)
+base_b = np.random.rand(2 * n)
+base_out = np.empty(2 * n)
+contig_a, contig_b, contig_out = (x[:n].copy() for x in (base_a, base_b, base_out))
+strided_a, strided_b, strided_out = (x[::2] for x in (base_a, base_b, base_out))
+
+def bench(fn, reps=10):
+    for _ in range(2):
+        fn()
+    t0 = time.perf_counter()
+    for _ in range(reps):
+        fn()
+    return (time.perf_counter() - t0) / reps * 1e3
+
+c = bench(lambda: np.add(contig_a, contig_b, out=contig_out))
+s = bench(lambda: np.add(strided_a, strided_b, out=strided_out))
+print(f"contig {c:.2f} ms  strided {s:.2f} ms  ratio {s/c:.2f}x")
+print("strides", contig_a.strides, strided_a.strides)
+```
+
+```bash
+python ufunc_stride_bench.py
+```
+
+```text
+contig 26.74 ms  strided 44.69 ms  ratio 1.67x
+strides (8,) (16,)
+```
+
+Numbers move with CPU and thermal state (other runs on this box landed near 1.8×). The qualitative result is stable: **layout beats micro-optimization** for ufuncs. Prefer contiguous operands (or `np.ascontiguousarray` at API boundaries) when the hot path is elementwise math.
+
+### Case 5: When the heavy iterator appears
+
+A non-contiguous **N-D** view (for example `base[:, ::2]`) or an `out=` that overlaps an input unsafely forces `NpyIter`: broadcasting, buffering, overlap copies. 1-D strided arrays alone do **not** force the iterator — they still call the inner loop once with real strides. That is why Case 4's gap lives *inside* `DOUBLE_add`, not in iterator setup.
+
+## The trap
+
+**Trap: "it's all C, so strides don't matter."** The C loop is still stride-aware. SIMD specializations guard on contiguous or scalar operands; everyone else pays the scalar loop and worse bandwidth.
+
+**Trap: "monkeypatching NumPy functions is how libraries interoperate."** For ufuncs, implement `__array_ufunc__` (and `__array_function__` for non-ufuncs like `concatenate`). Overriding `np.add` itself breaks everyone else.
+
+**Trap: "`.types` is the whole story."** Modern dtype loops may be absent from `.types`. Trust dispatch behaviour and NEP 43 ArrayMethods when you register new dtypes.
+
+## The boring rule
+
+Before you tune an elementwise NumPy hotspot: confirm you did not divert through `__array_ufunc__`, confirm the DType pair you think you have, and make the operands **C-contiguous** (or accept that you are on the scalar inner loop). Layout first; compiler flags second.
+
+## Try this
+
+1. Re-run Case 4 with `out=a` overlapping slices in both directions; watch which direction needs the iterator (unsafe overlap).
+2. Call `np.add(int32_array, float64_array)` and inspect the result dtype — promotion landed on `dd→d` without you writing a cast.
+3. Build NumPy from source with ufunc tracing enabled (see Veit Heller's post) if you want the iterator path printed — optional; not required for this chapter.
+
+## Verification
+
+- Ran on Python 3.13.5, NumPy **2.5.3**, Linux x86-64 (2026-10-15 IST). Outputs above are pasted from that run.
+- Heller's blog pins NumPy **2.5.2**; API surface for this trace matches 2.5.3. Free-threaded cache changes noted in that post's Fin may differ on `main` — this chapter describes the 2.5.x release line.
+- No system packages installed; used the environment's existing NumPy.
+
+## Sources
+
+- Veit Heller — [Tracing np.add, all the way down](https://blog.veitheller.de/numpy.html) (inspiration and map; re-verified against 2.5.3)
+- NumPy — [Universal functions (ufunc)](https://numpy.org/doc/stable/reference/ufuncs.html)
+- [NEP 13 — A Mechanism for Overriding Ufuncs](https://numpy.org/neps/nep-0013-ufunc-overrides.html)
+- [NEP 43 — Extensible ufuncs / ArrayMethod](https://numpy.org/neps/nep-0043-extensible-ufuncs.html)
+- NumPy — [CPU build options / SIMD](https://numpy.org/doc/stable/reference/simd/index.html)
