@@ -1,0 +1,239 @@
+---
+title: "Git infrastructure for agent-scale development"
+author:
+  - name: "K19G"
+  - name: "grok-bot"
+---
+
+# Git infrastructure for agent-scale development
+
+## Thesis
+
+Human Git workflows tolerate a few hundred milliseconds of push latency and occasional `git gc` pauses. **Agent fleets do not.** An agent in a tight loop commits or checkpoints after nearly every action; its wall-clock speed is bounded by how fast a single push completes. When thousands of agents write their own branches in one monorepo, and every push fans out into CI clones, the platform's Git store becomes the bottleneck — not the model that wrote the patch.
+
+This chapter teaches the **demands and design principles** behind GitHub's rebuild of its Git infrastructure for agent-scale development (October 2026 engineering post). You will not reproduce GitHub's storage stack (Spokes and its successor). You will learn why classic "full local replica per fileserver" designs hit a ceiling, which coordination you must keep, which work you can move off the push critical path, and how to reason about agent load when you operate your own forge or large monorepo.
+
+### The numbers behind the shift
+
+All figures are from GitHub's post (published 2026-10-06).
+
+| Signal | Figure |
+|--------|--------|
+| Git events per month (Sep 2025 → Aug 2026) | 218.2 B → **473.3 B** (more than 2×) |
+| Pushes per month, year over year | 0.69 B → **3.35 B** (4.9×) |
+| Commits in September 2026 | **7.38 B** (more than 5× a year earlier) |
+| GitHub Actions runs in September 2026 | **3.26 B** (more than 4×) |
+| Pull-request merges, year over year | nearly **4×** |
+| Busiest single repository, August 2026 | about **1 billion** requests |
+| New architecture, internal benchmarks | up to **35×** higher write throughput |
+
+The ratio that matters is that pushes grew faster than total events. The write side is where the curve bends.
+
+## Mental model
+
+```text
+                    agents / CI / humans
+                            │
+            ┌───────────────┼───────────────┐
+            ▼               ▼               ▼
+      push / update      clone / fetch    merge queue
+      (write path)       (read fan-out)   (one hot ref)
+            │               │               │
+            ▼               ▼               ▼
+   ┌─ critical path ─┐   caches /         single tip
+   │ agree on the    │   lightweight      must absorb
+   │ reference update│   read workers     every merge
+   └────────┬────────┘         │
+            │                  │
+            ▼                  ▼
+   durable object store   (scale independently)
+   (blobs / packs / refs)
+            │
+            ▼
+   background compaction / GC  (off the serving path)
+```
+
+| Pressure | Why agents make it worse | Design response |
+|---------|--------------------------|-----------------|
+| Push latency | Agent loop waits on every checkpoint | Shrink the coordinated step to the **ref update**; parallelize object storage, connectivity checks, scanning |
+| Write throughput | Thousands of branches updating one repo | Decouple durability from read replicas so adding read capacity does not slow every write |
+| Hot tip / merge queue | Trunk, release trains, merge queues funnel work onto one ref | Still needs agreement — but everything *around* the tip update can be independent |
+| Read fan-out | One push → thousands of CI clones/fetches | Scale reads with **lightweight workers + cache**, not more durable full copies |
+| Compaction / GC | Every write adds cleanup work | Run maintenance on **separate workers** against durable storage, not on the same host answering live Git |
+
+**Reads are easy; writes are hard.** Caches and replicas absorb clone storms. Every push must be stored durably and made visible consistently before the next agent or CI job can build on it.
+
+## Worked examples
+
+### Case 1: Measure what an agent actually waits on
+
+An agent that "feels slow" is often waiting on the forge, not on the model. Time the two halves of a checkpoint separately: the local commit, and the push.
+
+```bash
+#!/usr/bin/env bash
+# agent-push-budget.sh — time one agent-style checkpoint: commit locally, then push
+set -euo pipefail
+REPO="${1:?repo path}"
+cd "$REPO"
+
+printf '\n# checkpoint %s\n' "$(date -Is)" >> AGENT_CHECKPOINT.md
+git add AGENT_CHECKPOINT.md
+
+t0=$(date +%s%N)
+git commit -q -m "agent: checkpoint $(date +%s)"
+t1=$(date +%s%N)
+git push -q origin "HEAD:refs/heads/agent/checkpoint-$$"
+t2=$(date +%s%N)
+
+echo "commit_ms=$(( (t1 - t0) / 1000000 )) push_ms=$(( (t2 - t1) / 1000000 ))"
+```
+
+First get a floor: push to a bare repository on the same disk, with no network, no replicas and no server-side hooks.
+
+```bash
+mkdir agentlab && cd agentlab
+git init -q --bare remote.git && git clone -q remote.git work 2>/dev/null
+cd work
+git commit -q --allow-empty -m init && git push -q origin HEAD:main
+for i in 1 2 3; do ../agent-push-budget.sh .; done
+```
+
+```text
+commit_ms=7 push_ms=17
+commit_ms=13 push_ms=16
+commit_ms=7 push_ms=17
+```
+
+About 17 ms is what a push costs when Git does nothing but write objects and move a ref. Now point `origin` at your real forge and run it again. Everything above the floor is infrastructure: network round trips, authentication, hooks, connectivity checks, replication and the quorum. If the model produces a change in 2 s and the push takes 1.5 s, almost half of the agent loop is waiting on the Git host. A human never notices that. An agent that checkpoints after every action pays it every time, which is why GitHub says commit turnaround becomes a bottleneck **per agent**.
+
+Each run also left a branch behind:
+
+```bash
+cd ../remote.git
+git for-each-ref --count=5 --format="%(refname)" refs/heads
+```
+
+```text
+refs/heads/agent/checkpoint-822206
+refs/heads/agent/checkpoint-822228
+refs/heads/agent/checkpoint-822251
+refs/heads/main
+```
+
+Multiply that by thousands of agents and you have the write pattern from the post: many branches, each updated often, all landing in one repository.
+
+### Case 2: Why "add more Git replicas" can make pushes slower
+
+Classic hosting pattern (GitHub's historical Spokes model in broad strokes):
+
+1. Keep a full on-disk copy of the repository on several fileservers (five by default).
+2. Serve Git reads from those fast local disks.
+3. When a push updates a reference, run a three-phase commit protocol that uses a quorum, so CI, the web UI and API clients all see a consistent repository state.
+
+That design is excellent for a billion ordinary repositories. At the extreme tail it couples two jobs that want different scaling curves:
+
+```text
+  durability  =  "N full copies on disk"
+  read scale  =  "add another full copy"
+
+  ⇒ every new read replica joins every write
+  ⇒ push latency ≈ slowest replica in the set
+```
+
+So the operator move that fixes CI clone storms (more replicas) lengthens the agent push. Losing a replica hurts both capacity and durability. Losing quorum stops writes entirely.
+
+**Mental fix:** separate **authoritative durable storage** from **compute that answers Git requests**. Read spikes then look like cache misses and worker scale-out, not "spin up another permanent full mirror that votes on every push."
+
+### Case 3: What still needs coordination (and what does not)
+
+Git semantics force agreement on **reference updates**. Object upload, connectivity validation, secret scanning, and pack maintenance are heavy — but most of that work need not serialize behind other writers.
+
+| Must agree | Can proceed independently (with care) |
+|------------|----------------------------------------|
+| Updating `refs/heads/main` / merge-queue tip | Storing newly received objects |
+| Branch-protection / required-check gates before the tip moves | Secret scanning, malware scanning of blobs |
+| Visibility of a tip to CI and the UI after a successful push | Compaction, multi-pack-index, garbage collection |
+
+When you design or evaluate a forge:
+
+1. Instrument **time-to-ack** for pushes separately from **time-to-fully-replicated**.
+2. Move compaction off hosts that serve interactive `git fetch` / `git push`.
+3. Treat CI clone storms as a **read-scaling** problem (partial clone, pack bitmaps, CDN/cache, ephemeral workers), not as a reason to enlarge the write quorum.
+
+### Case 4: Watch maintenance work pile up on the receiving side
+
+Every push leaves work for the server. Back in the lab, the three checkpoints arrived as loose objects:
+
+```bash
+cd agentlab/remote.git
+git count-objects -vH | head -3
+```
+
+```text
+count: 11
+size: 44.00 KiB
+in-pack: 0
+```
+
+Eleven loose objects from four tiny commits. Run the same incremental tasks a busy server needs:
+
+```bash
+git maintenance run --task=commit-graph --task=loose-objects
+git count-objects -vH | head -4
+```
+
+```text
+count: 11
+size: 44.00 KiB
+in-pack: 11
+packs: 1
+```
+
+The objects are now in a pack, but the loose copies are still there. The `loose-objects` task first deletes loose objects that are *already* packed, and only then packs the rest, so the cleanup lands on the next run:
+
+```bash
+git maintenance run --task=loose-objects
+git count-objects -vH | head -4
+```
+
+```text
+count: 0
+size: 0 bytes
+in-pack: 11
+packs: 1
+```
+
+That two-step shape is deliberate: it is safe while other Git processes read the repository at the same time. It is also the work GitHub moves off the serving path. On one host, this runs next to live pushes and fetches. Every new write adds to it, and the cost compounds as volume climbs. In the new architecture, separate workers do it directly against durable storage.
+
+Product controls matter as much as storage. Use short-lived agent branches, a merge queue instead of a thundering herd of merges to `main`, branch protections so an unreviewed agent tip never becomes the default branch, and audit logs that record who (or what) pushed.
+
+## The trap
+
+**Trap: "faster clones will fix agent scale."** Partial clone, sparse checkout, and shallow fetch are necessary for large trees — and they only help the **read** side. Agent loops are write-latency and write-throughput problems. If every agent still waits on a quorum of full disk replicas, clone speedups do not unblock the checkpoint loop.
+
+**Trap: "drop coordination to go faster."** Skipping tip agreement breaks CI and humans equally: two agents can believe they both landed on `main`. The rebuild thesis is not "no coordination"; it is **coordinate only what Git requires**, and do everything else in parallel or in the background.
+
+**Trap: "agents replace governance."** Higher commit rates make branch protections, required reviews, and audit trails *more* important, not less. GitHub's design principles explicitly keep people in control of review and approval as automation volume grows.
+
+## The boring rule
+
+Treat every agent as a writer whose throughput is capped by **push ack latency**, and treat every successful push as a **read fan-out** event. Scale durability and read compute on different axes; keep ref-update agreement; move compaction off the serving path. Measure push wall time in the agent loop the same way you measure model tokens — it is part of the product.
+
+## Try this
+
+1. Time `git push` for a one-line commit to a shared branch on your forge. Compare to a push to a personal fork. Note the delta.
+2. Enable `git maintenance` with the incremental strategy on a large clone and confirm commit-graph / MIDX work happens on a schedule, not during interactive status (see the companion `git maintenance` chapter).
+3. Sketch your hosting topology: for each replica, mark whether it is **durable truth**, **read cache**, or accidentally both. If every box is both, you have redrawn the classic ceiling.
+
+## Verification
+
+- Primary source: GitHub Engineering, *Building Git infrastructure for agent-scale development* (2026-10-06, updated 2026-10-07) — figures for events/month, pushes, Actions runs, and the Spokes durability-vs-read-scale tradeoff are taken from that post.
+- Concepts cross-checked against Git's documented maintenance / commit-graph / multi-pack-index behaviour (no GitHub-internal services were exercised).
+- Cases 1 and 4 were run on this box with Git 2.47.3 against a local bare repository (2026-10-15 IST). Outputs are pasted from those runs; the local push time is a floor, not a forge measurement.
+- This host did not call GitHub private APIs or reproduce Spokes quorum behaviour.
+
+## Sources
+
+- GitHub Engineering — [Building Git infrastructure for agent-scale development](https://github.blog/engineering/architecture-optimization/building-git-infrastructure-for-agent-scale-development/)
+- Git — [`git maintenance`](https://git-scm.com/docs/git-maintenance), [commit-graph](https://git-scm.com/docs/git-commit-graph), [multi-pack-index](https://git-scm.com/docs/multi-pack-index)
+- Optional comparison (different problem domain, cited only as parallel "source control under agent load" thinking): Anthropic Engineering — [Redesigning source control](https://www.anthropic.com/engineering/redesigning-source-control)
