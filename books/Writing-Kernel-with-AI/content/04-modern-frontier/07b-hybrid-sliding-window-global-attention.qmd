@@ -1,0 +1,752 @@
+---
+title: "Hybrid Sliding-Window + Global Attention: Kernels and KV Cache Layout"
+author:
+  - name: "K19G"
+  - name: "grok-bot"
+---
+
+# Hybrid Sliding-Window + Global Attention: Kernels and KV Cache Layout
+
+Most open-weight models released since 2023 do not use the same attention in every layer. Mistral 7B put a 4096-token **sliding window** in every layer. Gemma 2 alternated local and global layers 1:1, and Gemma 3 moved to five local layers per global layer with a 1024-token window. gpt-oss alternates 128-token "banded" layers with dense ones. The recipe is the same each time: most layers see only the last $W$ tokens, and a few layers see everything.
+
+This is not a modelling detail you can leave to the model authors. A window changes two things that kernel and serving engineers own. The first is the **attention kernel**: which tiles of $QK^\top$ it visits, which tiles need a mask, and one numerical edge case that causal kernels never meet. The second is the **KV cache**: local layers stop growing at $W$ tokens, so a model's cache is no longer "bytes per token × context". You can lay it out as a ring buffer, or as pages that get freed, and the two layouts behave differently under prefix caching.
+
+**Thesis.** A sliding window is a statement about *loop bounds* and *cache lifetime*, not about masks. Write it as a mask and you pay full causal cost for a fraction of the work. Write it as loop bounds and you get $O(N\cdot W)$ attention and a constant-size cache for every local layer, provided you get three details exactly right: the window's off-by-one convention, its alignment when there are fewer queries than keys, and the first tile a row visits.
+
+Everything below runs on a CPU. The listings were run on Debian 13.7 with Python 3.13.5, NumPy 2.5.4, PyTorch 2.14.1 and Triton 3.8.0 (interpreter mode and ahead-of-time compilation, no GPU). The outputs are pasted unedited. Save the listings in one directory, because later files import `swa_reference.py` and `swa_tiled.py`. The dependencies are `pip install numpy torch triton` (the CPU wheels are enough). Model configurations come from the model reports and the official `config.json` files, and are cited at the end.
+
+---
+
+## 1. Why labs adopt it: the KV cache bill
+
+During decode, every new token reads the whole KV cache of its sequence, and that cache has to live in HBM for every concurrent sequence. A global layer stores $2 \cdot H_{kv} \cdot d$ values for every position. A local layer stores the same, but only for the last $W$ positions, however long the context gets.
+
+```python
+# file: swa_kv_budget.py
+# KV-cache bytes per sequence for three published hybrid configurations, next to the
+# same shapes with every layer global. bf16 cache, one sequence, all layers.
+GiB = 1024**3
+
+# name: (layers, kv_heads, head_dim, local_layers, window)   -- from the model reports/configs
+models = {
+    "Mistral-7B-v0.1": (32, 8, 128, 32, 4096),   # every layer SWA, W = 4096
+    "Gemma-2-27B":     (46, 16, 128, 23, 4096),  # local/global 1:1, W = 4096
+    "gpt-oss-120b":    (36, 8, 64, 18, 128),     # banded/dense 1:1, W = 128
+}
+# Counterfactual: Gemma 3's recipe (5 local : 1 global, W = 1024) applied to Gemma-2-27B shapes.
+models["Gemma-2-27B shape, 5:1 W=1024"] = (46, 16, 128, 46 - 46 // 6, 1024)
+
+def kv_bytes(layers, kv_heads, head_dim, local_layers, window, ctx, bytes_per=2):
+    per_token_layer = 2 * kv_heads * head_dim * bytes_per        # K and V
+    global_layers = layers - local_layers
+    return per_token_layer * (global_layers * ctx + local_layers * min(ctx, window))
+
+print(f"{'model':32} {'L/G':>6} {'ctx':>7} {'all-global GiB':>15} {'hybrid GiB':>11} {'saving':>7}")
+for name, (L, H, d, loc, W) in models.items():
+    for ctx in (8_192, 32_768, 131_072):
+        full = kv_bytes(L, H, d, 0, W, ctx)
+        hyb = kv_bytes(L, H, d, loc, W, ctx)
+        print(f"{name:32} {f'{loc}/{L - loc}':>6} {ctx:>7} {full / GiB:15.2f} {hyb / GiB:11.2f} {full / hyb:6.1f}x")
+
+# The receptive field of stacked windows (Mistral 7B report: "approximately 131K" for W=4096, 32 layers)
+L, W = 32, 4096
+print(f"\nstacked SWA reach after {L} layers: {L * (W - 1):,} tokens back (W-1 per layer)")
+```
+
+```bash
+python swa_kv_budget.py
+```
+
+Output:
+
+```text
+model                               L/G     ctx  all-global GiB  hybrid GiB  saving
+Mistral-7B-v0.1                    32/0    8192            1.00        0.50    2.0x
+Mistral-7B-v0.1                    32/0   32768            4.00        0.50    8.0x
+Mistral-7B-v0.1                    32/0  131072           16.00        0.50   32.0x
+Gemma-2-27B                       23/23    8192            2.88        2.16    1.3x
+Gemma-2-27B                       23/23   32768           11.50        6.47    1.8x
+Gemma-2-27B                       23/23  131072           46.00       23.72    1.9x
+gpt-oss-120b                      18/18    8192            0.56        0.29    2.0x
+gpt-oss-120b                      18/18   32768            2.25        1.13    2.0x
+gpt-oss-120b                      18/18  131072            9.00        4.50    2.0x
+Gemma-2-27B shape, 5:1 W=1024      39/7    8192            2.88        0.74    3.9x
+Gemma-2-27B shape, 5:1 W=1024      39/7   32768           11.50        2.05    5.6x
+Gemma-2-27B shape, 5:1 W=1024      39/7  131072           46.00        7.30    6.3x
+
+stacked SWA reach after 32 layers: 131,040 tokens back (W-1 per layer)
+```
+
+Read the table by the ratio of local to global layers, not by the window:
+
+- **All local (Mistral 7B).** The cache is flat at 0.5 GiB beyond 4096 tokens. The Mistral report quotes the 8× saving at 32K that the table reproduces. Long-range information still flows, but only *through depth*: each layer adds $W-1$ tokens of reach, so 32 layers reach about 131K tokens back.
+- **1:1 hybrid (Gemma 2, gpt-oss).** Half the layers are global, so the saving can never exceed 2×. gpt-oss is already at 2.0× at 8K because its window is only 128 tokens. Gemma 2 only approaches 2× as context grows well past its 4096-token window (1.3× at 8K, 1.9× at 128K). (Gemma 2's global span is 8192, so the 32K and 128K rows for it are arithmetic, not a supported configuration.)
+- **5:1 with a small window (Gemma 3's recipe, applied here to Gemma 2 27B's shapes).** The saving is 6.3× at 128K, and it keeps improving with context. The Gemma 3 report found minimal perplexity impact from moving 1:1 → 5:1, and from shrinking the window, and lists KV memory as the reason for the change.
+
+So the number that sets your memory budget is the **count of global layers**. The window size matters mostly for short contexts and for how much work the kernel does.
+
+## 2. Mental model: a band in the kernel, a ring in the cache
+
+![Left: the tiles of causal sliding-window attention form a diagonal band; tiles inside the window need no mask, tiles on the diagonal and the window edge need the mask, everything else is skipped by the loop bounds. Right: a 5:1 hybrid keeps a ring of W slots in each local layer and a growing cache in each global layer.](../../images/diagram-sliding-window-hybrid-attention.svg){fig-alt="Left: a 12 by 12 grid of attention tiles for causal sliding-window attention with tile size 16 and window 40. A band along the diagonal is computed: tiles fully inside the window are marked FULL with no mask, tiles on the diagonal and on the left edge of the window are PARTIAL and need the mask plus the -inf guard, and all other tiles are skipped by the loop bounds. Right: KV cache per layer for a model with five local layers and one global layer. Each local layer keeps four slots indexed by position mod W, and the global layer keeps a row of blocks that grows with context."}
+
+Fix the vocabulary first, because two conventions are in circulation and they differ by one:
+
+| Term | Meaning here | Where you meet it |
+|------|--------------|-------------------|
+| Window $W$ | Number of keys a query sees, **including itself**: $q - W < k \le q$ | `sliding_window` in Hugging Face `config.json`, Mistral and Gemma reports |
+| `window_size=(left, right)` | Keys **besides** the query: $q - \text{left} \le k \le q + \text{right}$, inclusive | FlashAttention's `flash_attn_func`. Causal SWA with window $W$ is `(W - 1, 0)` |
+| Bottom-right alignment | With $n_q < n_k$, query row $r$ sits at absolute position $n_k - n_q + r$ | FlashAttention since 2.1, for both `causal` and `window_size` |
+| Local / global layer | Layer with a window / layer with full causal attention | Gemma "local:global ratio", gpt-oss "banded vs dense" |
+| Rolling buffer | A cache of $W$ slots where position $p$ lives in slot $p \bmod W$ | Mistral 7B report |
+
+The reference semantics, small enough to print:
+
+```python
+# file: swa_reference.py
+# Reference semantics for causal sliding-window attention, in NumPy.
+#   window W = number of keys a query sees, *including itself* (HF config / Mistral convention)
+#   FlashAttention's window_size=(left, right) counts keys *besides* the query: (W - 1, 0)
+import numpy as np
+
+def swa_mask(n_q, n_k, window, q_offset=None):
+    """Boolean [n_q, n_k] mask. Query row r sits at absolute position q_offset + r.
+    Default q_offset = n_k - n_q: the queries are the *last* n_q positions (bottom-right)."""
+    if q_offset is None:
+        q_offset = n_k - n_q
+    qpos = q_offset + np.arange(n_q)[:, None]
+    kpos = np.arange(n_k)[None, :]
+    causal = kpos <= qpos
+    if window is None:
+        return causal
+    return causal & (qpos - kpos < window)
+
+def attention(q, k, v, mask):
+    s = q @ k.T / np.sqrt(q.shape[-1])
+    s = np.where(mask, s, -np.inf)
+    p = np.exp(s - s.max(axis=-1, keepdims=True))
+    return (p / p.sum(axis=-1, keepdims=True)) @ v
+
+if __name__ == "__main__":
+    W = 3
+    m = swa_mask(8, 8, W)
+    print(f"causal SWA mask, n=8, W={W}  (FlashAttention window_size=({W - 1}, 0))")
+    for row in m:
+        print("  " + " ".join("x" if b else "." for b in row))
+    print("keys per query:", m.sum(axis=1).tolist())
+
+    # Hybrid stack: how far back can information travel through L layers?
+    n = 64
+    local = swa_mask(n, n, 4).astype(np.int64)
+    glob = swa_mask(n, n, None).astype(np.int64)
+    for name, pattern in [("4 x local", "LLLL"), ("8 x local", "LLLLLLLL"), ("L L L G", "LLLG")]:
+        reach = np.eye(n, dtype=np.int64)
+        for kind in pattern:
+            reach = np.minimum(1, (local if kind == "L" else glob) @ reach)
+        print(f"{name:10} last token depends on positions >= {np.flatnonzero(reach[-1])[0]:2d}"
+              f"  (span {n - np.flatnonzero(reach[-1])[0]})")
+
+    rng = np.random.default_rng(0)
+    n, d = 512, 64
+    q, k, v = (rng.standard_normal((n, d)) for _ in range(3))
+    dense = attention(q, k, v, swa_mask(n, n, None))
+    for W in (64, 256, 512, 1024):
+        o = attention(q, k, v, swa_mask(n, n, W))
+        print(f"W={W:4d}: keys scored {swa_mask(n, n, W).sum():6d} of {n * (n + 1) // 2}"
+              f"   max |o - causal| = {np.abs(o - dense).max():.3e}")
+```
+
+```bash
+python swa_reference.py
+```
+
+Output:
+
+```text
+causal SWA mask, n=8, W=3  (FlashAttention window_size=(2, 0))
+  x . . . . . . .
+  x x . . . . . .
+  x x x . . . . .
+  . x x x . . . .
+  . . x x x . . .
+  . . . x x x . .
+  . . . . x x x .
+  . . . . . x x x
+keys per query: [1, 2, 3, 3, 3, 3, 3, 3]
+4 x local  last token depends on positions >= 51  (span 13)
+8 x local  last token depends on positions >= 39  (span 25)
+L L L G    last token depends on positions >=  0  (span 64)
+W=  64: keys scored  30752 of 131328   max |o - causal| = 8.321e-01
+W= 256: keys scored  98432 of 131328   max |o - causal| = 3.033e-01
+W= 512: keys scored 131328 of 131328   max |o - causal| = 0.000e+00
+W=1024: keys scored 131328 of 131328   max |o - causal| = 0.000e+00
+```
+
+Three facts to carry forward:
+
+1. Every row after the first $W-1$ sees exactly $W$ keys. That constant is what makes the work $O(N \cdot W)$ instead of $O(N^2)$.
+2. Reach grows by $W-1$ per local layer. Eight local layers with $W=4$ reach 25 tokens. A single global layer reaches everything. This is why labs keep *some* global layers instead of trusting depth.
+3. Once $W \ge N$ a window is just causal attention. A kernel test that uses short sequences and a production window never exercises the window at all.
+
+## 3. Worked examples
+
+### Case 1: the window is loop bounds, not a mask
+
+A FlashAttention kernel walks query tiles and, for each, a range of key tiles, carrying the online-softmax state $(m, \ell, \text{acc})$ across key tiles. Causal attention already shortens the key loop: stop at the diagonal. A window also moves its *start*: begin at the tile that holds key $q_0 - W + 1$ for the first query $q_0$ of the tile. Every tile in between is either **FULL** (all scores valid, no mask needed) or **PARTIAL** (diagonal or window edge, mask needed).
+
+```python
+# file: swa_tiled.py
+# FlashAttention-style tiled forward with sliding-window block skipping, in NumPy.
+# Each (query tile, key tile) pair is EMPTY (never visited), FULL (no mask needed)
+# or PARTIAL (needs the elementwise mask). Only the loop bounds change versus causal.
+import numpy as np
+from swa_reference import attention, swa_mask
+
+def kv_tile_range(q0, q1, window, BN, q_offset):
+    """Key tiles [lo, hi) that query rows [q0, q1) can touch."""
+    first_key = 0 if window is None else max(0, q_offset + q0 - window + 1)
+    last_key = q_offset + q1 - 1                      # causal: up to the diagonal
+    return first_key // BN, last_key // BN + 1
+
+def classify(q0, q1, k0, k1, window, q_offset):
+    qpos = np.arange(q0, q1)[:, None] + q_offset
+    kpos = np.arange(k0, k1)[None, :]
+    m = (kpos <= qpos) if window is None else (kpos <= qpos) & (qpos - kpos < window)
+    return ("FULL" if m.all() else "PARTIAL" if m.any() else "EMPTY"), m
+
+def flash_swa(q, k, v, window, BM=64, BN=64, guard=True):
+    n_q, d = q.shape
+    n_k = k.shape[0]
+    q_offset = n_k - n_q
+    out = np.zeros_like(q)
+    stats = {"FULL": 0, "PARTIAL": 0, "EMPTY": 0}
+    for q0 in range(0, n_q, BM):
+        q1 = min(q0 + BM, n_q)
+        m_i = np.full(q1 - q0, -np.inf)
+        l_i = np.zeros(q1 - q0)
+        acc = np.zeros((q1 - q0, d))
+        lo, hi = kv_tile_range(q0, q1, window, BN, q_offset)
+        for t in range(lo, hi):
+            k0, k1 = t * BN, min((t + 1) * BN, n_k)
+            kind, m = classify(q0, q1, k0, k1, window, q_offset)
+            stats[kind] += 1
+            if kind == "EMPTY":                          # in range but fully masked: wasted visit
+                continue
+            s = q[q0:q1] @ k[k0:k1].T / np.sqrt(d)
+            if kind == "PARTIAL":
+                s = np.where(m, s, -np.inf)
+            m_new = np.maximum(m_i, s.max(axis=1))
+            # A row whose window does not reach this tile has m_new = -inf on its first
+            # visit, and exp(-inf - -inf) is NaN. Causal attention never hits this
+            # (every row sees key 0); sliding windows hit it on every left-edge tile.
+            m_use = np.where(np.isneginf(m_new), 0.0, m_new) if guard else m_new
+            p = np.exp(s - m_use[:, None])
+            alpha = np.exp(m_i - m_use)
+            acc = acc * alpha[:, None] + p @ v[k0:k1]
+            l_i = l_i * alpha + p.sum(axis=1)
+            m_i = m_new
+        out[q0:q1] = acc / l_i[:, None]
+    return out, stats
+
+if __name__ == "__main__":
+    rng = np.random.default_rng(1)
+    n, d = 1000, 64                                      # 1000: not a multiple of the tile size
+    q, k, v = (rng.standard_normal((n, d)) for _ in range(3))
+    for W in (None, 1, 100, 128, 300):
+        o, st = flash_swa(q, k, v, W)
+        ref = attention(q, k, v, swa_mask(n, n, W))
+        print(f"W={str(W):>4}  tiles FULL={st['FULL']:3d} PARTIAL={st['PARTIAL']:3d} "
+              f"EMPTY={st['EMPTY']:2d}   max err = {np.abs(o - ref).max():.2e}")
+
+    print("\ntiles visited at BM=BN=128 (each tile = 128x128 scores)")
+    print(f"{'seq':>7} {'causal':>8} {'W=1024':>8} {'W=4096':>8}")
+    for n in (8_192, 32_768, 131_072):
+        row = []
+        for W in (None, 1024, 4096):
+            total = 0
+            for q0 in range(0, n, 128):
+                lo, hi = kv_tile_range(q0, q0 + 128, W, 128, 0)
+                total += hi - lo
+            row.append(total)
+        print(f"{n:7d} {row[0]:8d} {row[1]:8d} {row[2]:8d}")
+```
+
+```bash
+python swa_tiled.py
+```
+
+Output:
+
+```text
+W=None  tiles FULL=120 PARTIAL= 16 EMPTY= 0   max err = 9.44e-16
+W=   1  tiles FULL=  0 PARTIAL= 16 EMPTY= 0   max err = 0.00e+00
+W= 100  tiles FULL=  0 PARTIAL= 45 EMPTY= 0   max err = 1.11e-15
+W= 128  tiles FULL= 15 PARTIAL= 30 EMPTY= 0   max err = 9.44e-16
+W= 300  tiles FULL= 43 PARTIAL= 38 EMPTY= 0   max err = 9.44e-16
+
+tiles visited at BM=BN=128 (each tile = 128x128 scores)
+    seq   causal   W=1024   W=4096
+   8192     2080      540     1584
+  32768    32896     2268     7920
+ 131072   524800     9180    33264
+```
+
+`EMPTY=0` in every row is the point. The bounds are tight, so the kernel never loads a tile only to mask all of it. The second table is the payoff: at 128K tokens a 4096-token window visits 33,264 tiles instead of 524,800 (about 16× fewer), and the count grows linearly with sequence length instead of quadratically. The number of PARTIAL tiles per query tile is a small constant (at most three here: the diagonal and up to two at the window edge), so masking cost stays bounded while FULL tiles could take an unmasked fast path. FlashAttention 2's forward kernel uses the same bound: `n_block_min` is computed from `window_size_left`, and the key loop never goes below it.
+
+### Case 2: the same tile map from FlexAttention
+
+PyTorch's FlexAttention takes a `mask_mod` function and precomputes a `BlockMask` of 128×128 tiles, recording which are full and which are partial. It is a quick way to check your own loop-bound arithmetic, and to try variants such as attention sinks (the first few tokens stay visible to everyone, as in StreamingLLM) without writing a kernel.
+
+```python
+# file: swa_flex.py
+# Sliding window (and window + attention sinks) as FlexAttention mask_mods.
+# create_block_mask precomputes which 128x128 tiles are skipped, full, or partial.
+import torch
+import torch.nn.functional as F
+from torch.nn.attention.flex_attention import create_block_mask, flex_attention
+
+W, SINKS = 1024, 4
+
+def sliding_window(b, h, q_idx, kv_idx):
+    return (kv_idx <= q_idx) & (q_idx - kv_idx < W)
+
+def window_with_sinks(b, h, q_idx, kv_idx):          # StreamingLLM-style: keep the first tokens
+    return (kv_idx <= q_idx) & ((q_idx - kv_idx < W) | (kv_idx < SINKS))
+
+def tile_counts(bm):
+    partial = int(bm.kv_num_blocks.sum())
+    full = int(bm.full_kv_num_blocks.sum()) if bm.full_kv_num_blocks is not None else 0
+    return full, partial
+
+print(f"{'seq':>6} {'mask':18} {'full':>6} {'partial':>8} {'sparsity':>9}")
+for n in (4096, 8192, 16384):
+    for name, mod in [("causal", lambda b, h, q, k: k <= q), ("window 1024", sliding_window),
+                      ("window+4 sinks", window_with_sinks)]:
+        bm = create_block_mask(mod, None, None, n, n, device="cpu")
+        full, partial = tile_counts(bm)
+        print(f"{n:6d} {name:18} {full:6d} {partial:8d} {bm.sparsity():8.2f}%")
+
+torch.manual_seed(0)
+n, d = 4096, 64
+q, k, v = (torch.randn(1, 4, n, d) for _ in range(3))
+for name, mod in [("window 1024", sliding_window), ("window+4 sinks", window_with_sinks)]:
+    bm = create_block_mask(mod, None, None, n, n, device="cpu")
+    out = flex_attention(q, k, v, block_mask=bm)
+    qi = torch.arange(n)[:, None]; ki = torch.arange(n)[None, :]
+    dense = F.scaled_dot_product_attention(q, k, v, attn_mask=mod(0, 0, qi, ki))
+    print(f"{name:15} flex vs SDPA(dense bool mask): max err = {(out - dense).abs().max():.2e}")
+```
+
+```bash
+python -W ignore::UserWarning swa_flex.py
+```
+
+Output:
+
+```text
+   seq mask                 full  partial  sparsity
+  4096 causal                496       32    48.44%
+  4096 window 1024           196       56    75.39%
+  4096 window+4 sinks        196       79    73.14%
+  8192 causal               2016       64    49.22%
+  8192 window 1024           420      120    86.82%
+  8192 window+4 sinks        420      175    85.47%
+ 16384 causal               8128      128    49.61%
+ 16384 window 1024           868      248    93.19%
+ 16384 window+4 sinks        868      367    92.46%
+window 1024     flex vs SDPA(dense bool mask): max err = 5.36e-07
+window+4 sinks  flex vs SDPA(dense bool mask): max err = 5.36e-07
+```
+
+At 8192 tokens the window's tiles total 420 + 120 = 540, the same count as `swa_tiled.py` at 128×128 tiles. The causal row confirms the convention: 2016 full + 64 diagonal partial = 2080. Sinks add one partial column on the left (55 more tiles at 8192), which is cheap in compute but means every query tile now has *two* disjoint key ranges. A loop-bounds kernel has to handle that as a second short loop. The `-W ignore` hides PyTorch's warning that eager `flex_attention` materializes the score matrix. It is correct but unfused on CPU. Wrap it in `torch.compile` for a fused kernel.
+
+### Case 3: a Triton kernel with the window in the loop bounds
+
+Relative to a causal FlashAttention forward, the Triton version changes only a handful of lines: the loop start `lo`, the window term in the `keep` mask, and the guard on `m_use`. The loop end `hi` is the usual causal bound. It is aligned bottom-right, so the same kernel serves full prefill, chunked prefill and single-token decode.
+
+```python
+# file: swa_triton.py
+# Causal sliding-window FlashAttention forward in Triton. The window changes two things
+# versus a causal kernel: the key loop starts at the window's first tile, and rows that
+# see nothing in that tile must not produce exp(-inf - -inf).
+# GPU: python swa_triton.py      CPU correctness: TRITON_INTERPRET=1 python swa_triton.py
+import math
+import os
+
+import torch
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def swa_fwd_kernel(Q, K, V, O, n_q, n_k, window, scale,
+                   stride_qh, stride_qt, stride_kh, stride_kt,
+                   D: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr):
+    pid_m = tl.program_id(0)
+    h = tl.program_id(1)
+    q_offset = n_k - n_q                                   # bottom-right alignment
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_d = tl.arange(0, D)
+    qpos = offs_m + q_offset
+    q = tl.load(Q + h * stride_qh + offs_m[:, None] * stride_qt + offs_d[None, :],
+                mask=offs_m[:, None] < n_q, other=0.0)
+
+    m_i = tl.full([BLOCK_M], -float("inf"), tl.float32)
+    l_i = tl.zeros([BLOCK_M], tl.float32)
+    acc = tl.zeros([BLOCK_M, D], tl.float32)
+
+    first_key = tl.maximum(pid_m * BLOCK_M + q_offset - window + 1, 0)
+    lo = (first_key // BLOCK_N) * BLOCK_N                 # window: skip everything before this tile
+    hi = tl.minimum((pid_m + 1) * BLOCK_M + q_offset, n_k)  # causal: stop at the diagonal
+    for n0 in range(lo, hi, BLOCK_N):
+        offs_n = n0 + tl.arange(0, BLOCK_N)
+        kv_ok = offs_n < n_k
+        k = tl.load(K + h * stride_kh + offs_n[:, None] * stride_kt + offs_d[None, :],
+                    mask=kv_ok[:, None], other=0.0)
+        s = tl.dot(q, tl.trans(k)) * scale                # fp32 accumulate
+        keep = kv_ok[None, :] & (offs_n[None, :] <= qpos[:, None]) & \
+               (qpos[:, None] - offs_n[None, :] < window)
+        s = tl.where(keep, s, -float("inf"))
+        m_new = tl.maximum(m_i, tl.max(s, axis=1))
+        m_use = tl.where(m_new == -float("inf"), 0.0, m_new)   # the -inf guard
+        p = tl.exp(s - m_use[:, None])
+        alpha = tl.exp(m_i - m_use)
+        v = tl.load(V + h * stride_kh + offs_n[:, None] * stride_kt + offs_d[None, :],
+                    mask=kv_ok[:, None], other=0.0)
+        acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v)
+        l_i = l_i * alpha + tl.sum(p, axis=1)
+        m_i = m_new
+    o = acc / l_i[:, None]
+    tl.store(O + h * stride_qh + offs_m[:, None] * stride_qt + offs_d[None, :], o,
+             mask=offs_m[:, None] < n_q)
+
+
+def swa_attention(q, k, v, window, block_m=64, block_n=64):
+    """q: [H, n_q, D], k/v: [H, n_k, D], contiguous. Causal, bottom-right aligned window."""
+    H, n_q, D = q.shape
+    n_k = k.shape[1]
+    o = torch.empty(H, n_q, D, dtype=torch.float32, device=q.device)
+    grid = (triton.cdiv(n_q, block_m), H)
+    swa_fwd_kernel[grid](q, k, v, o, n_q, n_k, window, 1.0 / math.sqrt(D),
+                         q.stride(0), q.stride(1), k.stride(0), k.stride(1),
+                         D=D, BLOCK_M=block_m, BLOCK_N=block_n)
+    return o
+
+
+def reference(q, k, v, window):
+    n_q, n_k = q.shape[1], k.shape[1]
+    qpos = torch.arange(n_q)[:, None] + (n_k - n_q)
+    kpos = torch.arange(n_k)[None, :]
+    mask = (kpos <= qpos) & (qpos - kpos < window)
+    s = (q.float() @ k.float().transpose(1, 2)) / math.sqrt(q.shape[-1])
+    return torch.softmax(s.masked_fill(~mask, float("-inf")), dim=-1) @ v.float()
+
+
+if __name__ == "__main__":
+    device = "cpu" if os.environ.get("TRITON_INTERPRET") == "1" else "cuda"
+    torch.manual_seed(0)
+    H, D = 2, 64
+    for n_q, n_k, window in [(500, 500, 100), (500, 500, 128), (500, 500, 10_000),
+                             (96, 600, 128), (1, 600, 128)]:   # prefill, chunked prefill, decode
+        q = torch.randn(H, n_q, D, device=device)
+        k = torch.randn(H, n_k, D, device=device)
+        v = torch.randn(H, n_k, D, device=device)
+        got = swa_attention(q, k, v, window)
+        err = (got.cpu() - reference(q.cpu(), k.cpu(), v.cpu(), window)).abs().max().item()
+        print(f"n_q={n_q:3d} n_k={n_k:3d} window={window:5d}: max abs err = {err:.2e}  "
+              f"nan={torch.isnan(got).any().item()}")
+```
+
+```bash
+TRITON_INTERPRET=1 python swa_triton.py
+```
+
+Output (Triton 3.8.0 interpreter on CPU, FP32 tensors):
+
+```text
+n_q=500 n_k=500 window=  100: max abs err = 4.77e-07  nan=False
+n_q=500 n_k=500 window=  128: max abs err = 3.58e-07  nan=False
+n_q=500 n_k=500 window=10000: max abs err = 4.17e-07  nan=False
+n_q= 96 n_k=600 window=  128: max abs err = 4.17e-07  nan=False
+n_q=  1 n_k=600 window=  128: max abs err = 1.19e-07  nan=False
+```
+
+The test matrix covers the cases that break in production: a window that is not a multiple of the tile (100), one that is (128), a window wider than the sequence (10 000, which must equal causal attention), chunked prefill (96 queries against 600 keys), and decode (one query). On a GPU, FP32 inputs go through TF32 tensor cores by default, so expect errors around 1e-3 there, and test with bf16 tensors as you would deploy them.
+
+Interpreter success says nothing about whether the kernel lowers. Compile it for a Hopper target without owning one:
+
+```python
+# file: swa_compile_check.py
+# Ahead-of-time compile the sliding-window kernel for an H100 (sm_90) on a CPU-only machine.
+import re
+
+import triton
+from triton.backends.compiler import GPUTarget
+from triton.compiler import ASTSource
+
+from swa_triton import swa_fwd_kernel
+
+sig = {"Q": "*bf16", "K": "*bf16", "V": "*bf16", "O": "*fp32",
+       "n_q": "i32", "n_k": "i32", "window": "i32", "scale": "fp32",
+       "stride_qh": "i32", "stride_qt": "i32", "stride_kh": "i32", "stride_kt": "i32",
+       "D": "constexpr", "BLOCK_M": "constexpr", "BLOCK_N": "constexpr"}
+for bm, bn in [(64, 64), (128, 64)]:
+    src = ASTSource(fn=swa_fwd_kernel, signature=sig,
+                    constexprs={"D": 128, "BLOCK_M": bm, "BLOCK_N": bn})
+    k = triton.compile(src, target=GPUTarget("cuda", 90, 32))
+    mma = sorted(set(re.findall(r"wgmma\.mma_async\S*?(m\d+n\d+k\d+\.\S+)", k.asm["ptx"])))
+    print(f"BLOCK_M={bm:3d} BLOCK_N={bn}: stages={','.join(k.asm.keys())}  "
+          f"shared={k.metadata.shared} B")
+    print(f"    wgmma shapes: {', '.join(mma)}")
+```
+
+```bash
+python swa_compile_check.py
+```
+
+Output (Triton 3.8.0 on a CPU-only Linux box):
+
+```text
+BLOCK_M= 64 BLOCK_N=64: stages=source,ttir,ttgir,llir,ptx,cubin  shared=32768 B
+    wgmma shapes: m64n128k16.f32.bf16.bf16, m64n64k16.f32.bf16.bf16
+BLOCK_M=128 BLOCK_N=64: stages=source,ttir,ttgir,llir,ptx,cubin  shared=65536 B
+    wgmma shapes: m64n128k16.f32.bf16.bf16, m64n64k16.f32.bf16.bf16
+```
+
+Both tile configurations lower to an `sm_90` cubin, and the PTX uses `wgmma.mma_async` with bf16 inputs and FP32 accumulation for both dots. The window adds no shared memory and no new instruction types. It is purely control flow around the same tile loop, which is why FlashAttention could add it as a pair of integer arguments.
+
+### Case 4: a ring-buffer KV cache for local layers
+
+Because a local layer never looks back more than $W-1$ tokens, its cache needs only $W$ slots. Mistral 7B's rolling buffer stores position $p$ in slot $p \bmod W$. Slot order is scrambled after the first wrap, and that is fine: attention is a sum over keys, so the order of keys is irrelevant **as long as each key already carries its position**. With RoPE, that means caching keys *after* rotation.
+
+```python
+# file: swa_ring_cache.py
+# Decode with a rolling-buffer KV cache (slot = pos % W, Mistral 7B report) and check it
+# against full-history sliding-window attention. Keys are cached *after* RoPE.
+import numpy as np
+from swa_reference import attention, swa_mask
+
+def rope(x, pos, base=10_000.0):
+    """Rotary embedding of the last dim of x at integer positions pos (half-split layout)."""
+    half = x.shape[-1] // 2
+    freqs = base ** (-np.arange(half) / half)
+    ang = np.asarray(pos)[..., None] * freqs
+    x1, x2 = x[..., :half], x[..., half:]
+    return np.concatenate([x1 * np.cos(ang) - x2 * np.sin(ang),
+                           x1 * np.sin(ang) + x2 * np.cos(ang)], axis=-1)
+
+rng = np.random.default_rng(3)
+T, d, W = 40, 16, 8
+q_raw, k_raw, v = (rng.standard_normal((T, d)) for _ in range(3))
+pos = np.arange(T)
+ref = attention(rope(q_raw, pos), rope(k_raw, pos), v, swa_mask(T, T, W))
+
+k_ring = np.zeros((W, d)); v_ring = np.zeros((W, d)); raw_ring = np.zeros((W, d))
+err_good = err_bad = 0.0
+for t in range(T):
+    slot = t % W
+    k_ring[slot] = rope(k_raw[t], t)                 # rotate once, at write time
+    raw_ring[slot] = k_raw[t]                        # (the buggy variant caches raw keys)
+    v_ring[slot] = v[t]
+    live = min(t + 1, W)                             # slots in use; order inside the ring is irrelevant
+    qt = rope(q_raw[t], t)[None, :]
+    full = np.ones((1, live), dtype=bool)
+    o = attention(qt, k_ring[:live], v_ring[:live], full)
+    # Bug: rotate at read time using the slot index as the position.
+    o_bad = attention(qt, rope(raw_ring[:live], np.arange(live)), v_ring[:live], full)
+    err_good = max(err_good, np.abs(o - ref[t]).max())
+    err_bad = max(err_bad, np.abs(o_bad - ref[t]).max())
+    if t in (5, 7, 8, 9, 39):
+        owner = [t - ((t - s) % W) for s in range(live)]
+        print(f"t={t:2d}  slot={slot}  ring holds positions {owner}")
+
+print(f"\nring cache vs full history:          max err = {err_good:.2e}")
+print(f"RoPE applied at read with slot index: max err = {err_bad:.2e}")
+
+# vLLM's alternative: paged blocks, freeing blocks that fall out of the window.
+bs, W2 = 16, 128
+live_max = max(((t - 1) // bs) - (max(0, t - W2) // bs) + 1 for t in range(1, 4097))
+print(f"\npaged SWA, block_size={bs}, W={W2}: at most {live_max} live blocks "
+      f"({live_max * bs} token slots for a {W2}-token window)")
+```
+
+```bash
+python swa_ring_cache.py
+```
+
+Output:
+
+```text
+t= 5  slot=5  ring holds positions [0, 1, 2, 3, 4, 5]
+t= 7  slot=7  ring holds positions [0, 1, 2, 3, 4, 5, 6, 7]
+t= 8  slot=0  ring holds positions [8, 1, 2, 3, 4, 5, 6, 7]
+t= 9  slot=1  ring holds positions [8, 9, 2, 3, 4, 5, 6, 7]
+t=39  slot=7  ring holds positions [32, 33, 34, 35, 36, 37, 38, 39]
+
+ring cache vs full history:          max err = 6.66e-16
+RoPE applied at read with slot index: max err = 1.61e+00
+
+paged SWA, block_size=16, W=128: at most 9 live blocks (144 token slots for a 128-token window)
+```
+
+The ring matches full-history attention to rounding (6.7e-16). The tempting shortcut, caching raw keys and rotating them at read time by slot index, is exact until the first wrap and wrong from then on, with an error of order 1. Decoding only up to $W$ tokens will not catch it.
+
+The last line is the design vLLM chose instead. Its hybrid KV cache manager design document considers the round-robin ring and rejects it because a ring is not compatible with **prefix caching**. vLLM allocates ordinary paged blocks for local layers too and frees the blocks that fall out of the window. You pay up to one extra block per sequence (9 live blocks of 16 for a 128-token window, versus 128 slots). In return, a prompt prefix is still made of addressable, shareable blocks. The same document notes that a local layer needs only the last $W-1$ cached tokens for a prefix-cache hit, so the matching runs right to left, the opposite of global layers.
+
+| Layout | Memory per local layer | Prefix caching | Complexity |
+|--------|-----------------------|----------------|------------|
+| Ring buffer, slot $= p \bmod W$ | exactly $W$ slots | no: slots are overwritten in place | tiny: one modulo in the write path |
+| Paged + free outside window | $\le \lceil W/b \rceil + 1$ blocks | yes | block tables per layer type, a different hit rule per layer type |
+| Full cache, mask only | grows with context | yes | none, and none of the saving |
+
+## 4. The trap
+
+Sliding-window bugs are silent. Nothing crashes, the output has the right shape, and short tests pass. Three bugs account for most of them, and all three are measured below against the full-sequence reference.
+
+**Trap A: the first-tile NaN.** In causal attention every row sees key 0, so the first tile a row visits always has at least one valid score. With a window, the left-edge tile of a query block can be fully masked *for some rows* while still being needed by others. Those rows reach that tile with $m_i=-\infty$ and leave it with $m_\text{new}=-\infty$, and $e^{-\infty-(-\infty)}$ is NaN. The guard in Cases 1 and 3 (`m_use = 0` when `m_new == -inf`) is the fix. Without it:
+
+```python
+# file: swa_nan_trap.py
+# The same tiled kernel with the -inf guard removed: correct for causal, NaN for windows.
+import numpy as np
+from swa_reference import attention, swa_mask
+from swa_tiled import flash_swa
+
+np.seterr(invalid="ignore")
+rng = np.random.default_rng(1)
+n, d = 1000, 64
+q, k, v = (rng.standard_normal((n, d)) for _ in range(3))
+for W in (None, 100, 128, 300):
+    o, _ = flash_swa(q, k, v, W, guard=False)
+    bad = np.isnan(o).any(axis=1)
+    ref = attention(q, k, v, swa_mask(n, n, W))
+    ok = np.abs(o[~bad] - ref[~bad]).max()
+    print(f"W={str(W):>4}  NaN rows = {bad.sum():3d}   first NaN row = "
+          f"{(np.flatnonzero(bad)[0] if bad.any() else '-')!s:>4}   max err on other rows = {ok:.2e}")
+```
+
+```bash
+python swa_nan_trap.py
+```
+
+Output:
+
+```text
+W=None  NaN rows =   0   first NaN row =    -   max err on other rows = 9.44e-16
+W= 100  NaN rows = 382   first NaN row =  163   max err on other rows = 9.44e-16
+W= 128  NaN rows =  13   first NaN row =  191   max err on other rows = 9.44e-16
+W= 300  NaN rows = 210   first NaN row =  363   max err on other rows = 9.44e-16
+```
+
+The same experiment on the Triton kernel, with the guard line replaced by `m_use = m_new`, returns `nan=True` for every prefill case with a real window (W = 100 and W = 128 at 500 tokens, and the 96-query chunk). It returns clean results for the window wider than the sequence and for single-query decode. Causal tests and decode tests both pass, and only prefill with a real window fails.
+
+There are two production-grade fixes, and FlashAttention 2 uses both. Its forward kernel walks key tiles **from the diagonal backwards**, so every row has seen its own key, and has a finite max, before it reaches the window edge. It also turns on its `Check_inf` path (`row_max == -INFINITY ? 0 : row_max`, the same guard as `m_use` here) in every iteration when local attention is enabled. If your kernel walks left to right, as most tutorials do, the guard is not optional.
+
+**Traps B and C: off by one, and the wrong corner.**
+
+```python
+# file: swa_alignment_trap.py
+# Two silent sliding-window bugs, measured against a full-sequence reference.
+#  (1) off by one: passing the model's W as FlashAttention's left count, i.e. window_size=(W, 0),
+#      lets every query see W+1 keys.
+#  (2) misalignment: chunked prefill or decode with fewer queries than keys, masking as if the
+#      queries started at position 0 (top-left) instead of ending at the last key (bottom-right).
+import numpy as np
+from swa_reference import attention, swa_mask
+
+rng = np.random.default_rng(2)
+n, d, W = 1024, 64, 128
+q, k, v = (rng.standard_normal((n, d)) for _ in range(3))
+ref = attention(q, k, v, swa_mask(n, n, W))             # what the model was trained with
+
+wrong_w = attention(q, k, v, swa_mask(n, n, W + 1))      # window_size=(W, 0): W+1 keys
+print(f"(1) window_size=({W}, 0) instead of ({W - 1}, 0): max err = {np.abs(wrong_w - ref).max():.3e}, "
+      f"rows affected = {(np.abs(wrong_w - ref).max(axis=1) > 1e-12).sum()} of {n}")
+
+chunk = 256                                              # last 256 prompt tokens, cache holds all 1024
+qc = q[n - chunk:]
+good = attention(qc, k, v, swa_mask(chunk, n, W))                 # bottom-right (default)
+bad = attention(qc, k, v, swa_mask(chunk, n, W, q_offset=0))      # top-left
+print(f"(2) chunk of {chunk} queries vs {n} keys, bottom-right: max err = "
+      f"{np.abs(good - ref[n - chunk:]).max():.3e}")
+print(f"    same chunk, top-left alignment:            max err = "
+      f"{np.abs(bad - ref[n - chunk:]).max():.3e}")
+print(f"    decode step (1 query), top-left: keys seen = {swa_mask(1, n, W, q_offset=0).sum()}, "
+      f"bottom-right: keys seen = {swa_mask(1, n, W).sum()}  "
+      f"(top-left sees key {np.flatnonzero(swa_mask(1, n, W, q_offset=0))[0]} only)")
+```
+
+```bash
+python swa_alignment_trap.py
+```
+
+Output:
+
+```text
+(1) window_size=(128, 0) instead of (127, 0): max err = 1.749e-01, rows affected = 896 of 1024
+(2) chunk of 256 queries vs 1024 keys, bottom-right: max err = 0.000e+00
+    same chunk, top-left alignment:            max err = 2.462e+00
+    decode step (1 query), top-left: keys seen = 1, bottom-right: keys seen = 128  (top-left sees key 0 only)
+```
+
+- **Off by one.** Passing the config's `sliding_window` straight into FlashAttention's left count gives every query $W+1$ keys. 896 of 1024 rows differ from what the model was trained on, by up to 0.17. Hugging Face Transformers converts explicitly, with `window_size = (sliding_window - 1, sliding_window - 1)` and a comment explaining that the FlashAttention bounds are inclusive.
+- **Wrong corner.** Masking a prefill chunk as if its queries started at position 0 gives a max error of 2.5, and a decode step that sees only key 0. FlashAttention aligns both `causal` and `window_size` bottom-right. Any hand-written mask, Triton kernel or `mask_mod` must take the query offset as an input, or derive it as $n_k - n_q$.
+
+## 5. The boring rule
+
+> Store windows as one integer $W$ = keys visible including self, and convert to any library's convention at exactly one call site. Put the window in the **loop bounds**, never only in a mask. Align queries **bottom-right** using the absolute query position. Guard the online-softmax rescale against $-\infty - (-\infty)$. Cache keys **after** RoPE. Test with $N \gg W$, $W$ not a multiple of the tile, a chunked prefill and a single-token decode, every time, against a dense masked reference.
+
+## 6. Verification plan for a real GPU
+
+What was **not** run here: no GPU was available, so there are no throughput numbers in this chapter. To finish the job on hardware:
+
+**Functional.** Run `swa_triton.py` without `TRITON_INTERPRET` on bf16 tensors with $N \in \{4096, 32768\}$, $W \in \{128, 1000, 4096\}$, against `torch.nn.functional.scaled_dot_product_attention` with a boolean mask, and against `flash_attn_func(..., causal=True, window_size=(W - 1, 0))`.
+
+**Performance.** Plot time against $N$ at fixed $W$. A loop-bounds kernel should be linear in $N$, while a mask-only kernel stays quadratic. Compare the effective TFLOP/s using the *visited* tile count from `swa_tiled.py`, not the dense $N^2/2$ count. Expect the PARTIAL tiles to dominate when $W$ is close to the tile size, which is why tiny windows such as gpt-oss's 128 behave more like a few extra diagonal tiles than like "sparse attention".
+
+**Serving.** Measure KV memory per sequence against the formula in Section 1, and prefix-cache hit rates for a hybrid model, since the local and global layers follow different hit rules.
+
+## 7. Prompting an AI assistant for a windowed kernel
+
+Ask for the conventions explicitly, because a model will happily mix them:
+
+- "The window is $W$ keys including the query. Show the conversion to FlashAttention's `window_size`."
+- "Compute the key-tile loop bounds from the absolute query position, with `q_offset = n_k - n_q`."
+- "Explain what happens to `m_i` on a row whose window does not reach the first visited tile, and guard it."
+- "Write the test first: dense masked reference; $N=1000$, $W \in \{100,128,N+1\}$; a chunked prefill; one decode step."
+
+Then run the generated kernel through the interpreter and the AOT compile check before any GPU time.
+
+## Checkpoint
+
+You should be able to:
+
+- explain why the KV saving of a hybrid model is set by the number of global layers;
+- write the key-tile range of a query tile under a causal window, and explain why it produces no EMPTY tiles;
+- name the three silent bugs (first-tile NaN, off by one, top-left alignment), and the test that exposes each;
+- choose between a ring buffer and paged-and-free for local layers, given whether you need prefix caching.
+
+## Try this
+
+1. Change `swa_tiled.py` to use `BN = 32` while keeping `BM = 64`. Predict the PARTIAL count per query tile for `W = 100` before running it.
+2. Add the attention-sink variant to `swa_triton.py`: a second loop over the first `SINKS` keys when they fall outside the window. Check it against the `window_with_sinks` mask from `swa_flex.py`.
+3. Make the Triton kernel support a **per-layer** window by passing `window = n_k` for global layers. Confirm the 10 000-window case still matches.
+4. Extend `swa_ring_cache.py` to a chunked prefill of 20 tokens into a ring of 8. Which tokens must you write *after* computing the chunk's attention, and why? (The Mistral report's prefill-and-chunking section is the reference.)
+5. In `swa_kv_budget.py`, find the smallest local:global ratio that keeps a 128K-token Gemma-2-27B-shaped cache under 10 GiB at $W=1024$.
+
+## Summary
+
+Hybrid sliding-window attention trades a little modelling freedom for a KV cache that stops growing in most layers, and attention work that grows linearly. For kernel engineers it is a change of loop bounds plus one guard. For serving engineers it is a second kind of cache with its own lifetime and its own prefix-cache rule. The bugs are all silent, so the tests have to be designed to reach them: sequences much longer than the window, windows that do not align with tiles, chunked prefill, and decode.
+
+## Sources (for further reading)
+
+- Jiang et al., *Mistral 7B* (2023): sliding window, rolling buffer cache, prefill chunking. <https://arxiv.org/abs/2310.06825>
+- Gemma Team, *Gemma 2: Improving Open Language Models at a Practical Size* (2024): 1:1 local/global, window 4096, Table 1 shapes. <https://arxiv.org/abs/2408.00118>
+- Gemma Team, *Gemma 3 Technical Report* (2025): 5:1 interleaving, 1024-token window, KV-memory ablations, separate RoPE bases. <https://arxiv.org/abs/2503.19786>
+- OpenAI, *gpt-oss-120b & gpt-oss-20b Model Card* (2025): alternating banded (128-token) and dense attention, learned attention-sink bias. <https://arxiv.org/abs/2508.10925>. Configuration: <https://huggingface.co/openai/gpt-oss-120b/blob/main/config.json>
+- Beltagy, Peters, Cohan, *Longformer: The Long-Document Transformer* (2020): sliding window + global attention. <https://arxiv.org/abs/2004.05150>
+- Xiao et al., *Efficient Streaming Language Models with Attention Sinks* (2023). <https://arxiv.org/abs/2309.17453>
+- FlashAttention README and `flash_attn_interface.py`: `window_size` semantics, 2.1 bottom-right causal alignment, 2.3 sliding-window support. <https://github.com/Dao-AILab/flash-attention>
+- Hugging Face Transformers, `modeling_flash_attention_utils.py` (window conversion) and `masking_utils.py` (`sliding_window_overlay`). <https://github.com/huggingface/transformers>
+- vLLM design document, *Hybrid KV Cache Manager*: paged allocation and freeing for sliding-window layers, prefix-cache hit rule. <https://docs.vllm.ai/en/latest/design/hybrid_kv_cache_manager.html>
+- PyTorch, `torch.nn.attention.flex_attention` (`create_block_mask`, `BlockMask`). <https://docs.pytorch.org/docs/stable/nn.attention.flex_attention.html>
+- Triton documentation: interpreter mode and `triton.compile`. <https://triton-lang.org/main/>
