@@ -44,6 +44,7 @@ Latency distributions often have heavy tails; means can mislead SLOs. Medians an
 3. LLN, CLT, and consequences  
 4. Bayesian inference  
 5. Markov chains  
+6. Thresholds in random structures (expectation thresholds, Park–Pham)  
 
 ## Prerequisites
 
