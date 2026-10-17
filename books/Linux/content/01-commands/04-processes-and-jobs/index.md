@@ -35,6 +35,7 @@ List, prioritize, signal, and background work. Covers classic job control in the
 | `ipcs` | ipcs lists System V IPC objects: message queues, shared memory segments, and semaphore arrays. |
 | `ipcrm` | ipcrm removes System V IPC objects: shared memory segments, semaphore arrays, and message queues. |
 | `flock` | flock wraps a command or script section in a kernel file lock so two copies never run at once (cron overlap, deploy/backup mutual exclusion). |
+| `choom` | choom shows and sets a process's OOM-killer bias (`oom_score_adj`); the chapter explains how the kernel scores and picks an OOM victim, globally and per memory cgroup. |
 
 
 ## Suggested starting points
@@ -45,6 +46,7 @@ List, prioritize, signal, and background work. Covers classic job control in the
 4. Priority, I/O class, and CPU placement: `nice`, `renice`, `ionice`, `taskset`.
 5. Limits and IPC: `ulimit`, `ipcs`/`ipcrm`, `fuser`.
 6. Mutual exclusion for jobs and scripts: `flock`.
+7. Out-of-memory victims: `choom -p PID`, `/proc/PID/oom_score`, and cgroup `memory.events`.
 
 ## Related parts
 
