@@ -30,6 +30,7 @@ By the end of this module you should be able to:
 | 5 | [Compiler Sanitizers](05-sanitizers.md) | ASan, UBSan, TSan, brief MSan: flags, reports, CI matrix, false friends |
 | 6 | [Memory-Safe C in Practice](06-memory-safe-c.md) | Fil-C vs ASan vs `_FORTIFY_SOURCE=3`, `counted_by` + `-fsanitize=bounds`, `-fbounds-safety` status, costs and blind spots |
 | 7 | [GCC Diagnostics: JSON and SARIF](07-gcc-diagnostics-json-sarif.md) | `-fdiagnostics-format=` json/sarif file sinks, CI gates, analyzer pairing |
+| 8 | [Testing the Error Paths: Deterministic Failure Injection](08-failure-injection-error-paths.md) | Named `TW_FAIL` points, fork-per-injection sweeps under ASan/LSan, zero-cost release builds, one-exit cleanup |
 
 ## Suggested order
 
@@ -40,6 +41,7 @@ By the end of this module you should be able to:
 5. **Compiler Sanitizers** — deepen ASan/UBSan and add TSan/MSan operator practice beyond the harness chapter.
 6. **Memory-Safe C in Practice** — move from finding memory bugs in tests to stopping them in production.
 7. **GCC Diagnostics (JSON/SARIF)** — turn `-Wall` into CI-consumable artifacts without scraping carets.
+8. **Testing the Error Paths** — inject failures at every `malloc`/`open`/`read` so cleanup code is exercised, not just reviewed.
 
 ## Tooling cheat sheet
 
