@@ -36,6 +36,7 @@ List, prioritize, signal, and background work. Covers classic job control in the
 | `ipcrm` | ipcrm removes System V IPC objects: shared memory segments, semaphore arrays, and message queues. |
 | `flock` | flock wraps a command or script section in a kernel file lock so two copies never run at once (cron overlap, deploy/backup mutual exclusion). |
 | `choom` | choom shows and sets a process's OOM-killer bias (`oom_score_adj`); the chapter explains how the kernel scores and picks an OOM victim, globally and per memory cgroup. |
+| `pidfd` | pidfds are file descriptors that name one process and survive PID reuse: signal, wait, poll for exit (even of non-children), copy fds and identify socket peers without racing a recycled PID. |
 
 
 ## Suggested starting points
@@ -47,6 +48,7 @@ List, prioritize, signal, and background work. Covers classic job control in the
 5. Limits and IPC: `ulimit`, `ipcs`/`ipcrm`, `fuser`.
 6. Mutual exclusion for jobs and scripts: `flock`.
 7. Out-of-memory victims: `choom -p PID`, `/proc/PID/oom_score`, and cgroup `memory.events`.
+8. Race-free process handles: pidfds (`pidfd_open`, `pidfd_send_signal`, `waitid(P_PIDFD)`) instead of saved PIDs.
 
 ## Related parts
 
