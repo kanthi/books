@@ -52,7 +52,7 @@ awk '/MemAvailable:/ {print $2}' /proc/meminfo
 
 ```bash
 free -h
-cat /proc/pressure/memory 2>/dev/null    # PSI on modern kernels
+cat /proc/pressure/memory 2>/dev/null    # PSI on modern kernels (full chapter: [Pressure Stall Information](../05-system-monitoring/12-pressure-stall-information.md))
 vmstat 1 5
 swapon --show
 ```

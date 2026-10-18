@@ -21,6 +21,7 @@ Measure subsystem health over time and debug *why* a host is slow or stuck: virt
 | `ltrace` | ltrace intercepts and prints dynamic library calls of a process (similar to how strace prints syscalls). |
 | `pmap` | pmap prints a process's memory map (size, RSS, dirty per mapping); the first step in hunting native leaks that heap profilers miss. |
 | THP (`/sys/kernel/mm/transparent_hugepage`) | Transparent Huge Pages: read the policy, find who holds 2 MiB pages (`AnonHugePages`), and opt in or out with `madvise`/`prctl`. |
+| PSI (`/proc/pressure`, cgroup `*.pressure`) | Pressure Stall Information: share of time tasks are stalled on CPU, memory or I/O — `some` vs `full`, averages and triggers. |
 
 
 ## Suggested starting points
@@ -31,6 +32,7 @@ Measure subsystem health over time and debug *why* a host is slow or stuck: virt
 4. Hotspots: `perf` (and interactive `btop` for a dashboard).
 5. RSS keeps growing: `pmap` (which mapping?), then `strace`/`bpftrace` and `gdb` (who maps it?).
 6. RSS jumps or latency spikes after a THP policy change: Transparent Huge Pages (`AnonHugePages`, `/proc/vmstat` `thp_*`, `compact_stall`).
+7. Latency without obvious saturation: `/proc/pressure/*` and the service cgroup's `*.pressure` (`some` vs `full`).
 
 ## Related parts
 
