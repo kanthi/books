@@ -66,7 +66,10 @@ humanize_dir_title() {
   slug="$(echo "$slug" | sed -E 's/([a-z])([A-Z])/\1-\2/g' | tr '[:upper:]' '[:lower:]')"
 
   case "$slug" in
-    # Linux
+    # Linux & Boring-Linux
+    devops-and-observability)   printf '%s\n' "DevOps and Observability"; return ;;
+    gitops-and-cloud-native)    printf '%s\n' "GitOps and Cloud-Native"; return ;;
+    appendices-and-runbooks)    printf '%s\n' "Appendices and Runbooks"; return ;;
     terminals-and-mux)          printf '%s\n' "Terminals and Multiplexers"; return ;;
     help-and-docs)              printf '%s\n' "Help and Docs"; return ;;
     services-and-runtime)       printf '%s\n' "Services and Runtime"; return ;;
