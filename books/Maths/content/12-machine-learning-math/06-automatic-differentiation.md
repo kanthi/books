@@ -31,7 +31,6 @@ For $f:\mathbb{R}^n\to\mathbb{R}^m$ with operation count $\mathrm{ops}(f)$, the 
 A **dual number** is $a+b\varepsilon$ with $\varepsilon^2=0$. Multiplying two of them gives $(a+b\varepsilon)(c+d\varepsilon)=ac+(ad+bc)\varepsilon$, which is the product rule. More generally, for any smooth $g$, Taylor's theorem gives $g(a+b\varepsilon)=g(a)+g'(a)\,b\,\varepsilon$, because every higher power of $\varepsilon$ vanishes. So if you evaluate $f$ on $x+1\cdot\varepsilon$, the $\varepsilon$ coefficient of the result is $f'(x)$. You only need to define each primitive's rule once.
 
 ```python
-```python
 # dual.py: forward-mode AD with dual numbers a + b*eps, eps**2 = 0
 import math
 
@@ -116,7 +115,6 @@ if __name__ == "__main__":
     expr = sp.log(a) + a * b - sp.sin(b)
     print("sympy:", [round(float(sp.diff(expr, v).subs({a: 2, b: 5})), 6) for v in (a, b)])
 ```
-```
 
 ```bash
 python dual.py
@@ -142,7 +140,6 @@ The value $11.652071$ and the derivatives $5.5$ and $1.716338$ are exactly the n
 
 Reverse mode needs the graph, so the forward pass records every operation together with its *local* partial derivatives. The backward pass walks that record in reverse order and accumulates $\bar v_{\text{parent}} \mathrel{+}= \bar v_{\text{child}}\cdot\partial(\text{child})/\partial(\text{parent})$. A node with several children, such as $x_1$ (used by `log` and by `mul`), receives the sum of their contributions, which is the multivariable chain rule. The implementation below accepts NumPy arrays as well as floats, so the same 117 lines handle the Monte Carlo example in section 5.
 
-```python
 ```python
 # tape.py: reverse-mode AD on a Wengert list (tape); values may be floats or NumPy arrays
 import numpy as np
@@ -262,9 +259,7 @@ def backward(out):
 def reset():
     TAPE.clear()
 ```
-```
 
-```python
 ```python
 # tape_demo.py: the Wengert list for f(x1, x2) = ln x1 + x1*x2 - sin x2, forward and reverse
 import tape as ad
@@ -286,7 +281,6 @@ t2 = torch.tensor(5.0, dtype=torch.float64, requires_grad=True)
 ty = torch.log(t1) + t1 * t2 - torch.sin(t2)
 ty.backward()
 print(f"torch {torch.__version__}: dy/dx1 = {t1.grad.item():.4f}   dy/dx2 = {t2.grad.item():.4f}")
-```
 ```
 
 ```bash
@@ -315,7 +309,6 @@ The printed tape is the survey's three-part table: the node names $v_{-1},v_0,\d
 
 Take $f(x)=\sum_i \sin(x_i)\,x_{i+1}+\log(1+x_i^2)$ with $n$ inputs. A forward-mode gradient needs $n$ passes over $O(n)$ work, which is $O(n^2)$. Reverse mode needs one forward pass and one backward pass, which is $O(n)$.
 
-```python
 ```python
 # cost.py: gradient of f: R^n -> R by n forward-mode passes vs one reverse sweep
 import math
@@ -373,7 +366,6 @@ t1 = time.perf_counter()
 print(f"\nR -> R^{m}: one forward pass gives all {m} derivatives in {t1 - t0:.4f} s;"
       f" check out[9].eps = {out[9].eps:.6f} vs 10*cos(3) = {10 * math.cos(3.0):.6f}")
 ```
-```
 
 ```bash
 python cost.py
@@ -383,11 +375,11 @@ Output:
 
 ```text
     n tape nodes  fwd-mode s  rev-mode s  plain f s  max |diff|
-   10         91      0.0002      0.0003   0.000004     2.2e-16
-  100        901      0.0143      0.0024   0.000014     4.4e-16
- 1000       9001      1.5269      0.0284   0.000114     4.4e-16
+   10         91      0.0002      0.0004   0.000004     2.2e-16
+  100        901      0.0179      0.0029   0.000016     4.4e-16
+ 1000       9001      1.5274      0.0260   0.000095     4.4e-16
 
-R -> R^1000: one forward pass gives all 1000 derivatives in 0.0007 s; check out[9].eps = -9.899925 vs 10*cos(3) = -9.899925
+R -> R^1000: one forward pass gives all 1000 derivatives in 0.0006 s; check out[9].eps = -9.899925 vs 10*cos(3) = -9.899925
 ```
 
 Going from $n=100$ to $n=1000$ multiplies forward mode's time by about $100\times$ (quadratic), while reverse mode's time grows by about $10\times$ (linear). Both gradients agree to $4\times10^{-16}$. The last line is the mirror case: for $g:\mathbb{R}\to\mathbb{R}^{1000}$, one forward pass gives all 1000 derivatives, where reverse mode would need 1000 sweeps.
@@ -398,7 +390,6 @@ The "plain f" column is the honest footnote. In pure Python, the tape costs hund
 
 Under Black–Scholes, $S_T = S_0\exp\big((r-\tfrac12\sigma^2)T+\sigma\sqrt T Z\big)$ with $Z\sim N(0,1)$. A European call is worth $V=\mathbb{E}\big[e^{-rT}\max(S_T-K,0)\big]$. A Monte Carlo pricer averages the discounted payoff over many draws of $Z$. Its sensitivities (the **Greeks**: delta $\partial V/\partial S_0$, vega $\partial V/\partial\sigma$, rho $\partial V/\partial r$, and $\partial V/\partial T$) are a gradient of one scalar with respect to several inputs. That is reverse mode's best case. Giles and Glasserman's "Smoking adjoints" (2006) brought this observation to finance: the pathwise derivatives of every input come from one adjoint sweep, at a cost independent of how many inputs there are.
 
-```python
 ```python
 # greeks.py: adjoint (reverse-mode) Monte Carlo Greeks for a European call, vs Black-Scholes
 import math
@@ -447,7 +438,6 @@ print(f"{'price':>7} {float(price.value):17.4f} {exact_price:14.4f}")
 for k in ("delta", "vega", "rho", "dT"):
     print(f"{k:>7} {mc[k]:17.4f} {exact[k]:14.4f}")
 ```
-```
 
 ```bash
 python greeks.py
@@ -467,7 +457,6 @@ paths 400000, tape nodes 24
 
 One backward sweep over a 24-node tape (each node a vector of 400,000 paths) produced all four sensitivities. They agree with the closed-form Black–Scholes values to Monte Carlo accuracy (the price itself is off by 0.008, well inside one Monte Carlo standard error of 0.020). The listing hard-codes the `max` payoff's derivative as $\mathbf 1\{S_T>K\}$, which is the *pathwise* estimator. It is valid here because the payoff is continuous in $S_0$. PyTorch, given the same random numbers, gives the same Greeks to every printed digit:
 
-```python
 ```python
 # torch_check.py: the same adjoint Greeks from PyTorch's reverse mode, and a forward-mode JVP
 import numpy as np
@@ -494,7 +483,6 @@ tangent = tuple(torch.tensor(t, dtype=torch.float64) for t in (1.0, 0.0, 0.0, 0.
 _, d = jvp(price, primals, tangent)                 # one forward pass = one directional derivative
 print(f"forward mode (jvp along S0): delta = {d.item():.4f}")
 ```
-```
 
 ```bash
 python -W ignore::FutureWarning torch_check.py
@@ -513,7 +501,6 @@ forward mode (jvp along S0): delta = 0.5027
 
 Swap the call for a **digital** option that pays 1 if $S_T>K$. The price $e^{-rT}\,\mathbb{P}(S_T>K)$ is a smooth function of $S_0$ with a strictly positive delta. The *program*, however, computes `step(S_T - K)`, and that step's derivative is 0 everywhere it exists.
 
-```python
 ```python
 # digital.py: the trap. AD differentiates the program, and a step function's derivative is 0
 import math
@@ -562,7 +549,6 @@ for seed in (1, 2):
             _, naive = ad_delta(Z, naive_smooth(w))
         _, stable = ad_delta(Z, stable_smooth(w))
         print(f"         sigmoid width {w:>4}: AD delta naive {naive:.5f}   stable {stable:.5f}")
-```
 ```
 
 ```bash
