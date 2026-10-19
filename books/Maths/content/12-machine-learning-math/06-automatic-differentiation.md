@@ -9,7 +9,7 @@ author:
 
 There are three ways to get a derivative out of a computer. **Symbolic differentiation** manipulates formulas, and the expressions can grow exponentially. **Finite differences** evaluate $f$ twice and divide, which costs one extra evaluation per input and loses about half the digits to cancellation. **Automatic differentiation (AD)** does neither. It runs the program and applies the chain rule to each elementary operation as it executes, so the result is exact to floating-point rounding and costs a small constant factor more than the program itself.
 
-AD comes in two modes, and choosing between them is the whole game. **Forward mode** pushes a tangent from the inputs to the outputs alongside the values, and dual numbers make it a 30-line class. **Reverse mode** records the computation on a *tape* and then pulls adjoints from the output back to every input in one sweep. Backpropagation in neural networks is reverse mode applied to a scalar loss. "Adjoint Greeks" in quantitative finance are reverse mode applied to a scalar price. They are the same algorithm under two names.
+AD comes in two modes, and choosing between them is the whole game. **Forward mode** pushes a tangent from the inputs to the outputs alongside the values, and dual numbers make it a class of about forty lines. **Reverse mode** records the computation on a *tape* and then pulls adjoints from the output back to every input in one sweep. Backpropagation in neural networks is reverse mode applied to a scalar loss. "Adjoint Greeks" in quantitative finance are reverse mode applied to a scalar price. They are the same algorithm under two names.
 
 This chapter builds both modes from scratch, reproduces the worked example of the standard survey (Baydin et al., *JMLR* 2018), measures the $n$ versus $1$ cost asymmetry, computes four Black–Scholes sensitivities from one reverse sweep, and cross-checks everything against SymPy and PyTorch. The trap at the end is the one that catches practitioners: AD differentiates the program you wrote, not the function you meant.
 
@@ -384,8 +384,8 @@ Output:
 ```text
     n tape nodes  fwd-mode s  rev-mode s  plain f s  max |diff|
    10         91      0.0002      0.0003   0.000004     2.2e-16
-  100        901      0.0142      0.0029   0.000015     4.4e-16
- 1000       9001      1.5051      0.0301   0.000111     4.4e-16
+  100        901      0.0143      0.0024   0.000014     4.4e-16
+ 1000       9001      1.5269      0.0284   0.000114     4.4e-16
 
 R -> R^1000: one forward pass gives all 1000 derivatives in 0.0007 s; check out[9].eps = -9.899925 vs 10*cos(3) = -9.899925
 ```
