@@ -11,6 +11,7 @@ Machine learning systems are optimization procedures applied to statistical mode
 | Probability for ML | Likelihood, MAP, calibration, softmax |
 | Neural nets math sketch | Affine + nonlinearity, depth, gradients |
 | Matrix calculus for ML | Practical identities and grad checks |
+| Automatic differentiation | Dual numbers, the reverse-mode tape, cost asymmetry, adjoint Greeks |
 
 ## What an ML problem looks like mathematically
 
