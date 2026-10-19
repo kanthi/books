@@ -33,9 +33,10 @@ A **multi-book Quarto monorepo**. Each book is a self-contained Quarto project u
 
 ### Current books (as of last inventory)
 
-`C`, `Go`, `Linux`, `Maths`, `Networking`, `NixOS`, `Python`, `Rust`, `VCS`, `Writing-Kernel-with-AI`
+`Boring-Linux`, `C`, `Go`, `Linux`, `Maths`, `Networking`, `NixOS`, `Python`, `Rust`, `VCS`, `Writing-Kernel-with-AI`
 
 - **`Linux`**: merged former `Linux-Commands` + `Linux-Editors` + `Linux-ShellScripting-Bash` (parts Commands / Editors / Scripting→Bash).
+- **`Boring-Linux`**: Fast-iteration workspace for modern Ubuntu 26.04+ systems engineering & administration (Parts 05-13); to be merged into `Linux` upon completion.
 - **`Rust`**: consolidated from former `Boring-Rust`.
 
 ### Book paths (user language → path)
@@ -56,6 +57,7 @@ Every book is meant to be read **on its own**. A reader of Python should never n
 | **`NixOS`**, **`NixOS book`** | `books/NixOS/` |
 | **`Maths`**, **`Maths book`** | `books/Maths/` |
 | **`Linux`**, **`Linux book`** | `books/Linux/` |
+| **`Boring-Linux`** | `books/Boring-Linux/` (fast-iteration for Parts 05-13; merges into `Linux`) |
 | **`Python`**, **`Python book`** | `books/Python/` |
 | **`Rust`**, **`Rust book`** | `books/Rust/` |
 | **`Writing-Kernel-with-AI`**, **`Writing Kernel with AI`**, **`Kernel`** | `books/Writing-Kernel-with-AI/` |

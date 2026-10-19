@@ -24,7 +24,7 @@ For books using `scripts/update-index.sh` in this repo:
 
 ## Book naming
 
-All titles under `books/` are **standalone libraries**. Paths: `books/Go/`, `books/Rust/`, `books/Writing-Kernel-with-AI/`, `books/Maths/`, `books/Linux/`, `books/Networking/`, `books/C/`, `books/Python/`, `books/NixOS/`, `books/VCS/` (published: `01-git-foundations/`; full map in `content/_planning/SYLLABUS.md`). Prefer root **`AGENTS.md`** for inventory and workflow.
+All titles under `books/` are **standalone libraries**. Paths: `books/Boring-Linux/`, `books/Go/`, `books/Rust/`, `books/Writing-Kernel-with-AI/`, `books/Maths/`, `books/Linux/`, `books/Networking/`, `books/C/`, `books/Python/`, `books/NixOS/`, `books/VCS/` (published: `01-git-foundations/`; full map in `content/_planning/SYLLABUS.md`). Prefer root **`AGENTS.md`** for inventory and workflow.
 
 ## Book independence
 
@@ -99,3 +99,12 @@ Every live book (and `Template/`) uses the same generator: **nested sections**, 
 - **Independent** of other titles. A Python reader never needs Maths, Linux, Networking, or any sibling book.
 - Basics assume **no prior Python**. Named worked examples (input / output / why). Term defined on first use. No type hints in Basics. Python **3.14**, toolchain **`uv`**.
 - Getting started is self-contained (install with `uv`, editor you already like). Do not send the reader to the Linux book.
+
+## Boring-Linux book
+
+- Path: `Boring-Linux/`
+- Title: **Boring Linux**
+- Fast-iteration workspace dedicated to authoring the modern Ubuntu 26.04 LTS ("Resolute Raccoon") engineering and administration curriculum (Parts 05 through 13).
+- Master roadmap and planning live in `INDEX.md` and `content/_planning/SYLLABUS.md`.
+- When the curriculum is complete, it will be merged directly back into `Linux`.
+
