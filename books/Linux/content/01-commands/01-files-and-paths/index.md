@@ -52,6 +52,7 @@ Navigate the filesystem, create and move data, inspect metadata, search by name 
 | `strings` | strings extracts printable character sequences from binary files. |
 | `namei` | namei walks a path component by component, showing whether each element is a file, directory, or symlink — and… |
 | `umask` | umask sets the file mode creation mask for the current shell: bits that are turned *off* when new files and… |
+| inotify / fanotify | inotify and fanotify deliver filesystem change events without polling: watches, overflow, limits, and the editor-save trap. |
 
 
 ## Suggested starting points
@@ -61,6 +62,7 @@ Navigate the filesystem, create and move data, inspect metadata, search by name 
 3. Permissions: `chmod`, `chown`, then ACLs (`getfacl`) or attributes (`chattr`/`lsattr`) when modes are not enough.
 4. Find things: `find` or `fd` for live trees; `locate` for indexed names; `rg` for content.
 5. Space: `df`, `du` (and later Storage tools like `ncdu`).
+6. React to changes: inotify / fanotify (`tail -F`, watchers, `max_user_watches`) instead of polling loops.
 
 ## Related parts
 
