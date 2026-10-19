@@ -22,6 +22,7 @@ By the end of this module, you will be able to:
 3. **Dynamic Memory Management** - malloc, calloc, realloc, free, and memory debugging
 4. **Advanced Pointer Concepts** - Pointers to pointers, function pointers, void pointers, and const correctness
 5. **Common Pointer Pitfalls** - Dangling pointers, buffer overflows, segmentation faults, and memory leaks
+6. **When the Optimizer Deletes Your NULL Check** - Dereference-before-check, `nonnull` and zero-length `memcpy`, `-fdelete-null-pointer-checks`, finding it with `-fanalyzer` and UBSan
 
 ## Key Concepts Covered
 - Understanding memory addresses and the & operator
