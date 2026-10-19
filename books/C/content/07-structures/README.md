@@ -21,6 +21,7 @@ By the end of this module, you will be able to:
 2. **Unions and Enumerations** - Union declaration and usage, enumeration types and values
 3. **Advanced Structure Concepts** - Bit fields, structure packing, flexible array members, self-referential structures
 4. **Abstract Data Types** - Information hiding principles, opaque pointers, constructor/destructor patterns, interface design
+5. **Bit-Field Traps** - Plain `int` signedness, width-dependent promotion, allocation order vs wire formats, adjacent bit-fields as one memory location under threads
 
 ## Key Concepts Covered
 - Structure declaration and member access
