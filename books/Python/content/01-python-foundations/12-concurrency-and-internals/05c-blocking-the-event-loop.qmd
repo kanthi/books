@@ -1,0 +1,455 @@
+---
+title: "Blocking the Event Loop: Finding Sync Calls in Async Code and Moving Them Off the Loop"
+author:
+  - name: "K19G"
+  - name: "grok-bot"
+---
+
+# Blocking the Event Loop: Finding Sync Calls in Async Code and Moving Them Off the Loop
+
+## Thesis
+
+asyncio runs every coroutine of a program on **one thread**. A task gives the loop back only at an `await` that actually suspends. Any code between two such points, a `time.sleep()`, a synchronous database driver, a large `json.dumps()`, a checksum over an upload, runs while *every other task waits*. Nothing crashes and nothing is logged by default. The symptom is latency: requests that do no work themselves take a second, and only sometimes.
+
+This chapter makes that cost visible and then fixes it, in four steps:
+
+1. **Measure** the loop's lateness with a 10 ms heartbeat, and the effect on real requests with a ping client that runs *outside* the loop.
+2. **Name the task** with asyncio's debug mode (`-X dev` or `PYTHONASYNCIODEBUG=1`) and `slow_callback_duration`.
+3. **Name the line** with a small watchdog thread that prints the loop thread's stack when the loop stalls. Unlike debug mode, it is cheap enough to leave on.
+4. **Move the work**: `asyncio.to_thread` for blocking I/O and for C code that releases the GIL, a process or interpreter pool for pure-Python CPU work, and a dedicated executor when the shared default pool becomes the bottleneck.
+
+Version note: every listing was run on **CPython 3.15.0** (released 2026-10-09) and **CPython 3.14.8**, both from `uv` (python-build-standalone, Linux x86-64, standard GIL builds), on a shared 8-core machine. Results are the same on both versions within noise; where only one version's output is shown, the other matched. Timings vary between runs on a shared box, so compare the orders of magnitude, not the decimals. Free-threaded builds are not covered here.
+
+## Mental model
+
+![Blocking the asyncio event loop: an inline checksum holds the loop for over a second and pings queue behind it; to_thread keeps the loop ticking; a process or interpreter pool also handles pure-Python CPU work; measure with a heartbeat, name the task with debug mode, name the line with a watchdog](../../../images/diagram-asyncio-blocking-loop.svg){fig-alt="Three timelines of the asyncio loop thread on CPython 3.15.0 and 3.14.8. Inline: a SHA-256 checksum runs as one task step for more than a second and nothing else runs; pings from another thread wait, p50 0.30 ms, p99 533 ms, max 1297 ms. to_thread: hashlib releases the GIL, the loop keeps ticking and the worst ping is 0.60 ms; pure-Python CPU work in a thread still adds about 5 ms of lag, the GIL switch interval. Process or interpreter pool: the loop is late by at most 1 to 3.7 ms. Detection: a 10 ms heartbeat or pings from another thread; debug mode logs steps longer than slow_callback_duration, default 100 ms; a watchdog thread prints the loop thread's stack. to_thread shares one default pool of min(32, cpu count + 4) workers, 12 here, so 40 blocking 200 ms calls took 0.80 s."}
+
+- **The loop runs one thing at a time.** `BaseEventLoop._run_once()` pops each ready handle (a callback, or the next *step* of a task) and calls it. A task step runs from one suspension point to the next. While a step runs, timers do not fire, sockets are not read, and no other task makes progress.
+- **`await` is not a yield point by itself.** Awaiting a coroutine runs it inline. Only awaiting something that is not ready yet (a sleeping timer, a socket with no data, a pending future) suspends the task and returns control to the loop.
+- **Debug mode times every step.** With debug enabled, `_run_once()` measures each `handle._run()` and logs `Executing <handle> took N seconds` when it reaches `loop.slow_callback_duration` (default `0.1`). It tells you *which task step* was slow, not which line inside it.
+- **`to_thread` moves a call, not the GIL.** `asyncio.to_thread(f, *args)` runs `f` in the loop's default `ThreadPoolExecutor` and propagates the current `contextvars.Context`. The loop stays free only to the extent that `f` lets go of the GIL. Blocking system calls and many C functions (hashlib on buffers over 2047 bytes, zlib, file and socket I/O) do. A pure-Python loop does not; the interpreter then switches threads every `sys.getswitchinterval()` (5 ms).
+- **Executors are shared and bounded.** The default pool has `min(32, os.process_cpu_count() + 4)` threads. Every `to_thread` and `run_in_executor(None, ...)` in the process queues on it.
+
+## Worked examples
+
+All scripts live in one directory (`/tmp/aioblock` on the test machine, which is why that path appears in tracebacks) and need nothing outside the standard library.
+
+### Case 1: Measure the loop with a heartbeat
+
+A heartbeat task sleeps for 10 ms in a loop and records how late each wake-up is. Another task does five rounds of 200 ms of blocking work, in six different ways:
+
+```python
+# lag_probe.py: how late does the event loop run a 10 ms timer while a
+# task does 5 x 200 ms of blocking work, done six different ways?
+import asyncio
+import concurrent.futures as cf
+import sys
+import time
+
+
+async def heartbeat(lates, stop):
+    """Sleep 10 ms at a time and record how late each wake-up is (ms)."""
+    while not stop.is_set():
+        t0 = time.perf_counter()
+        await asyncio.sleep(0.010)
+        lates.append((time.perf_counter() - t0 - 0.010) * 1000)
+
+
+def busy(seconds):
+    """Pure-Python CPU work for about `seconds`."""
+    end = time.perf_counter() + seconds
+    n = 0
+    while time.perf_counter() < end:
+        n += 1
+    return n
+
+
+async def work(mode, pool):
+    loop = asyncio.get_running_loop()
+    for _ in range(5):
+        match mode:
+            case "sleep-in-loop":
+                time.sleep(0.2)                              # blocks the loop
+            case "sleep-to-thread":
+                await asyncio.to_thread(time.sleep, 0.2)
+            case "cpu-in-loop":
+                busy(0.2)                                    # blocks the loop
+            case "cpu-to-thread":
+                await asyncio.to_thread(busy, 0.2)           # shares the GIL
+            case "cpu-to-process" | "cpu-to-interp":
+                await loop.run_in_executor(pool, busy, 0.2)  # own GIL
+
+
+async def main(mode):
+    pool = None
+    if mode == "cpu-to-process":
+        pool = cf.ProcessPoolExecutor(max_workers=1)
+    elif mode == "cpu-to-interp":
+        pool = cf.InterpreterPoolExecutor(max_workers=1)     # 3.14+
+    if pool:  # start the worker before measuring
+        await asyncio.get_running_loop().run_in_executor(pool, busy, 0)
+    lates, stop = [], asyncio.Event()
+    hb = asyncio.create_task(heartbeat(lates, stop))
+    await asyncio.sleep(0.05)                                # let it settle
+    t0 = time.perf_counter()
+    await work(mode, pool)
+    elapsed = time.perf_counter() - t0
+    stop.set()
+    await hb
+    if pool:
+        pool.shutdown()
+    lates.sort()
+    print(f"{mode:16} {elapsed:4.2f}s  ticks={len(lates):3}  "
+          f"p50 late={lates[len(lates) // 2]:6.1f} ms  max late={lates[-1]:6.1f} ms")
+
+
+if __name__ == "__main__":
+    for mode in sys.argv[1:]:
+        asyncio.run(main(mode))
+```
+
+```text
+$ M="sleep-in-loop sleep-to-thread cpu-in-loop cpu-to-thread cpu-to-process cpu-to-interp"
+$ python3.15 lag_probe.py $M
+sleep-in-loop    1.00s  ticks=  5  p50 late=   0.1 ms  max late=1000.7 ms
+sleep-to-thread  1.01s  ticks=104  p50 late=   0.1 ms  max late=   7.8 ms
+cpu-in-loop      1.00s  ticks=  5  p50 late=   0.1 ms  max late=1000.3 ms
+cpu-to-thread    1.00s  ticks= 71  p50 late=   5.2 ms  max late=   7.1 ms
+cpu-to-process   1.01s  ticks=104  p50 late=   0.1 ms  max late=   1.3 ms
+cpu-to-interp    1.00s  ticks=104  p50 late=   0.1 ms  max late=   1.3 ms
+$ python3.14 lag_probe.py $M
+sleep-in-loop    1.00s  ticks=  5  p50 late=   0.2 ms  max late=1000.8 ms
+sleep-to-thread  1.00s  ticks=104  p50 late=   0.1 ms  max late=   2.1 ms
+cpu-in-loop      1.00s  ticks=  5  p50 late=   0.1 ms  max late=1000.2 ms
+cpu-to-thread    1.00s  ticks= 69  p50 late=   5.2 ms  max late=  13.8 ms
+cpu-to-process   1.00s  ticks=104  p50 late=   0.1 ms  max late=   3.7 ms
+cpu-to-interp    1.00s  ticks=104  p50 late=   0.1 ms  max late=   1.0 ms
+```
+
+Read the `in-loop` rows carefully. The work loop never awaits anything between its five rounds, so it is **one task step of a full second**. The heartbeat got 4 ticks before the work started and 1 after; its single late wake-up was 1000 ms late. The median looks perfect, which is why medians hide this problem. Look at the maximum, or at a high percentile.
+
+The `to-thread` rows split by what the thread does:
+
+- `time.sleep` releases the GIL, so the loop keeps its full ~104 ticks with sub-millisecond medians.
+- A pure-Python `busy()` loop keeps the GIL. The loop thread gets it back only at the interpreter's switch interval, so every wake-up is about 5 ms late (`p50 late=5.2 ms`) and a third of the ticks are lost. Better than a 1 s stall, but not free.
+
+A `ProcessPoolExecutor` or an `InterpreterPoolExecutor` (3.14+, one interpreter with its own GIL per worker) takes the CPU work off the loop's GIL completely. Both pools are started before the measurement, because creating a process or interpreter is itself slow.
+
+### Case 2: What the stall does to other requests
+
+A heartbeat measures the loop. Users measure requests. This server answers `ping` immediately and computes a SHA-256 chain over a 40 MB `upload`. The clients are plain blocking sockets in their **own threads**, so they keep sending while the server's loop is busy:
+
+```python
+# server_demo.py: one asyncio TCP server, two kinds of request. Clients run
+# in their own threads (not on the server's loop), so they keep sending
+# while the loop is blocked: one uploads, one pings every 20 ms.
+import asyncio
+import hashlib
+import socket
+import statistics
+import sys
+import threading
+import time
+
+MODE = sys.argv[1]  # "inline" or "to_thread"
+
+
+def checksum(data: bytes) -> str:
+    for _ in range(20):  # hashlib releases the GIL for large buffers
+        data = hashlib.sha256(data).digest() + data[32:]
+    return hashlib.sha256(data).hexdigest()[:12]
+
+
+async def handle(reader, writer):
+    while line := await reader.readline():
+        if line == b"upload\n":
+            payload = bytes(40 * 1024 * 1024)
+            if MODE == "inline":
+                digest = checksum(payload)
+            else:
+                digest = await asyncio.to_thread(checksum, payload)
+            writer.write(f"ok {digest}\n".encode())
+        else:
+            writer.write(b"pong\n")
+        await writer.drain()
+    writer.close()
+
+
+def pinger(port, rtts, n=60):
+    with socket.create_connection(("127.0.0.1", port)) as s, s.makefile("rwb") as f:
+        for _ in range(n):
+            t0 = time.perf_counter()
+            f.write(b"ping\n")
+            f.flush()
+            f.readline()
+            rtts.append((time.perf_counter() - t0) * 1000)
+            time.sleep(0.02)
+
+
+def uploader(port, out):
+    with socket.create_connection(("127.0.0.1", port)) as s, s.makefile("rwb") as f:
+        time.sleep(0.2)  # let some pings through first
+        f.write(b"upload\n")
+        f.flush()
+        out.append(f.readline().decode().strip())
+
+
+async def main():
+    server = await asyncio.start_server(handle, "127.0.0.1", 0)
+    port = server.sockets[0].getsockname()[1]
+    rtts, reply = [], []
+    clients = [threading.Thread(target=pinger, args=(port, rtts)),
+               threading.Thread(target=uploader, args=(port, reply))]
+    async with server:
+        for t in clients:
+            t.start()
+        while any(t.is_alive() for t in clients):
+            await asyncio.sleep(0.01)
+    q = statistics.quantiles(rtts, n=100, method="inclusive")
+    print(f"{MODE:9} {reply[0]}  ping p50={q[49]:7.2f} ms  "
+          f"p99={q[98]:7.2f} ms  max={max(rtts):7.2f} ms")
+
+
+asyncio.run(main())
+```
+
+```text
+$ python3.15 server_demo.py inline
+inline    ok d8365e844786  ping p50=   0.30 ms  p99= 532.72 ms  max=1296.88 ms
+$ python3.15 server_demo.py to_thread
+to_thread ok d8365e844786  ping p50=   0.28 ms  p99=   0.57 ms  max=   0.60 ms
+$ python3.14 server_demo.py inline
+inline    ok d8365e844786  ping p50=   0.28 ms  p99= 571.21 ms  max=1392.28 ms
+$ python3.14 server_demo.py to_thread
+to_thread ok d8365e844786  ping p50=   0.32 ms  p99=   0.55 ms  max=   0.57 ms
+```
+
+One upload request made an unrelated ping wait 1.3 seconds. The server did nothing wrong by its own measure: the upload finished and returned the right digest. Moving `checksum` to a thread brought the worst ping down by more than three orders of magnitude, and here the thread really does run in parallel, because `hashlib` releases the GIL while it hashes large buffers.
+
+### Case 3: Let debug mode name the slow task
+
+Debug mode is off by default. Turn it on with `python -X dev`, `PYTHONASYNCIODEBUG=1`, `asyncio.run(..., debug=True)` or `loop.set_debug(True)`. This program has one task that blocks for over a second and one that blocks for 30 ms:
+
+```python
+# debug_mode.py: let asyncio's debug mode name the code that blocked the loop.
+import asyncio
+import hashlib
+import sys
+import time
+
+
+def checksum(data: bytes) -> str:
+    # Looks harmless; on 40 MB it takes a while, and it runs on the loop.
+    for _ in range(20):
+        data = hashlib.sha256(data).digest() + data[32:]
+    return hashlib.sha256(data).hexdigest()[:12]
+
+
+async def handle_upload(n):
+    payload = bytes(40 * 1024 * 1024)
+    return f"upload {n}: {checksum(payload)}"
+
+
+async def handle_ping():
+    time.sleep(0.03)  # 30 ms: under the 100 ms default threshold
+    return "pong"
+
+
+async def main():
+    loop = asyncio.get_running_loop()
+    if len(sys.argv) > 1:
+        loop.slow_callback_duration = float(sys.argv[1])  # seconds
+    print("debug:", loop.get_debug(), " slow_callback_duration:", loop.slow_callback_duration)
+    async with asyncio.TaskGroup() as tg:
+        tg.create_task(handle_upload(1))
+        tg.create_task(handle_ping())
+
+
+asyncio.run(main())  # debug mode comes from -X dev or PYTHONASYNCIODEBUG=1
+```
+
+```text
+$ python3.15 -u debug_mode.py
+debug: False  slow_callback_duration: 0.1
+$ python3.15 -u -X dev debug_mode.py
+debug: True  slow_callback_duration: 0.1
+Executing <Task finished name='Task-2' coro=<handle_upload() done, defined at /tmp/aioblock/debug_mode.py:15> result='upload 1: d8365e844786' created at /home/box/.local/share/uv/python/cpython-3.15.0-linux-x86_64-gnu/lib/python3.15/asyncio/taskgroups.py:220> took 1.628 seconds
+$ PYTHONASYNCIODEBUG=1 python3.15 -u debug_mode.py 0.02
+debug: True  slow_callback_duration: 0.02
+Executing <Task finished name='Task-2' coro=<handle_upload() done, defined at /tmp/aioblock/debug_mode.py:15> result='upload 1: d8365e844786' created at /home/box/.local/share/uv/python/cpython-3.15.0-linux-x86_64-gnu/lib/python3.15/asyncio/taskgroups.py:220> took 1.294 seconds
+Executing <Task finished name='Task-3' coro=<handle_ping() done, defined at /tmp/aioblock/debug_mode.py:20> result='pong' created at /home/box/.local/share/uv/python/cpython-3.15.0-linux-x86_64-gnu/lib/python3.15/asyncio/taskgroups.py:220> took 0.030 seconds
+```
+
+The warning comes from the `asyncio` logger at `WARNING` level; with no logging configured, Python's last-resort handler prints it to stderr. It names the coroutine and where it is defined. In debug mode tasks also remember where they were created, which here is inside `TaskGroup.create_task` rather than your code. The 30 ms `time.sleep` is invisible at the default 100 ms threshold and appears once the threshold is lowered.
+
+Two limits. Debug mode times a whole **step**, so a task with many awaits is reported as "this task's step took 1.2 s", not "line 43". And it is meant for development: it also records a traceback for every task and future it creates, checks for calls from the wrong thread, and reports coroutines that were never awaited, all of which cost time.
+
+### Case 4: A watchdog that names the line
+
+For production, a cheaper detector is enough. The loop updates a timestamp every 50 ms. A normal thread checks it; when the timestamp is stale, the thread prints the loop thread's current stack using `sys._current_frames()`, which works because the loop is stuck *in* that stack:
+
+```python
+# watchdog.py: a production-safe detector. The loop touches a timestamp
+# every 50 ms; a plain thread prints the loop thread's stack when the
+# timestamp goes stale, so you see the blocking *line*, not just the task.
+import asyncio
+import sys
+import threading
+import time
+import traceback
+
+
+class LoopWatchdog:
+    def __init__(self, threshold=0.25, tick=0.05):
+        self.threshold, self.tick = threshold, tick
+        self.last = time.monotonic()
+        self.loop_thread = threading.get_ident()
+        self._stop = threading.Event()
+
+    async def run(self):
+        threading.Thread(target=self._watch, daemon=True, name="loop-watchdog").start()
+        try:
+            while True:
+                self.last = time.monotonic()
+                await asyncio.sleep(self.tick)
+        finally:
+            self._stop.set()
+
+    def _watch(self):
+        reported = 0.0
+        while not self._stop.wait(self.tick):
+            stalled = time.monotonic() - self.last
+            if stalled > self.threshold and self.last != reported:
+                reported = self.last
+                frame = sys._current_frames().get(self.loop_thread)
+                stack = "".join(traceback.format_stack(frame, limit=4))
+                print(f"[watchdog] loop blocked for {stalled * 1000:.0f} ms at:\n{stack}",
+                      file=sys.stderr, flush=True)
+
+
+def parse_report(text):
+    total = 0
+    for line in text.splitlines():  # pretend this is expensive parsing
+        total += sum(int(x) for x in line.split(","))
+        time.sleep(0.0001)
+    return total
+
+
+async def handler():
+    await asyncio.sleep(0.1)
+    report = "\n".join(",".join(str(i) for i in range(50)) for _ in range(4000))
+    total = parse_report(report)          # the hidden blocker
+    await asyncio.sleep(0.1)
+    return total
+
+
+async def main():
+    dog = asyncio.create_task(LoopWatchdog().run())
+    print("total:", await handler())
+    dog.cancel()
+
+
+asyncio.run(main())
+```
+
+```text
+$ python3.15 -u watchdog.py
+[watchdog] loop blocked for 251 ms at:
+  File "/home/box/.local/share/uv/python/cpython-3.15.0-linux-x86_64-gnu/lib/python3.15/asyncio/events.py", line 94, in _run
+    self._context.run(self._callback, *self._args)
+  File "/tmp/aioblock/watchdog.py", line 57, in main
+    print("total:", await handler())
+  File "/tmp/aioblock/watchdog.py", line 50, in handler
+    total = parse_report(report)          # the hidden blocker
+  File "/tmp/aioblock/watchdog.py", line 43, in parse_report
+    time.sleep(0.0001)
+
+total: 4900000
+```
+
+The report points at `parse_report`, called from `handler`, which is the line to fix. The watchdog costs one wake-up every 50 ms on each side and does nothing unless the loop stalls. Send its output to your logging system instead of stderr, and rate-limit it. `sys._current_frames()` is CPython-specific and documented as intended for debugging, which is exactly this use.
+
+### Case 5: The shared pool is a limit too
+
+`to_thread` and `run_in_executor(None, ...)` share one default `ThreadPoolExecutor`. It is created on first use with the standard default size:
+
+```python
+# pool_limit.py: asyncio.to_thread shares one default thread pool. How long
+# do 40 concurrent 200 ms blocking calls take?
+import asyncio
+import concurrent.futures as cf
+import os
+import time
+
+
+async def run(n, executor=None):
+    loop = asyncio.get_running_loop()
+    if executor:
+        loop.set_default_executor(executor)
+    t0 = time.perf_counter()
+    await asyncio.gather(*(asyncio.to_thread(time.sleep, 0.2) for _ in range(n)))
+    return time.perf_counter() - t0
+
+
+async def main():
+    print("process_cpu_count:", os.process_cpu_count(),
+          " default max_workers:", min(32, (os.process_cpu_count() or 1) + 4))
+    print(f"default pool  : 40 calls in {await run(40):.2f}s")
+    big = cf.ThreadPoolExecutor(max_workers=40, thread_name_prefix="blocking")
+    print(f"40-thread pool: 40 calls in {await run(40, big):.2f}s")
+
+
+asyncio.run(main())
+```
+
+```text
+$ python3.15 pool_limit.py
+process_cpu_count: 8  default max_workers: 12
+default pool  : 40 calls in 0.80s
+40-thread pool: 40 calls in 0.21s
+```
+
+Forty 200 ms calls on 12 threads take four rounds: 0.8 s. The loop itself is never blocked here, but requests now wait in the executor's queue instead. If a service offloads a blocking client library, size a dedicated executor for it (and pass it to `run_in_executor`) so one slow dependency cannot use up the threads every other `to_thread` call needs. The formula printed above is the documented default (since 3.13) and the one in `concurrent/futures/thread.py`; the script recomputes it only for display.
+
+### Case 6: Choosing where blocking work goes
+
+| The blocking call is | Move it with | Why |
+|----------------------|--------------|-----|
+| A blocking client library (sync DB driver, `requests`, SDK) | Prefer an async library; otherwise `to_thread` or a dedicated `ThreadPoolExecutor` | Waiting in a system call releases the GIL |
+| C code that releases the GIL (`hashlib` on large data, `zlib`, file I/O, many NumPy operations) | `to_thread` | Runs in parallel with the loop (Case 2) |
+| Pure-Python CPU work (parsing, big `json.dumps`, loops) | `ProcessPoolExecutor` or `InterpreterPoolExecutor` | A thread would still share the GIL (Case 1, `cpu-to-thread`) |
+| Long CPU work you can split | Do it in chunks with `await asyncio.sleep(0)` between them | Gives the loop a turn, but the total time is unchanged |
+| `time.sleep(x)` in a coroutine | `await asyncio.sleep(x)` | It was never meant to block |
+
+## The trap
+
+- **Measuring latency from inside the same loop.** The first version of Case 2 ran its ping client as a coroutine on the server's own loop. With the inline checksum it reported `ping p50= 0.08 ms ... max= 0.35 ms`: the client could not send while the loop was blocked, so it never observed the stall it was meant to catch. Probes must run on another thread, in another process, or on another machine. Also report the maximum or p99, not the median (Case 1).
+- **`to_thread` for pure-Python CPU work.** It makes the stall smaller and longer instead of removing it: about 5 ms of lag on every tick, and a loop that does a third less work.
+- **Leaving debug mode on in production.** It names slow steps, but it adds per-task tracebacks and checks to every operation. Use the watchdog (Case 4) there, and debug mode in tests and development.
+- **A threshold that hides the problem.** At the default 100 ms, a handler that blocks for 30 ms on every request is never reported, yet it caps the whole service at about 33 such requests per second.
+- **One shared executor for everything.** A slow dependency that fills the default pool delays every other `to_thread` caller (Case 5).
+
+## The boring rule
+
+Never call anything that might block from a coroutine without deciding where it runs. Keep a heartbeat or a watchdog in every long-running asyncio service and alert on loop lag. Run tests and local development with `-X dev`, and lower `slow_callback_duration` to the latency budget of one request. Move blocking I/O and GIL-releasing C calls to threads, pure-Python CPU work to processes or interpreters, and give each blocking dependency its own bounded executor.
+
+## Try this
+
+1. Run `lag_probe.py cpu-to-thread` after calling `sys.setswitchinterval(0.001)` at the top. What happens to `p50 late` and to the total time of the CPU work?
+2. In `server_demo.py`, replace `hashlib.sha256` in `checksum` with a pure-Python loop of similar duration and run the `to_thread` mode again. Then switch it to a `ProcessPoolExecutor`. Compare the ping p99s.
+3. Add the watchdog from Case 4 to `server_demo.py` and run the `inline` mode. Does the reported stack point at `checksum`?
+4. Use `logging.basicConfig(level=logging.DEBUG)` with `-X dev` and call `loop.getaddrinfo("localhost", 80)`. What does asyncio log, and in which thread does the lookup run?
+5. Find one synchronous call in an async service you maintain (`grep -n "requests\.\|time\.sleep\|open(" -r app/`), measure the request p99 with a ping client in another process, and move the call. Measure again.
+
+## Sources
+
+- asyncio, "Developing with asyncio" (debug mode, `slow_callback_duration`, running blocking code): <https://docs.python.org/3/library/asyncio-dev.html>
+- `asyncio.to_thread`: <https://docs.python.org/3/library/asyncio-task.html#asyncio.to_thread>
+- `loop.run_in_executor`, `loop.set_default_executor`, `loop.slow_callback_duration`: <https://docs.python.org/3/library/asyncio-eventloop.html>
+- `concurrent.futures` (`ThreadPoolExecutor` default `max_workers`, `ProcessPoolExecutor`, `InterpreterPoolExecutor`): <https://docs.python.org/3/library/concurrent.futures.html>
+- Python Development Mode (`-X dev`): <https://docs.python.org/3/library/devmode.html>
+- `PYTHONASYNCIODEBUG`: <https://docs.python.org/3/using/cmdline.html#envvar-PYTHONASYNCIODEBUG>
+- `hashlib` (GIL released for data larger than 2047 bytes): <https://docs.python.org/3/library/hashlib.html>
+- `sys.getswitchinterval`, `sys._current_frames`: <https://docs.python.org/3/library/sys.html>
+- CPython source at the `v3.15.0` tag: `Lib/asyncio/base_events.py` (`_run_once`, the slow-step warning, the default executor), `Lib/asyncio/threads.py` (`to_thread`), `Lib/concurrent/futures/thread.py` (default pool size): <https://github.com/python/cpython/tree/v3.15.0/Lib/asyncio>
+- What's New in Python 3.15 (asyncio: `TaskGroup.cancel`; no changes to debug mode): <https://docs.python.org/3.15/whatsnew/3.15.html>
