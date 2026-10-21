@@ -22,6 +22,8 @@ By the end of this module, you should be able to:
 2. **Optimization Techniques** - Algorithm optimization, loop optimization, and code restructuring
 3. **Memory Optimization** - Memory allocation strategies, cache optimization, and memory layout
 4. **Advanced Optimization** - Compiler optimizations, vectorization, and parallel processing
+5. **ISPC 1.32: AVX10.2, APX, and Zen 6 Targets** - SPMD vectorization with Intel's ISPC on current x86 targets
+6. **Arena Allocators** - Bump-pointer allocation, alignment padding, scratch lifetimes, and the use-after-reset trap
 
 ## Prerequisites
 
