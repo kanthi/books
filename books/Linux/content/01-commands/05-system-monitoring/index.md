@@ -22,6 +22,7 @@ Measure subsystem health over time and debug *why* a host is slow or stuck: virt
 | `pmap` | pmap prints a process's memory map (size, RSS, dirty per mapping); the first step in hunting native leaks that heap profilers miss. |
 | THP (`/sys/kernel/mm/transparent_hugepage`) | Transparent Huge Pages: read the policy, find who holds 2 MiB pages (`AnonHugePages`), and opt in or out with `madvise`/`prctl`. |
 | PSI (`/proc/pressure`, cgroup `*.pressure`) | Pressure Stall Information: share of time tasks are stalled on CPU, memory or I/O — `some` vs `full`, averages and triggers. |
+| vDSO (`[vdso]`, `[vvar]`) | The kernel-provided shared object that answers `clock_gettime`, `gettimeofday`, `time`, `getcpu` and `getrandom` without a syscall — why `strace` and seccomp never see them, and when they fall back. |
 
 
 ## Suggested starting points
@@ -33,6 +34,7 @@ Measure subsystem health over time and debug *why* a host is slow or stuck: virt
 5. RSS keeps growing: `pmap` (which mapping?), then `strace`/`bpftrace` and `gdb` (who maps it?).
 6. RSS jumps or latency spikes after a THP policy change: Transparent Huge Pages (`AnonHugePages`, `/proc/vmstat` `thp_*`, `compact_stall`).
 7. Latency without obvious saturation: `/proc/pressure/*` and the service cgroup's `*.pressure` (`some` vs `full`).
+8. Timestamps look slow, or `strace` shows no clock reads: the vDSO (`[vdso]` in `/proc/PID/maps`, `current_clocksource`).
 
 ## Related parts
 
