@@ -256,6 +256,78 @@ humanize_dir_title() {
     open-source)                printf '%s\n' "Open Source"; return ;;
     orgs-and-teams)             printf '%s\n' "Orgs and Teams"; return ;;
     advanced-topics)            printf '%s\n' "Advanced Topics"; return ;;
+    # Boring-Linux v2 (parts and sections)
+    foundations-boot-and-platform) printf '%s\n' "Foundations, Boot and Platform"; return ;;
+    machine-and-kernel-model) printf '%s\n' "The Machine and Kernel Model"; return ;;
+    firmware-and-bootloaders) printf '%s\n' "Firmware and Bootloaders"; return ;;
+    init-and-recovery) printf '%s\n' "Init Handoff and Recovery"; return ;;
+    system-administration) printf '%s\n' "System Administration"; return ;;
+    identity-and-access) printf '%s\n' "Identity and Access"; return ;;
+    packages-and-updates) printf '%s\n' "Packages and Updates"; return ;;
+    services-and-scheduling) printf '%s\n' "Services and Scheduling"; return ;;
+    resources-and-kernel-tuning) printf '%s\n' "Resources and Kernel Tuning"; return ;;
+    storage-administration) printf '%s\n' "Storage Administration"; return ;;
+    block-devices-and-filesystems) printf '%s\n' "Block Devices and Filesystems"; return ;;
+    volumes-and-encryption) printf '%s\n' "Volumes and Encryption"; return ;;
+    network-storage-and-protection) printf '%s\n' "Network Storage and Protection"; return ;;
+    network-administration) printf '%s\n' "Network Administration"; return ;;
+    stack-and-addressing) printf '%s\n' "Stack and Addressing"; return ;;
+    routing-and-switching) printf '%s\n' "Routing and Switching"; return ;;
+    services-firewall-and-tunnels) printf '%s\n' "Name Services, Firewall and Tunnels"; return ;;
+    performance-and-diagnosis) printf '%s\n' "Performance and Diagnosis"; return ;;
+    security-administration) printf '%s\n' "Security Administration"; return ;;
+    host-access-control) printf '%s\n' "Host Access Control"; return ;;
+    remote-access-and-crypto) printf '%s\n' "Remote Access and Cryptography"; return ;;
+    hardening-and-assurance) printf '%s\n' "Hardening and Assurance"; return ;;
+    virtualization-administration) printf '%s\n' "Virtualization Administration"; return ;;
+    kvm-qemu-libvirt) printf '%s\n' "KVM, QEMU and libvirt"; return ;;
+    guest-storage-network-and-images) printf '%s\n' "Guest Storage, Network and Images"; return ;;
+    advanced-and-alternative) printf '%s\n' "Advanced Topics"; return ;;
+    container-administration) printf '%s\n' "Container Administration"; return ;;
+    kernel-primitives) printf '%s\n' "Kernel Primitives"; return ;;
+    images-runtimes-and-tools) printf '%s\n' "Images, Runtimes and Tools"; return ;;
+    networking-and-security) printf '%s\n' "Networking and Security"; return ;;
+    kubernetes-node) printf '%s\n' "Kubernetes from the Node"; return ;;
+    service-administration) printf '%s\n' "Service Administration"; return ;;
+    web-and-proxy) printf '%s\n' "Web and Proxy"; return ;;
+    data-services) printf '%s\n' "Data Services"; return ;;
+    availability-and-infrastructure-services) printf '%s\n' "Availability and Infrastructure Services"; return ;;
+    observability) printf '%s\n' "Observability"; return ;;
+    signals-and-host-tools) printf '%s\n' "Signals and Host Tools"; return ;;
+    kernel-tracing-and-profiling) printf '%s\n' "Kernel Tracing and Profiling"; return ;;
+    telemetry-pipelines) printf '%s\n' "Telemetry Pipelines"; return ;;
+    monitoring-and-alerting) printf '%s\n' "Monitoring and Alerting"; return ;;
+    metrics-with-prometheus) printf '%s\n' "Metrics with Prometheus"; return ;;
+    dashboards-and-alerts) printf '%s\n' "Dashboards and Alerts"; return ;;
+    coverage-and-resilience) printf '%s\n' "Coverage and Resilience"; return ;;
+    devops) printf '%s\n' "DevOps"; return ;;
+    automation-and-builds) printf '%s\n' "Automation and Builds"; return ;;
+    ci-and-artifacts) printf '%s\n' "CI and Artifacts"; return ;;
+    delivery-and-measurement) printf '%s\n' "Delivery and Measurement"; return ;;
+    infrastructure-as-code) printf '%s\n' "Infrastructure as Code"; return ;;
+    principles-and-configuration-management) printf '%s\n' "Principles and Configuration Management"; return ;;
+    provisioning) printf '%s\n' "Provisioning"; return ;;
+    images-and-first-boot) printf '%s\n' "Images and First Boot"; return ;;
+    quality) printf '%s\n' "Quality"; return ;;
+    gitops) printf '%s\n' "GitOps"; return ;;
+    principles-and-repositories) printf '%s\n' "Principles and Repositories"; return ;;
+    controllers-and-secrets) printf '%s\n' "Controllers and Secrets"; return ;;
+    delivery-policy-and-scale) printf '%s\n' "Delivery, Policy and Scale"; return ;;
+    platform-engineering) printf '%s\n' "Platform Engineering"; return ;;
+    platform-as-product) printf '%s\n' "Platform as Product"; return ;;
+    platform-foundations) printf '%s\n' "Platform Foundations"; return ;;
+    running-the-platform) printf '%s\n' "Running the Platform"; return ;;
+    site-reliability-engineering) printf '%s\n' "Site Reliability Engineering"; return ;;
+    targets-and-toil) printf '%s\n' "Targets and Toil"; return ;;
+    incidents-and-learning) printf '%s\n' "Incidents and Learning"; return ;;
+    resilience) printf '%s\n' "Resilience"; return ;;
+    forward-deployed-engineering) printf '%s\n' "Forward-Deployed Engineering"; return ;;
+    role-and-discovery) printf '%s\n' "Role and Discovery"; return ;;
+    working-under-constraint) printf '%s\n' "Working Under Constraint"; return ;;
+    integration-and-communication) printf '%s\n' "Integration and Communication"; return ;;
+    appendices) printf '%s\n' "Appendices"; return ;;
+    reference) printf '%s\n' "Reference"; return ;;
+    palace-index) printf '%s\n' "Palace Index"; return ;;
   esac
 
   title="$(echo "$slug" | sed 's/-/ /g' | awk '{
@@ -314,6 +386,19 @@ book:
     - index.qmd
 EOL
 
+# Overview stubs are authoring notes, not reader-facing chapters. Only expose
+# parts/sections containing actual chapters so planned groups do not create
+# empty navigation headings after their overview is omitted.
+has_publishable_content() {
+  local doc
+  while IFS= read -r -d '' doc; do
+    if [ "$(extract_qmd_title "$doc")" != "Overview" ]; then
+      return 0
+    fi
+  done < <(find "$1" -type d -name '_*' -prune -o -type f \( -name '*.qmd' -o -name '*.md' \) -print0)
+  return 1
+}
+
 emit_chapter_files() {
   local folder="$1"
   local rel="$2"
@@ -323,6 +408,7 @@ emit_chapter_files() {
   for ext in qmd md; do
     if [ -f "$folder/index.$ext" ]; then
       file_title="$(extract_qmd_title "$folder/index.$ext")"
+      [[ "$file_title" == "Overview" ]] && continue
       {
         echo "${ind}- text: \"$file_title\""
         echo "${ind}  file: ${rel}/index.$ext"
@@ -335,6 +421,7 @@ emit_chapter_files() {
     doc_name="$(basename "$doc")"
     [[ "$doc_name" == index.* ]] && continue
     file_title="$(extract_qmd_title "$doc")"
+    [[ "$file_title" == "Overview" ]] && continue
     {
       echo "${ind}- text: \"$file_title\""
       echo "${ind}  file: ${rel}/${doc_name}"
@@ -349,7 +436,8 @@ emit_section() {
   local nested_ind="${ind}  "
   local item_ind="${nested_ind}  "
   local name title sub sub_name sub_rel
-  local has_nested=0
+
+  has_publishable_content "$folder" || return 0
 
   name="$(basename "$folder")"
   title="$(humanize_dir_title "$name")"
@@ -361,7 +449,6 @@ emit_section() {
 
   for sub in "$folder"/*; do
     if [ -d "$sub" ] && [[ ! $(basename "$sub") == _* ]]; then
-      has_nested=1
       sub_name="$(basename "$sub")"
       sub_rel="${rel}/${sub_name}"
       emit_section "$sub" "$sub_rel" "$item_ind"
@@ -374,6 +461,7 @@ emit_section() {
 process_directory() {
   local dir="$1"
   local metadata order title
+  has_publishable_content "$dir" || return 0
   metadata="$(get_metadata "$dir")"
   order="$(echo "$metadata" | cut -d'|' -f1)"
   title="$(echo "$metadata" | cut -d'|' -f2)"
@@ -383,28 +471,8 @@ process_directory() {
     echo "      contents:"
   } >> "$TMP_FILE"
 
-  local ext doc doc_name file_title subdir
-
-  for ext in qmd md; do
-    if [ -f "$dir/index.$ext" ]; then
-      file_title="$(extract_qmd_title "$dir/index.$ext")"
-      {
-        echo "        - text: \"$file_title\""
-        echo "          file: content/$(basename "$dir")/index.$ext"
-      } >> "$TMP_FILE"
-      break
-    fi
-  done
-
-  while IFS= read -r -d '' doc; do
-    doc_name="$(basename "$doc")"
-    [[ "$doc_name" == index.* ]] && continue
-    file_title="$(extract_qmd_title "$doc")"
-    {
-      echo "        - text: \"$file_title\""
-      echo "          file: content/$(basename "$dir")/${doc_name}"
-    } >> "$TMP_FILE"
-  done < <(find "$dir" -maxdepth 1 -type f \( -name "*.qmd" -o -name "*.md" \) -print0 2>/dev/null | sort -z)
+  local subdir
+  emit_chapter_files "$dir" "content/$(basename "$dir")" "        "
 
   for subdir in "$dir"/*; do
     if [ -d "$subdir" ] && [[ ! $(basename "$subdir") == _* ]]; then
