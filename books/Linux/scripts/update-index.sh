@@ -79,7 +79,28 @@ humanize_dir_title() {
     system-monitoring)          printf '%s\n' "System Monitoring"; return ;;
     shell-commands)             printf '%s\n' "Shell Commands"; return ;;
     intro-to-shells)            printf '%s\n' "Intro to Shells"; return ;;
+    scripting)                  printf '%s\n' "Scripting"; return ;;
+    scripting-fundamentals)     printf '%s\n' "Scripting Fundamentals"; return ;;
     bash-features)              printf '%s\n' "Bash Features"; return ;;
+    execution-model)            printf '%s\n' "The Bash Execution Model"; return ;;
+    variables)                  printf '%s\n' "Variables, Quoting, and Safe Syntax"; return ;;
+    control)                    printf '%s\n' "Control Flow and Logic"; return ;;
+    functions)                  printf '%s\n' "Functions and Modular Design"; return ;;
+    arrays)                     printf '%s\n' "Arrays and Associative Arrays"; return ;;
+    io-and-redirection)         printf '%s\n' "Input/Output, Redirection, and File Descriptors"; return ;;
+    process-and-jobs)           printf '%s\n' "Process and Job Management"; return ;;
+    signals-and-traps)          printf '%s\n' "Signals, Traps, and Cleanup"; return ;;
+    error-handling)             printf '%s\n' "Error Handling and Defensive Scripting"; return ;;
+    debugging-and-testing)      printf '%s\n' "Debugging and Testing Scripts"; return ;;
+    text-processing)            printf '%s\n' "Text Processing Essentials in Scripts"; return ;;
+    posix-and-portability)      printf '%s\n' "POSIX Compatibility and Portability"; return ;;
+    distribution-differences)   printf '%s\n' "Linux Distribution Differences"; return ;;
+    security)                   printf '%s\n' "Security in Shell Scripts"; return ;;
+    performance-and-concurrency) printf '%s\n' "Performance Optimization and Concurrency"; return ;;
+    automation-and-devops)      printf '%s\n' "Automation, DevOps, and CI/CD"; return ;;
+    sysadmin-patterns)          printf '%s\n' "System Administration Patterns"; return ;;
+    workbook)                   printf '%s\n' "Workbook"; return ;;
+    appendices)                 printf '%s\n' "Appendices"; return ;;
     lazyvim)                    printf '%s\n' "LazyVim"; return ;;
     modern-tools)               printf '%s\n' "Modern Tools"; return ;;
     # C
