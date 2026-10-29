@@ -180,6 +180,7 @@ Lab platform (macOS / Linux + Containerlab)
 ### Ch 01 — Tunneling ideas (why encapsulate)
 ### Ch 02 — Site connectivity patterns
 ### Ch 03 — DC overlay intro (VXLAN-class data plane)
+### Ch 03b — Head office and branch office (Tailscale underlay, VXLAN VNI across one subnet)
 ### Ch 04 — EVPN-class control plane (conceptual + lab if free images allow)
 ### Ch 05 — Multicast essentials
 **Labs:** point-to-point tunnel; mini overlay fabric with open NOS.
