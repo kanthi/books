@@ -1,0 +1,349 @@
+---
+title: "Chapter 3: Building TCP Servers and Clients"
+---
+
+# Chapter 3: Building TCP Servers and Clients: The Connection Lifecycle
+
+TCP is the backbone of reliable internet communication. Writing a basic TCP server in Go takes fewer than ten lines of code, but writing a robust, production-ready server capable of handling unexpected client disconnections, slow clients, and graceful zero-downtime shutdowns requires careful design.
+
+In this chapter, you will build working TCP servers and clients, master the server accept loop pattern, manage connection states, and implement clean graceful shutdowns with `context.Context` and `sync.WaitGroup`.
+
+---
+
+## Your First TCP Server
+
+Let’s start with a foundational echo server. The server listens on a local port, accepts incoming TCP connections, reads messages until `io.EOF`, and echoes the exact data back to the client.
+
+```go
+// server.go
+package main
+
+import (
+	"bufio"
+	"fmt"
+	"io"
+	"log"
+	"net"
+)
+
+func main() {
+	ln, err := net.Listen("tcp", "127.0.0.1:9090")
+	if err != nil {
+		log.Fatalf("failed to listen: %v", err)
+	}
+	defer ln.Close()
+
+	log.Printf("Echo server listening on %s", ln.Addr())
+
+	for {
+		conn, err := ln.Accept()
+		if err != nil {
+			log.Printf("accept error: %v", err)
+			continue
+		}
+
+		go handleConnection(conn)
+	}
+}
+
+func handleConnection(conn net.Conn) {
+	defer conn.Close()
+	remoteAddr := conn.RemoteAddr()
+	log.Printf("accepted connection from %s", remoteAddr)
+
+	reader := bufio.NewReader(conn)
+	for {
+		line, err := reader.ReadBytes('\n')
+		if err != nil {
+			if err != io.EOF {
+				log.Printf("[%s] read error: %v", remoteAddr, err)
+			}
+			break
+		}
+
+		if _, err := conn.Write(line); err != nil {
+			log.Printf("[%s] write error: %v", remoteAddr, err)
+			break
+		}
+	}
+
+	log.Printf("closed connection from %s", remoteAddr)
+}
+```
+
+---
+
+## Your First TCP Client
+
+Now let’s implement a corresponding TCP client that connects to our echo server, writes a message, reads the echoed reply, and exits cleanly.
+
+```go
+// client.go
+package main
+
+import (
+	"bufio"
+	"fmt"
+	"log"
+	"net"
+	"time"
+)
+
+func main() {
+	// Establish connection with a 5-second dial timeout
+	conn, err := net.DialTimeout("tcp", "127.0.0.1:9090", 5*time.Second)
+	if err != nil {
+		log.Fatalf("dial failed: %v", err)
+	}
+	defer conn.Close()
+
+	log.Printf("connected to %s from %s", conn.RemoteAddr(), conn.LocalAddr())
+
+	// Send a message terminated by a newline
+	message := "Hello from Go TCP client!\n"
+	if _, err := conn.Write([]byte(message)); err != nil {
+		log.Fatalf("write failed: %v", err)
+	}
+
+	// Read reply with a 2-second read deadline
+	if err := conn.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		log.Fatalf("failed to set deadline: %v", err)
+	}
+
+	reply, err := bufio.NewReader(conn).ReadString('\n')
+	if err != nil {
+		log.Fatalf("read failed: %v", err)
+	}
+
+	fmt.Printf("Received echo: %s", reply)
+}
+```
+
+You can test these two programs together in separate terminals:
+
+```bash
+# Terminal 1:
+go run server.go
+
+# Terminal 2:
+go run client.go
+```
+
+---
+
+## The Accept Loop and Connection Handling Patterns
+
+The core loop of any Go network daemon is the **Accept Loop**:
+
+```
+                       ┌─────────────────────────┐
+                       │    net.Listen("tcp")    │
+                       └────────────┬────────────┘
+                                    │
+                                    ▼
+                          ┌──────────────────┐
+                          │   ln.Accept()    │ ◄──────────┐
+                          └─────────┬────────┘            │
+                                    │                     │
+                       Connection Accepted?               │
+                        /                \                │
+                     Yes                  No (error)      │
+                     /                      \             │
+                    ▼                        ▼            │
+         ┌────────────────────┐    ┌─────────────────┐    │
+         │ go handleConn(c)   │    │ Check if closed │    │
+         └────────────────────┘    └────────┬────────┘    │
+                                            │             │
+                                  Permanent or Transient? │
+                                            │             │
+                                            └─────────────┘
+```
+
+### 1. Always Spawn a Goroutine per Connection
+
+In Go, goroutines cost approximately 2 KB of memory. Spawning `go handleConnection(conn)` for every connection is the standard idiomatic design. Do *not* process connection traffic inside the accept loop itself, as doing so blocks all other incoming clients from being accepted.
+
+### 2. Handling Accept Errors
+
+When `ln.Accept()` fails, you must inspect whether the error is transient (e.g., temporary file descriptor exhaustion) or permanent (e.g., the listener was explicitly closed during server shutdown):
+
+```go
+for {
+    conn, err := ln.Accept()
+    if err != nil {
+        // If the listener was closed, stop accepting
+        if errors.Is(err, net.ErrClosed) {
+            return nil
+        }
+        // Handle transient errors with backoff
+        var netErr net.Error
+        if errors.As(err, &netErr) && netErr.Temporary() {
+            time.Sleep(10 * time.Millisecond)
+            continue
+        }
+        return fmt.Errorf("fatal accept error: %w", err)
+    }
+    go handleConn(conn)
+}
+```
+
+---
+
+## Graceful Shutdown with context.Context
+
+In production, servers must shut down without dropping active user requests or leaving sockets hanging. A graceful shutdown must:
+
+1. Stop accepting new connections (`ln.Close()`).
+2. Signal existing connection goroutines to wrap up their in-flight work.
+3. Wait for active connections to finish before terminating the process, with an enforced timeout.
+
+```go
+// graceful_server.go
+package main
+
+import (
+	"context"
+	"errors"
+	"io"
+	"log"
+	"net"
+	"os"
+	"os/signal"
+	"sync"
+	"syscall"
+	"time"
+)
+
+type Server struct {
+	addr     string
+	listener net.Listener
+	wg       sync.WaitGroup
+	ctx      context.Context
+	cancel   context.CancelFunc
+}
+
+func NewServer(addr string) *Server {
+	ctx, cancel := context.WithCancel(context.Background())
+	return &Server{
+		addr:   addr,
+		ctx:    ctx,
+		cancel: cancel,
+	}
+}
+
+func (s *Server) Start() error {
+	ln, err := net.Listen("tcp", s.addr)
+	if err != nil {
+		return err
+	}
+	s.listener = ln
+	log.Printf("Server listening on %s", s.addr)
+
+	for {
+		conn, err := s.listener.Accept()
+		if err != nil {
+			if errors.Is(err, net.ErrClosed) {
+				// Normal termination when listener is closed
+				return nil
+			}
+			log.Printf("Accept error: %v", err)
+			continue
+		}
+
+		s.wg.Add(1)
+		go s.handleConn(conn)
+	}
+}
+
+func (s *Server) handleConn(conn net.Conn) {
+	defer s.wg.Done()
+	defer conn.Close()
+
+	// Launch a watcher goroutine to close the connection if context is cancelled
+	closed := make(chan struct{})
+	go func() {
+		select {
+		case <-s.ctx.Done():
+			_ = conn.Close() // Force unblock active Read/Write
+		case <-closed:
+		}
+	}()
+	defer close(closed)
+
+	buf := make([]byte, 4096)
+	for {
+		n, err := conn.Read(buf)
+		if err != nil {
+			if err != io.EOF && !errors.Is(err, net.ErrClosed) {
+				log.Printf("Read error: %v", err)
+			}
+			return
+		}
+
+		if _, err := conn.Write(buf[:n]); err != nil {
+			return
+		}
+	}
+}
+
+func (s *Server) Shutdown(timeout time.Duration) error {
+	s.cancel() // Signal all workers
+	if s.listener != nil {
+		_ = s.listener.Close() // Unblock Accept()
+	}
+
+	done := make(chan struct{})
+	go func() {
+		s.wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		log.Println("All connections terminated cleanly")
+		return nil
+	case <-time.After(timeout):
+		return errors.New("shutdown timed out; forcing process exit")
+	}
+}
+
+func main() {
+	srv := NewServer(":8080")
+
+	go func() {
+		if err := srv.Start(); err != nil && !errors.Is(err, net.ErrClosed) {
+			log.Fatalf("Server startup failed: %v", err)
+		}
+	}()
+
+	// Listen for OS termination signals (SIGINT, SIGTERM)
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+	<-sigChan
+
+	log.Println("Shutting down server...")
+	if err := srv.Shutdown(5 * time.Second); err != nil {
+		log.Printf("Shutdown warning: %v", err)
+	}
+}
+```
+
+---
+
+## Managing Connection State and Resources
+
+Network services in production must guard against resource exhaustion:
+
+1. **File Descriptors:** Every TCP socket requires a kernel file descriptor. On Linux, check limits via `ulimit -n`. If descriptors are exhausted, `Accept()` fails with `EMFILE` / `ENFILE`.
+2. **Goroutine Leaks:** If a client abruptly stops reading or closes their laptop without sending a `FIN`, a naive server calling `conn.Read()` without a deadline may hang that goroutine forever. Over days, thousands of zombie goroutines accumulate, consuming gigabytes of memory.
+3. **Deadlines as Guardrails:** Always set read and write deadlines (`SetReadDeadline`, `SetWriteDeadline`) on connections to ensure resources are returned to the pool when peers become unresponsive.
+
+---
+
+## Chapter Summary
+
+- TCP servers follow an **Accept Loop** pattern, delegating each accepted connection to an independent goroutine.
+- Clients use **`net.DialTimeout`** to guard against hanging connections during the TCP three-way handshake.
+- Graceful shutdown requires: closing the listener, notifying active goroutines via **`context.Context`**, and synchronizing termination via **`sync.WaitGroup`**.
+- Unbounded reads without deadlines lead to **goroutine leaks** and socket descriptor leaks.
+- In the next chapter, we will examine TCP reliability, flow control, Nagle's algorithm, keep-alives, and socket buffer tuning.

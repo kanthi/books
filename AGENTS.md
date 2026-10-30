@@ -33,7 +33,7 @@ A **multi-book Quarto monorepo**. Each book is a self-contained Quarto project u
 
 ### Current books (as of last inventory)
 
-`Boring-Linux`, `C`, `Go`, `Linux`, `Maths`, `Networking`, `NixOS`, `Python`, `Rust`, `VCS`, `Writing-Kernel-with-AI`
+`Boring-Linux`, `BYOL`, `C`, `Go`, `Linux`, `Maths`, `Networking`, `NixOS`, `OpenTofu`, `Python`, `Rust`, `VCS`, `Writing-Kernel-with-AI`
 
 - **`Linux`**: merged former `Linux-Commands` + `Linux-Editors` + `Linux-ShellScripting-Bash` (parts Commands / Editors / Scripting→Bash).
 - **`Boring-Linux`**: Fast-iteration workspace for modern Ubuntu 26.04+ systems engineering & administration (Parts 05-13); to be merged into `Linux` upon completion.
@@ -55,9 +55,11 @@ Every book is meant to be read **on its own**. A reader of Python should never n
 |------------|------|
 | **`Go`**, **`Go book`** | `books/Go/` |
 | **`NixOS`**, **`NixOS book`** | `books/NixOS/` |
+| **`OpenTofu`**, **`OpenTofu book`** | `books/OpenTofu/` (IaC, pin OpenTofu 1.13.2; syllabus `content/_planning/SYLLABUS.md`) |
 | **`Maths`**, **`Maths book`** | `books/Maths/` |
 | **`Linux`**, **`Linux book`** | `books/Linux/` |
 | **`Boring-Linux`** | `books/Boring-Linux/` (fast-iteration for Parts 05-13; merges into `Linux`) |
+| **`BYOL`**, **`BYOL book`** | `books/BYOL/` (Build Your Own Linux: Designing, Building, and Publishing a Custom Linux OS) |
 | **`Python`**, **`Python book`** | `books/Python/` |
 | **`Rust`**, **`Rust book`** | `books/Rust/` |
 | **`Writing-Kernel-with-AI`**, **`Writing Kernel with AI`**, **`Kernel`** | `books/Writing-Kernel-with-AI/` |

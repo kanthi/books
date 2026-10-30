@@ -1,0 +1,276 @@
+---
+title: "Chapter 7: Concurrency Patterns for Network Programming"
+---
+
+# Chapter 7: Concurrency Patterns for Network Programming
+
+Concurrency is Go's greatest superpower. In network programming, managing thousands of simultaneous I/O streams requires disciplined concurrency architectures to prevent resource exhaustion, eliminate data races, and minimize garbage collection (GC) pauses.
+
+In this chapter, you will master the standard goroutine-per-connection pattern, understand when and how to implement worker pools, coordinate bidirectional I/O streams using channels, recycle high-frequency memory buffers using `sync.Pool`, and avoid the most common concurrency bugs found in network applications.
+
+---
+
+## One Goroutine Per Connection: The Standard Pattern
+
+The default and most natural idiom in Go is spawning a dedicated goroutine for each accepted connection:
+
+```go
+for {
+    conn, err := ln.Accept()
+    if err != nil {
+        handleError(err)
+        continue
+    }
+    go handleConn(conn) // Lightweight: ~2KB stack initial footprint
+}
+```
+
+```
+                        ┌────────────────────────┐
+                        │   ln.Accept() Loop     │
+                        └───────────┬────────────┘
+         ┌──────────────────────────┼──────────────────────────┐
+         ▼                          ▼                          ▼
+┌─────────────────┐        ┌─────────────────┐        ┌─────────────────┐
+│  Goroutine #1   │        │  Goroutine #2   │        │  Goroutine #N   │
+│  Conn 1 Read/W  │        │  Conn 2 Read/W  │        │  Conn N Read/W  │
+└─────────────────┘        └─────────────────┘        └─────────────────┘
+```
+
+### Why This Works in Go
+
+In C or Java, spawning an OS thread per connection collapses at a few thousand clients due to 8MB stack reservations and kernel scheduler overhead. In Go, goroutines start at **2 KB**, their stacks grow dynamically, and the runtime netpoller multiplexes them across available CPU cores. Having 50,000 idle TCP connections in Go consumes roughly 100 MB of RAM—trivial on modern servers.
+
+---
+
+## Worker Pools for Connection Handling
+
+While goroutines are cheap, the resources they consume inside your application might not be. If each client request executes heavy CPU computations or queries a database pool with a hard limit of 50 connections, spawning 20,000 simultaneous goroutines will overwhelm downstream systems and cause CPU thrashing.
+
+A **Worker Pool** limits concurrent active execution while maintaining an inbound backlog queue.
+
+```go
+package main
+
+import (
+	"log"
+	"net"
+)
+
+type WorkerPool struct {
+	maxWorkers int
+	tasks      chan net.Conn
+}
+
+func NewWorkerPool(maxWorkers, queueSize int) *WorkerPool {
+	return &WorkerPool{
+		maxWorkers: maxWorkers,
+		tasks:      make(chan net.Conn, queueSize),
+	}
+}
+
+func (wp *WorkerPool) Start() {
+	for i := 0; i < wp.maxWorkers; i++ {
+		go func(workerID int) {
+			for conn := range wp.tasks {
+				processConnection(workerID, conn)
+			}
+		}(i)
+	}
+}
+
+func (wp *WorkerPool) Submit(conn net.Conn) bool {
+	select {
+	case wp.tasks <- conn:
+		return true
+	default:
+		// Queue full: shed load or reject immediately
+		return false
+	}
+}
+
+func processConnection(workerID int, conn net.Conn) {
+	defer conn.Close()
+	// Process business logic under bounded concurrency...
+}
+```
+
+---
+
+## Channels for Coordinating Network Operations
+
+In full-duplex TCP connections, you often need to decouple inbound reads from outbound writes. A standard pattern uses separate read and write loops coordinated via channels.
+
+```
+                  ┌─────────────────────────────────────────┐
+                  │               net.Conn                  │
+                  └────────────┬───────────────▲────────────┘
+                               │ conn.Read()   │ conn.Write()
+                               ▼               │
+                      ┌─────────────────┐ ┌─────────────────┐
+                      │    Read Loop    │ │   Write Loop    │
+                      └────────┬────────┘ └────────▲────────┘
+                               │                   │
+                               ▼                   │ outboundChan
+                      ┌─────────────────┐          │
+                      │  Dispatch /     │──────────┘
+                      │  Business Logic │
+                      └─────────────────┘
+```
+
+### Full-Duplex Actor Pattern
+
+```go
+type ClientSession struct {
+	conn     net.Conn
+	outgoing chan []byte
+	closed   chan struct{}
+}
+
+func NewSession(conn net.Conn) *ClientSession {
+	s := &ClientSession{
+		conn:     conn,
+		outgoing: make(chan []byte, 128),
+		closed:   make(chan struct{}),
+	}
+	go s.writeLoop()
+	go s.readLoop()
+	return s
+}
+
+func (s *ClientSession) writeLoop() {
+	defer s.conn.Close()
+	for {
+		select {
+		case msg, ok := <-s.outgoing:
+			if !ok {
+				return
+			}
+			if _, err := s.conn.Write(msg); err != nil {
+				return
+			}
+		case <-s.closed:
+			return
+		}
+	}
+}
+
+func (s *ClientSession) readLoop() {
+	defer close(s.closed)
+	defer s.conn.Close()
+
+	buf := make([]byte, 4096)
+	for {
+		n, err := s.conn.Read(buf)
+		if err != nil {
+			return
+		}
+		handleIncomingMessage(buf[:n])
+	}
+}
+
+func (s *ClientSession) Send(data []byte) bool {
+	select {
+	case s.outgoing <- data:
+		return true
+	case <-s.closed:
+		return false
+	}
+}
+```
+
+---
+
+## sync.Pool for Reusing Buffers and Connections
+
+At 100,000 requests per second, allocating a new `make([]byte, 4096)` buffer for every read forces the Go garbage collector to track and reclaim millions of short-lived objects, leading to frequent GC stop-the-world pauses.
+
+`sync.Pool` provides a thread-safe cache of reusable memory buffers.
+
+```go
+package main
+
+import (
+	"io"
+	"net"
+	"sync"
+)
+
+// Global pool of reusable 4KB byte slices
+var bufferPool = sync.Pool{
+	New: func() any {
+		b := make([]byte, 4096)
+		return &b
+	},
+}
+
+func handleEchoWithPool(conn net.Conn) {
+	defer conn.Close()
+
+	// Acquire a buffer from the pool
+	bufPtr := bufferPool.Get().(*[]byte)
+	buf := *bufPtr
+	// Crucial: Always return the buffer to the pool when finished
+	defer bufferPool.Put(bufPtr)
+
+	for {
+		n, err := conn.Read(buf)
+		if err != nil {
+			if err != io.EOF {
+				// Handle non-EOF error
+			}
+			return
+		}
+
+		if _, err := conn.Write(buf[:n]); err != nil {
+			return
+		}
+	}
+}
+```
+
+> [!WARNING]
+> When using `sync.Pool`, never retain references to a pooled slice after putting it back into the pool. Doing so leads to insidious data corruption when another goroutine acquires and overwrites that buffer.
+
+---
+
+## Avoiding Common Concurrency Bugs in Network Code
+
+### 1. The Hanging Goroutine Leak
+
+**Bug:** A goroutine calls `conn.Read()` without a deadline or timeout. If the client disconnects without a TCP `FIN` (e.g., WiFi dropped), the goroutine blocks forever.
+**Fix:** Always set deadlines (`SetDeadline`) or close the connection when the parent context cancels.
+
+### 2. Double-Closing Channels
+
+**Bug:** Two goroutines detect an error and both attempt to call `close(doneChan)`, triggering a panic: `panic: close of closed channel`.
+**Fix:** Use `sync.Once` to guard channel closure, or use a dedicated owner goroutine for each channel.
+
+```go
+type Session struct {
+    closeOnce sync.Once
+    closed    chan struct{}
+}
+
+func (s *Session) Close() {
+    s.closeOnce.Do(func() {
+        close(s.closed)
+    })
+}
+```
+
+### 3. Concurrent Writes to `net.Conn`
+
+**Bug:** Multiple worker goroutines call `conn.Write(data)` on the same `net.Conn` simultaneously. While the `net.Conn` implementation will not crash, bytes from different messages will interleave and corrupt your application protocol.
+**Fix:** Route all writes through a single write loop using a channel or protect writes with a `sync.Mutex`.
+
+---
+
+## Chapter Summary
+
+- **Goroutine-per-connection** is the default and scalable pattern for Go network daemons.
+- **Worker Pools** should be used to protect bounded downstream resources (e.g., database connections, CPU capacity).
+- Decouple full-duplex TCP I/O into **dedicated read and write loops** communicating via channels.
+- **`sync.Pool`** drastically lowers memory allocations and GC pause times when recycling network buffers.
+- Guard against **goroutine leaks** using deadlines, prevent **concurrent writes** with channels or mutexes, and ensure **channel closure safety** via `sync.Once`.
+- In the next chapter, we will master timeouts, deadlines, and context cancellation to build resilient production services.

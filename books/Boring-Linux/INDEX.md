@@ -126,7 +126,7 @@ Add coherent sections only when they have written chapters. Keep numeric prefixe
 - Follow the monorepo illustrated-diagram standard.
 - Content and source assets are the work of the authoring pass.
 - After each content update batch, use `indipub.sh Boring-Linux` to render, refresh this book's local published artifacts, and regenerate the local portal once. Follow the commands in `README.md`; never hand-edit `_quarto.yml` or commit build artifacts.
-- Part numbers now describe this accepted 01–32 learning sequence. A future integration with another book requires its own deliberate mapping; the old fixed 04–19 arrangement is retired.
+- Part numbers now describe this accepted 01–34 learning sequence, including the specialized tracks [Running Multiple Kernels on One Bare-Metal Server](content/_planning/SYLLABUS-RUNNING-MULTIPLE-KERNELS-ON-ONE-BARE-METAL-SERVER.md) and [Linux Performance Engineering & Server Benchmarking](content/_planning/SYLLABUS-LINUX-PERFORMANCE-ENGINEERING-AND-SERVER-BENCHMARKING.md). A future integration with another book requires its own deliberate mapping; the old fixed 04–19 arrangement is retired.
 
 ## Full progression
 
@@ -164,3 +164,5 @@ Add coherent sections only when they have written chapters. Keep numeric prefixe
 | 30 | Tracing, eBPF and Failure Analysis |
 | 31 | Specialist Linux Systems |
 | 32 | Integrated Systems Engineering Projects |
+| 33 | Running Multiple Kernels on One Bare-Metal Server |
+| 34 | Linux Performance Engineering & Server Benchmarking |

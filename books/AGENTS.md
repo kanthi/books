@@ -24,7 +24,7 @@ For books using `scripts/update-index.sh` in this repo:
 
 ## Book naming
 
-All titles under `books/` are **standalone libraries**. Paths: `books/Boring-Linux/`, `books/Go/`, `books/Rust/`, `books/Writing-Kernel-with-AI/`, `books/Maths/`, `books/Linux/`, `books/Networking/`, `books/C/`, `books/Python/`, `books/NixOS/`, `books/VCS/` (published: `01-git-foundations/`; full map in `content/_planning/SYLLABUS.md`). Prefer root **`AGENTS.md`** for inventory and workflow.
+All titles under `books/` are **standalone libraries**. Paths: `books/Boring-Linux/`, `books/BYOL/`, `books/Go/`, `books/Rust/`, `books/Writing-Kernel-with-AI/`, `books/Maths/`, `books/Linux/`, `books/Networking/`, `books/C/`, `books/Python/`, `books/NixOS/`, `books/OpenTofu/`, `books/VCS/` (published: `01-git-foundations/`; full map in `content/_planning/SYLLABUS.md`). Prefer root **`AGENTS.md`** for inventory and workflow.
 
 ## Book independence
 
@@ -100,6 +100,15 @@ Every live book (and `Template/`) uses the same generator: **nested sections**, 
 - Basics assume **no prior Python**. Named worked examples (input / output / why). Term defined on first use. No type hints in Basics. Python **3.14**, toolchain **`uv`**.
 - Getting started is self-contained (install with `uv`, editor you already like). Do not send the reader to the Linux book.
 
+## OpenTofu book
+
+- Path: `OpenTofu/`
+- Title: **OpenTofu**. Subtitle: Infrastructure as Code for Modern Cloud and On-Premises Environments.
+- **Pin:** OpenTofu **1.13.2** (`tofu`). Worked commands are Linux. Chapter 3 also records macOS, Windows, and `ghcr.io/opentofu/opentofu`.
+- **Independent** of other titles. Do not cross-link.
+- Six parts, chapters 1–14 plus a conclusion. Syllabus: `content/_planning/SYLLABUS.md`.
+- Runnable example is the `random` provider. Cloud blocks are sketches. Sentinel does not run on OpenTofu; policy is OPA.
+
 ## Boring-Linux book
 
 - Path: `Boring-Linux/`
@@ -107,4 +116,14 @@ Every live book (and `Template/`) uses the same generator: **nested sections**, 
 - Fast-iteration workspace dedicated to authoring the modern Ubuntu 26.04 LTS ("Resolute Raccoon") engineering and administration curriculum (Parts 05 through 13).
 - Master roadmap and planning live in `INDEX.md` and `content/_planning/SYLLABUS.md`.
 - When the curriculum is complete, it will be merged directly back into `Linux`.
+
+## BYOL book
+
+- Path: `BYOL/`
+- Title: **BYOL: Build Your Own Linux** (Subtitle: *A Complete Step-by-Step Guide to Designing, Building, and Publishing a Custom Linux Operating System*)
+- Complete end-to-end curriculum for designing, cross-compiling, initializing, packaging, and publishing a custom Linux OS from scratch.
+- 13 Chapters, Capstone Project, and Conclusion/References across 84 structured chapters.
+- Syllabus & Master Roadmap: `content/_planning/SYLLABUS.md`.
+- Independent of other titles.
+
 

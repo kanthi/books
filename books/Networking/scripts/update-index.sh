@@ -135,6 +135,7 @@ humanize_dir_title() {
     policy-qos-hardening)       printf '%s\n' "Policy, QoS, and Hardening"; return ;;
     overlays-tunnels)           printf '%s\n' "Overlays and Tunnels"; return ;;
     fabrics-multi-area)         printf '%s\n' "Fabrics and Multi-Area"; return ;;
+    bgp-security)               printf '%s\n' "BGP Security"; return ;;
     # VCS (before generic CamelCase split effects: GitHub → git-hub)
     git-fundamentals)           printf '%s\n' "Git Fundamentals"; return ;;
     core-operations)            printf '%s\n' "Core Operations"; return ;;

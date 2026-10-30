@@ -32,7 +32,7 @@ The core question for every subject is: **How does this Linux facility work, how
 | E — Enforce and verify security | 17–18 | Apply access policy, protect keys, harden systems and investigate security events |
 | F — Run applications and isolated workloads | 19–22 | Operate data services, VMs, containers and clusters with understood dependencies |
 | G — Operate and improve production systems | 23–28 | Observe, tune, automate, upgrade, scale and recover complete environments |
-| H — Investigate deeply and specialize | 29–32 | Connect kernel mechanisms to evidence, handle specialist systems and complete integrated projects |
+| H — Investigate deeply and specialize | 29–33 | Connect kernel mechanisms to evidence, handle multikernel bare-metal setups, specialist systems and complete integrated projects |
 
 These stages describe the main reading route. Troubleshooting, verification and security start in Stage A and recur throughout; the later dedicated parts develop the earlier habits into broader methods.
 
@@ -681,6 +681,148 @@ Outcome: demonstrate independent design, operation, diagnosis and recovery acros
 
 Every project includes a design diagram, assumptions, capacity/resource budget, configuration sources, acceptance tests, monitoring, failure exercises, rollback, backup/restore and an operator handover. Give a minimum implementation and advanced extensions; do not make every project depend on completing every specialist branch.
 
+### Part 33 — Running Multiple Kernels on One Bare-Metal Server
+
+Outcome: partition physical bare-metal hardware to run concurrent isolated Linux kernel instances, configure hardware-assisted virtualization and true bare-metal partitioning, isolate CPUs/memory/devices with VFIO and NUMA tuning, and operate multi-kernel environments reliably. Detailed syllabus: [SYLLABUS-RUNNING-MULTIPLE-KERNELS-ON-ONE-BARE-METAL-SERVER.md](SYLLABUS-RUNNING-MULTIPLE-KERNELS-ON-ONE-BARE-METAL-SERVER.md).
+
+- **Introduction: The Multikernel Problem**
+  1. Why You Want Multiple Kernels
+  2. What Multikernel Actually Means
+  3. The Landscape of Approaches
+  4. How to Use This Book
+- **Chapter 1: Linux Kernel Fundamentals**
+  5. The Kernel as Resource Monopolist
+  6. Boot and Initialization Sequence
+  7. Hardware Discovery and Enumeration
+  8. CPU Topology and NUMA Architecture
+  9. Memory Management Fundamentals
+- **Chapter 2: The Boot Process in Depth**
+  10. Firmware and the EFI Environment
+  11. Bootloaders: GRUB, systemd-boot, and Others
+  12. Kernel Command-Line Parameters
+  13. Initramfs Construction and Role
+  14. The Handoff to Userspace
+- **Chapter 3: Virtualization vs True Bare-Metal Multi-Kernel**
+  15. Type-1 Hypervisors: ESXi, Xen, KVM in Bare-Metal Mode
+  16. KVM Architecture Deep Dive
+  17. Linux Containers and Shared-Kernel Architectures
+  18. MicroVMs and Lightweight Virtualization
+  19. True Bare-Metal Partitioning Concepts
+- **Chapter 4: kexec and Kernel-to-Kernel Transitions**
+  20. How kexec Works
+  21. kexec-tools Configuration and Usage
+  22. kdump for Crash Dumping
+  23. Limitations of kexec for Multi-Kernel Goals
+  24. Production Use Cases for kexec
+- **Chapter 5: Hardware-Assisted Multi-Kernel with KVM/QEMU**
+  25. KVM Setup and Kernel Module Configuration
+  26. Guest Kernel Installation and Configuration
+  27. CPU Pinning and NUMA-Aware VM Placement
+  28. Memory Ballooning vs Static Allocation
+  29. Complete Working Deployment Example
+- **Chapter 6: Device Assignment and I/O Isolation**
+  30. PCI Passthrough (VFIO) Fundamentals
+  31. SR-IOV and Virtual Functions
+  32. Network Interface Assignment
+  33. Storage Device Partitioning
+  34. Specialized Hardware: GPUs, FPGAs, Accelerators
+- **Chapter 7: Networking Between Kernel Instances**
+  35. Internal Networking Architectures
+  36. External Network Configuration
+  37. Network Performance Optimization
+  38. Inter-Kernel Communication Patterns
+  39. Complete Networking Configuration Example
+- **Chapter 8: Resource Isolation Strategies**
+  40. CPU Isolation: isolcpus, nohz_full, rcu_nocbs
+  41. Cpusets and Cgroup-Based CPU Management
+  42. Memory Isolation and NUMA Policies
+  43. Interrupt Routing and IRQ Affinity
+  44. I/O Scheduling and Storage Contention
+  45. What Can and Cannot Be Safely Shared
+- **Chapter 9: Security Analysis and Threat Modeling**
+  46. Attack Surfaces in Multi-Kernel Architectures
+  47. VM Escape Vulnerabilities and Recent CVEs
+  48. Secure Boot and Kernel Trust
+  49. DMA Protection and IOMMU Security
+  50. Secrets and Credential Isolation
+  51. Comparing Multi-Kernel vs VM Security Posture
+- **Chapter 10: Observability and Operations**
+  52. Metrics and Monitoring Architecture
+  53. Logging Strategy Across Kernel Instances
+  54. Crash Diagnostics and kdump Integration
+  55. Performance Profiling Methodology
+  56. Health Checks and Alerting Design
+- **Chapter 11: Performance Engineering**
+  57. Boot Time Analysis
+  58. CPU Overhead and Virtualization Tax
+  59. Cache Effects and NUMA Locality
+  60. I/O Performance: Virtio vs Passthrough
+  61. Benchmarking Methodology for Multi-Kernel Systems
+- **Chapter 12: Production Operations and Lifecycle Management**
+  62. Kernel Upgrade Strategies
+  63. Configuration Management at Scale
+  64. Disaster Recovery Architecture
+  65. Maintenance Windows and Change Management
+  66. Decommissioning and Migration Procedures
+- **Chapter 13: Troubleshooting Guide**
+  67. Boot Failures and Recovery
+  68. Device Assignment and VFIO Issues
+  69. Networking Problems
+  70. Performance Degradation Diagnosis
+  71. Kernel Panics and Crashes
+  72. Resource Exhaustion
+- **Chapter 14: Architecture Comparisons and Decision Framework**
+  73. Multi-Kernel vs Multiple Physical Servers
+  74. KVM vs Xen vs ESXi for Multi-Kernel Workloads
+  75. Containers vs VMs vs Multi-Kernel: When to Use What
+  76. MicroVMs and Unikernels as Alternatives
+  77. Hardware Partitioning Approaches
+  78. A Decision Matrix for Architecture Selection
+- **Chapter 15: Complete Project Plan: From Requirements to Decommissioning**
+  79. Phase 1: Requirements Gathering and Hardware Assessment
+  80. Phase 2: Architecture Selection and Lab Validation
+  81. Phase 3: Kernel Preparation and Configuration
+  82. Phase 4: Deployment and Verification
+  83. Phase 5: Operations, Maintenance, and Decommissioning
+- **Conclusion**
+  84. Multikernel trade-offs, future disaggregated hardware (CXL), and operational principles
+
+Lab: deploy a dual-kernel bare-metal architecture on a dedicated host using KVM/VFIO with CPU pinning, NUMA isolation, SR-IOV network partitioning, and dedicated NVMe passthrough. Demonstrate inter-kernel networking, measure virtualization tax vs bare metal, simulate a guest kernel panic, and execute an isolated kernel upgrade without interrupting the primary instance.
+
+### Part 34 — Linux Performance Engineering & Server Benchmarking
+
+Outcome: master low-level Linux performance analysis, subsystem profiling, kernel optimization, and empirical benchmarking. Move methodically from queueing theory and statistical analysis through CPU scheduling, NUMA memory architectures, page cache mechanics, block I/O schedulers, and network stack tuning to production eBPF tracing, PSI metrics, and performance regression automation. Detailed syllabus: [SYLLABUS-LINUX-PERFORMANCE-ENGINEERING-AND-SERVER-BENCHMARKING.md](SYLLABUS-LINUX-PERFORMANCE-ENGINEERING-AND-SERVER-BENCHMARKING.md).
+
+- **Introduction: The Discipline of Performance Engineering**
+- **Chapter 1: The Performance Engineering Methodology**
+- **Chapter 2: Linux Kernel Architecture and Performance**
+- **Chapter 3: CPU Architecture and Performance Counters**
+- **Chapter 4: CPU Scheduling and Process Placement**
+- **Chapter 5: Memory Management: Virtual Memory and Pages**
+- **Chapter 6: NUMA Architecture and Memory Placement**
+- **Chapter 7: The Page Cache and Memory-Mapped Files**
+- **Chapter 8: I/O Subsystems: From Block Layer to Disk**
+- **Chapter 9: Storage Technologies and Performance Characteristics**
+- **Chapter 10: Filesystems and Mount Options**
+- **Chapter 11: The Networking Stack and Performance**
+- **Chapter 12: Network Performance Tuning in Practice**
+- **Chapter 13: System Call Tracing and Process Analysis**
+- **Chapter 14: eBPF and BPF-Based Observability**
+- **Chapter 15: Performance Analysis Tools and Flame Graphs**
+- **Chapter 16: System Monitoring and Observability**
+- **Chapter 17: Benchmarking: Design and Execution**
+- **Chapter 18: Benchmarking Tools and Suites**
+- **Chapter 19: CPU and Memory Tuning for Production**
+- **Chapter 20: I/O and Filesystem Tuning for Production**
+- **Chapter 21: cgroups, systemd and Resource Management**
+- **Chapter 22: Containers, Virtualization and Noisy Neighbors**
+- **Chapter 23: Databases and High-Performance Applications**
+- **Chapter 24: Distributed Systems and Cluster Performance**
+- **Chapter 25: Production Case Studies**
+- **Chapter 26: Capacity Planning and Performance Regression**
+- **Chapter 27: Advanced Topics and Emerging Technologies**
+- **Conclusion: Putting It All Together**
+
 ## Appendices and reference material
 
 Reference material supports the progressive chapters and is not required pre-reading.
@@ -721,6 +863,7 @@ Breadth must not turn into repeated introductions or mutually dependent chapters
 | Container primitives and runtimes | 21 | Kubernetes node and workload operation |
 | Whole-system observability | 23 | Performance, incidents and deeper tracing |
 | Source-level kernel mechanisms | 29 | Expert analysis and the focused investigations in 30 |
+| Multikernel architecture and bare-metal partitioning | 33 | Advanced bare-metal isolation, low-latency virtualization, and specialized workloads |
 
 Early chapters supply the mechanism required to understand their current task. Later chapters explicitly deepen that model. For example, practical memory accounting appears before container limits; detailed page-reclaim implementation appears after the reader has workloads to investigate. A forward reference can identify advanced follow-up but must not be required to complete the present lab.
 

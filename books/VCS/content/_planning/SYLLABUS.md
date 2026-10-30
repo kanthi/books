@@ -6,6 +6,7 @@
 
 This file is the single table of contents. It consolidates the two source outlines (25-chapter compressed book + 63-chapter complete guide) into one progressive journey.
 
+Detailed track syllabus for Independent Code Hosting: [SYLLABUS-ARCHITECTURES-PLATFORMS-AND-OPERATIONS-FOR-INDEPENDENT-CODE-HOSTING.md](SYLLABUS-ARCHITECTURES-PLATFORMS-AND-OPERATIONS-FOR-INDEPENDENT-CODE-HOSTING.md).  
 Old syllabi: `archive/SYLLABUS-git-github-jj-forges.md`, `archive/SYLLABUS-hosting-20ch.md`.
 
 ---
@@ -324,6 +325,8 @@ Old syllabi: `archive/SYLLABUS-git-github-jj-forges.md`, `archive/SYLLABUS-hosti
 ## Part IV: Hosting Platforms and Architectures
 
 `content/04-platforms/`
+
+> **Curriculum Track:** Implements Chapters 1, 3–9 of [Architectures, Platforms and Operations for Independent Code Hosting](SYLLABUS-ARCHITECTURES-PLATFORMS-AND-OPERATIONS-FOR-INDEPENDENT-CODE-HOSTING.md) (Chapter 2 infrastructure fundamentals are provided by Parts I–III). Part V covers Chapters 10–20.
 
 ### Chapter 22 — The GitHub Monoculture Problem
 

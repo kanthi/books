@@ -103,6 +103,7 @@ humanize_dir_title() {
     concurrency-ground-up)      printf '%s\n' "Concurrency Ground Up"; return ;;
     web-development-in-go)      printf '%s\n' "Web Development in Go"; return ;;
     cli-tools-in-go)            printf '%s\n' "CLI Tools in Go"; return ;;
+    socket-programming)         printf '%s\n' "Socket Programming"; return ;;
     # NixOS
     front-matter)               printf '%s\n' "Front Matter"; return ;;
     nix-on-linux)               printf '%s\n' "Nix on Linux"; return ;;

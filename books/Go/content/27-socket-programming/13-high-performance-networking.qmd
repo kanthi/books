@@ -1,0 +1,210 @@
+---
+title: "Chapter 13: High-Performance Networking"
+---
+
+# Chapter 13: High-Performance Networking: Scaling to Millions of Connections
+
+Achieving high-throughput, low-latency networking at scale requires understanding the intersection between Go's runtime, operating system kernel subsystems, and physical hardware.
+
+In this chapter, you will explore the internal architecture of Go’s runtime network poller, implement connection multiplexing, leverage kernel zero-copy optimizations, tune Linux kernel parameters for millions of concurrent connections (the C1000K/C10M problem), and profile network bottlenecks using `pprof`.
+
+---
+
+## Epoll, Kqueue and Go’s Network Poller (How Go Scales)
+
+In traditional C networking code, engineers must write explicit event loops around system calls like `epoll_create`, `epoll_ctl`, and `epoll_wait`.
+
+In Go, the runtime manages an internal event multiplexer called the **Runtime Netpoller**.
+
+```
+Goroutine (G) calls conn.Read()
+             │
+             ▼
+    Non-blocking read(fd)
+             │
+      ┌──────┴──────┐
+Data Ready?       EAGAIN / EWOULDBLOCK
+   │                    │
+   ▼                    ▼
+Return bytes     runtime.netpollblock(pd, 'r')
+                        │
+                        ▼
+                 Park G in _Gwaiting
+                 Register fd with OS netpoller (epoll_ctl EPOLLIN)
+                 Thread (M) continues running other Goroutines!
+```
+
+### The Netpoller Execution Cycle
+
+1. **Non-blocking by Default:** Every file descriptor created by `net.Listen` or `net.Dial` is set to `O_NONBLOCK`.
+2. **Parking on `EAGAIN`:** When an application calls `conn.Read()` or `conn.Write()` and the kernel socket buffer cannot satisfy the request immediately, the system call returns `EAGAIN` or `EWOULDBLOCK`.
+3. **Registration:** The Go runtime intercepts this code and parks the calling goroutine in the `_Gwaiting` state. It registers the socket descriptor with the OS kernel poller (`epoll` on Linux, `kqueue` on macOS/BSD, `IOCP` on Windows).
+4. **Rescheduling:** The underlying operating system thread (`M`) does not sleep! It immediately selects another runnable goroutine from the local run queue (`P`).
+5. **Waking:** During runtime scheduling ticks or sysmon background monitoring, the Go runtime calls `netpoll()`. When the kernel signals that the descriptor is ready for I/O, the parked goroutine is moved to `_Grunnable` and resumes execution right where it left off.
+
+---
+
+## Connection Multiplexing Patterns
+
+Establishing a fresh TCP connection incurs a 3-way handshake, slow-start congestion control ramps, and TLS handshake overhead. In high-performance microservices, **Connection Multiplexing** routes hundreds of independent logical request/response streams over a single shared TCP connection.
+
+```
+Logical Stream 1 ──┐
+Logical Stream 2 ──┼──► [ Stream Multiplexer ] ──► ( Single Physical TCP Conn )
+Logical Stream 3 ──┘
+```
+
+Protocols like **HTTP/2**, **HTTP/3**, and libraries like **Yamux** (`github.com/hashicorp/yamux`) encapsulate logical streams into multiplexed byte frames tagged with a `StreamID`.
+
+```go
+// Example using HashiCorp Yamux for connection multiplexing
+import "github.com/hashicorp/yamux"
+
+// Server side:
+session, err := yamux.Server(rawTCPConn, nil)
+for {
+    stream, err := session.Accept() // Accepts a multiplexed virtual stream
+    go handleVirtualStream(stream)
+}
+
+// Client side:
+session, err := yamux.Client(rawTCPConn, nil)
+stream1, _ := session.Open() // Opens virtual stream 1 over the single TCP conn
+stream2, _ := session.Open() // Opens virtual stream 2 over the same TCP conn
+```
+
+---
+
+## Zero-Copy Techniques and Memory-Mapped I/O
+
+In standard network transfers, reading data from disk and writing it to a socket involves **four context switches and four memory copies**:
+
+```
+[ Disk ] ──(DMA)──► [ Kernel Page Cache ] ──(CPU Copy)──► [ User Buffer ]
+                                                                 │
+[ NIC ] ◄──(DMA)─── [ Kernel Socket Buffer ] ◄──(CPU Copy)───────┘
+```
+
+### 1. Zero-Copy with `sendfile` and `splice`
+
+On Linux, the `sendfile` and `splice` system calls transfer data directly within kernel space between file descriptors, bypassing user-space memory entirely:
+
+```
+[ Disk ] ──(DMA)──► [ Kernel Page Cache ] ──(Zero-Copy Pipe)──► [ NIC ]
+```
+
+In Go, when you pass an `*os.File` and a `*net.TCPConn` to `io.Copy`, the standard library's internal optimizations automatically detect the types and invoke the Linux `sendfile(2)` or `splice(2)` system call!
+
+```go
+// Pure zero-copy file transfer in Go:
+func sendFileZeroCopy(conn *net.TCPConn, file *os.File) (int64, error) {
+    // Under Linux, io.Copy detects *net.TCPConn and *os.File,
+    // automatically invoking the kernel sendfile system call!
+    return io.Copy(conn, file)
+}
+```
+
+---
+
+## Tuning the Kernel for High-Performance Networking
+
+To sustain 100,000 to 1,000,000 concurrent sockets on a Linux host, default kernel parameters must be adjusted.
+
+### 1. File Descriptor Limits
+
+Every TCP connection requires a file descriptor. Check and raise limits:
+
+```bash
+# Check current limit
+ulimit -n
+
+# Set session limit to 1 million descriptors
+ulimit -n 1048576
+
+# Set system-wide limit in /etc/security/limits.conf:
+* soft nofile 1048576
+* hard nofile 1048576
+```
+
+### 2. Kernel Socket Parameters (`/etc/sysctl.conf`)
+
+Add these production tuning directives to `/etc/sysctl.conf` and apply with `sudo sysctl -p`:
+
+```ini
+# Maximum number of open files system-wide
+fs.file-max = 2097152
+
+# Maximum connection backlog queue (SYN queue and Accept queue)
+net.core.somaxconn = 65535
+net.ipv4.tcp_max_syn_backlog = 65535
+
+# Expand ephemeral port range for outgoing connections
+net.ipv4.ip_local_port_range = 1024 65535
+
+# Fast recycling of TIME_WAIT sockets for outgoing connections
+net.ipv4.tcp_tw_reuse = 1
+
+# Reduce FIN timeout from 60s to 15s to reclaim memory faster
+net.ipv4.tcp_fin_timeout = 15
+
+# Default and maximum socket receive/send buffer sizes (bytes)
+net.core.rmem_default = 262144
+net.core.rmem_max = 16777216
+net.core.wmem_default = 262144
+net.core.wmem_max = 16777216
+net.ipv4.tcp_rmem = 4096 87380 16777216
+net.ipv4.tcp_wmem = 4096 65536 16777216
+```
+
+---
+
+## Profiling Network Performance with pprof
+
+When a network service experiences latency or high CPU, Go’s built-in profiler (`net/http/pprof`) pinpoints the root cause.
+
+### Enabling pprof
+
+Import `_ "net/http/pprof"` and start a diagnostic listener:
+
+```go
+package main
+
+import (
+	"log"
+	"net/http"
+	_ "net/http/pprof"
+)
+
+func main() {
+	go func() {
+		log.Println(http.ListenAndServe("localhost:6060", nil))
+	}()
+	// Start primary network service...
+}
+```
+
+### Profiling Workflows
+
+```bash
+# 1. Inspect live goroutines (detect goroutine leaks)
+go tool pprof http://localhost:6060/debug/pprof/goroutine
+
+# 2. Capture a 30-second CPU profile during load test
+go tool pprof http://localhost:6060/debug/pprof/profile?seconds=30
+
+# 3. Analyze heap allocations (detect memory buffer bloat)
+go tool pprof -alloc_space http://localhost:6060/debug/pprof/heap
+```
+
+Inside the pprof interactive shell, use commands like `top20`, `list <function_name>`, or generate flamegraphs using the web UI (`go tool pprof -http=:8080 profile.pb.gz`).
+
+---
+
+## Chapter Summary
+
+- Go's **Runtime Netpoller** integrates with kernel event notification systems (`epoll`/`kqueue`), allowing synchronous code to execute with asynchronous non-blocking performance.
+- **Connection Multiplexing** eliminates TCP handshake latency by channeling multiple logical streams over a single shared connection.
+- **`io.Copy`** automatically leverages **zero-copy kernel calls (`sendfile`, `splice`)** when transferring data between files and TCP sockets on Linux.
+- Scaling beyond 100,000 connections requires tuning **`somaxconn`**, **`file-max`**, and **TCP buffer sizes** in `/etc/sysctl.conf`.
+- Use **`pprof`** to diagnose goroutine leaks, CPU bottlenecks, and memory churn under production traffic.
+- In the next chapter, we will build production infrastructure patterns including proxies, load balancers, and connection pools.

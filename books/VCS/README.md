@@ -11,7 +11,9 @@ VCS/
 │   ├── 01-git-foundations/        # Part I chs 1–5 (prose + new stubs)
 │   ├── 02-everyday-workflows/     # Part II chs 6–15 (prose + new stubs)
 │   ├── 99-appendices/
-│   └── _planning/SYLLABUS.md      # Full 63-chapter map
+│   └── _planning/
+│       ├── SYLLABUS.md            # Full 66-chapter unified map
+│       └── SYLLABUS-ARCHITECTURES-PLATFORMS-AND-OPERATIONS-FOR-INDEPENDENT-CODE-HOSTING.md # 20-ch hosting track
 ├── scripts/update-index.sh        # Regenerates _quarto.yml
 ├── styles/
 └── _quarto.yml                    # GENERATED — do not hand-edit

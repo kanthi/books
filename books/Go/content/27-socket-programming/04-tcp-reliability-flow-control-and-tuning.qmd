@@ -1,0 +1,224 @@
+---
+title: "Chapter 4: TCP Reliability, Flow Control and Performance Tuning"
+---
+
+# Chapter 4: TCP Reliability, Flow Control and Performance Tuning
+
+While the TCP abstraction feels like an unbroken, error-free pipe of bytes, the physical network underneath is lossy, jittery, and packet-based. To write high-performance network applications in Go, you must understand the mechanisms TCP uses to guarantee delivery and how to tune them.
+
+This chapter covers TCP acknowledgments, sliding windows, flow control, Nagle's algorithm, keep-alive probes, partial write mechanics, and low-level socket tuning in Go.
+
+---
+
+## How TCP Guarantees Delivery
+
+TCP delivers reliability over an unreliable IP substrate through four core mechanisms:
+
+1. **Sequence Numbers & Acknowledgments (ACKs):**
+   Every byte sent over a TCP connection is assigned a 32-bit sequence number. When the receiver accepts data into its kernel buffer, it transmits an ACK packet containing the sequence number of the next expected byte.
+2. **Retransmission Timers (RTO):**
+   If an ACK is not received within the Retransmission Timeout (calculated dynamically from Round-Trip Time measurements), the sender retransmits the lost segment.
+3. **Cumulative & Selective ACKs (SACK):**
+   Modern TCP implementations use SACK (RFC 2018) to inform the sender of non-contiguous blocks of bytes received, avoiding wasteful retransmissions of packets that have already arrived safely.
+4. **Checksums:**
+   Every TCP segment includes a 16-bit one's complement checksum covering the header and data, detecting bit flips introduced by faulty network equipment.
+
+```
+Sender                                              Receiver
+  │  Segment 1 [Seq 1..1000]                           │
+  ├───────────────────────────────────────────────────►│
+  │  Segment 2 [Seq 1001..2000] (Dropped in transit)   │
+  ├─── ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ✘│
+  │  Segment 3 [Seq 2001..3000]                        │
+  ├───────────────────────────────────────────────────►│
+  │  ACK 1001 (SACK 2001..3000)                        │
+  │◄───────────────────────────────────────────────────┤
+  │  Retransmit Segment 2 [Seq 1001..2000]             │
+  ├───────────────────────────────────────────────────►│
+  │  ACK 3001                                          │
+  │◄───────────────────────────────────────────────────┤
+```
+
+---
+
+## Nagle’s Algorithm and TCP_NODELAY
+
+### The Problem of "Tinygrams"
+
+In interactive applications (like Telnet or SSH), a user typing a single character causes the application to write 1 byte of payload. Encapsulated in a 20-byte TCP header and a 20-byte IPv4 header, transmitting that 1 byte requires a 41-byte packet—a 4000% bandwidth overhead.
+
+### John Nagle's Solution (1984)
+
+Nagle’s algorithm prevents congestion by mandating:
+> If there is unacknowledged in-flight data, buffer any small outgoing writes until either:
+> 1. A full maximum segment size (MSS, typically 1460 bytes) is accumulated, OR
+> 2. An ACK arrives for all previously transmitted data.
+
+### The Conflict: Nagle + Delayed ACKs
+
+Receivers implement **Delayed ACKs** (RFC 1122), waiting up to 40ms–200ms before acknowledging incoming segments in hopes of piggybacking the ACK onto an outbound reply.
+
+When an application performs multiple small writes followed by a read (e.g., writing an RPC header, then writing the payload, then waiting for a response), **disaster strikes**:
+- Sender buffers the second write waiting for an ACK (due to Nagle).
+- Receiver waits 200ms before sending the ACK (due to Delayed ACK).
+- The application suffers a mandatory 40–200ms latency penalty on every request.
+
+### Go's Stance: `TCP_NODELAY` is Enabled by Default
+
+To prioritize low latency for modern distributed systems, **Go sets `TCP_NODELAY` to `true` by default on all TCP connections**. Outbound packets are dispatched immediately without buffering.
+
+If you are writing large volumes of small chunks, you can either:
+1. Wrap the connection with `bufio.NewWriter(conn)` in user space (the idiomatic Go approach).
+2. Explicitly re-enable Nagle's algorithm if high packet consolidation is desired:
+   ```go
+   tcpConn, ok := conn.(*net.TCPConn)
+   if ok {
+       _ = tcpConn.SetNoDelay(false) // Re-enables Nagle's algorithm
+   }
+   ```
+
+---
+
+## TCP Keep-Alive and Detecting Dead Connections
+
+If a client machine crashes, loses power, or has its ethernet cable disconnected without sending a TCP `FIN` packet, the server's socket remains in state `ESTABLISHED` indefinitely. Without keep-alives or deadlines, the server will never know the client has vanished.
+
+### Configuring Keep-Alive in Go
+
+Go enables keep-alive probes by default (typically every 15 seconds):
+
+```go
+var dialer net.Dialer
+dialer.KeepAlive = 30 * time.Second
+
+conn, err := dialer.Dial("tcp", "example.com:80")
+```
+
+On an existing `*net.TCPConn`:
+
+```go
+if tcpConn, ok := conn.(*net.TCPConn); ok {
+    _ = tcpConn.SetKeepAlive(true)
+    _ = tcpConn.SetKeepAlivePeriod(30 * time.Second)
+}
+```
+
+When keep-alive is active, if the peer does not acknowledge successive probes over a configured duration (governed by kernel parameters `tcp_keepalive_probes` and `tcp_keepalive_intvl`), the kernel forcibly terminates the connection, causing pending `Read()` calls to return an error (`connection timed out`).
+
+---
+
+## Window Scaling and Flow Control Basics
+
+Flow control prevents a fast sender from overwhelming a slow receiver's kernel buffer.
+
+```
+Receiver Kernel Socket Buffer
++------------------------------------+--------------------------+
+|  Received & Buffered Data (unread) | Advertised Window (Free) |
++------------------------------------+--------------------------+
+0                                                              65,535 bytes
+```
+
+### The Receive Window (`rwnd`)
+
+In every ACK packet, the receiver advertises its available buffer space (`rwnd`). The sender cannot send more unacknowledged bytes than the advertised window size. If the application on the receiver does not call `Read()`, the window shrinks until it reaches zero (Zero Window Probe), stalling the sender.
+
+### Window Scaling (RFC 1323)
+
+The original TCP header allocates 16 bits for window size, capping it at 64 KB ($65{,}535$ bytes). On high-bandwidth, high-latency links (e.g., 10 Gbps trans-oceanic cables), a 64 KB window artificially throttles throughput.
+
+The **Bandwidth-Delay Product (BDP)** defines the required buffer:
+
+$$\text{BDP} = \text{Bandwidth (bytes/sec)} \times \text{Round-Trip Time (sec)}$$
+
+Window scaling introduces a scale factor during the TCP handshake, allowing window sizes up to 1 Gigabyte.
+
+---
+
+## Handling Partial Writes Correctly
+
+A fundamental error in network programming is assuming that `conn.Write(p)` will transmit the entire slice `p` in a single invocation.
+
+The `io.Writer` contract explicitly states:
+
+```go
+// Write writes len(p) bytes from p to the underlying data stream.
+// It returns the number of bytes written from p (0 <= n <= len(p))
+// and any error encountered that caused the write to stop early.
+```
+
+If the kernel send buffer fills up, a non-blocking socket will only write as many bytes as can fit, returning $n < \text{len}(p)$ with `err == nil`.
+
+### The Idiomatic Go Solution: `io.WriteString` or Loop
+
+Never write raw loops if you can use `io.Copy`, `io.WriteString`, or `io.WriteFull`:
+
+```go
+// WRONG: Ignores partial write
+n, err := conn.Write(largePayload)
+
+// RIGHT: Idiomatic write loop (io.WriteString handles partial writes internally)
+_, err := io.WriteString(conn, string(largePayload))
+
+// RIGHT: Explicit partial write handler
+func writeAll(conn net.Conn, data []byte) error {
+    for len(data) > 0 {
+        n, err := conn.Write(data)
+        if err != nil {
+            return err
+        }
+        data = data[n:]
+    }
+    return nil
+}
+```
+
+---
+
+## Tuning TCP Parameters in Go
+
+When standard options are insufficient, Go allows direct access to the underlying socket file descriptor via `syscall.RawConn`.
+
+### 1. Adjusting Socket Buffers (`SO_RCVBUF` and `SO_SNDBUF`)
+
+```go
+if tcpConn, ok := conn.(*net.TCPConn); ok {
+    // Set kernel receive buffer to 1MB
+    _ = tcpConn.SetReadBuffer(1024 * 1024)
+    // Set kernel send buffer to 1MB
+    _ = tcpConn.SetWriteBuffer(1024 * 1024)
+}
+```
+
+### 2. Low-Level Control via `RawConn.Control`
+
+Using `RawConn`, you can invoke arbitrary socket options (such as `SO_REUSEPORT` or `TCP_QUICKACK` on Linux):
+
+```go
+var lc net.ListenConfig
+lc.Control = func(network, address string, c syscall.RawConn) error {
+    var operr error
+    err := c.Control(func(fd uintptr) {
+        // Set SO_REUSEPORT (Linux specific constant 0x0F)
+        const SO_REUSEPORT = 0x0F
+        operr = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, SO_REUSEPORT, 1)
+    })
+    if err != nil {
+        return err
+    }
+    return operr
+}
+
+ln, err := lc.Listen(context.Background(), "tcp", ":8080")
+```
+
+---
+
+## Chapter Summary
+
+- **TCP reliability** relies on sequence numbers, cumulative and selective ACKs, and retransmission timers.
+- **Nagle's algorithm** buffers tiny outbound packets; Go enables **`TCP_NODELAY`** by default to prevent latency spikes caused by Delayed ACKs.
+- **TCP Keep-Alive** detects silent link failures and dead peers; configure it on the dialer or `*net.TCPConn`.
+- **Flow control** uses advertised receive windows (`rwnd`); window scaling enables high-throughput transfers across high BDP links.
+- Sockets can return **partial writes**; always use utilities like `io.Copy`, `io.WriteString`, or explicit loops.
+- In the next chapter, we will turn our attention to connectionless programming with UDP.

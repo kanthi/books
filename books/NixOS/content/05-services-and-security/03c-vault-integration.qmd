@@ -1,0 +1,213 @@
+---
+title: "HashiCorp Vault Integration"
+---
+
+# HashiCorp Vault Integration
+
+**Goal:** Integrate HashiCorp Vault with NixOS to inject dynamic secrets, short-lived database credentials, and rotated TLS certificates into systemd services at runtime without ever exposing plaintext secrets to `/nix/store` or git history.
+
+::: {.callout-note}
+This chapter complements `02-sops-nix.qmd` and `03-agenix.qmd`. While SOPS and Agenix excel at repository-committed static secrets (bootstrapping SSH keys, WireGuard preshared keys), enterprise platforms require centralized audit logs, ephemeral credentials, and automated rotation provided by HashiCorp Vault.
+:::
+
+## The Enterprise Secret Boundary
+
+In small homelabs or single-node servers, static encrypted secrets stored in git (`sops-nix` or `agenix`) are often sufficient. However, at enterprise scale, static repository secrets hit severe operational boundaries:
+
+1. **No Ephemeral Leases:** A compromised database password remains valid indefinitely until an engineer manually re-encrypts the secret file and triggers a full fleet rebuild.
+2. **Absence of Centralized Auditing:** Statically decrypted secrets at boot cannot produce audit logs answering *"Which service queried the Stripe API key at 14:02:11 UTC?"*
+3. **No Automatic PKI Rotation:** Internal mTLS certificates expire, requiring manual renewals and deployment coordination.
+4. **Static Credentials vs Dynamic Credentials:** Modern security compliance (SOC 2, ISO 27001) mandates that applications never share a static master database credential; each service instance must request a unique, short-lived database role that auto-revokes when the container or service dies.
+
+```text
+Static Secrets (sops-nix / agenix):
+[Git Repository] ──> Encrypted File ──> Host Private Key ──> Decrypted into /run/secrets at Boot
+
+Dynamic Secrets (HashiCorp Vault):
+[NixOS Host] ──> AppRole Auth ──> [Vault Server] ──> Issues Short-Lived Token (1 hr lease)
+                                         │
+                                         ▼
+                               Generates Unique Database User (auto-expires)
+                               Renders into volatile RAM (/run/vault/db.env)
+                               Auto-renews & triggers systemd reload on rotation
+```
+
+---
+
+## Vault Architecture on NixOS
+
+To maintain pure declarative reproducibility while consuming dynamic secrets, NixOS separates **infrastructure definition** from **runtime secret resolution**:
+
+1. **NixOS declares the system state:** It installs the `vault-agent` daemon, provisions systemd units, defines authentication parameters, and sets up template rendering directives.
+2. **Vault Agent manages runtime tokens:** Running as an unprivileged service, `vault-agent` authenticates to the remote Vault cluster using the **AppRole** method (or AWS/GCP instance identity), auto-renews leases, and writes decrypted secrets to an in-memory `tmpfs` directory (`/run/vault/`).
+3. **systemd isolates service access:** Target application services read secrets either via systemd `LoadCredential` directives or via protected environment files in `/run/vault/`.
+
+---
+
+## Declarative Vault Agent Configuration
+
+NixOS provides a first-class module for Vault Agent via `services.vault-agent`. Here is a complete production configuration:
+
+```nix
+# modules/security/vault-agent.nix
+{ config, pkgs, ... }: {
+  # 1. Ensure Vault client tools are available
+  environment.systemPackages = [ pkgs.vault ];
+
+  # 2. Vault Agent systemd service
+  services.vault-agent = {
+    enable = true;
+    settings = {
+      vault = {
+        address = "https://vault.internal.corp:8200";
+        ca_cert = "/etc/ssl/certs/internal-ca.pem";
+      };
+
+      auto_auth = {
+        method = {
+          type = "approle";
+          config = {
+            role_id_file_path = "/var/lib/vault/role-id";
+            secret_id_file_path = "/var/lib/vault/secret-id"; # Bootstrap secret ID
+            remove_secret_id_file_after_reading = false;
+          };
+        };
+
+        sink = {
+          type = "file";
+          config = {
+            path = "/run/vault/vault-token";
+            mode = 384; # 0600
+          };
+        };
+      };
+
+      # Templates render dynamic secrets to volatile tmpfs
+      template = [
+        {
+          destination = "/run/vault/app-db.env";
+          perms = "0400";
+          # Template written in Consul/Vault template syntax
+          contents = ''
+            {{ with secret "database/creds/backend-role" }}
+            DATABASE_USER="{{ .Data.username }}"
+            DATABASE_PASSWORD="{{ .Data.password }}"
+            DATABASE_URL="postgres://{{ .Data.username }}:{{ .Data.password }}@db.internal.corp:5432/production"
+            {{ end }}
+          '';
+          # Command executed by systemd when secrets rotate
+          command = "${pkgs.systemd}/bin/systemctl reload-or-restart backend-api.service";
+        }
+      ];
+    };
+  };
+
+  # 3. Create volatile runtime directory in tmpfs (RAM only)
+  systemd.services.vault-agent.serviceConfig = {
+    RuntimeDirectory = "vault";
+    RuntimeDirectoryMode = "0750";
+    StateDirectory = "vault";
+    StateDirectoryMode = "0700";
+    User = "vault";
+    Group = "vault";
+    Restart = "always";
+    RestartSec = "5s";
+  };
+
+  # Define system user and group for vault agent
+  users.users.vault = {
+    isSystemUser = true;
+    group = "vault";
+  };
+  users.groups.vault = {};
+}
+```
+
+---
+
+## Consuming Dynamic Secrets in systemd Services
+
+Once Vault Agent renders dynamic secrets into `/run/vault/app-db.env`, the consumer service must read them securely without creating world-readable files:
+
+### Pattern A: `EnvironmentFile` with File ACLs
+
+```nix
+# modules/services/backend-api.nix
+{ config, pkgs, ... }: {
+  # Add backend user to vault group to read rendered secrets
+  users.users.backend = {
+    isSystemUser = true;
+    group = "backend";
+    extraGroups = [ "vault" ];
+  };
+  users.groups.backend = {};
+
+  systemd.services.backend-api = {
+    description = "Production Backend API";
+    after = [ "network.target" "vault-agent.service" ];
+    wants = [ "vault-agent.service" ];
+    wantedBy = [ "multi-user.target" ];
+
+    serviceConfig = {
+      Type = "notify";
+      User = "backend";
+      Group = "backend";
+      ExecStart = "${pkgs.backend-api}/bin/server";
+
+      # Load dynamic credentials rendered by Vault Agent
+      EnvironmentFile = "/run/vault/app-db.env";
+
+      # Security Hardening
+      ProtectSystem = "strict";
+      ProtectHome = true;
+      PrivateTmp = true;
+      NoNewPrivileges = true;
+      Restart = "on-failure";
+      RestartSec = "3s";
+    };
+  };
+}
+```
+
+### Pattern B: Modern systemd `LoadCredential`
+
+For maximum isolation, use systemd's built-in credential management. systemd mounts credentials into a private, encrypted directory per service under `$CREDENTIALS_DIRECTORY`:
+
+```nix
+systemd.services.backend-api.serviceConfig = {
+  # systemd safely provisions the credential into the service namespace
+  LoadCredential = [
+    "db_password:/run/vault/db_password.txt"
+    "api_token:/run/vault/api_token.txt"
+  ];
+  ExecStart = "${pkgs.backend-api}/bin/server --credentials-dir=\${CREDENTIALS_DIRECTORY}";
+};
+```
+
+---
+
+## Architectural Comparison: SOPS vs Agenix vs Vault
+
+| Feature | `sops-nix` | `agenix` | HashiCorp Vault |
+|---------|------------|----------|-----------------|
+| **Storage Location** | Git repository (Encrypted) | Git repository (Encrypted) | Centralized External Cluster |
+| **Decryption Key** | Host Age/SSH Key or KMS | Host SSH Key | AppRole / Cloud Instance Identity |
+| **Decryption Timing** | NixOS System Activation | NixOS System Activation | Continuous runtime daemon |
+| **Secret Lifetime** | Static (until manual re-key) | Static (until manual re-key) | **Dynamic leases (minutes to hours)** |
+| **Audit Trails** | Git commit logs only | Git commit logs only | **Comprehensive real-time API logs** |
+| **Auto-Rotation** | Manual rebuild required | Manual rebuild required | **Automated zero-downtime reloads** |
+| **Primary Use Case** | Node bootstrapping, static tokens | Node bootstrapping, lightweight setups | **Multi-tenant platforms, enterprise compliance** |
+
+## Best Practice: The Hybrid Vault + SOPS Pattern
+
+In production architectures, combine SOPS and Vault:
+1. Use **`sops-nix`** to store the **bootstrap AppRole Secret ID** in git.
+2. When the NixOS machine boots, `sops-nix` decrypts the Secret ID into `/var/lib/vault/secret-id`.
+3. `vault-agent` reads the Secret ID, authenticates to HashiCorp Vault, and manages all dynamic database passwords, cloud API tokens, and TLS certificates dynamically.
+
+## Checkpoint
+
+- [ ] Vault Agent is declared as a managed systemd service.
+- [ ] Secrets are written only to volatile `tmpfs` (`/run/vault/`) and never touch `/nix/store` or persistent disks.
+- [ ] Application services depend on `vault-agent.service` and read credentials via `EnvironmentFile` or `LoadCredential`.
+- [ ] Dynamic database leases auto-renew and trigger automatic service reloads on expiration.

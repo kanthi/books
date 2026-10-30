@@ -244,3 +244,37 @@ Lab platform (macOS / Linux + Containerlab)
 |------|------|
 | 2026-07-24 | Initial multi-syllabus exploration |
 | 2026-07-24 | Vendor-agnostic rewrite; open images only; expert pedagogy; diagrams |
+| 2026-10-29 | Published **part 11** (`content/11-bgp-security/`): BGP security at production scale. The part intro holds the chapter map. Earlier BGP, policy, community, and ROV labs stay in parts 04, 05, 07, and 08. |
+
+---
+
+# Published part 11 — BGP security
+
+**Title in the part:** Architecture, Implementation, and Operations at Production Scale.
+
+Sidebar directory: `content/11-bgp-security/`. These pages are the reader-facing syllabus. They state the production argument for each chapter. Hands-on FRR commands stay in the earlier labs named from the part introduction. A later writing pass can add topologies where a page still only names the checklist (platform stanzas for IOS-XR and Junos, a BGPsec lab).
+
+| File | Chapter |
+|------|---------|
+| `00-why-bgp-security-is-a-systems-problem.qmd` | Introduction |
+| `01-internet-routing-system.qmd` | The routing system and the problem space |
+| `02-bgp-protocol-mechanics.qmd` | Protocol mechanics that security attaches to |
+| `03-bgp-threat-landscape.qmd` | Hijacks, leaks, path edits, exhaustion |
+| `04-routing-trust-architecture.qmd` | What can be verified, and what is trusted |
+| `05-rpki-cryptographic-architecture.qmd` | Certificates, ROAs, maxLength, revocation |
+| `06-rpki-repositories-validators-rtr.qmd` | Repositories, validators, RTR |
+| `07-route-origin-validation.qmd` | Valid, Invalid, NotFound, migration |
+| `08-irr-rpsl.qmd` | IRR and RPSL beside RPKI |
+| `09-aspa.qmd` | ASPA provider authorisation |
+| `10-bgpsec.qmd` | BGPsec as a goal, not a 2026 deployment |
+| `11-communities-and-attributes.qmd` | Communities as an unauthenticated policy API |
+| `12-prefix-as-path-bogon-filtering.qmd` | Customer, peer, and transit filters |
+| `13-route-stability-controls.qmd` | Dampening, max-prefix, quotas |
+| `14-blackholing-and-rtbh.qmd` | Blackhole and RTBH |
+| `15-reference-architectures.qmd` | Provider, enterprise, content, cloud, IXP, managed |
+| `16-implementing-configurations.qmd` | The same checklist on FRR, BIRD, GoBGP, IOS-XR, Junos, OpenBGPD |
+| `17-automation-and-gitops.qmd` | Generate, review, roll back |
+| `18-telemetry-monitoring-anomaly-detection.qmd` | BMP, origin alerts, dashboard |
+| `19-incident-response.qmd` | Hijack, leak, and bad-ROA response |
+| `20-operational-lifecycle.qmd` | ROA lifecycle, rotation, drills, audit |
+| `21-conclusion.qmd` | What to turn on this quarter |

@@ -1,0 +1,285 @@
+---
+title: "Chapter 14: Production Patterns: Proxies and Load Balancers"
+---
+
+# Chapter 14: Production Patterns: Proxies, Load Balancers and Distributed Systems
+
+In production environments, applications rarely talk directly to a single server instance. Real-world systems sit behind proxies, load balancers, service meshes, and resilient connection pools designed to absorb failures and distribute traffic evenly.
+
+In this chapter, you will build a bidirectional TCP proxy, implement a round-robin load balancer with active health checking, design a circuit breaker, implement client-side connection pooling, integrate observability metrics, and explore gRPC over sockets.
+
+---
+
+## Building a TCP Proxy in Go
+
+A TCP proxy forwards raw bytes bidirectionally between an inbound client connection and an upstream server. In Go, you can build a high-performance proxy using two concurrent `io.Copy` calls:
+
+```
+Client Conn  ◄──────── io.Copy(client, backend) ────────  Backend Conn
+             ──────── io.Copy(backend, client) ────────►
+```
+
+```go
+// proxy.go
+package main
+
+import (
+	"io"
+	"log"
+	"net"
+	"sync"
+)
+
+func ForwardTCP(clientConn net.Conn, backendAddr string) {
+	defer clientConn.Close()
+
+	backendConn, err := net.Dial("tcp", backendAddr)
+	if err != nil {
+		log.Printf("failed to dial backend %s: %v", backendAddr, err)
+		return
+	}
+	defer backendConn.Close()
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	// Pipe client -> backend
+	go func() {
+		defer wg.Done()
+		_, _ = io.Copy(backendConn, clientConn)
+		// Propagate TCP FIN to backend when client finishes sending
+		if tcpConn, ok := backendConn.(*net.TCPConn); ok {
+			_ = tcpConn.CloseWrite()
+		}
+	}()
+
+	// Pipe backend -> client
+	go func() {
+		defer wg.Done()
+		_, _ = io.Copy(clientConn, backendConn)
+		if tcpConn, ok := clientConn.(*net.TCPConn); ok {
+			_ = tcpConn.CloseWrite()
+		}
+	}()
+
+	wg.Wait()
+}
+
+func main() {
+	ln, err := net.Listen("tcp", ":8000")
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer ln.Close()
+
+	log.Println("TCP Proxy listening on :8000 forwarding to :9000")
+	for {
+		client, err := ln.Accept()
+		if err != nil {
+			continue
+		}
+		go ForwardTCP(client, "127.0.0.1:9000")
+	}
+}
+```
+
+---
+
+## Implementing a Round-Robin Load Balancer
+
+A load balancer distributes inbound connections across a pool of backend targets.
+
+```go
+package main
+
+import (
+	"errors"
+	"net"
+	"sync/atomic"
+	"time"
+)
+
+type Backend struct {
+	Addr    string
+	Alive   bool
+}
+
+type LoadBalancer struct {
+	backends []*Backend
+	counter  uint64
+}
+
+func NewLoadBalancer(addrs []string) *LoadBalancer {
+	lb := &LoadBalancer{}
+	for _, addr := range addrs {
+		lb.backends = append(lb.backends, &Backend{Addr: addr, Alive: true})
+	}
+	go lb.startHealthChecks(3 * time.Second)
+	return lb
+}
+
+// NextBackend picks the next healthy backend in round-robin fashion
+func (lb *LoadBalancer) NextBackend() (*Backend, error) {
+	n := len(lb.backends)
+	if n == 0 {
+		return nil, errors.New("no backends configured")
+	}
+
+	for i := 0; i < n; i++ {
+		idx := atomic.AddUint64(&lb.counter, 1) % uint64(n)
+		backend := lb.backends[idx]
+		if backend.Alive {
+			return backend, nil
+		}
+	}
+	return nil, errors.New("all backends are currently unhealthy")
+}
+
+func (lb *LoadBalancer) startHealthChecks(interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	for range ticker.C {
+		for _, b := range lb.backends {
+			conn, err := net.DialTimeout("tcp", b.Addr, 1*time.Second)
+			if err != nil {
+				b.Alive = false
+			} else {
+				b.Alive = true
+				_ = conn.Close()
+			}
+		}
+	}
+}
+```
+
+---
+
+## Health Checking and Circuit Breaking
+
+When a downstream dependency experiences an outage, continuing to pound it with requests compounds the failure. A **Circuit Breaker** isolates degraded services by temporarily halting outbound traffic.
+
+```
+                  ┌───────────────┐
+      ┌──────────►│    CLOSED     │◄──────────┐
+      │           │ (Normal Ops)  │           │
+      │           └───────┬───────┘           │
+Success Threshold Met     │ Failure Count     │
+      │                   │ Exceeds Threshold │
+      │                   ▼                   │
+  ┌───┴──────────┐   ┌───────────────┐        │
+  │  HALF-OPEN   │   │     OPEN      │        │ Success
+  │ (Canary Test)│   │ (Fast-Fail)   │        │
+  └──────────────┘   └───────┬───────┘        │
+      ▲                      │ Timeout Expires│
+      └──────────────────────┴────────────────┘
+```
+
+- **Closed:** Traffic flows normally. Error counts are tracked.
+- **Open:** When errors exceed a threshold, all calls fail immediately without attempting network I/O.
+- **Half-Open:** After a cooldown period, canary requests are allowed through. If they succeed, the breaker resets to Closed; if they fail, it trips back to Open.
+
+---
+
+## Connection Pooling for Client-Side Efficiency
+
+Establishing a TCP connection for every short-lived request creates excessive ephemeral port churn and latency. A client-side **Connection Pool** maintains a cache of established, idle connections ready for immediate reuse.
+
+```go
+type ConnPool struct {
+	factory func() (net.Conn, error)
+	conns   chan net.Conn
+}
+
+func NewConnPool(maxConns int, factory func() (net.Conn, error)) *ConnPool {
+	return &ConnPool{
+		factory: factory,
+		conns:   make(chan net.Conn, maxConns),
+	}
+}
+
+func (p *ConnPool) Get() (net.Conn, error) {
+	select {
+	case conn := <-p.conns:
+		return conn, nil // Reused idle connection!
+	default:
+		return p.factory() // Pool empty, create new connection
+	}
+}
+
+func (p *ConnPool) Put(conn net.Conn) {
+	select {
+	case p.conns <- conn:
+		// Returned to idle pool
+	default:
+		// Pool full, close connection
+		_ = conn.Close()
+	}
+}
+```
+
+---
+
+## Observability: Logging, Metrics and Tracing for Network Services
+
+A production socket service must expose telemetry to answer three questions:
+1. *How much traffic are we processing?* (Throughput: bytes/sec, connections/sec)
+2. *How fast is it completing?* (Latency distributions: P50, P99)
+3. *Where are failures occurring?* (Error rates, dropped connections)
+
+### Instrumenting with `net.Conn` Wrappers
+
+You can wrap any standard `net.Conn` to transparently record metrics without changing business logic:
+
+```go
+type MeteredConn struct {
+	net.Conn
+	BytesRead    uint64
+	BytesWritten uint64
+}
+
+func (m *MeteredConn) Read(b []byte) (int, error) {
+	n, err := m.Conn.Read(b)
+	m.BytesRead += uint64(n)
+	return n, err
+}
+
+func (m *MeteredConn) Write(b []byte) (int, error) {
+	n, err := m.Conn.Write(b)
+	m.BytesWritten += uint64(n)
+	return n, err
+}
+```
+
+---
+
+## Service Discovery Patterns for Distributed Systems
+
+In modern cloud environments, service instances are ephemeral: IP addresses change dynamically as pods scale and restart.
+
+- **DNS-Based Discovery:** Relying on SRV records or round-robin DNS records. Simple, but subject to DNS cache TTL delays.
+- **Control Plane Registries (etcd, Consul):** Instances register their IP and port upon startup with a heartbeating lease. Clients watch key prefixes using long-polling streams to update their local routing tables instantly.
+
+---
+
+## gRPC: The Industry Standard for RPC Over Sockets
+
+For polyglot microservice architectures, hand-crafting custom RPC protocols is often redundant. **gRPC** leverages HTTP/2 multiplexed streams, Protocol Buffers serialization, bidirectional streaming, and TLS by default:
+
+```protobuf
+service OrderService {
+  rpc CreateOrder (OrderRequest) returns (OrderResponse);
+  rpc StreamUpdates (StreamRequest) returns (stream UpdateEvent);
+}
+```
+
+Underneath its high-level API, gRPC compiles down to the very same socket primitives, non-blocking I/O routines, and frame decoders explored in this book.
+
+---
+
+## Chapter Summary
+
+- A high-performance **TCP proxy** pipes connections bidirectionally using `io.Copy` and propagates half-close (`CloseWrite`) signals.
+- **Load balancers** distribute traffic across backends using round-robin selection and background active health checks.
+- **Circuit breakers** protect degraded downstreams by fast-failing traffic during outages.
+- **Connection pooling** eliminates TCP handshake latency by caching idle connections for reuse.
+- **`net.Conn` wrappers** transparently inject metrics, byte counting, and tracing into any socket stream.
+- In the next chapter, we will learn how to test network code reliably using unit tests, mocks, and integration test harnesses.

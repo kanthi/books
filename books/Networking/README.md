@@ -2,7 +2,7 @@
 
 Vendor-agnostic notes: **first principles → expert NetOps**, labs in **Containerlab** with **open/free images** only.
 
-Curriculum map and journey are on `index.qmd` (parts 01–10). Planning notes (if any) live under `content/_planning/` (not published).
+Curriculum map and journey are on `index.qmd` (parts 01–11). Part 11 is production-scale BGP security. Planning notes (if any) live under `content/_planning/` (not published).
 
 ## Diagrams
 

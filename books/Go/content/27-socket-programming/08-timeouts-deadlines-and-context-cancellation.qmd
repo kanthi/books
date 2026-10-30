@@ -1,0 +1,204 @@
+---
+title: "Chapter 8: Timeouts, Deadlines and Context Cancellation"
+---
+
+# Chapter 8: Timeouts, Deadlines and Context Cancellation
+
+In production distributed systems, networks will fail. Routers drop packets, intermediate firewalls silently sever idle TCP sessions, cellular clients transit through dead zones, and malicious actors intentionally trickle bytes to exhaust server resources.
+
+If your network code assumes that reads and writes will always complete in a timely manner, your application will eventually freeze as all available file descriptors and goroutines become permanently locked.
+
+In this chapter, you will learn how to enforce non-negotiable timeouts, master Go's deadline APIs, cleanly integrate `context.Context` with network I/O, and protect your services against Slowloris attacks.
+
+---
+
+## Why Timeouts Are Non-Negotiable in Production Code
+
+Consider what happens when a client sends a request to a Go server and then experiences an abrupt network outage without sending a TCP `FIN`:
+
+1. The server calls `conn.Read(buf)`.
+2. The Go runtime netpoller deschedules the goroutine and registers the file descriptor with `epoll`.
+3. If no deadline is set, **that goroutine will wait forever**.
+4. The file descriptor remains open in the operating system kernel.
+5. If thousands of clients experience dropped connections, the server exhausts its OS file descriptor limit (`EMFILE`), causing `ln.Accept()` to fail and taking down the entire service.
+
+> [!IMPORTANT]
+> A network call without a timeout is a production incident waiting to happen. Every connection, read, and write must be bounded by an explicit time limit.
+
+---
+
+## SetDeadline vs SetReadDeadline vs SetWriteDeadline
+
+The `net.Conn` interface exposes three methods for managing timeouts:
+
+```go
+type Conn interface {
+    // ...
+    SetDeadline(t time.Time) error
+    SetReadDeadline(t time.Time) error
+    SetWriteDeadline(t time.Time) error
+}
+```
+
+### Absolute Point in Time (`time.Time`), Not Duration
+
+A common beginner mistake is confusing deadlines with durations:
+
+```go
+// WRONG: Does not compile or behaves unpredictably
+conn.SetDeadline(5 * time.Second) 
+
+// RIGHT: Pass an absolute time in the future
+conn.SetDeadline(time.Now().Add(5 * time.Second))
+```
+
+### Differences Between the Methods
+
+1. **`SetDeadline(t)`:** Sets both the read and write deadline simultaneously to point in time `t`.
+2. **`SetReadDeadline(t)`:** Affects only future and currently active `Read()` calls. If `t` is reached before bytes arrive, `Read()` unblocks immediately and returns an error satisfying `net.Error.Timeout() == true`.
+3. **`SetWriteDeadline(t)`:** Affects only future and currently active `Write()` calls. Prevents writes from blocking indefinitely if the receiver's TCP window shrinks to zero.
+4. **Clearing Deadlines:** Passing `time.Time{}` (the zero value) clears the deadline, allowing indefinite blocking.
+
+### Forcibly Unblocking a Hanging I/O Call
+
+Because deadlines operate across goroutines, you can unblock a goroutine currently stuck inside `conn.Read()` by calling `conn.SetReadDeadline(time.Now())` from another goroutine!
+
+```go
+// Forcibly unblock any pending read immediately
+_ = conn.SetReadDeadline(time.Now())
+```
+
+---
+
+## Integrating context.Context with Network Operations
+
+While `net.Conn` operates on `time.Time` deadlines, modern Go idioms rely on `context.Context` for request cancellation and deadline propagation.
+
+### 1. Context-Aware Dialing with `net.Dialer`
+
+Always dial using `DialContext`:
+
+```go
+func fetchWithTimeout(ctx context.Context, addr string) (net.Conn, error) {
+    var dialer net.Dialer
+    return dialer.DialContext(ctx, "tcp", addr)
+}
+```
+
+### 2. Bridging `context.Context` to an Existing `net.Conn`
+
+Because `net.Conn` does not have a `ReadContext(ctx)` method, you can bridge context cancellation to connection deadlines using a background watcher goroutine:
+
+```go
+func ReadWithContext(ctx context.Context, conn net.Conn, buf []byte) (int, error) {
+	// Guard against unhandled context cancellations
+	done := make(chan struct{})
+	defer close(done)
+
+	go func() {
+		select {
+		case <-ctx.Done():
+			// Context expired: force unblock pending I/O
+			_ = conn.SetDeadline(time.Now())
+		case <-done:
+			// Normal return
+		}
+	}()
+
+	n, err := conn.Read(buf)
+	if err != nil {
+		if ctx.Err() != nil {
+			return 0, ctx.Err() // Return context.Canceled or context.DeadlineExceeded
+		}
+		return 0, err
+	}
+	return n, nil
+}
+```
+
+---
+
+## Handling Slowloris and Resource Exhaustion Attacks
+
+### What is a Slowloris Attack?
+
+In a Slowloris attack, an attacker opens hundreds of TCP connections to a server and sends data extremely slowly (e.g., 1 byte every 20 seconds).
+
+If a naive server resets its deadline on every successful `Read()`:
+
+```go
+// VULNERABLE TO SLOWLORIS:
+for {
+    // Sliding deadline resets on EVERY single byte!
+    _ = conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+    n, err := conn.Read(buf)
+    // An attacker sending 1 byte every 9 seconds keeps this connection open forever!
+}
+```
+
+The attacker holds hundreds of server connections open while consuming virtually zero client bandwidth.
+
+### Defensive Strategies Against Slowloris
+
+#### Strategy 1: Total Request Budget (Hard Timeout)
+
+Enforce an absolute, fixed deadline for the entire request lifecycle that never resets:
+
+```go
+// Hard deadline: the entire message must be received within 15 seconds
+conn.SetReadDeadline(time.Now().Add(15 * time.Second))
+// Read headers and body...
+```
+
+#### Strategy 2: Minimum Transfer Rate Throttling
+
+Track both time and bytes received. If the data transfer rate drops below a minimum threshold (e.g., 500 bytes per second), terminate the connection:
+
+```go
+type RateLimitedReader struct {
+	conn       net.Conn
+	minRateBPS int64 // Minimum required bytes per second
+}
+
+func (r *RateLimitedReader) ReadFullMessage(maxDuration time.Duration) ([]byte, error) {
+	startTime := time.Now()
+	var totalBytes int64
+	var result []byte
+	buf := make([]byte, 1024)
+
+	_ = r.conn.SetReadDeadline(startTime.Add(maxDuration))
+
+	for {
+		n, err := r.conn.Read(buf)
+		if n > 0 {
+			totalBytes += int64(n)
+			result = append(result, buf[:n]...)
+
+			elapsed := time.Since(startTime).Seconds()
+			if elapsed > 1.0 {
+				rate := float64(totalBytes) / elapsed
+				if rate < float64(r.minRateBPS) {
+					_ = r.conn.Close()
+					return nil, errors.New("connection closed: transfer rate too slow")
+				}
+			}
+		}
+
+		if err != nil {
+			return result, err
+		}
+		// Break when message boundary is detected...
+	}
+}
+```
+
+---
+
+## Chapter Summary
+
+- **Missing timeouts** cause leaked goroutines, file descriptor exhaustion, and catastrophic cascading outages.
+- Go deadlines are **absolute points in time (`time.Time`)**, not durations.
+- Setting a deadline in the past (`conn.SetDeadline(time.Now())`) **immediately unblocks** active I/O calls across goroutines.
+- Use **`net.Dialer.DialContext`** to propagate context deadlines to connection attempts.
+- Prevent **Slowloris attacks** by avoiding sliding deadlines that reset on every byte; instead, enforce total request budgets and minimum throughput rates.
+- In the next chapter, we will learn how to design and parse custom network protocols, from text-based lines to length-prefixed binary frames.

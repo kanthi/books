@@ -121,6 +121,8 @@ humanize_dir_title() {
     hypervisor-internals-and-kvm) printf '%s\n' "Hypervisor Internals & KVM"; return ;;
     hardware-passthrough-and-microvms) printf '%s\n' "Passthrough, MicroVMs & CoCo"; return ;;
     private-cloud-and-bare-metal) printf '%s\n' "Private Cloud & Bare-Metal"; return ;;
+    running-multiple-kernels-on-one-bare-metal-server) printf '%s\n' "Running Multiple Kernels on One Bare-Metal Server"; return ;;
+    linux-performance-engineering-and-server-benchmarking) printf '%s\n' "Linux Performance Engineering & Server Benchmarking"; return ;;
     containers-and-kubernetes-orchestration) printf '%s\n' "Containers and Kubernetes Orchestration"; return ;;
     container-runtimes-and-image-craft) printf '%s\n' "Container Runtimes & Images"; return ;;
     kubernetes-architecture-and-platform) printf '%s\n' "Kubernetes Architecture"; return ;;
