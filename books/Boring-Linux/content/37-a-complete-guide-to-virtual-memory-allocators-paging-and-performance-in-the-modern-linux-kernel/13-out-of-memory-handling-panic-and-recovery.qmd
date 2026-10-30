@@ -1,0 +1,151 @@
+---
+title: "Chapter 13: Out-of-Memory Handling, Panic, and Recovery"
+---
+
+# Chapter 13: Out-of-Memory Handling, Panic, and Recovery
+
+When available physical memory is exhausted, all page cache pages have been reclaimed, swap storage is completely full, and memory compaction cannot synthesize a single free block, the operating system enters an existential state: **Out of Memory (OOM)**.
+
+At this juncture, the kernel can no longer service memory allocation requests. If the kernel simply returned `-ENOMEM` to calling processes, applications would crash haphazardly, and system daemons would hang in undefined deadlock states.
+
+To prevent an uncontrolled system-wide freeze, the Linux kernel deploys its ultimate weapon of last resort: the **Out-of-Memory (OOM) Killer**.
+
+This chapter explores how the OOM killer selects its victims, the mathematical heuristics behind `oom_badness()`, how to protect critical daemons using `oom_score_adj`, kernel panic triggers, automated recovery architectures, and post-mortem incident forensics.
+
+## When Reclaim Fails: The Last Resort
+
+The path leading to an OOM kill follows a progressive degradation curve:
+
+```
+┌────────────────────────────────────────────────────────────────────────┐
+│                        OOM KILLER ESCALATION PATH                      │
+│                                                                        │
+│   1. Free memory falls below zone WMARK_LOW                            │
+│      └─► Background kswapd daemon begins reclaiming clean page cache   │
+│                                                                        │
+│   2. Free memory falls below zone WMARK_MIN                            │
+│      └─► Direct Reclaim: Allocating threads stall; flush dirty pages   │
+│                                                                        │
+│   3. High-order fragmentation blocks contiguous allocations           │
+│      └─► Direct Compaction: Two-pointer scanner attempts page migration│
+│                                                                        │
+│   4. Swap space reaches 100% saturation; no pages reclaimable          │
+│      └─► Kernel invokes out_of_memory() in mm/oom_kill.c               │
+│                                                                        │
+│   5. The OOM Killer:                                                  │
+│      ├─ Evaluates every runnable task on the machine                   │
+│      ├─ Computes badness score (0 to 1000)                             │
+│      └─ Sends SIGKILL to the single highest-scoring process!           │
+└────────────────────────────────────────────────────────────────────────┘
+```
+
+## The OOM Killer Algorithm and Victim Selection
+
+The primary goal of the OOM killer is to **reclaim the maximum amount of physical RAM while minimizing collateral damage to the operating system**.
+
+Terminating a tiny 500 KiB daemon does not solve the memory crisis—the system would immediately run out of memory again milliseconds later. Conversely, killing `init` (PID 1) or `systemd` causes an instant kernel panic.
+
+### The Victim Selection Function (`oom_badness()`)
+In `mm/oom_kill.c`, the kernel iterates across all processes in the task list, computing an integer score ($0 \le \text{points} \le 1000$) for each candidate:
+
+```c
+unsigned long oom_badness(struct task_struct *p, unsigned long totalpages) {
+    long points;
+    long adj;
+
+    if (oom_task_origin(p))
+        return ULONG_MAX;
+
+    /* Do not terminate PID 1 (init) or kernel threads */
+    if (p->flags & PF_KTHREAD || is_global_init(p) || (p->signal->flags & SIGNAL_GROUP_COREDUMP))
+        return 0;
+
+    /* Base score is proportional to resident physical RAM */
+    points = get_mm_rss(p->mm) + get_mm_counter(p->mm, MM_SWAPENTS) +
+             atomic_long_read(&p->mm->nr_ptes);
+
+    /* Scale points to range between 0 and 1000 */
+    points = points * 1000 / totalpages;
+
+    /* Incorporate manual administrative adjustment */
+    adj = (long)p->signal->oom_score_adj;
+    if (adj == OOM_SCORE_ADJ_MIN)
+        return 0; /* Completely immune to OOM kill */
+
+    points += adj;
+    return points > 0 ? points : 1;
+}
+```
+
+## Scoring Factors and Heuristics
+
+The badness score is driven by three factors:
+
+1. **Resident Set Size (RSS)**: Number of physical RAM pages currently mapped into the process's page tables.
+2. **Swap Usage (`MM_SWAPENTS`)**: Number of swap slots consumed by the process.
+3. **Page Table Overhead (`nr_ptes`)**: Memory consumed by the process's page table structures themselves.
+4. **Root Privilege Discount**: In older kernels, root-owned processes received a slight discount; modern kernels evaluate strictly based on memory footprint and `oom_score_adj`.
+
+The task consuming the largest aggregate volume of physical RAM and swap yields the highest score and is selected as the victim.
+
+## OOM Score Adjustment and Task Protection
+
+Systems administrators can explicitly bias the OOM killer's calculations using `/proc/[pid]/oom_score_adj`:
+
+- Range: `-1000` to `+1000`.
+- **`-1000` (`OOM_SCORE_ADJ_MIN`)**: Makes the process **completely immune** to the OOM killer. The kernel will never kill this process, even if system memory reaches 100% exhaustion. (Reserved for critical daemons like `sshd`, `kubelet`, or hypervisors).
+- **`+1000` (`OOM_SCORE_ADJ_MAX`)**: Forces the process to be killed first, regardless of how little memory it consumes. (Ideal for batch workers or untrusted sandbox scripts).
+
+```bash
+# Make SSH daemon completely immune to OOM kill
+echo -1000 | sudo tee /proc/$(pgrep -x sshd)/oom_score_adj
+
+# Protect a systemd service declaratively in its unit file
+# In /etc/systemd/system/myapp.service:
+[Service]
+OOMScoreAdjust=-900
+```
+
+To inspect the calculated runtime score of any process:
+```bash
+cat /proc/1234/oom_score
+```
+
+## System-wide vs Cgroup-local OOM Events
+
+- **System-wide OOM**: Occurs when host physical RAM and swap are completely exhausted. The kernel evaluates all processes across the entire machine.
+- **Cgroup-local OOM**: Occurs when a specific container or cgroup reaches its `memory.max` boundary. The kernel evaluates *only* tasks belonging to that cgroup, killing an internal process and preserving host stability.
+
+## Kernel Panic Conditions and Memory Exhaustion Scenarios
+
+Under extreme conditions, the OOM killer cannot find a viable victim:
+
+1. All memory-consuming processes have `oom_score_adj = -1000` (immune).
+2. Memory is exhausted entirely within unswappable kernel slab allocations (e.g., driver memory leak).
+3. The kernel parameter `vm.panic_on_oom` is explicitly enabled:
+   ```ini
+   # /etc/sysctl.d/99-oom.conf
+   vm.panic_on_oom = 1
+   ```
+
+When `vm.panic_on_oom = 1`, the kernel refuses to kill any process and immediately triggers a **Kernel Panic**, initiating automated hardware reboot via the motherboard watchdog or kdump kernel crash dump.
+
+## Real-World Case Studies: OOM Incidents and Post-Mortems
+
+When an OOM event occurs in production, the kernel dumps a rich diagnostic trace into the system log (`dmesg` / `journalctl`):
+
+```bash
+sudo dmesg -T | grep -A 20 -B 5 "invoked oom-killer"
+```
+
+```
+[Fri Oct 30 15:20:10 2026] nodejs invoked oom-killer: gfp_mask=0x1100cca(GFP_HIGHUSER_MOVABLE), order=0, oom_score_adj=0
+...
+[Fri Oct 30 15:20:10 2026] Node 0 active_anon:12401880kB inactive_anon:420kB active_file:12kB inactive_file:8kB unevictable:0kB dirty:0kB writeback:0kB
+[Fri Oct 30 15:20:10 2026] Out of memory: Killed process 54201 (worker_task) total-vm:18942000kB, anon-rss:14201880kB, file-rss:0kB, shmem-rss:0kB
+```
+
+### Forensic Analysis Checklist
+1. **Identify the Trigger vs the Victim**: In the trace above, `nodejs` triggered the allocation that failed, but the victim selected for termination was `worker_task` (consuming 14.2 GiB). The allocating process is rarely the true cause of the leak.
+2. **Inspect `active_file` vs `active_anon`**: If `active_file` is near zero, file cache was completely starved prior to the kill.
+3. **Verify Swap Saturation**: Check if swap space was exhausted or if swapping was disabled.

@@ -1,0 +1,107 @@
+---
+title: "Chapter 7: Journaling with JBD2"
+---
+
+# Chapter 7: Journaling with JBD2
+
+A modern storage device can lose power at any microsecond. If a server experiences a sudden power loss while the kernel is in the middle of writing a directory entry, updating a block bitmap, and appending an extent to an inode, Discretionary Access Control structures and metadata linkages become desynchronized. Without protection, such an unclean shutdown leaves the filesystem with orphaned blocks, dangling inodes, and cross-linked files.
+
+To guarantee metadata consistency across sudden crashes without incurring hours of offline `fsck` scans, ext4 delegates transaction logging to the **Journaling Block Device 2 (JBD2)** subsystem.
+
+This chapter explores JBD2: its atomic transaction lifecycle, commit sequence numbers, the three writeback modes (`data=ordered`, `data=journal`, `data=writeback`), journal on-disk descriptor blocks, crash recovery replay mechanics, and modern **Fast Commits**.
+
+## Transaction Model and Commit Sequence Numbers
+
+JBD2 does not log operations on a per-system-call basis. Writing to the journal on every individual `write()` or `mkdir()` would saturate storage with excessive barrier flushes. Instead, JBD2 batches dozens or hundreds of filesystem operations into atomic **Transactions**:
+
+```
+┌────────────────────────────────────────────────────────────────────────┐
+│                        JBD2 TRANSACTION LIFECYCLE                      │
+│                                                                        │
+│   1. RUNNING (TID 1042)                                                │
+│   ├─ Accumulates atomic filesystem updates from concurrent threads     │
+│   └─ Duration: Typically 5 seconds (or until fsync / sync triggers)    │
+│          │                                                             │
+│          ▼                                                             │
+│   2. COMMITTING (TID 1042)                                             │
+│   ├─ Closes transaction; new updates diverted to Running TID 1043     │
+│   ├─ Flushes dirty metadata blocks sequentially to on-disk Journal     │
+│   └─ Writes JBD2 Commit Block with hardware barrier (fsync)            │
+│          │                                                             │
+│          ▼ (Transaction is now DURABLE on disk)                        │
+│   3. CHECKPOINTING (TID 1042)                                          │
+│   ├─ Writes metadata to permanent on-disk locations (Block Groups)     │
+│   └─ Once permanent writes complete, transaction log space is reclaimed│
+└────────────────────────────────────────────────────────────────────────┘
+```
+
+Every transaction is assigned a monotonically increasing **Transaction ID (TID)**. A transaction is considered durable if and only if its trailing **Commit Block** has been physically acknowledged by the storage controller.
+
+## Writeback Modes: Data, Ordered, Writeback
+
+ext4 allows administrators to choose the degree of synchronization between file data (user payload) and file metadata (inodes and directories) via the `data=` mount option:
+
+```
+┌────────────────────────────────────────────────────────────────────────┐
+│                        EXT4 JOURNALING MODES                           │
+│                                                                        │
+│   Mode              Journal Contents        Crash Guarantee            │
+│   ───────────────   ─────────────────────   ────────────────────────   │
+│   data=journal      Both Data & Metadata    Maximum: Zero data loss;   │
+│                                             High write amplification   │
+│   data=ordered      Metadata Only; Data is  Balanced (Default): No     │
+│   (Default)         flushed BEFORE metadata stale data leakage         │
+│   data=writeback    Metadata Only; Data is  Fastest: Potential stale   │
+│                     flushed asynchronously  data read after crash      │
+└────────────────────────────────────────────────────────────────────────┘
+```
+
+1. **`data=journal`**: Both metadata and user data blocks are written to the journal before being written to their permanent locations. Provides the highest data integrity, but incurs a 100% write penalty (every byte is written twice).
+2. **`data=ordered` (Standard Default)**: Only metadata is written to the journal. However, the kernel guarantees that all file data blocks are flushed to physical disk *before* the corresponding transaction commit block is written to the journal. If a crash occurs, a newly appended file will never contain uninitialized data or garbage bytes from previously deleted files.
+3. **`data=writeback`**: Only metadata is logged. Data blocks are written whenever the page cache flushes. Offers maximum throughput, but after a crash, a recently appended file may expose stale residual data from previous disk sectors.
+
+## The Journal Superblock and Descriptor Blocks
+
+The journal is typically stored in a dedicated, hidden inode (Inode 8) occupying a circular ring buffer of blocks (typically 128 MiB to 1 GiB).
+
+```
+┌────────────────────────────────────────────────────────────────────────┐
+│                        JOURNAL ON-DISK RING BUFFER                     │
+│                                                                        │
+│   Block 0: Journal Superblock (Magic: 0xC03B3998, blocksize, head/tail)│
+│                                                                        │
+│   Transaction N:                                                       │
+│   ├─ Block 1: Descriptor Block (Tags listing permanent target blocks)  │
+│   ├─ Block 2: Inode Table Block (Metadata payload)                     │
+│   ├─ Block 3: Block Bitmap Block (Metadata payload)                    │
+│   └─ Block 4: Commit Block (Checksum, commit timestamp, TID)           │
+│                                                                        │
+│   Transaction N+1:                                                     │
+│   ├─ Block 5: Descriptor Block ...                                     │
+└────────────────────────────────────────────────────────────────────────┘
+```
+
+- **Journal Superblock (`journal_superblock_t`)**: Located at Block 0 of the journal. Identified by the magic number `0xC03B3998`. Records the current journal head and tail pointers and the oldest uncheckpointed transaction sequence number.
+- **Descriptor Block**: Contains an array of tags describing which permanent filesystem block numbers match the subsequent payload blocks inside the journal.
+- **Commit Block**: Written as the final block of a transaction. Contains a CRC32c checksum of all preceding transaction blocks. If power fails while writing payload blocks, the commit block is never written, and the partial transaction is discarded during recovery.
+
+## Journal Replay and Crash Recovery
+
+When a Linux system boots after an unexpected power outage:
+
+1. **Clean Flag Check**: The kernel reads the primary filesystem superblock. If `s_state` contains `0x0001` (`EXT4_VALID_FS`), the volume was cleanly unmounted, and normal mount proceeds immediately.
+2. **Journal Inspection**: If `s_state` is `0x0002` (`EXT4_ERROR_FS`) or lacks the clean flag, the kernel locates Inode 8 and reads the journal superblock.
+3. **Transaction Scan**: JBD2 scans the circular log from the recorded journal head. It verifies the CRC32c checksums of every transaction descriptor and commit block.
+4. **Replay Execution**: For every transaction with a valid, fully committed block, JBD2 copies the metadata blocks directly into their target on-disk locations (block groups, bitmaps, inode tables). Any uncommitted trailing transaction is discarded.
+5. **Re-mount**: Once replay completes (typically taking less than 2 seconds), the filesystem state is clean and consistent, and normal VFS operations resume without requiring an offline `e2fsck`.
+
+## Fast Commits (`fast_commit`)
+
+Merged in Linux 5.10, **Fast Commits** (`EXT4_FEATURE_INCOMPAT_FAST_COMMIT`) is a major performance enhancement designed for low-latency solid-state NVMe drives.
+
+### The Fast Commit Optimization
+Traditional JBD2 commits operate at full-block granularity: if an application modifies a single 30-byte directory entry or appends 4 KiB to a file, JBD2 writes the entire $4\text{ KiB}$ directory block, the $4\text{ KiB}$ inode table block, and the $4\text{ KiB}$ bitmap block into the journal.
+
+Fast Commits record fine-grained, delta-encoded operations instead of full physical blocks:
+- Rather than writing a $4\text{ KiB}$ inode table block, it logs: `CREAT Inode 5401 in Dir 2 with name "temp.txt"`.
+- Fast commit records consume only a few dozen bytes in a dedicated sub-region of the journal, drastically reducing write amplification and cutting `fsync()` latency by up to **50%** on high-performance storage.

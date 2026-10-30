@@ -244,37 +244,43 @@ Lab platform (macOS / Linux + Containerlab)
 |------|------|
 | 2026-07-24 | Initial multi-syllabus exploration |
 | 2026-07-24 | Vendor-agnostic rewrite; open images only; expert pedagogy; diagrams |
-| 2026-10-29 | Published **part 11** (`content/11-bgp-security/`): BGP security at production scale. The part intro holds the chapter map. Earlier BGP, policy, community, and ROV labs stay in parts 04, 05, 07, and 08. |
+| 2026-10-30 | Expanded **part 11** (`content/11-bgp-security/`): A Deep Dive into BGP, RPKI, Routing Attacks and Global Internet Defense (Introduction + 29 chapters). |
 
 ---
 
-# Published part 11 — BGP security
+# Published part 11 — BGP Security: A Deep Dive into BGP, RPKI, Routing Attacks and Global Internet Defense
 
-**Title in the part:** Architecture, Implementation, and Operations at Production Scale.
-
-Sidebar directory: `content/11-bgp-security/`. These pages are the reader-facing syllabus. They state the production argument for each chapter. Hands-on FRR commands stay in the earlier labs named from the part introduction. A later writing pass can add topologies where a page still only names the checklist (platform stanzas for IOS-XR and Junos, a BGPsec lab).
+Sidebar directory: `content/11-bgp-security/`.
 
 | File | Chapter |
 |------|---------|
-| `00-why-bgp-security-is-a-systems-problem.qmd` | Introduction |
-| `01-internet-routing-system.qmd` | The routing system and the problem space |
-| `02-bgp-protocol-mechanics.qmd` | Protocol mechanics that security attaches to |
-| `03-bgp-threat-landscape.qmd` | Hijacks, leaks, path edits, exhaustion |
-| `04-routing-trust-architecture.qmd` | What can be verified, and what is trusted |
-| `05-rpki-cryptographic-architecture.qmd` | Certificates, ROAs, maxLength, revocation |
-| `06-rpki-repositories-validators-rtr.qmd` | Repositories, validators, RTR |
-| `07-route-origin-validation.qmd` | Valid, Invalid, NotFound, migration |
-| `08-irr-rpsl.qmd` | IRR and RPSL beside RPKI |
-| `09-aspa.qmd` | ASPA provider authorisation |
-| `10-bgpsec.qmd` | BGPsec as a goal, not a 2026 deployment |
-| `11-communities-and-attributes.qmd` | Communities as an unauthenticated policy API |
-| `12-prefix-as-path-bogon-filtering.qmd` | Customer, peer, and transit filters |
-| `13-route-stability-controls.qmd` | Dampening, max-prefix, quotas |
-| `14-blackholing-and-rtbh.qmd` | Blackhole and RTBH |
-| `15-reference-architectures.qmd` | Provider, enterprise, content, cloud, IXP, managed |
-| `16-implementing-configurations.qmd` | The same checklist on FRR, BIRD, GoBGP, IOS-XR, Junos, OpenBGPD |
-| `17-automation-and-gitops.qmd` | Generate, review, roll back |
-| `18-telemetry-monitoring-anomaly-detection.qmd` | BMP, origin alerts, dashboard |
-| `19-incident-response.qmd` | Hijack, leak, and bad-ROA response |
-| `20-operational-lifecycle.qmd` | ROA lifecycle, rotation, drills, audit |
-| `21-conclusion.qmd` | What to turn on this quarter |
+| `00-why-routing-security-is-harder-than-it-looks.qmd` | Introduction: Why Routing Security Is Harder Than It Looks |
+| `01-architecture-of-global-connectivity.qmd` | Chapter 1: The Architecture of Global Connectivity |
+| `02-interdomain-routing-fundamentals.qmd` | Chapter 2: Interdomain Routing Fundamentals |
+| `03-bgp-protocol-architecture.qmd` | Chapter 3: BGP Protocol Architecture |
+| `04-bgp-path-attributes-and-policy-expression.qmd` | Chapter 4: BGP Path Attributes and Policy Expression |
+| `05-bgp-decision-process-and-route-selection.qmd` | Chapter 5: The BGP Decision Process and Route Selection |
+| `06-convergence-stability-and-propagation-dynamics.qmd` | Chapter 6: Convergence, Stability and Propagation Dynamics |
+| `07-historical-design-decisions-and-security-consequences.qmd` | Chapter 7: Historical Design Decisions and Their Security Consequences |
+| `08-threat-landscape-accidents-and-attacks.qmd` | Chapter 8: The Threat Landscape: Accidents and Intentional Attacks |
+| `09-origin-hijacking-attacks-mechanics-impact-detection.qmd` | Chapter 9: Origin Hijacking Attacks: Mechanics, Impact and Detection |
+| `10-route-leaks-and-policy-abuse.qmd` | Chapter 10: Route Leaks and Policy Abuse |
+| `11-advanced-and-emerging-routing-threats.qmd` | Chapter 11: Advanced and Emerging Routing Threats |
+| `12-routing-registries-irrs-and-limitations.qmd` | Chapter 12: The Routing Registries: IRRs and Their Limitations |
+| `13-rpki-architecture-resource-certificates-and-trust-anchors.qmd` | Chapter 13: The RPKI Architecture: Resource Certificates and Trust Anchors |
+| `14-route-origin-authorizations-core-object.qmd` | Chapter 14: Route Origin Authorizations: The Core Authorization Object |
+| `15-rpki-validation-validators-vrps-relying-parties.qmd` | Chapter 15: RPKI Validation: Validators, VRPs and Relying Parties |
+| `16-rpki-to-router-rtr-and-route-origin-validation-rov.qmd` | Chapter 16: RPKI-to-Router (RTR) and Route Origin Validation (ROV) |
+| `17-operational-consequences-of-rov.qmd` | Chapter 17: Operational Consequences of ROV: Invalid, Valid, NotFound and Real-World Effects |
+| `18-scope-and-limits-of-rpki-and-rov.qmd` | Chapter 18: The Scope and Limits of RPKI and ROV |
+| `19-complementary-mechanisms-irr-prefix-aspath-filters.qmd` | Chapter 19: Complementary Mechanisms: IRR Filtering, Prefix Filters and AS_PATH Filters |
+| `20-route-leak-detection-and-prevention-mechanisms.qmd` | Chapter 20: Route Leak Detection and Prevention Mechanisms |
+| `21-bgpsec-architecture-guarantees-deployment-reality.qmd` | Chapter 21: BGPsec: Architecture, Security Guarantees and Deployment Reality |
+| `22-aspa-autonomous-system-provider-authorizations.qmd` | Chapter 22: ASPA: Autonomous System Provider Authorizations |
+| `23-designing-and-implementing-routing-security.qmd` | Chapter 23: Designing and Implementing Routing Security in Your Network |
+| `24-configuration-examples-vendor-specific-considerations.qmd` | Chapter 24: Configuration Examples and Vendor-Specific Considerations |
+| `25-troubleshooting-routing-security-controls.qmd` | Chapter 25: Troubleshooting Routing Security Controls |
+| `26-monitoring-measurement-and-testing.qmd` | Chapter 26: Monitoring, Measurement and Testing |
+| `27-case-studies-documented-routing-incidents.qmd` | Chapter 27: Case Studies: Documented Routing Incidents |
+| `28-economics-governance-human-dimension.qmd` | Chapter 28: Economics, Governance and the Human Dimension |
+| `29-current-state-and-future-of-internet-routing-security.qmd` | Chapter 29: The Current State and Future of Internet Routing Security |

@@ -1,0 +1,124 @@
+---
+title: "Chapter 8: The Page Cache and Buffer Head Architecture"
+---
+
+# Chapter 8: The Page Cache and Buffer Head Architecture
+
+Accessing persistent storage is several orders of magnitude slower than accessing dynamic RAM: reading a $4\text{ KiB}$ block from system DRAM takes approximately $50\text{ to } 80\text{ nanoseconds}$, while reading the identical block from a PCIe Gen4 NVMe solid-state drive takes $10\text{ to } 50\text{ microseconds}$—a latency disparity of nearly 1,000 to 1.
+
+To bridge this vast performance chasm, the Linux kernel routes all filesystem read and write operations through a unified, in-RAM caching layer: the **Page Cache**.
+
+This chapter details the page cache architecture: why caching transforms system throughput, the modern **XArray** data structure, page state machines, sequential readahead algorithms, dirty page writeback daemons, the historical evolution from buffer heads to extents and folios, and an experiment to measure live page cache hit rates.
+
+## Why Caching File Data in RAM Transforms Performance
+
+In traditional Unix systems, disk caching was divided into two disparate pools:
+1. **The Buffer Cache**: Cached raw physical disk blocks from block devices.
+2. **The Page Cache**: Cached virtual memory pages for memory-mapped files.
+
+This dual-cache architecture wasted physical memory: reading a file via `read()` and simultaneously mapping it via `mmap()` resulted in duplicate copies of the same file data in RAM, requiring complex synchronization locks.
+
+In Linux 2.4, the kernel unified these architectures into a single **Unified Page Cache**. Today:
+- All disk reads populate the page cache.
+- All standard buffered writes modify page cache pages in RAM.
+- Virtual memory mappings and filesystem read/write calls operate on the identical physical memory frames.
+
+```
+┌────────────────────────────────────────────────────────────────────────┐
+│                        UNIFIED PAGE CACHE FLOW                         │
+│                                                                        │
+│   read(fd, buf, 4096)                 mmap(..., PROT_READ, fd, 0)      │
+│          │                                        │                    │
+│          ▼                                        ▼                    │
+│   VFS vfs_read()                       Process Page Table PTE          │
+│          │                                        │                    │
+│          └──────────────────┬─────────────────────┘                    │
+│                             ▼                                          │
+│   ┌──────────────────────────────────────────────────────────────┐     │
+│   │ Unified Page Cache (struct address_space)                    │     │
+│   │ Key: (struct inode *, page_offset)                           │     │
+│   │ Physical DRAM Page Frame                                     │     │
+│   └─────────────────────────┬────────────────────────────────────┘     │
+│                             ▼ Only on Cache Miss                       │
+│   Block I/O Layer (BIO) ──► NVMe / SATA Controller ──► Storage Disk    │
+└────────────────────────────────────────────────────────────────────────┘
+```
+
+## Page Cache Data Structures: Radix Trees and XArrays
+
+Every file in the filesystem is represented by an **`address_space`** structure (`inode->i_mapping`). To find whether page offset $N$ of a file is currently cached in RAM, the kernel needs an ultra-fast associative lookup data structure.
+
+### From Radix Trees to XArrays
+Historically, Linux organized page cache pages in a **Radix Tree**. In Linux 4.20+, Matthew Wilcox introduced the **XArray (eXtensible Array)**:
+
+```
+┌────────────────────────────────────────────────────────────────────────┐
+│                        XARRAY LOOKUP HIERARCHY                         │
+│                                                                        │
+│   File Offset Index: 0x0004A12B (32-bit chunk index)                   │
+│   [Bits 31..18]        [Bits 17..12]        [Bits 11..6]    [Bits 5..0]│
+│   Root Chunk           Level 2              Level 1         Leaf Slot  │
+│       │                    │                    │               │      │
+│       ▼                    ▼                    ▼               ▼      │
+│   [xa_node 64-way] ──► [xa_node 64-way] ──► [xa_node] ──► struct folio*│
+└────────────────────────────────────────────────────────────────────────┘
+```
+
+- **64-Way Radix Branches**: Each `xa_node` contains 64 pointers, indexed by 6-bit slices of the file offset.
+- **Lockless RCU Traversal**: XArray lookups operate under **Read-Copy Update (RCU)**. Thousands of concurrent reader threads can look up cached pages in the XArray simultaneously without acquiring locks or causing CPU cache-line bouncing.
+- **Modern Compound Folios**: In modern kernels, the XArray stores pointers to **`struct folio`**, representing variable-sized multi-page chunks ($4\text{ KiB}$ to $2\text{ MiB}$) rather than individual pages.
+
+## Page State Machine and Lifecycle Management
+
+A page inside the page cache transitions through well-defined states tracked by atomic flags in `page->flags`:
+
+1. **Allocated**: An empty physical page frame is allocated from the Buddy Allocator and inserted into the file's XArray. Marked with `PG_locked`.
+2. **Reading**: The kernel submits an asynchronous Block I/O read (`bio`) to the storage drive.
+3. **Uptodate (`PG_uptodate`)**: The DMA transfer completes; the page contains valid, synchronized file data. The lock is released.
+4. **Referenced & Active (`PG_referenced`, `PG_active`)**: Process reads the page; page is promoted on the LRU lists.
+5. **Dirty (`PG_dirty`)**: An application calls `write()`, modifying bytes in RAM. The page is now out of sync with disk storage.
+6. **Writeback (`PG_writeback`)**: The background flusher begins transferring the page to physical disk.
+7. **Clean**: Disk write completes; `PG_dirty` and `PG_writeback` are cleared. The page can now be reclaimed immediately if memory is needed.
+
+## Readahead Algorithms and Prefetching Strategies
+
+When an application reads a file sequentially, waiting for disk I/O on every consecutive $4\text{ KiB}$ page destroys throughput.
+
+ext4 and the page cache implement **Dynamic Asynchronous Readahead**:
+- **Initial Read**: When a process reads the first $4\text{ KiB}$, the kernel speculatively issues an I/O request for the next 16 to 32 pages ($64\text{ KiB}$ to $128\text{ KiB}$).
+- **Window Scaling**: As the application continues sequential reads, the kernel dynamically doubles the readahead window up to $512\text{ KiB}$ or $2\text{ MiB}$.
+- **Background I/O**: The prefetch I/O runs asynchronously in the background. By the time the user application reaches block 30, the data has already arrived in RAM, transforming disk reads into zero-latency memory copies.
+
+## Dirty Pages, Writeback, and Flush Daemons
+
+Buffered writes are committed to persistent disk storage asynchronously by dedicated kernel background threads: **`kworker/flush`** (formerly `pdflush` and `bdi-default-flush`).
+
+### The Writeback Triggers
+1. **Periodic Timer**: Every 5 seconds (configurable via `vm.dirty_writeback_centisecs`), flush threads wake up and write back pages that have been dirty longer than 30 seconds (`vm.dirty_expire_centisecs`).
+2. **Background Memory Ratio**: When dirty memory exceeds `vm.dirty_background_ratio` (e.g., 10% of total RAM), flusher threads start background I/O to drain dirty pages.
+3. **Hard Throttle Ratio**: If dirty memory reaches `vm.dirty_ratio` (e.g., 20% of total RAM), any process issuing `write()` is throttled: the process is forced to sleep and execute synchronous writeback itself before returning to user space.
+4. **Explicit Sync**: System calls `fsync()`, `fdatasync()`, or `sync()` force immediate, synchronous flushing.
+
+## Buffer Heads, Extents, and Historical Evolution
+
+In early Linux, every $4\text{ KiB}$ page frame was associated with four 1 KiB **Buffer Heads (`struct buffer_head`)** to track individual physical disk sectors.
+
+On high-throughput modern SSDs, maintaining buffer head descriptors introduces severe memory overhead and CPU spinlock contention. Modern filesystems (ext4 with extents, XFS, Btrfs) bypass buffer heads for data pages, submitting direct multi-page Block I/O requests (`bio`) mapped directly from extent ranges. Buffer heads are retained only for legacy metadata tracking.
+
+## Practical Experiment: Measuring Page Cache Hit Rates
+
+Using the `cachestat` eBPF tool from BCC, we can observe the live hit rate of the Linux page cache across all running processes:
+
+```bash
+# Monitor page cache hits, misses, and dirties every 2 seconds
+sudo /usr/share/bcc/tools/cachestat 2
+```
+
+```
+   HITS   MISSES  DIRTIES    HITRATIO   BUFFERS_MB  CACHED_MB
+ 142051       42      102      99.97%          214      12480
+ 189402       12      310      99.99%          214      12482
+  45210    12401     1205      78.47%          214      12530
+```
+
+A hit ratio drop below 90% indicates that the active workload working set exceeds available RAM, forcing frequent physical storage reads.

@@ -1,0 +1,167 @@
+---
+title: "Chapter 4: Physical Memory Management and the Buddy Allocator"
+---
+
+# Chapter 4: Physical Memory Management and the Buddy Allocator
+
+At the foundation of all memory allocations—whether servicing a user-space `malloc()`, a kernel SLUB object cache, or an NVMe Direct Memory Access (DMA) ring buffer—lies the physical page allocator.
+
+In Linux, physical RAM is managed in units of **page frames** (typically $4\text{ KiB}$). The kernel subsystem responsible for allocating and freeing contiguous physical page frames is the **Buddy Allocator**.
+
+This chapter explores physical memory management: the ubiquitous `struct page` descriptor, memory nodes and zones, the binary buddy allocation algorithm, allocation orders, GFP (Get Free Page) flags, fragmentation mitigation (migrate types), NUMA node policies, and an architectural walkthrough of the kernel source file `mm/page_alloc.c`.
+
+## Tracking Physical Pages: The `page` Struct and Memmap
+
+Every physical $4\text{ KiB}$ page frame of RAM in the system is tracked by a 64-byte descriptor: **`struct page`** (defined in `include/linux/mm_types.h`).
+
+On a server with 128 GiB of RAM, there are:
+$$\frac{128 \times 1024 \times 1024 \times 1024\text{ bytes}}{4096\text{ bytes}} = 33,554,432 \text{ physical pages}$$
+
+The contiguous array of all `struct page` descriptors is called the **memmap** (`vmemmap`). It consumes:
+$$33,554,432 \times 64\text{ bytes} \approx 2.14\text{ Gigabytes of RAM}$$
+
+Because the `page` struct consumes over 1.6% of total system RAM, kernel developers heavily overload its fields using unions to keep its size strictly locked at **64 bytes** (one CPU cache line).
+
+```c
+struct page {
+    unsigned long flags;          /* Bit flags: PG_locked, PG_active, PG_dirty, PG_lru */
+    union {
+        struct {
+            struct list_head lru; /* Page LRU list linkage */
+            struct address_space *mapping; /* Points to file inode if page cache */
+            pgoff_t index;        /* Offset within backing file */
+            unsigned long private;
+        };
+        struct { /* Used by SLUB Allocator */
+            void *freelist;       /* First free object */
+            unsigned counters;    /* inuse, objects, frozen */
+        };
+    };
+    atomic_t _refcount;           /* Structural reference counter */
+    atomic_t _mapcount;           /* Number of page tables mapping this page */
+};
+```
+
+In modern kernels (Linux 5.17+), multi-page contiguous allocations are increasingly tracked using **Memory Folios (`struct folio`)**, which guarantee that a memory chunk is a complete, unfragmented compound page.
+
+## Memory Zones and Node Architecture
+
+Physical memory is partitioned into a hierarchy: **Nodes $\rightarrow$ Zones $\rightarrow$ Page Frames**.
+
+```
+┌────────────────────────────────────────────────────────────────────────┐
+│                        PHYSICAL MEMORY HIERARCHY                       │
+│                                                                        │
+│   NUMA Node 0 (Socket 0 DRAM)          NUMA Node 1 (Socket 1 DRAM)     │
+│   ┌──────────────────────────────┐     ┌────────────────────────────┐  │
+│   │ ZONE_DMA    (First 16 MiB)   │     │ ZONE_NORMAL (All DRAM)     │  │
+│   │ ZONE_DMA32  (16 MiB - 4 GiB) │     │ ZONE_MOVABLE               │  │
+│   │ ZONE_NORMAL (4 GiB - 64 GiB) │     └────────────────────────────┘  │
+│   │ ZONE_MOVABLE                 │                                     │
+│   └──────────────────────────────┘                                     │
+└────────────────────────────────────────────────────────────────────────┘
+```
+
+- **`ZONE_DMA`**: The first $16\text{ MiB}$ of physical RAM, reserved for legacy ISA devices that cannot address beyond 24 bits.
+- **`ZONE_DMA32`**: Memory between $16\text{ MiB}$ and $4\text{ GiB}$, accessible by 32-bit PCI devices limited to 32-bit DMA addresses.
+- **`ZONE_NORMAL`**: Standard directly addressable memory used for regular kernel and user allocations.
+- **`ZONE_MOVABLE`**: Memory containing only movable pages (page cache and anonymous memory), used for hot-plug memory removal and memory compaction without pinning.
+
+Each zone is represented by a `struct zone` containing free page lists, page counters, and watermark thresholds (`WMARK_MIN`, `WMARK_LOW`, `WMARK_HIGH`).
+
+## The Buddy Allocator Algorithm and Implementation
+
+The Buddy Allocator is designed to satisfy two requirements:
+1. Allocate contiguous chunks of physical pages in powers of two.
+2. Rapidly coalesce adjacent free chunks (buddies) back into larger blocks when freed, preventing external fragmentation.
+
+### Allocation Orders ($0$ to $10$)
+The allocator categorizes free blocks into **Orders** ($0 \le \text{Order} \le 10$):
+
+$$\text{Block Size} = 2^{\text{Order}} \times 4096\text{ bytes}$$
+
+| Order | Page Count | Contiguous Memory Size |
+|---|---|---|
+| **0** | 1 page | $4\text{ KiB}$ |
+| **1** | 2 pages | $8\text{ KiB}$ |
+| **2** | 4 pages | $16\text{ KiB}$ |
+| **...** | ... | ... |
+| **9** | 512 pages | $2\text{ MiB}$ (Huge Page boundary) |
+| **10** | 1,024 pages | $4\text{ MiB}$ (Maximum allocation unit) |
+
+```
+┌────────────────────────────────────────────────────────────────────────┐
+│                        BUDDY SPLITTING AND MERGING                     │
+│                                                                        │
+│   Initial State: One Order 3 Block (8 Pages)                           │
+│   [Page 0] [Page 1] [Page 2] [Page 3] [Page 4] [Page 5] [Page 6] [Page 7]│
+│                                                                        │
+│   Request: Allocate Order 1 Block (2 Pages)                            │
+│   1. Split Order 3 -> Two Order 2 Blocks ([0..3] and [4..7])           │
+│   2. Split Order 2 [0..3] -> Two Order 1 Buddies ([0..1] and [2..3])   │
+│   3. Allocate [0..1] to caller. Remaining buddies placed on free lists: │
+│      - Order 1 List: [2..3]                                            │
+│      - Order 2 List: [4..7]                                            │
+│                                                                        │
+│   Freeing: When [0..1] is freed, the kernel checks its buddy [2..3].   │
+│   If [2..3] is free, they coalesce instantly into Order 2 [0..3],      │
+│   which coalesces with buddy [4..7] back into Order 3 [0..7]!         │
+└────────────────────────────────────────────────────────────────────────┘
+```
+
+The physical buddy of a page block is calculated using a bitwise XOR:
+$$\text{Buddy PFN} = \text{Block PFN} \oplus (1 \ll \text{Order})$$
+
+## Allocation Paths: GFP Flags and Context Sensitivity
+
+Kernel code requests pages using `alloc_pages(gfp_mask, order)`:
+
+```c
+struct page *page = alloc_pages(GFP_KERNEL, 0);
+```
+
+The **Get Free Page (GFP)** flags instruct the allocator how aggressively it may behave to find memory:
+
+- **`GFP_KERNEL`**: Standard process-context allocation. The calling thread may sleep, wait for I/O, or trigger page reclaim if memory is low.
+- **`GFP_ATOMIC`**: High-priority allocation for interrupt handlers and atomic spinlock regions. **Must never sleep**. Draws from emergency watermark memory pools.
+- **`GFP_DMA32`**: Forces allocation from `ZONE_DMA32`.
+- **`__GFP_ZERO`**: Automatically fills the allocated pages with zeros before returning.
+- **`__GFP_NOWARN`**: Suppresses kernel warning stack traces if the allocation fails.
+
+## Fragmentation Analysis and Mitigation Strategies
+
+Over time, random allocations and deallocations scatter pinned pages across the buddy lists, preventing the formation of contiguous Order 9 ($2\text{ MiB}$) blocks required for Transparent Huge Pages.
+
+### Grouping by Mobility (`migrate_types`)
+Linux combats fragmentation by dividing free lists within each zone into distinct mobility classes:
+1. **`MIGRATE_UNMOVABLE`**: Kernel code, core data structures, and DMA buffers. Cannot be relocated in memory.
+2. **`MIGRATE_RECLAIMABLE`**: File-backed page cache folios and slab caches that can be shrunk or dropped under memory pressure.
+3. **`MIGRATE_MOVABLE`**: User-space anonymous memory and buffers. The kernel can relocate these pages to new physical frames simply by updating the owning process's page table entries.
+
+By clustering unmovable allocations into dedicated physical page blocks, Linux prevents a single unmovable 4 KiB kernel page from spoiling a contiguous 2 MiB huge page block.
+
+```bash
+# Inspect buddyinfo free page counts across orders on your system
+cat /proc/buddyinfo
+```
+
+## Source Walkthrough: `mm/page_alloc.c`
+
+The entry point for all physical page allocation is `__alloc_pages()` in `mm/page_alloc.c`:
+
+```
+__alloc_pages(gfp_mask, order, preferred_nid, nodemask)
+  │
+  ├─► 1. Fast Path: get_page_from_freelist()
+  │      Scan preferred zone free lists above WMARK_LOW.
+  │      If free block exists: rmqueue() removes block from buddy list.
+  │      Returns page immediately! (Latency: ~50 ns)
+  │
+  └─► 2. Slow Path: __alloc_pages_slowpath()
+         Watermark fell below threshold.
+         ├─ Wake kswapd background reclaim daemon.
+         ├─ If GFP_ATOMIC: draw from emergency reserve pools.
+         ├─ Compact memory (kcompactd) to synthesize contiguous blocks.
+         ├─ Direct Reclaim: caller thread flushes dirty pages to disk.
+         └─ Final resort: invoke the Out-of-Memory (OOM) killer!
+```

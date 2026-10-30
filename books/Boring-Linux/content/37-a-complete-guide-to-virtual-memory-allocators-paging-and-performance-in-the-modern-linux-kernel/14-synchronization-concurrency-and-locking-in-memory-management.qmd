@@ -1,0 +1,238 @@
+---
+title: "Chapter 14: Synchronization, Concurrency, and Locking in Memory Management"
+---
+
+# Chapter 14: Synchronization, Concurrency, and Locking in Memory Management
+
+On modern multi-core servers featuring 128, 256, or more physical CPU cores, millions of concurrent allocation, deallocation, page table modification, and cache invalidation operations execute simultaneously every second.
+
+If the Linux kernel relied on a coarse-grained global memory lock, processor cores would spend more than 90% of their execution time stalled on cache coherency traffic and spinlock contention. Conversely, uncoordinated concurrent updates to page tables, freelists, and reference counters would cause catastrophic kernel memory corruption, use-after-free exploits, and silent filesystem destruction.
+
+This chapter examines the synchronization primitives, locking hierarchies, and lockless algorithms that allow the Linux memory management subsystem to scale efficiently across hundreds of cores.
+
+---
+
+## Concurrency Challenges in a Shared Allocator
+
+The memory management subsystem faces several acute concurrency challenges:
+
+1. **High Call Frequency**: `kmalloc`, page faults, and page frees occur millions of times per second across all running threads.
+2. **Global State Mutation**: The buddy allocator maintains global free lists; the page cache maintains global inode mappings; swap maintains shared disk slots.
+3. **Cache Line Bouncing**: When multiple CPUs contend for the same atomic spinlock or cache line, the inter-core interconnect (UPI on Intel, Infinity Fabric on AMD) is flooded with MESI invalidation traffic.
+4. **Deadlock Vulnerability**: Memory allocation occurs inside interrupt contexts, page fault handlers, filesystem writeback paths, and storage drivers. A circular lock dependency between memory and I/O will instantly freeze the machine.
+
+```
+┌────────────────────────────────────────────────────────────────────────┐
+│             THE LOCK CONTENTION VS MEMORY ISOLATION SPECTRUM           │
+│                                                                        │
+│ Global Lock (Bottleneck)         Hierarchical / Distributed (Scalable) │
+│                                                                        │
+│   CPU 0 ──┐                        CPU 0 ──► Per-CPU PCP Array (Fast) │
+│   CPU 1 ──┼─► [ Global Lock ]      CPU 1 ──► Per-CPU PCP Array (Fast) │
+│   CPU 2 ──┤        │                                   │ (Depleted)    │
+│   CPU 3 ──┘   100% Contention                          ▼               │
+│               Bus Invalidation                [ Zone Spinlock ]        │
+│                                                        │ (Depleted)    │
+│                                                        ▼               │
+│                                               [ Node pgdat Lock ]      │
+└────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Locking Hierarchy and Deadlock Prevention
+
+To eliminate circular lock deadlocks (`ABBA` lock inversions), the Linux kernel enforces an unyielding, top-down locking hierarchy across all virtual memory operations:
+
+```
+1. mmap_lock (struct mm_struct) [Down Read / Down Write]
+     │
+     ▼
+2. VMA Lock (struct vm_area_struct) [Per-VMA lock for concurrent faults]
+     │
+     ▼
+3. Page Table Lock (PTL) (pmd_lock / pte_lock) [Spinlock]
+     │
+     ▼
+4. Page Lock (PG_locked flag / folio_lock) [Bit-wait queue]
+     │
+     ▼
+5. Inode i_rwsem & Address Space Lock (i_mapping->i_mmap_rwsem)
+     │
+     ▼
+6. Zone / Node Lock (zone->lock / pgdat->lru_lock) [Spinlock]
+```
+
+### The `mmap_lock` (Formerly `mmap_sem`)
+The `mmap_lock` is a reader-writer semaphore protecting a process's virtual address space (`mm_struct`):
+- **Read Mode (`down_read(&mm->mmap_lock)`)**: Multiple threads within the same process handle page faults simultaneously, read `/proc/self/maps`, or query address mappings.
+- **Write Mode (`down_write(&mm->mmap_lock)`)**: Exclusively acquired during `mmap()`, `munmap()`, `mprotect()`, `brk()`, or `mremap()`. All page faults across all threads in that process freeze until the structural modification completes.
+
+Historically, heavily multi-threaded workloads (such as JVMs, Go runtimes, and databases) suffered severe latency spikes when background threads called `mprotect()` or allocated large memory arenas while hundreds of worker threads handled concurrent minor page faults.
+
+### Per-VMA Locks (Modern Linux 6.2+)
+To break the `mmap_lock` bottleneck, modern Linux kernels introduce **Per-VMA Locking**. Each `struct vm_area_struct` has its own lightweight lock (`vma->vm_lock`):
+- A page fault acquires only the local VMA lock in read mode using RCU and sequence counting (`vma_start_read(vma)`).
+- Multiple threads can fault on different memory regions (e.g., Thread A on the heap and Thread B on a thread stack) without contending on `mm->mmap_lock`.
+
+---
+
+## Page Table Locks (PTL) and Split Lock Architecture
+
+Early Linux kernels used a single spinlock per process (`mm->page_table_lock`) to protect all page table updates. In multi-socket servers with hundreds of threads modifying pagetables simultaneously, this lock caused massive contention.
+
+Modern Linux kernels utilize **Split Page Table Locks**:
+
+```c
+/* Lock defined per Page Table Entry (PTE) or Page Middle Directory (PMD) */
+spinlock_t *pte_lockptr(struct mm_struct *mm, pmd_t *pmd) {
+    return ptlock_ptr(pmd_pgtable(*pmd));
+}
+```
+
+- **PTE-Level Locking**: Each 4 KiB PTE page table page has its own individual spinlock (often embedded in the `struct page` representing that page table page).
+- **PMD-Level Locking**: Used during 2 MiB Transparent Huge Page (THP) allocations, splits, and collapses.
+- **Benefits**: Threads modifying disparate 2 MiB virtual address regions lock completely separate spinlocks, allowing parallel page table updates without inter-thread interference.
+
+---
+
+## Zone Locks, pgdat Locks, and LRU Lists
+
+Moving from virtual memory to physical memory, the kernel must protect physical frame allocators:
+
+1. **`zone->lock`**: A spinlock protecting the buddy allocator freelists (`free_area[order]`) within a specific memory zone (e.g., `ZONE_NORMAL`).
+2. **`pgdat->lru_lock`**: Protects the active and inactive LRU lists for an entire NUMA node. When `kswapd` or direct reclaim scans pages for eviction, it acquires `lru_lock`.
+
+Because thousands of allocation requests occur per second, threads do not directly acquire `zone->lock` on every `alloc_pages()` call. Instead, they hit per-CPU caches.
+
+---
+
+## Per-CPU Data Structures and Lockless Paths
+
+The golden rule of kernel scalability is: **The fastest lock is the lock you never acquire**.
+
+```
+┌────────────────────────────────────────────────────────────────────────┐
+│                   PER-CPU PAGE ALLOCATION FAST PATH                     │
+│                                                                        │
+│   CPU 3 Thread                                                         │
+│     │                                                                  │
+│     ▼                                                                  │
+│   Disable Preemption / Local Interrupts                                │
+│     │                                                                  │
+│     ▼                                                                  │
+│   Read cpu_id = 3                                                      │
+│     │                                                                  │
+│     ├───► PCP List has pages?                                          │
+│     │       ├── YES: Pop page struct from local array; re-enable IRQ;  │
+│     │       │        RETURN (Zero bus locks, zero contention!)         │
+│     │       │                                                          │
+│     │       └── NO:  Acquire spin_lock(&zone->lock)                    │
+│     │                Batch refill 32 pages from Buddy Allocator        │
+│     │                Release spin_lock(&zone->lock)                    │
+│     │                Pop page; RETURN                                  │
+└────────────────────────────────────────────────────────────────────────┘
+```
+
+1. **Per-CPU Pagesets (PCP)**:
+   - Each CPU core maintains a private array of free single pages (`struct per_cpu_pages`).
+   - Accessing local PCP requires only disabling local interrupts (`local_irq_save()`) to prevent interrupt handler races. No cross-CPU locks are touched.
+2. **SLUB Cpu-Slabs**:
+   - `kmem_cache_cpu` allows lockless fast-path allocations using atomic compare-and-swap (`cmpxchg_double`) or local freelist traversal.
+3. **Page Counter Buffers**:
+   - Memory cgroup tracking uses per-CPU stock caches (`struct memcg_stock_pcp`) to batch charge adjustments, preventing global atomic counter bouncing.
+
+---
+
+## Reference Counting and RCU Page Lifecycle
+
+Tracking when a physical page can be safely freed is governed by reference counters and Read-Copy-Update (RCU):
+
+### Page Reference Count vs Map Count
+- **`page->_refcount`** (accessed via `page_count()` / `get_page()` / `put_page()`): Tracks active kernel references. If `_refcount == 0`, the page has no users and belongs to the buddy allocator.
+- **`page->_mapcount`** (accessed via `page_mapcount()`): Tracks how many user-space page table entries map this physical page. A page can have `_refcount == 5` (e.g., page cache + DMA buffers) but `_mapcount == 0` (unmapped from user space).
+
+### Read-Copy-Update (RCU) in Page Lookups
+When searching the page cache for an inode's file offset, acquiring a lock on the entire Radix Tree / XArray on every read would cripple I/O throughput.
+
+```c
+/* Lockless page cache lookup using RCU */
+rcu_read_lock();
+folio = filemap_get_folio(mapping, index);
+rcu_read_unlock();
+
+if (!folio)
+    goto page_miss;
+```
+
+1. The reader acquires `rcu_read_lock()`.
+2. The XArray is traversed without taking any write lock or spinlock.
+3. When freeing or replacing a page, the memory management subsystem updates the pointer and defers physical destruction until all active RCU read-side critical sections have completed (`call_rcu()`).
+
+---
+
+## Memory Barriers and Ordering
+
+Modern out-of-order execution processors (such as x86-64, ARM64 Neoverse, and RISC-V) reorder memory loads and stores aggressively. When one CPU initializes a page's contents and makes it visible to another CPU via a page table update, strict memory ordering must be enforced.
+
+```c
+/* CPU 0: Allocates and initializes page */
+memset(page_address(page), 0, PAGE_SIZE);
+/* Ensure page content writes commit to L1/L2 cache before PTE update */
+smp_wmb();
+set_pte_at(mm, address, ptep, pte);
+
+/* CPU 1: Traverses page table and consumes page */
+pte = ptep_get(ptep);
+if (pte_present(pte)) {
+    /* Ensure PTE read completes before accessing memory payload */
+    smp_rmb();
+    data = *page_address(pte_page(pte));
+}
+```
+
+- **`smp_wmb()`**: Store memory barrier; guarantees all writes before the barrier are globally observed before any writes after the barrier.
+- **`smp_rmb()`**: Read memory barrier; prevents subsequent reads from being speculatively fetched before preceding reads.
+- **`smp_mb()`**: Full two-way barrier; serializes all memory accesses across the bus.
+
+Without these explicit barriers, a remote CPU might execute instructions against stale uninitialized data while reading the newly published page table pointer.
+
+---
+
+## Diagnosing Scalability Contention on Large Systems
+
+Systems engineers can detect memory locking contention in production using built-in Linux profiling tools.
+
+### 1. Inspecting Spinlock Bottlenecks with `perf`
+```bash
+# Record lock events and CPU cycles across all cores
+sudo perf record -a -g -e lock:lock_acquire,lock:lock_acquired -- sleep 5
+
+# Identify top contended spinlocks
+sudo perf report --sort=symbol
+```
+
+If symbols like `_raw_spin_lock` originating from `free_pcppages_bulk`, `rmqueue_bulk`, or `lru_lock` dominate the profile, the system is suffering from memory allocator lock contention.
+
+### 2. Monitoring Per-VMA Lock Hit Rates
+```bash
+# Check per-VMA lock statistics on Linux 6.2+
+grep -E "vma_lock" /proc/vmstat
+```
+Output:
+```text
+vma_lock_success 184592031
+vma_lock_abort   120349
+vma_lock_retry   4102
+```
+A high ratio of `vma_lock_success` to `vma_lock_abort` indicates that page faults are executing concurrently across cores without stalling on `mm->mmap_lock`.
+
+---
+
+## Key Takeaways
+
+- Memory allocation relies on a strict lock hierarchy starting with `mmap_lock` and terminating in `zone->lock` to prevent circular deadlocks.
+- Per-VMA locks in modern Linux kernels decouple concurrent page fault handling from global address space modification.
+- Split page table locks distribute spinlocks to individual PTE and PMD pages, avoiding cross-core collisions.
+- Per-CPU pagesets and lockless SLUB caches allow over 95% of allocation requests to complete without touching shared bus locks.
+- RCU and explicit SMP memory barriers ensure fast-path page cache lookups remain coherent across out-of-order CPU microarchitectures.

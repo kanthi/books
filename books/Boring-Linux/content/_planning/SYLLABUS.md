@@ -823,6 +823,93 @@ Outcome: master low-level Linux performance analysis, subsystem profiling, kerne
 - **Chapter 27: Advanced Topics and Emerging Technologies**
 - **Conclusion: Putting It All Together**
 
+### Part 35 — A Practical Guide to Securing Linux from Kernel to Cloud
+
+Outcome: master defense-in-depth Linux security engineering from hardware roots of trust and kernel mitigations up to container runtimes, cloud instance metadata, and enterprise fleet orchestration.
+
+- **Introduction: Why Linux Security Is Not a Given**
+- **Chapter 1: The State of Linux Security**
+- **Chapter 2: The Linux Security Model**
+- **Chapter 3: Boot, Initialization, and Runtime Environment**
+- **Chapter 4: Identity, Authentication, and Access Control**
+- **Chapter 5: Filesystem Security and Data Protection**
+- **Chapter 6: Network Security Hardening**
+- **Chapter 7: Kernel Security Mechanisms**
+- **Chapter 8: Mandatory Access Control: SELinux and AppArmor**
+- **Chapter 9: Auditing, Logging, and Security Monitoring**
+- **Chapter 10: Secure Service and Workload Configuration**
+- **Chapter 11: Container and Virtualization Security**
+- **Chapter 12: Common Attack Paths and Defensive Strategies**
+- **Chapter 13: Enterprise Hardening at Scale**
+- **Chapter 14: Compliance, Benchmarks, and Security Standards**
+- **Chapter 15: Incident Response, Troubleshooting, and Continuous Improvement**
+- **Conclusion: Continuous Security Improvement**
+
+### Part 36 — The ext4 Filesystem: Architecture, Internals, and Implementation
+
+Outcome: master on-disk filesystem engineering, block group geometries, 256-byte inode layouts, B+ extent trees, HTree directory indexing, Multi-Block allocation (mballoc), delayed allocation, JBD2 journaling internals, metadata checksumming, and C/Rust parsing implementations.
+
+- **Introduction**
+- **Chapter 1: The Story of ext**
+- **Chapter 2: On-Disk Layout Fundamentals**
+- **Chapter 3: The Inode – Anatomy of a File**
+- **Chapter 4: Directory Formats**
+- **Chapter 5: Extents – Modern Block Mapping**
+- **Chapter 6: Block Allocation Algorithms**
+- **Chapter 7: Journaling with JBD2**
+- **Chapter 8: Extended Attributes, ACLs and Quotas**
+- **Chapter 9: Advanced Features**
+- **Chapter 10: Feature Flags and Compatibility**
+- **Chapter 11: VFS Integration and Kernel Implementation**
+- **Chapter 12: Recovery, Corruption Detection and Repair**
+- **Chapter 13: Performance, Scalability and Comparisons**
+- **Chapter 14: Implementation Guide**
+
+### Part 37 — A Complete Guide to Virtual Memory, Allocators, Paging, and Performance in the Modern Linux Kernel
+
+Outcome: master low-level virtual memory, hardware MMUs, multi-level page table walks, physical frame tracking in struct page, the buddy allocator, SLUB/SLAB/SLOB caches, user-space allocators, demand paging and copy-on-write, unified page caching with XArrays/folios, LRU swap/reclaim, compaction and huge pages (THP/HugeTLB), NUMA policies, cgroups v2 memory limits, OOM badness heuristics, concurrency synchronization/locking, profiling with perf/eBPF/ftrace, memory exploitation mitigations, architecture-specific MM across x86-64/ARM64/RISC-V, and emerging tiered CXL memory architectures.
+
+- **Introduction**
+- **Chapter 1: Foundations of Memory Abstraction**
+- **Chapter 2: Hardware Foundations and Address Translation**
+- **Chapter 3: Linux Address Spaces and the Virtual Memory Layout**
+- **Chapter 4: Physical Memory Management and the Buddy Allocator**
+- **Chapter 5: Kernel Memory Allocators: Slab, Slub, and SLOB**
+- **Chapter 6: User-Space Memory Allocation and vmalloc**
+- **Chapter 7: Demand Paging, Page Faults, and Copy-on-Write**
+- **Chapter 8: The Page Cache and Buffer Head Architecture**
+- **Chapter 9: Swapping, Reclaim, and Page Replacement Policies**
+- **Chapter 10: Memory Compaction, Defragmentation, and Huge Pages**
+- **Chapter 11: NUMA, Memory Policy, and Scalability**
+- **Chapter 12: Memory Cgroups, Controllers, and Resource Limits**
+- **Chapter 13: Out-of-Memory Handling, Panic, and Recovery**
+- **Chapter 14: Synchronization, Concurrency, and Locking in Memory Management**
+- **Chapter 15: Performance Optimization, Profiling, and Debugging**
+- **Chapter 16: Security Implications, Exploits, and Mitigations**
+- **Chapter 17: Architecture-Specific Implementations and Source Walkthroughs**
+- **Chapter 18: Conclusion: Synthesis and Future Directions**
+
+### Part 38 — Ubuntu 26.04 LTS: From Desktop to Enterprise Cloud
+
+Outcome: master the 2026–2038 Long Term Support baseline of Ubuntu across developer workstations, headless bare-metal servers, containerized microservices, and multi-region enterprise clouds. Covers GNOME 50 on Wayland, memory-safe userspace primitives in Rust (sudo-rs, uutils), TPM 2.0-backed full-disk encryption, systemd 259 with unified cgroups v2, Netplan 1.2, AppArmor 4, nftables, OpenSSH 10.2, KVM/QEMU and LXD, confidential computing with Intel TDX / AMD SEV-SNP, cloud-init multi-cloud deployments, toolchains for Python 3.14 (free-threaded), Rust, Go 1.25, AI acceleration (NVIDIA CUDA 13, AMD ROCm), kdump forensics, performance tuning on amd64-v3, custom image crafting with ubuntu-image, and enterprise fleet management with Canonical Landscape, authd, and ADSys.
+
+- **Introduction: Why Ubuntu 26.04 Matters**
+- **Chapter 1: What Is Ubuntu 26.04 LTS?**
+- **Chapter 2: System Requirements and Installation**
+- **Chapter 3: First Boot and Desktop Experience**
+- **Chapter 4: Command-Line Fundamentals**
+- **Chapter 5: System Administration Essentials**
+- **Chapter 6: Security Hardening**
+- **Chapter 7: Networking and Services**
+- **Chapter 8: Virtualization and Containers**
+- **Chapter 9: Cloud Infrastructure**
+- **Chapter 10: Development Workflow**
+- **Chapter 11: Troubleshooting and Diagnostics**
+- **Chapter 12: Performance Tuning and Optimization**
+- **Chapter 13: Customization and Flavors**
+- **Chapter 14: Enterprise Deployment and Management**
+- **Conclusion: The Road Ahead**
+
 ## Appendices and reference material
 
 Reference material supports the progressive chapters and is not required pre-reading.

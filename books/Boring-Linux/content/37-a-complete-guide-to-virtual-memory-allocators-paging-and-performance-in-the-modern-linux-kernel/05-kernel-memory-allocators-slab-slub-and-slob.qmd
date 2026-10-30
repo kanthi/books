@@ -1,0 +1,187 @@
+---
+title: "Chapter 5: Kernel Memory Allocators: Slab, Slub, and SLOB"
+---
+
+# Chapter 5: Kernel Memory Allocators: Slab, Slub, and SLOB
+
+While the Buddy Allocator manages memory in coarse $4\text{ KiB}$ page frames, the Linux kernel rarely allocates memory in page-sized chunks. Kernel subsystems continuously allocate tiny objects: a 256-byte `struct inode`, a 192-byte `struct dentry`, a 160-byte network packet buffer (`sk_buff`), or a 32-byte timer descriptor.
+
+If the kernel allocated a full $4\text{ KiB}$ page frame for every 64-byte data structure, over 98% of physical memory would be lost to internal fragmentation.
+
+To solve this, Linux employs the **Slab Allocator Family**. This chapter explores the architecture of kernel object caching: the historical SLAB allocator, the modern **SLUB** allocator, the embedded SLOB allocator, lockless per-CPU caches, the `kmalloc` family, cache line alignment, false sharing, and how to write a custom kernel module with a dedicated slab cache.
+
+## Why Kernel Needs Specialized Allocators
+
+Kernel object allocation exhibits distinct characteristics:
+
+1. **Repetitive Lifecycles**: The kernel allocates and deallocates identical data structures millions of times per second (e.g., creating and destroying `task_struct` on every fork/exit, or allocating `sk_buff` on every incoming Ethernet packet).
+2. **Expensive Initialization**: Initializing complex kernel objects involves setting up linked list pointers, initializing mutexes, spinlocks, and atomic reference counters. Reinitializing memory from scratch on every allocation wastes CPU cycles.
+3. **Internal Fragmentation Prevention**: Sub-page allocators carve a $4\text{ KiB}$ page into hundreds of uniform slots, ensuring zero internal waste.
+4. **Cache Warmth and CPU Affinity**: Reusing recently freed objects keeps hot data inside CPU L1/L2 caches, eliminating DRAM bus stalls.
+
+## The Slab Allocator Design and History
+
+Invented by Jeff Bonwick at Sun Microsystems for Solaris and adopted by Linux in 2.2, the **SLAB** allocator introduced **Object Caching**:
+
+```
+┌────────────────────────────────────────────────────────────────────────┐
+│                        TRADITIONAL SLAB DESIGN                         │
+│                                                                        │
+│   kmem_cache ("inode_cache", size = 256 B)                             │
+│   ├── slabs_full   (All objects allocated)                             │
+│   ├── slabs_partial (Some objects free; allocations serviced here)     │
+│   └── slabs_empty  (All objects free; candidates for page reclaim)     │
+│                                                                        │
+│   Physical Slab (Contiguous 4 KiB Page Frame):                         │
+│   ┌──────────────────────────────────────────────────────────────┐     │
+│   │ [kmem_bufctl (queue)] [Object 0] [Object 1] ... [Object 15]  │     │
+│   └──────────────────────────────────────────────────────────────┘     │
+└────────────────────────────────────────────────────────────────────────┘
+```
+
+The original SLAB allocator maintained complex on-page metadata queues (`kmem_bufctl`) and three double-linked lists (`slabs_full`, `slabs_partial`, `slabs_empty`). On large multi-core servers, lock contention across these shared lists degraded scalability.
+
+## Slub: Simplification and Performance Improvements
+
+Authored by Christoph Lameter, **SLUB** is the default allocator in all modern Linux distributions. SLUB radically simplified internal mechanics by eliminating external list queues:
+
+```
+┌────────────────────────────────────────────────────────────────────────┐
+│                        SLUB IN-OBJECT FREELIST                         │
+│                                                                        │
+│   Slab Page (struct page repurposed):                                  │
+│   ┌──────────────────────────────────────────────────────────────┐     │
+│   │ Object 0: [payload]                                          │     │
+│   │ Object 1 (Free): [freelist_ptr ──► 0x... (points to Obj 3)] │     │
+│   │ Object 2: [payload]                                          │     │
+│   │ Object 3 (Free): [freelist_ptr ──► NULL (last free object)]  │     │
+│   └──────────────────────────────────────────────────────────────┘     │
+└────────────────────────────────────────────────────────────────────────┘
+```
+
+- **In-Object Free Lists**: Unallocated objects store the pointer to the next free object directly inside their own uninitialized payload memory, requiring zero external metadata.
+- **`struct page` Metadata**: SLUB repurposes unused fields in the page frame's `struct page` (`page->freelist`, `page->inuse`, `page->objects`), tracking slab status without allocating separate control descriptors.
+
+## SLOB: Minimalist Allocation for Embedded Systems
+
+**Simple List of Blocks (SLOB)** was engineered for tiny embedded microcontrollers with minimal RAM (e.g., 8–32 MiB):
+- Implements a first-fit singly linked list algorithm over page frames.
+- Low memory footprint, but suffers from poor multi-core scaling and fragmentation.
+- Deprecated and formally removed in Linux 6.4 in favor of SLUB.
+
+## Per-CPU Caches and Lockless Fast Paths
+
+To achieve millions of allocations per second across 128 CPU cores without lock contention, SLUB maintains a **Per-CPU Cache (`struct kmem_cache_cpu`)**:
+
+```
+┌────────────────────────────────────────────────────────────────────────┐
+│                        SLUB PER-CPU ALLOCATION PATH                    │
+│                                                                        │
+│   Core 0 executes kmem_cache_alloc():                                  │
+│   1. Read this_cpu_ptr(s->cpu_slab)->freelist                          │
+│   2. If freelist != NULL:                                              │
+│      - Atomically advance freelist pointer (cmpxchg_double)            │
+│      - Return object pointer immediately! (ZERO LOCKS ACQUIRED, ~5 ns) │
+│                                                                        │
+│   3. If freelist == NULL (Local CPU Slab Exhausted):                   │
+│      - Slow Path: Acquire node spinlock                                │
+│      - Fetch partial slab from NUMA node list                          │
+│      - If node empty: allocate new physical page from Buddy Allocator  │
+└────────────────────────────────────────────────────────────────────────┘
+```
+
+By decoupling normal allocations from global locks, SLUB delivers near-perfect linear scaling across multi-socket systems.
+
+## `kmalloc`, `kcalloc`, and the Kernel Allocation API
+
+The kernel provides dynamic memory APIs analogous to user-space `malloc()`:
+
+- **`kmalloc(size_t size, gfp_t flags)`**: Allocates a buffer of arbitrary size. Backed by general-purpose slab caches sized in powers of two (`kmalloc-8`, `kmalloc-16`, `kmalloc-32`, ..., `kmalloc-8192`):
+  ```c
+  char *buf = kmalloc(512, GFP_KERNEL);
+  if (!buf) return -ENOMEM;
+  kfree(buf);
+  ```
+- **`kzalloc(size_t size, gfp_t flags)`**: Identical to `kmalloc`, but zeroes the allocated memory.
+- **`kcalloc(size_t n, size_t size, gfp_t flags)`**: Allocates memory for an array with integer overflow protection.
+
+## Cache Colocation, False Sharing, and NUMA Effects
+
+Memory performance on multi-core processors depends heavily on CPU L1/L2 cache line alignment ($64\text{ bytes}$ on x86-64 and ARM64):
+
+- **False Sharing**: Occurs when two independent variables accessed concurrently by different CPU cores reside on the same 64-byte cache line. When Core 0 writes Variable A, the hardware cache coherency protocol (MESI/MOESI) invalidates the entire cache line on Core 1, forcing Core 1 to stall while re-fetching Variable B from L3 cache or DRAM.
+- **Slab Cache Alignment**: Always align performance-critical structures to cache line boundaries using `SLAB_HWCACHE_ALIGN`:
+  ```c
+  struct kmem_cache *cache = kmem_cache_create("my_cache", sizeof(struct my_struct),
+                                               0, SLAB_HWCACHE_ALIGN, NULL);
+  ```
+
+## Building a Custom Kernel Allocator Module
+
+Below is a complete, working Linux kernel module demonstrating the creation, allocation, and destruction of a dedicated SLUB cache:
+
+```c
+/* slab_demo.c - Kernel module demonstrating custom SLUB allocator */
+#include <linux/module.h>
+#include <linux/kernel.h>
+#include <linux/init.h>
+#include <linux/slab.h>
+
+MODULE_LICENSE("GPL");
+MODULE_AUTHOR("Systems Engineer");
+MODULE_DESCRIPTION("Custom SLUB Cache Demonstration");
+
+struct worker_task {
+    int task_id;
+    char buffer[256];
+    unsigned long timestamp;
+};
+
+static struct kmem_cache *worker_cache;
+
+static int __init slab_demo_init(void) {
+    struct worker_task *task;
+    pr_info("SLUB Demo: Initializing custom cache\n");
+
+    /* Create a named SLUB cache with hardware cache line alignment */
+    worker_cache = kmem_cache_create(
+        "worker_task_cache",
+        sizeof(struct worker_task),
+        0,
+        SLAB_HWCACHE_ALIGN | SLAB_PANIC,
+        NULL
+    );
+
+    /* Allocate an object from the dedicated cache */
+    task = kmem_cache_alloc(worker_cache, GFP_KERNEL);
+    if (!task) {
+        pr_err("SLUB Demo: Allocation failed\n");
+        return -ENOMEM;
+    }
+
+    task->task_id = 101;
+    task->timestamp = jiffies;
+    pr_info("SLUB Demo: Allocated object at address %px (task_id: %d)\n",
+            task, task->task_id);
+
+    /* Free the object back to the cache */
+    kmem_cache_free(worker_cache, task);
+    pr_info("SLUB Demo: Object freed successfully\n");
+
+    return 0;
+}
+
+static void __exit slab_demo_exit(void) {
+    /* Destroy the cache */
+    kmem_cache_destroy(worker_cache);
+    pr_info("SLUB Demo: Cache destroyed\n");
+}
+
+module_init(slab_demo_init);
+module_exit(slab_demo_exit);
+```
+
+```bash
+# Verify active slab caches on a running system using slabtop
+sudo slabtop -s c
+```

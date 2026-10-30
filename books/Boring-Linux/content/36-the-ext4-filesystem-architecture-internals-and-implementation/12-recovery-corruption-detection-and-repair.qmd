@@ -1,0 +1,130 @@
+---
+title: "Chapter 12: Recovery, Corruption Detection and Repair"
+---
+
+# Chapter 12: Recovery, Corruption Detection and Repair
+
+Storage media is physically volatile. Cosmic rays, firmware bugs in drive controllers, failing SATA/NVMe lanes, cabling faults, and abrupt power loss can induce silent data corruption (bit rot) or leave metadata pointers pointing to corrupt blocks.
+
+A production filesystem must provide robust mechanisms to detect corruption immediately, isolate damaged structures before damage spreads, and offer deterministic repair tools capable of restoring structural invariants.
+
+This chapter explores ext4's resilience architecture: metadata checksumming (`metadata_csum`), the internal five-pass mechanics of `e2fsck`, runtime kernel error handling, locating and mounting backup superblocks, and low-level forensic disk analysis with `debugfs`.
+
+## Checksum Offsets and Verification (`crc32c`)
+
+In early ext2 and ext3 filesystems, corruption often went unnoticed until a process attempted to traverse an invalid pointer and crashed.
+
+Modern ext4 incorporates **Full Metadata Checksumming (`metadata_csum`)**, protecting every critical structural element with a hardware-accelerated **CRC32c (Castagnoli)** checksum:
+
+```
+┌────────────────────────────────────────────────────────────────────────┐
+│                        METADATA CSUM CALCULATION                       │
+│                                                                        │
+│   Superblock UUID (128-bit) ──► Initial CRC32c Seed (s_csum_seed)      │
+│                                           │                            │
+│                                           ▼                            │
+│   Target Metadata Block / Inode Bytes (minus checksum field itself)    │
+│                                           │                            │
+│                                           ▼ Hardware CRC32c            │
+│   Calculated Checksum ──► Matches Stored Checksum?                     │
+│         ├─► YES: Process operation safely                              │
+│         └─► NO:  Trigger ext4_error(); block operation; log to dmesg   │
+└────────────────────────────────────────────────────────────────────────┘
+```
+
+### Checksum Locations Across On-Disk Structures
+- **Superblock**: `s_checksum` (offset `0x3FC` in the superblock).
+- **Group Descriptors**: `bg_checksum` (16-bit) and `bg_block_bitmap_csum_hi/lo` (32-bit).
+- **Inodes**: `i_checksum_lo` (offset `0x7E`) and `i_checksum_hi` (offset `0x82`).
+- **Extent Tree Nodes**: Final 4 bytes of leaf and index blocks (`ext4_extent_tail.et_checksum`).
+- **Directory Blocks**: Final 12 bytes of leaf blocks (`ext4_dir_entry_tail.det_checksum`).
+
+By initializing the CRC32c generator with the filesystem's UUID, ext4 prevents cross-volume contamination: if a block from drive A is accidentally copied to drive B, its checksum will fail validation immediately.
+
+## The `e2fsck` Passes: From Structure to Links
+
+The standard Linux filesystem repair utility, `e2fsck`, enforces structural consistency through five sequential, rigorous passes:
+
+```
+┌────────────────────────────────────────────────────────────────────────┐
+│                          THE FIVE PASSES OF E2FSCK                     │
+│                                                                        │
+│   Pass 1: Inode and Block Validation                                   │
+│   ├─ Verifies inode formats, extent tree bounds, and mode bits         │
+│   └─ Builds in-memory bitmap of all claimed blocks; detects collisions │
+│                                                                        │
+│   Pass 2: Directory Structure Verification                             │
+│   ├─ Validates directory entry record lengths, padding, and characters │
+│   └─ Verifies HTree index hash ordering and checks for cycles          │
+│                                                                        │
+│   Pass 3: Directory Connectivity and Path Resolution                   │
+│   ├─ Reconnects unlinked directories to /lost+found                    │
+│   └─ Verifies .. pointers point to true parent directories             │
+│                                                                        │
+│   Pass 4: Reference Count Reconciliation                               │
+│   ├─ Compares actual directory references against inode i_links_count  │
+│   └─ Reclaims zero-link unreferenced inodes                            │
+│                                                                        │
+│   Pass 5: Group Summary and Bitmap Reconciliation                      │
+│   ├─ Compares actual allocated blocks/inodes against on-disk bitmaps   │
+│   └─ Re-writes accurate free block and free inode counters             │
+└────────────────────────────────────────────────────────────────────────┘
+```
+
+1. **Pass 1 (Check Inodes, Blocks, and Sizes)**: Iterates across every inode table. Verifies that extent trees do not overlap and that block numbers fall within physical disk boundaries. Identifies duplicate claims (two inodes claiming the same physical block).
+2. **Pass 2 (Check Directory Structure)**: Reads all directory data blocks. Verifies that entry record lengths sum to the exact block size and that no directory entry points to an invalid or unallocated inode.
+3. **Pass 3 (Check Directory Connectivity)**: Traverses the directory hierarchy downward from the root inode (Inode 2). Any directory disconnected from root is re-anchored into `/lost+found`.
+4. **Pass 4 (Check Reference Counts)**: Compares the number of hard links discovered during Pass 2 against each inode's recorded `i_links_count`. If a file has 2 directory links on disk but `i_links_count` claims 1, Pass 4 corrects the counter.
+5. **Pass 5 (Check Group Summary Information)**: Recomputes the entire filesystem's block and inode bitmaps from scratch based on evidence verified in Passes 1–4, writing freshly synchronized bitmaps back to disk.
+
+## Corruption Detection in Production (`errors=`)
+
+When the Linux kernel detects a corrupted extent tree, an invalid checksum, or an unreadable inode during normal runtime operations, it invokes `ext4_error()`.
+
+The host's response is governed by the `errors=` mount option:
+
+```ini
+# Configured in /etc/fstab:
+UUID=...  /data  ext4  errors=remount-ro  0 2
+```
+
+- **`errors=continue`**: Records an error in the system log and continues running. Highly dangerous; allows corrupted metadata to overwrite adjacent valid data.
+- **`errors=remount-ro` (Recommended Production Default)**: Immediately sets the filesystem state to Read-Only (`MS_RDONLY`). Active applications can read existing data, but write operations fail immediately, halting corruption propagation until an administrator investigates.
+- **`errors=panic`**: Triggers a full Linux kernel panic immediately. Essential for high-availability database failover clusters where fencing (STONITH) must switch traffic to a standby node before corrupted state can persist.
+
+## Backup Superblocks and Redundancy
+
+If Block Group 0 suffers catastrophic physical bad-sector failure, the primary superblock becomes unreadable, preventing normal mounting.
+
+As established in Chapter 2, ext4 maintains redundant backup superblocks in Block Groups 1, 3, 5, 7, 9, 25, 49, etc.
+
+To locate and utilize backup superblocks:
+```bash
+# Query all backup superblock locations
+sudo dumpe2fs /dev/nvme0n1p2 | grep -i "backup"
+# Backup superblock at 32768, Group descriptors at 32769-32770 ...
+# Backup superblock at 98304, Group descriptors at 98305-98306 ...
+
+# Force e2fsck to restore filesystem using the backup superblock at Block 32768
+sudo e2fsck -b 32768 -y /dev/nvme0n1p2
+```
+
+`e2fsck` reads the intact backup superblock from Group 1, reconstructs the missing master superblock in Group 0, and restores normal mountability.
+
+## Forensic Analysis of ext4 Images
+
+The **`debugfs`** utility provides an interactive, read-only window into raw ext4 data structures without mounting the filesystem:
+
+```bash
+# Launch interactive debugfs shell on unmounted volume
+sudo debugfs /dev/nvme0n1p2
+
+# Inside debugfs:
+debugfs:  stat <2>               # Inspect Root Directory Inode 2
+debugfs:  stat /etc/passwd       # Inspect inode metadata and extent tree
+debugfs:  extents /var/log/syslog# Print exact physical block mappings
+debugfs:  dump_unused            # Recover deleted files from free blocks
+debugfs:  bdump 1048576          # Hex dump physical block 1048576
+```
+
+Using `debugfs`, forensics investigators can extract deleted files from unallocated inodes, map corrupted bad blocks back to owning filenames, and inspect raw journal transaction streams.

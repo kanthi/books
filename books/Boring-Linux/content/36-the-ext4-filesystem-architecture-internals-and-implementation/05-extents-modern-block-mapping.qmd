@@ -1,0 +1,118 @@
+---
+title: "Chapter 5: Extents – Modern Block Mapping"
+---
+
+# Chapter 5: Extents – Modern Block Mapping
+
+The most significant architectural departure between legacy ext3 and modern ext4 is how files map logical byte offsets to physical disk sectors. While indirect block pointers required a distinct 4-byte pointer for every single $4\text{ KiB}$ block, **Extents** replace individual pointers with contiguous range descriptors.
+
+An extent describes a contiguous run of up to **32,768 physical blocks** using a single 12-byte record. This design reduces metadata overhead by up to 99%, dramatically accelerates sequential read and write throughput, and enables zero-cost preallocation.
+
+This chapter details the mechanics of ext4 extent trees: the on-disk structures of headers, leaf extents, and index nodes, multi-level B+ tree traversal, uninitialized extents, and the algorithms behind extent splitting, merging, and truncation.
+
+## The Extent Tree as a B+ Tree
+
+In ext4, extents are organized into an on-disk **B+ Tree**:
+- The **Root Node** always resides directly inside the 60 bytes of the inode's `i_block` field.
+- **Interior Nodes** (`depth > 0`) store index records (`ext4_extent_idx`) pointing to child blocks.
+- **Leaf Nodes** (`depth == 0`) store leaf extents (`ext4_extent`) that map logical file block numbers directly to physical disk block numbers.
+
+```
+┌────────────────────────────────────────────────────────────────────────┐
+│                        EXT4 EXTENT TREE TOPOLOGY                       │
+│                                                                        │
+│   Inode (i_block[15] - 60 Bytes): Root Node (depth = 1)                │
+│   ┌──────────────────────────────────────────────────────────────┐     │
+│   │ Header: magic=0xF30A, entries=2, max=4, depth=1              │     │
+│   │ Index 0: logical block 0      ──► Child Block 102400         │     │
+│   │ Index 1: logical block 65536  ──► Child Block 102401         │     │
+│   └──────────────────────┬───────────────────────┬───────────────┘     │
+│                          │                       │                     │
+│          ┌───────────────┘                       └──────────────┐      │
+│          ▼                                                      ▼      │
+│   Block 102400: Leaf Node (depth = 0)            Block 102401: Leaf    │
+│   ┌──────────────────────────────┐              ┌────────────────────┐ │
+│   │ Header: magic=0xF30A, depth=0│              │ Header: depth=0    │ │
+│   │ Extent 0: log 0, len 32768   │              │ Extent 0: log 65536│ │
+│   │           ──► phys 200000    │              │           ...      │ │
+│   │ Extent 1: log 32768, len 32768              └────────────────────┘ │
+│   │           ──► phys 232768    │                                     │
+│   └──────────────────────────────┘                                     │
+└────────────────────────────────────────────────────────────────────────┘
+```
+
+## `ext4_extent_header` and `ext4_extent` Records
+
+Every node in an extent tree—whether stored inside `i_block` or inside an external $4\text{ KiB}$ disk block—begins with an identical **12-byte header**:
+
+```c
+struct ext4_extent_header {
+    __le16 eh_magic;      /* Magic number: 0xF30A */
+    __le16 eh_entries;    /* Number of valid entries currently in this node */
+    __le16 eh_max;        /* Capacity: maximum entries this node can hold */
+    __le16 eh_depth;      /* Distance to leaf nodes: 0 = leaf node, >0 = index node */
+    __le32 eh_generation; /* Generation ID (used for online tree modifications) */
+};
+```
+
+### The Leaf Extent Record (`ext4_extent`)
+When `eh_depth == 0`, the header is followed immediately by an array of **12-byte leaf extent records**:
+
+```c
+struct ext4_extent {
+    __le32 ee_block;    /* First logical block number in the file */
+    __le16 ee_len;      /* Number of contiguous blocks covered (up to 32,768) */
+    __le16 ee_start_hi; /* Upper 16 bits of physical block address */
+    __le32 ee_start_lo; /* Lower 32 bits of physical block address */
+};
+```
+
+Combining `ee_start_hi` (16 bits) and `ee_start_lo` (32 bits) yields a full **48-bit physical block address**, allowing ext4 to address up to **$2^{48} \times 4096\text{ bytes} = 1\text{ Exabyte}$** of physical storage.
+
+## `ext4_extent_idx` for Multi-Level Trees
+
+When a file becomes heavily fragmented and cannot be described by the 4 extents that fit inside the inode's `i_block`, the kernel converts the root node into an index node (`eh_depth = 1`) and allocates external disk blocks for the leaf nodes.
+
+When `eh_depth > 0`, the header is followed by **12-byte index records**:
+
+```c
+struct ext4_extent_idx {
+    __le32 ei_block;   /* Lowest logical block number reachable through this branch */
+    __le32 ei_leaf_lo; /* Lower 32 bits of physical block containing child node */
+    __le16 ei_leaf_hi; /* Upper 16 bits of child block address */
+    __u16  ei_unused;
+};
+```
+
+A standard $4\text{ KiB}$ disk block can store:
+$$\frac{4096 - 12\text{ (header)} - 4\text{ (checksum)}}{12\text{ bytes per record}} = 340\text{ extent records}$$
+
+With a fan-out of 340 entries per block:
+- **Depth 0 (Inside Inode)**: Maps up to 4 extents ($\approx 512\text{ MiB}$).
+- **Depth 1 (Root + 4 Leaves)**: Maps up to $4 \times 340 = 1,360\text{ extents}$ ($\approx 174\text{ GiB}$).
+- **Depth 2 (Root + 4 Indices + 1360 Leaves)**: Maps over **$462,000\text{ extents}$** ($> 59\text{ Petabytes}$).
+
+In practice, ext4 extent trees almost never exceed a depth of 2 or 3.
+
+## Uninitialized Extents and Lazy Allocation
+
+When an application invokes `fallocate()` or `posix_fallocate()` to preallocate a $50\text{ GiB}$ database file, writing 50 GiB of zeros to physical disk would take minutes.
+
+ext4 solves this using **Uninitialized Extents**:
+- In the `ext4_extent` structure, `ee_len` is an unsigned 16-bit integer ($0 - 65,535$).
+- If `ee_len <= 32768`, the extent is **initialized** (contains valid data).
+- If `ee_len > 32768`, the highest bit is set, marking the extent as **uninitialized**. The true block count is calculated as:
+  $$\text{Real Length} = \text{ee\_len} - 32768$$
+
+When userspace reads from an uninitialized extent, the kernel immediately returns zero-filled buffers without reading the physical disk. When userspace writes to a portion of an uninitialized extent, the kernel splits the extent and marks only the written portion as initialized. This allows instant, zero-cost preallocation without risking uninitialized memory data leakage.
+
+## Extent Manipulation: Splitting, Merging, Truncation
+
+The ext4 extent engine maintains tree balance through automated runtime heuristics:
+
+1. **Extent Merging**: When a process performs sequential writes, the multi-block allocator checks if the newly allocated physical blocks are contiguous with the previous extent. If contiguous, ext4 simply increments `ee_len`, expanding the existing extent rather than creating a new record.
+2. **Extent Splitting**: When an application writes $4\text{ KiB}$ into the middle of a $100\text{ MiB}$ uninitialized preallocated extent, the kernel splits the single record into three distinct extents:
+   - Extent A: Uninitialized prefix
+   - Extent B: Initialized $4\text{ KiB}$ target block
+   - Extent C: Uninitialized suffix
+3. **Truncation and Tree Compaction**: When a file is truncated via `truncate()` or `ftruncate()`, ext4 removes trailing extents from the right side of the B+ tree. If leaf blocks become completely empty, they are freed back to the block group's allocation bitmap, and the parent index entries are removed.

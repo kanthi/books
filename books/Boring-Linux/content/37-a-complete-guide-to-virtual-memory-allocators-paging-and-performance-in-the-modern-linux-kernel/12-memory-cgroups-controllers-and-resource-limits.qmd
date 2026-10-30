@@ -1,0 +1,151 @@
+---
+title: "Chapter 12: Memory Cgroups, Controllers, and Resource Limits"
+---
+
+# Chapter 12: Memory Cgroups, Controllers, and Resource Limits
+
+In modern cloud-native architectures, physical servers rarely execute a single monolithic application. Instead, hosts run dozens of containerized microservices (Docker, containerd, Kubernetes pods) collocated on a shared Linux kernel.
+
+If an unprivileged container experiences a memory leak, it could consume all available physical memory on the host, triggering the host-level Out-of-Memory (OOM) killer to terminate critical system services (such as `sshd`, `kubelet`, or adjacent database instances).
+
+To provide multi-tenant isolation, Linux utilizes **Control Groups (cgroups)** and the dedicated **Memory Controller (`memcg`)**.
+
+This chapter explores memory cgroups: the cgroups v2 hierarchy, memory accounting models, high vs max limit thresholds, hierarchical reclaim pressure, swap isolation, container OOM semantics, and a hands-on experiment configuring memory-limited cgroups.
+
+## Containerization and the Need for Memory Isolation
+
+Containers are not virtual machines; they do not have independent kernels or private DRAM allocations. Every process inside a container calls the identical kernel memory allocation routines (`do_page_fault`, `alloc_pages`, `kmem_cache_alloc`).
+
+Without resource constraints, a container has an unrestricted view of the host's physical RAM:
+- A Java Virtual Machine (JVM) inside a container on a 128 GiB host will calculate its default heap size as $32\text{ GiB}$ ($25\%$ of host RAM), even if the container was intended to run with only 512 MiB!
+- A process allocating memory in a loop will exhaust host memory, causing "noisy neighbor" failures across unrelated workloads.
+
+The **Memory Cgroup Controller** acts as a virtual boundary, enforcing strict accounting, reclaim, and containment on subsets of processes.
+
+## Cgroup Hierarchy and Memory Controller Architecture
+
+In **cgroups v2** (standard in modern Linux distributions), all resource controllers are organized into a single, unified tree mounted at `/sys/fs/cgroup/`:
+
+```
+┌────────────────────────────────────────────────────────────────────────┐
+│                        CGROUPS V2 UNIFIED MEMORY TREE                  │
+│                                                                        │
+│   /sys/fs/cgroup/ (Root Cgroup - Unlimited)                            │
+│   ├── system.slice/ (System daemons: sshd, systemd-journald)           │
+│   │   └─ memory.min = 2G (Protected memory; immune to reclaim)        │
+│   │                                                                    │
+│   └── kubepods.slice/ (Container workloads)                            │
+│       ├── pod_frontend/                                                │
+│       │   ├── memory.high = 1G (Throttle threshold)                    │
+│       │   ├── memory.max  = 2G (Hard kill ceiling)                     │
+│       │   └─ memory.current (Current usage: 450M)                      │
+│       └── pod_analytics/                                               │
+│           └── ...                                                      │
+└────────────────────────────────────────────────────────────────────────┘
+```
+
+When a process executes `fork()`, its child automatically inherits the parent's cgroup placement.
+
+## Memory Limits, Soft Limits, and Thresholds
+
+In cgroups v2, memory boundaries are governed by four distinct parameters:
+
+```
+┌────────────────────────────────────────────────────────────────────────┐
+│                        CGROUPS V2 MEMORY THRESHOLDS                    │
+│                                                                        │
+│   ┌──────────────────────────────────────────────────────────────┐     │
+│   │ memory.max (Hard Limit - e.g. 2 GiB)                         │     │
+│   │ Violations trigger IMMEDIATE synchronous reclaim or OOM KILL │     │
+│   ├──────────────────────────────────────────────────────────────┤     │
+│   │ memory.high (Soft Throttle - e.g. 1.8 GiB)                   │     │
+│   │ Exceeding triggers proactive background reclaim; throttles   │     │
+│   │ allocating processes with artificial sleep delays            │     │
+│   ├──────────────────────────────────────────────────────────────┤     │
+│   │ memory.low (Best-Effort Protection - e.g. 512 MiB)           │     │
+│   │ Reclaim avoids taking pages from this cgroup unless all      │     │
+│   │ unprotected memory across the system is exhausted            │     │
+│   ├──────────────────────────────────────────────────────────────┤     │
+│   │ memory.min (Hard Protection - e.g. 256 MiB)                  │     │
+│   │ Completely immune to reclaim under ANY circumstance          │     │
+│   └──────────────────────────────────────────────────────────────┘     │
+└────────────────────────────────────────────────────────────────────────┘
+```
+
+1. **`memory.min`**: Strict guaranteed floor. Pages inside this cgroup will never be reclaimed or swapped out by kernel reclaim loops.
+2. **`memory.low`**: Soft protection. Reclaimed only as a last resort.
+3. **`memory.high`**: The primary throttling boundary. When usage crosses `memory.high`, the kernel does not kill the process; it slows down allocating threads by injecting microsecond delays and commands background reclaim to pull memory back under the threshold.
+4. **`memory.max`**: The hard absolute ceiling. If usage reaches `memory.max` and reclaim cannot free enough pages to satisfy the allocation, the kernel triggers an **OOM event** localized strictly to that cgroup.
+
+## Accounting: Tracking Usage Per-Cgroup
+
+The memory controller charges every allocated page to the cgroup that initiated the allocation:
+
+- **Anonymous Memory (`anon`)**: Process heaps, stacks, and private dirty COW pages.
+- **File Page Cache (`file`)**: Cached filesystem pages accessed by processes inside the cgroup.
+- **Kernel Slab Memory (`kernel_stack`, `slab`)**: In cgroups v2, kernel object allocations (such as dentry caches, inode structures, and socket buffers) allocated on behalf of the container are charged directly to the container's memory usage! An attacker cannot exhaust host RAM by spawning millions of sockets inside a constrained container.
+
+Current usage is inspected via `/sys/fs/cgroup/<group>/memory.current` and broken down in `memory.stat`.
+
+## Reclaim Under Constraints: Hierarchical Pressure
+
+When a cgroup crosses its `memory.high` or `memory.max` threshold, the kernel initiates **Targeted Cgroup Reclaim**:
+- The reclaim engine scans *only* the LRU lists associated with that specific cgroup and its child slices.
+- File-backed pages cached by the container are dropped or flushed.
+- Anonymous pages are compressed into zswap or written to swap.
+- Surrounding host services and sibling containers experience **zero disruption or I/O pressure**.
+
+## Swap Accounting and `memory.swap` Limits
+
+In early cgroups v1, a container with a 1 GiB memory limit could consume 50 GiB of host swap space, degrading entire storage arrays.
+
+cgroups v2 strictly isolates swap through dedicated controls:
+- **`memory.swap.max`**: Sets the absolute maximum swap space the cgroup can occupy. Once reached, anonymous memory cannot be swapped out; further allocations trigger an immediate local OOM event.
+- Setting `memory.swap.max = 0` completely disables swapping for that specific container, ensuring latency-sensitive microservices fail fast rather than stalling on swap I/O.
+
+## OOM Behavior Within Cgroups
+
+When a container's memory usage reaches `memory.max` and reclaim yields zero pages:
+1. The kernel's OOM killer activates, but its scope is **confined strictly to tasks within that cgroup**.
+2. The kernel evaluates `oom_score` heuristics among processes residing inside the cgroup and selects a victim.
+3. The victim process receives `SIGKILL`. The rest of the host remains completely unaffected.
+4. The event is recorded in `memory.events`:
+   ```bash
+   cat /sys/fs/cgroup/docker/container-1/memory.events
+   # oom 1
+   # oom_kill 1
+   ```
+
+## Practical Experiment: Setting Up Memory-Limited Containers
+
+We can configure a memory-constrained cgroup using raw systemd or cgroups v2 interfaces:
+
+```bash
+# 1. Create a transient memory-limited slice using systemd-run
+sudo systemd-run --unit=memtest --slice=test.slice \
+  --property=MemoryMax=100M \
+  --property=MemorySwapMax=0 \
+  python3 -c '
+data = []
+print("Allocating memory...")
+for i in range(200):
+    data.append(b" " * (1024 * 1024)) # Allocate 1 MiB chunks
+    print(f"Allocated {i+1} MiB")
+'
+```
+
+Inspect the system journal to observe the localized cgroup containment:
+```bash
+journalctl -u memtest.service -e
+```
+
+```
+Allocating memory...
+Allocated 1 MiB
+...
+Allocated 98 MiB
+systemd[1]: memtest.service: A process of this unit was killed by the OOM killer.
+systemd[1]: memtest.service: Main process exited, code=killed, status=9/KILL
+```
+
+The process was terminated cleanly at exactly the 100 MiB boundary without causing any memory pressure on the broader host system.

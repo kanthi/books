@@ -1,0 +1,276 @@
+---
+title: "Chapter 6: Network Security Hardening"
+---
+
+# Chapter 6: Network Security Hardening
+
+The network interface is the primary external attack surface of any connected Linux server. From raw packet floods and TCP sequence manipulation to rogue routing announcements, protocol spoofing, and man-in-the-middle interception, exposed hosts face continuous probing from internet-wide scanners and lateral movement attempts from within the internal network.
+
+This chapter constructs a multi-layered network defense. We harden the Linux TCP/IP stack via sysctl parameters, implement stateful packet filtering using modern `nftables`, examine enterprise firewall orchestration, enforce system-wide TLS 1.3 cryptographic policies, secure DNS resolution, address IPv6 attack vectors, and configure encrypted overlay tunnels with WireGuard.
+
+## TCP/IP Stack Security and Sysctl Controls
+
+The Linux kernel networking stack contains dozens of tunable knobs exposed via `/proc/sys/net/`. Default distribution configurations are tuned for maximum interoperability across noisy legacy networks rather than security.
+
+Create a hardened network profile in `/etc/sysctl.d/99-network-security.conf`:
+
+```ini
+# /etc/sysctl.d/99-network-security.conf
+
+# 1. Defend Against SYN Flood Denial of Service
+net.ipv4.tcp_syncookies = 1
+net.ipv4.tcp_syn_retries = 3
+net.ipv4.tcp_synack_retries = 3
+net.ipv4.tcp_max_syn_backlog = 4096
+
+# 2. Disable IP Source Routing (Prevents attacker-specified routing paths)
+net.ipv4.conf.all.accept_source_route = 0
+net.ipv4.conf.default.accept_source_route = 0
+net.ipv6.conf.all.accept_source_route = 0
+net.ipv6.conf.default.accept_source_route = 0
+
+# 3. Disable ICMP Redirect Acceptance (Prevents route table poisoning)
+net.ipv4.conf.all.accept_redirects = 0
+net.ipv4.conf.default.accept_redirects = 0
+net.ipv4.conf.all.secure_redirects = 0
+net.ipv4.conf.default.secure_redirects = 0
+net.ipv6.conf.all.accept_redirects = 0
+net.ipv6.conf.default.accept_redirects = 0
+
+# 4. Disable ICMP Redirect Sending (Host is not a router)
+net.ipv4.conf.all.send_redirects = 0
+net.ipv4.conf.default.send_redirects = 0
+
+# 5. Enable Reverse Path Filtering (Mitigates IP address spoofing)
+net.ipv4.conf.all.rp_filter = 1
+net.ipv4.conf.default.rp_filter = 1
+
+# 6. Ignore Broadcast ICMP Echo Requests (Mitigates Smurf amplification attacks)
+net.ipv4.icmp_echo_ignore_broadcasts = 1
+
+# 7. Ignore Bogus ICMP Error Responses
+net.ipv4.icmp_ignore_bogus_error_responses = 1
+
+# 8. Log Martians (Packets with impossible source addresses)
+net.ipv4.conf.all.log_martians = 1
+net.ipv4.conf.default.log_martians = 1
+
+# 9. Disable IP Forwarding (Ensure non-gateway host does not route packets)
+net.ipv4.ip_forward = 0
+net.ipv6.conf.all.forwarding = 0
+
+# 10. Disable TCP Timestamps (Mitigates system uptime fingerprinting)
+net.ipv4.tcp_timestamps = 0
+```
+
+Apply the parameters immediately:
+```bash
+sudo sysctl --system
+```
+
+## Network Interfaces, Routing, and Segmentation
+
+A secure host should never expose administrative listening sockets to untrusted network segments:
+
+1. **Localhost Binding**: Configure application servers, metrics exporters (e.g., Prometheus node_exporter), and internal databases to bind explicitly to `127.0.0.1` or `::1`, rather than `0.0.0.0` (all interfaces):
+   ```ini
+   # In postgresql.conf
+   listen_addresses = 'localhost'
+   ```
+2. **Interface Segregation**: Physical and virtual servers in production should maintain at least two dedicated network interfaces:
+   - **Management Interface (VLAN / Private Subnet)**: Handles SSH, Ansible, metrics collection, and administrative backups.
+   - **Data Plane Interface (Public / Load Balancer Subnet)**: Only exposes the application's public ingress port (e.g., port 443).
+
+## Firewalls: nftables and iptables
+
+While `iptables` served as the Linux packet filtering tool for two decades, it suffers from severe architectural limitations: separate binaries for IPv4 and IPv6 (`iptables` vs `ip6tables`), inefficient linear rule inspection, and lack of atomic updates.
+
+**`nftables`** is the modern Linux kernel packet classification framework. It unifies IPv4, IPv6, ARP, and bridge filtering into a single bytecode-driven engine (`nf_tables`) with native set lookups and atomic rule commits.
+
+```
+┌────────────────────────────────────────────────────────────────────────┐
+│                        NFTABLES HOOK ARCHITECTURE                      │
+│                                                                        │
+│   Incoming Packet                                                      │
+│          │                                                             │
+│          ▼                                                             │
+│   PREROUTING ──► Routing Decision ──► INPUT ──► Local Process          │
+│                                         │                              │
+│                                         ▼ (If Forwarding Enabled)      │
+│                                      FORWARD                           │
+│                                         │                              │
+│   Local Process ──► OUTPUT ──► Routing ─┴─► POSTROUTING ──► Wire       │
+└────────────────────────────────────────────────────────────────────────┘
+```
+
+### Complete Hardened `nftables` Configuration
+Below is a production-grade, stateful, default-drop firewall ruleset for a Linux server:
+
+```bash
+# /etc/nftables.conf
+#!/usr/sbin/nft -f
+
+flush ruleset
+
+table inet filter {
+    # Define sets for management IPs and rate limits
+    set admin_v4 {
+        type ipv4_addr
+        flags interval
+        elements = { 10.0.0.0/8, 192.168.1.0/24 }
+    }
+
+    chain input {
+        type filter hook input priority filter; policy drop;
+
+        # 1. Allow traffic on loopback interface
+        iif "lo" accept
+
+        # 2. Drop invalid packets immediately
+        ct state invalid drop
+
+        # 3. Accept established and related connections (Stateful tracking)
+        ct state { established, related } accept
+
+        # 4. Allow essential ICMP / ICMPv6 (Path MTU discovery, ping)
+        ip protocol icmp icmp type { echo-request, destination-unreachable, time-exceeded } limit rate 5/second accept
+        ip6 nexthdr icmpv6 icmpv6 type { echo-request, destination-unreachable, packet-too-big, time-exceeded, nd-router-advert, nd-neighbor-solicit, nd-neighbor-advert } limit rate 5/second accept
+
+        # 5. Allow SSH only from authorized management CIDRs with rate limiting
+        ip saddr @admin_v4 tcp dport 22 ct state new limit rate 10/minute accept
+
+        # 6. Public Ingress: Allow HTTPS (port 443)
+        tcp dport 443 ct state new accept
+
+        # 7. Log and drop remaining unsolicited packets
+        limit rate 3/minute log prefix "NFT_INPUT_DROP: " flags all
+        drop
+    }
+
+    chain forward {
+        type filter hook forward priority filter; policy drop;
+    }
+
+    chain output {
+        type filter hook output priority filter; policy accept;
+    }
+}
+```
+
+Load and enable the ruleset:
+```bash
+sudo nft -c -f /etc/nftables.conf    # Check syntax
+sudo systemctl enable --now nftables
+sudo nft list ruleset
+```
+
+## Firewalld and Policy Management
+
+On Red Hat, Fedora, and SUSE distributions, `firewalld` acts as a dynamic management daemon that manages nftables underneath.
+
+```bash
+# View active zone and configured services
+sudo firewall-cmd --get-active-zones
+sudo firewall-cmd --zone=public --list-all
+
+# Remove insecure default services
+sudo firewall-cmd --permanent --zone=public --remove-service=cockpit
+sudo firewall-cmd --permanent --zone=public --remove-service=dhcpv6-client
+
+# Add SSH with rich rule restricting access to internal subnet
+sudo firewall-cmd --permanent --zone=public --add-rich-rule='rule family="ipv4" source address="10.20.0.0/16" service name="ssh" accept'
+
+# Reload firewalld to commit changes
+sudo firewall-cmd --reload
+```
+
+## TLS, Certificates, and Encryption in Transit
+
+Data transmitted over the network must be cryptographically protected using Transport Layer Security (TLS).
+
+### Enforcing System-Wide Cryptographic Policies
+Enterprise distributions (such as Ubuntu 24.04+, RHEL 9+, and Fedora) implement system-wide crypto policies that dictate minimum key lengths, hashing algorithms, and protocol versions across all applications (GnuTLS, OpenSSL, NSS, BIND):
+
+```bash
+# Set crypto policy to FUTURE or DEFAULT (disables TLS 1.0, 1.1, RC4, 3DES, SHA-1)
+sudo update-crypto-policies --set FUTURE
+
+# Verify current active policy
+sudo update-crypto-policies --show
+```
+
+### Modern Web Server Cipher Configuration
+When configuring Nginx, HAProxy, or Envoy, mandate TLS 1.3 and forward-secret ciphers:
+```nginx
+ssl_protocols TLSv1.3 TLSv1.2;
+ssl_ciphers 'ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305';
+ssl_prefer_server_ciphers off;
+ssl_session_timeout 1d;
+ssl_session_cache shared:SSL:10m;
+ssl_session_tickets off;
+add_header Strict-Transport-Security "max-age=63072000; includeSubDomains; preload" always;
+```
+
+## DNS Security and Configuration
+
+Plaintext DNS queries (port 53) are vulnerable to interception, manipulation, and cache poisoning.
+
+### DNSSEC and DNS-over-TLS with `systemd-resolved`
+Configure `systemd-resolved` in `/etc/systemd/resolved.conf` to validate cryptographic DNSSEC signatures and encrypt queries using DNS-over-TLS (DoT):
+
+```ini
+# /etc/systemd/resolved.conf
+[Resolve]
+DNS=1.1.1.1#cloudflare-dns.com 9.9.9.9#dns.quad9.net
+FallbackDNS=1.0.0.1 149.112.112.112
+DNSSEC=yes
+DNSOverTLS=opportunistic
+MulticastDNS=no
+LLMNR=no
+```
+
+```bash
+sudo systemctl restart systemd-resolved
+resolvectl status
+```
+
+## IPv6 Security Considerations
+
+Many administrators configure strict IPv4 firewalls while inadvertently leaving IPv6 completely unmonitored. Threat actors exploit this asymmetry by scanning for IPv6 link-local or global addresses to bypass IPv4 rules.
+
+- **Parity Principle**: Every firewall rule, rate limit, and monitoring policy applied to IPv4 must be mirrored identically in IPv6.
+- **Rogue Router Advertisements (RA)**: Malicious hosts on a local subnet can broadcast spoofed ICMPv6 Router Advertisements to re-route outbound host traffic. Mitigate this by disabling RA acceptance on static servers:
+  ```ini
+  net.ipv6.conf.all.accept_ra = 0
+  net.ipv6.conf.default.accept_ra = 0
+  ```
+- **Disabling IPv6**: If IPv6 is not routed or supported within your infrastructure, disable it explicitly to eliminate the attack surface:
+  ```ini
+  # In /etc/sysctl.d/99-disable-ipv6.conf
+  net.ipv6.conf.all.disable_ipv6 = 1
+  net.ipv6.conf.default.disable_ipv6 = 1
+  net.ipv6.conf.lo.disable_ipv6 = 1
+  ```
+
+## VPNs and Secure Remote Access
+
+Traditional VPN protocols (IPsec, PPTP) suffer from massive codebases, complex key negotiation phases, and weak default ciphers.
+
+### WireGuard: Modern Kernel-Level Cryptographic Routing
+WireGuard operates directly in the Linux kernel using state-of-the-art cryptography (Noise protocol framework, Curve25519, ChaCha20-Poly1305, BLAKE2s):
+
+```ini
+# /etc/wireguard/wg0.conf
+[Interface]
+Address = 10.100.0.2/24
+PrivateKey = <ClientPrivateKey>
+ListenPort = 51820
+
+[Peer]
+PublicKey = <GatewayPublicKey>
+Endpoint = vpn.corp.internal:51820
+AllowedIPs = 10.100.0.0/24, 10.0.0.0/8
+PersistentKeepalive = 25
+```
+
+WireGuard creates a secure, authenticated, and encrypted network interface (`wg0`). Because WireGuard does not respond to unauthenticated packets, port scans against its UDP port report closed, providing stealth against automated internet scans.

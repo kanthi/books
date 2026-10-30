@@ -123,6 +123,10 @@ humanize_dir_title() {
     private-cloud-and-bare-metal) printf '%s\n' "Private Cloud & Bare-Metal"; return ;;
     running-multiple-kernels-on-one-bare-metal-server) printf '%s\n' "Running Multiple Kernels on One Bare-Metal Server"; return ;;
     linux-performance-engineering-and-server-benchmarking) printf '%s\n' "Linux Performance Engineering & Server Benchmarking"; return ;;
+    a-practical-guide-to-securing-linux-from-kernel-to-cloud) printf '%s\n' "A Practical Guide to Securing Linux from Kernel to Cloud"; return ;;
+    the-ext4-filesystem-architecture-internals-and-implementation) printf '%s\n' "The ext4 Filesystem: Architecture, Internals, and Implementation"; return ;;
+    a-complete-guide-to-virtual-memory-allocators-paging-and-performance-in-the-modern-linux-kernel) printf '%s\n' "A Complete Guide to Virtual Memory, Allocators, Paging, and Performance in the Modern Linux Kernel"; return ;;
+    ubuntu-26-04-lts-from-desktop-to-enterprise-cloud) printf '%s\n' "Ubuntu 26.04 LTS: From Desktop to Enterprise Cloud"; return ;;
     containers-and-kubernetes-orchestration) printf '%s\n' "Containers and Kubernetes Orchestration"; return ;;
     container-runtimes-and-image-craft) printf '%s\n' "Container Runtimes & Images"; return ;;
     kubernetes-architecture-and-platform) printf '%s\n' "Kubernetes Architecture"; return ;;

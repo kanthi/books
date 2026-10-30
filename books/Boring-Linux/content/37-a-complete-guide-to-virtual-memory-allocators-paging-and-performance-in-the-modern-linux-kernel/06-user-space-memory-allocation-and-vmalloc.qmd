@@ -1,0 +1,137 @@
+---
+title: "Chapter 6: User-Space Memory Allocation and vmalloc"
+---
+
+# Chapter 6: User-Space Memory Allocation and vmalloc
+
+While the kernel relies on the Buddy Allocator and SLUB for internal allocations, user-space applications depend on runtime dynamic memory allocators executing in Ring 3. Every call to `malloc()`, `calloc()`, or C++ `new` resolves through runtime allocator libraries (such as glibc's `ptmalloc3`, `jemalloc`, or Google's `tcmalloc`).
+
+Concurrently, within the kernel itself, subsystems periodically need large buffers (several megabytes in size) that must be virtually contiguous to the software, but do not need to be physically contiguous in DRAM. For this, the kernel provides **`vmalloc()`**.
+
+This chapter explores user-space memory allocation engines, the boundary between `brk()` and `mmap()`, kernel `vmalloc()` and `ioremap()` mappings, performance trade-offs across allocators, and practical tracing of allocation behavior using eBPF.
+
+## The `malloc` Contract and POSIX Requirements
+
+The POSIX standard for `malloc()` imposes strict operational contracts:
+
+1. **Alignment**: Must return a pointer suitably aligned for any built-in scalar type ($16\text{ bytes}$ on 64-bit platforms).
+2. **Reentrancy and Thread Safety**: In multi-threaded programs, concurrent calls from separate threads must succeed without deadlocking or memory corruption.
+3. **Overhead Bounds**: Allocators must maintain low metadata overhead per allocation and resist both internal fragmentation (wasted space inside an allocated chunk) and external fragmentation (inability to allocate because free memory is split into tiny pieces).
+
+## glibc `ptmalloc`: Arenas, Bins, and Thread Safety
+
+The GNU C Library (`glibc`) implements **ptmalloc3** (derived from Doug Lea's `dlmalloc`):
+
+```
+┌────────────────────────────────────────────────────────────────────────┐
+│                        GLIBC PTMALLOC ARCHITECTURE                     │
+│                                                                        │
+│   Multi-Threaded Arenas:                                               │
+│   ├─ Main Arena (Uses heap / brk)                                      │
+│   └─ Thread Arenas (Created dynamically; uses mmap; up to 8x CPU cores)│
+│                                                                        │
+│   Chunk Bins (Categorized by Size):                                    │
+│   ├─ Fastbins: Singly-linked LIFO caches (16 to 80 bytes; lock-free)   │
+│   ├─ Tcache (Thread Local Cache): Lockless per-thread bins (< 1032 B)  │
+│   ├─ Unsorted Bin: Holding area for recently freed chunks              │
+│   ├─ Small Bins: Exact-size circular FIFO lists (< 512 bytes)          │
+│   └─ Large Bins: Binned size ranges with skip lists (> 512 bytes)      │
+└────────────────────────────────────────────────────────────────────────┘
+```
+
+- **Thread Local Caching (Tcache)**: Merged in glibc 2.26, Tcache provides per-thread arrays of singly linked lists for allocations under $1032\text{ bytes}$. Servicing an allocation from Tcache requires zero mutex synchronization, dramatically speeding up multi-threaded performance.
+- **Per-Thread Arenas**: To eliminate global mutex lock contention, ptmalloc creates multiple arenas. When a thread contends for an arena lock, it allocates a dedicated arena (up to $8 \times \text{number of CPU cores}$ on 64-bit systems).
+
+## Alternative Allocators: `jemalloc` and `tcmalloc`
+
+For multi-threaded, high-throughput servers (such as Redis, MySQL, and Kubernetes runtimes), glibc's ptmalloc can suffer from memory fragmentation and high memory footprints due to arena proliferation.
+
+- **`jemalloc` (Jason Evans' Allocator)**:
+  - Standard in FreeBSD, Facebook services, and Redis.
+  - Divides allocations into Small, Large, and Huge classes.
+  - Implements fine-grained arenas indexed by thread ID, aggressive slab purging via `madvise(MADV_DONTNEED)`, and built-in heap profiling.
+- **`tcmalloc` (Thread-Caching Malloc by Google)**:
+  - Optimizes aggressively for small object thread caches.
+  - Employs lock-free thread-local caches and a central page heap managing $4\text{ KiB}$ spans.
+
+```bash
+# Preload jemalloc into an existing application to eliminate ptmalloc fragmentation
+LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libjemalloc.so.2 ./my_server_app
+```
+
+## `mmap` vs `brk`: Strategies for Large and Small Allocations
+
+Dynamic memory allocators draw memory from the Linux kernel using two distinct syscall paths:
+
+```
+┌────────────────────────────────────────────────────────────────────────┐
+│                        MMAP VS BRK DECISION BOUNDARY                   │
+│                                                                        │
+│   Small Allocation (< MMAP_THRESHOLD, default 128 KiB):                │
+│   ├─ Uses brk() / sbrk() to grow the heap segment                      │
+│   ├─ Low syscall overhead: 1 brk() call amortized across 1000s of small│
+│   │  allocations                                                       │
+│   └─ Caveat: Freeing a small chunk in the middle does not return RAM   │
+│      to the kernel until the top of the heap is lowered.               │
+│                                                                        │
+│   Large Allocation (>= MMAP_THRESHOLD):                                │
+│   ├─ Uses mmap(MAP_ANONYMOUS | MAP_PRIVATE)                            │
+│   ├─ Allocates independent VMA aligned to 4 KiB page boundary          │
+│   └─ Advantage: When free() is called, munmap() returns physical RAM   │
+│      to the kernel immediately!                                        │
+└────────────────────────────────────────────────────────────────────────┘
+```
+
+The threshold parameter (`M_MMAP_THRESHOLD`) dynamically self-tunes in glibc between 128 KiB and 32 MiB based on observed allocation patterns.
+
+## `vmalloc` and the Kernel's Virtual Memory Allocator
+
+In kernel space, `kmalloc()` requires physically contiguous pages from the Buddy Allocator. If system memory is fragmented, attempting to allocate an Order 8 ($1\text{ MiB}$) physically contiguous buffer will fail with `-ENOMEM`.
+
+For large kernel buffers where physical contiguity is unnecessary (e.g., loading large kernel modules or allocating firewall filter tables), the kernel provides **`vmalloc()`**:
+
+```c
+void *ptr = vmalloc(16 * 1024 * 1024); /* Allocate 16 MiB */
+if (!ptr) return -ENOMEM;
+vfree(ptr);
+```
+
+```
+┌────────────────────────────────────────────────────────────────────────┐
+│                        VMALLOC TRANSLATION MAPPING                     │
+│                                                                        │
+│   Virtual Memory Space (Contiguous 16 MiB in VMALLOC_START region)     │
+│   [Page 0] [Page 1] [Page 2] [Page 3] ... [Page 4095]                  │
+│      │        │        │        │                                      │
+│      ▼        ▼        ▼        ▼                                      │
+│   Physical DRAM (Completely scattered, non-contiguous page frames)     │
+│   [PFN 0x12] ... [PFN 0x89] ... [PFN 0x04] ... [PFN 0xE2]              │
+└────────────────────────────────────────────────────────────────────────┘
+```
+
+`vmalloc()` allocates independent Order 0 ($4\text{ KiB}$) pages from the Buddy Allocator across physical memory and builds custom kernel page table entries mapping them into a contiguous virtual address range inside the `VMALLOC` zone.
+- **Cost**: Slower than `kmalloc()` because it must allocate and populate page tables; induces TLB overhead.
+- **Restriction**: Cannot be used in interrupt contexts (`GFP_ATOMIC`) because page table allocation may sleep.
+
+## `vmap`, `ioremap`, and Special Mapping Regions
+
+- **`ioremap(resource_size_t offset, unsigned long size)`**: Maps physical hardware MMIO addresses (e.g., PCIe registers on a network card) into the kernel's virtual address space, configuring page caching bits to Uncacheable (`PWT=1`, `PCD=1`) so CPU write buffers do not delay register reads.
+- **`vmap(struct page **pages, unsigned int count)`**: Takes an array of existing physical page descriptors and maps them into a contiguous virtual window.
+
+## Practical Experiment: Tracing `malloc` Behavior with eBPF
+
+Using modern eBPF tracing tools (from the BCC toolkit), we can inspect memory allocation sizes and stack traces across a running process in real time:
+
+```bash
+# Trace all allocations made by process PID 1234
+sudo /usr/share/bcc/tools/memleak -p 1234 --combined-only
+```
+
+```
+Attaching to process 1234...
+[15:20:01] Top 5 active allocations:
+  16384 bytes in 4 allocations from:
+    malloc+0x24 [libc.so.6]
+    WorkerThread::Init()+0x4a [my_app]
+    start_thread+0xd9 [libc.so.6]
+```

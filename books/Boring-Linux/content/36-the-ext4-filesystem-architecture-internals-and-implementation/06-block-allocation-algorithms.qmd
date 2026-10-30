@@ -1,0 +1,104 @@
+---
+title: "Chapter 6: Block Allocation Algorithms"
+---
+
+# Chapter 6: Block Allocation Algorithms
+
+A filesystem's allocation algorithm determines where on physical storage newly written data blocks and metadata will reside. An inefficient allocator scatters related blocks across disparate physical sectors, inducing severe fragmentation, saturating storage queues, and degrading sequential read performance into high-latency random I/O.
+
+ext4 abandoned the legacy single-block allocator inherited from ext2 and ext3 in favor of a modern, multi-tiered allocation pipeline. This chapter explores ext4's block allocation architecture: the **Orlov group selection strategy**, the **Multi-Block Allocator (`mballoc`)**, **delayed allocation (`delalloc`)**, preallocation pools, and online defragmentation (`e4defrag`).
+
+## Group Selection Strategy
+
+Before allocating individual blocks, ext4 must decide *which Block Group* should host the new file or directory. This decision is guided by the **Orlov Allocator** (developed by Grigoriy Orlov):
+
+```
+┌────────────────────────────────────────────────────────────────────────┐
+│                        ORLOV ALLOCATION HEURISTICS                     │
+│                                                                        │
+│   New Directory Creation (/var/log/nginx):                             │
+│   ├─ Disperse across different Block Groups                            │
+│   ├─ Pick a group with above-average free inodes and free blocks       │
+│   └─ Goal: Prevent directories from clustering into a single group     │
+│                                                                        │
+│   New Regular File Creation (/var/log/nginx/access.log):               │
+│   ├─ Colocate in the SAME Block Group as parent directory              │
+│   ├─ Goal: Keep directory entries, inodes, and file data adjacent      │
+│   └─ Fallback: If parent group is saturated, search adjacent groups    │
+└────────────────────────────────────────────────────────────────────────┘
+```
+
+By scattering top-level directories across the disk while tightly clustering the files within those directories, the Orlov strategy achieves a balance between long-term free space distribution and local spatial clustering.
+
+## The Multi-Block Allocator (`mballoc`)
+
+Legacy ext3 allocated blocks one by one: a $100\text{ MiB}$ write loop invoked the allocator 25,600 times, scanning allocation bitmaps bit-by-bit and acquiring global locks on every iteration.
+
+ext4 introduced the **Multi-Block Allocator (`mballoc`)**, capable of finding and allocating thousands of contiguous blocks in a single, atomic operation:
+
+```
+┌────────────────────────────────────────────────────────────────────────┐
+│                        MBALLOC BUDDY BITMAP STRUCTURE                  │
+│                                                                        │
+│   Order 0 (1 Block):   [1][0][0][1] [0][0][0][0]  (Standard Bitmap)    │
+│   Order 1 (2 Blocks):  [1]   [0]    [0]   [0]                          │
+│   Order 2 (4 Blocks):  [1]          [0]                                │
+│   Order 3 (8 Blocks):  [0]                                             │
+└────────────────────────────────────────────────────────────────────────┘
+```
+
+1. **Buddy Bitmap Cache**: In memory, `mballoc` builds an in-RAM buddy tree for each block group's bitmap. Consecutive free blocks are grouped into powers of two (Order 0 = 1 block, Order 1 = 2 blocks, Order 2 = 4 blocks, up to Order 11 = 2,048 blocks).
+2. **$O(1)$ Search**: When an application requests an allocation of 512 blocks, `mballoc` skips inspecting individual bits and queries the Order 9 buddy tree directly. If available, it reserves the contiguous block chunk in a single clock cycle.
+3. **Normalization**: If an application requests an irregular write size (e.g., 37 blocks), `mballoc` normalizes the request upward to the nearest power of two (64 blocks), allocating extra space into a preallocation pool to anticipate subsequent sequential appends.
+
+## Delayed Allocation (`delalloc`)
+
+Traditionally, when userspace calls `write()`, filesystems immediately allocate physical storage blocks and update metadata.
+
+ext4 implements **Delayed Allocation (`delalloc`)**, controlled via the `nodelalloc` / `delalloc` mount options:
+
+```
+┌────────────────────────────────────────────────────────────────────────┐
+│                        DELAYED ALLOCATION LIFECYCLE                    │
+│                                                                        │
+│   1. Userspace write() ──► Write dirty pages to RAM (Page Cache)       │
+│                            Reserve quota counter in memory             │
+│                            DO NOT allocate physical blocks yet         │
+│                                  │                                     │
+│                                  ▼ 30-Second Flush Window              │
+│   2. Kernel flusher thread (writeback) or fsync() triggers             │
+│                                  │                                     │
+│                                  ▼ Full file size now known!           │
+│   3. mballoc allocates ONE massive contiguous extent on physical disk │
+│                                  │                                     │
+│   4. DMA transfers dirty pages directly to contiguous disk sectors     │
+└────────────────────────────────────────────────────────────────────────┘
+```
+
+### Benefits of Delayed Allocation
+- **Eliminates Fragmentation**: If a process writes a $200\text{ MiB}$ file in small 8 KiB chunks over several seconds, legacy allocators would allocate hundreds of fragmented block slices. With `delalloc`, the kernel waits until the full file resides in memory, then allocates a single contiguous $200\text{ MiB}$ extent.
+- **Zero Disk Writes for Ephemeral Files**: Temporary files created, processed, and deleted within the 30-second dirty page flush window are unlinked in memory and never touch physical disk storage.
+
+## Block Preallocation Pools
+
+To coordinate concurrent multi-threaded writes without block contention:
+
+- **Inode Preallocation**: When a specific thread writes to a file, `mballoc` reserves an extra window of physical blocks (typically 128 to 512 blocks) dedicated exclusively to that inode. Subsequent appends by the same file draw from this preallocated window without scanning bitmaps.
+- **Per-CPU Locality Preallocation**: For small files, `mballoc` maintains per-CPU preallocation pools. CPU 0 allocates small files from a dedicated physical chunk, while CPU 1 allocates from an adjacent chunk, eliminating cross-core spinlock contention.
+
+## Fragmentation Avoidance and Defragmentation
+
+Despite advanced allocators, aging filesystems subjected to random overwrites, out-of-order writes, and near-full disk capacities inevitably accumulate fragmentation.
+
+### Auditing Fragmentation with `e4defrag`
+ext4 includes the **`EXT4_IOC_MOVE_EXT`** ioctl, enabling safe, online defragmentation while filesystems remain mounted and active in production:
+
+```bash
+# Check fragmentation score of a directory or filesystem
+sudo e4defrag -c /var/lib/docker/
+
+# Perform online defragmentation without unmounting
+sudo e4defrag /var/lib/docker/
+```
+
+During online defragmentation, `e4defrag` creates a temporary unlinked file, uses `mballoc` to allocate a completely contiguous extent on free disk space, copies data blocks from the original fragmented file to the new extent using page cache locks, and atomically swaps extent pointers inside the inode using the journal.
