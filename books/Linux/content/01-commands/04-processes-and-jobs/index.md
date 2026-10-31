@@ -37,6 +37,7 @@ List, prioritize, signal, and background work. Covers classic job control in the
 | `flock` | flock wraps a command or script section in a kernel file lock so two copies never run at once (cron overlap, deploy/backup mutual exclusion). |
 | `choom` | choom shows and sets a process's OOM-killer bias (`oom_score_adj`); the chapter explains how the kernel scores and picks an OOM victim, globally and per memory cgroup. |
 | `pidfd` | pidfds are file descriptors that name one process and survive PID reuse: signal, wait, poll for exit (even of non-children), copy fds and identify socket peers without racing a recycled PID. |
+| `signalfd` / `timerfd` / `eventfd` | Signals, timers and cross-thread wake-ups as file descriptors in one `epoll` loop: blocking first, read-to-clear, coalesced counts, and the blocked mask that leaks into children. |
 
 
 ## Suggested starting points
@@ -49,6 +50,7 @@ List, prioritize, signal, and background work. Covers classic job control in the
 6. Mutual exclusion for jobs and scripts: `flock`.
 7. Out-of-memory victims: `choom -p PID`, `/proc/PID/oom_score`, and cgroup `memory.events`.
 8. Race-free process handles: pidfds (`pidfd_open`, `pidfd_send_signal`, `waitid(P_PIDFD)`) instead of saved PIDs.
+9. One event loop for signals, timers and wake-ups: `signalfd`, `timerfd`, `eventfd` with `epoll`.
 
 ## Related parts
 
