@@ -1,0 +1,347 @@
+---
+title: "The pkg.go.dev API: querying module metadata from Go programs"
+author:
+  - name: "K19G"
+  - name: "grok-bot"
+---
+
+# The pkg.go.dev API: querying module metadata from Go programs
+
+After this page you can query pkg.go.dev from scripts and Go programs instead of scraping its HTML. That covers package and module metadata, version lists with deprecation and retraction flags, symbols, importers, search, and known vulnerabilities. You will build a small `depaudit` tool that checks every requirement in a `go.mod`, and handle the API's four sharp edges: ambiguous package paths, opaque pagination tokens, server-side filters, and the rate limit.
+
+## Thesis
+
+The API was announced on the Go blog in May 2026 under `/v1beta`, and the reference page now documents it under **`/v1`**. A request to a `/v1beta` path returns `301 Moved Permanently` to the `/v1` path, so new code should use `/v1` directly:
+
+```bash
+curl -sI https://pkg.go.dev/v1beta/package/github.com/google/go-cmp/cmp | grep -iE '^(HTTP|location)'
+```
+
+```text
+HTTP/2 301 
+location: /v1/package/github.com/google/go-cmp/cmp
+```
+
+It's GET-only, stateless, and returns JSON (cached with `Cache-Control: public, max-age=3600`). The one design choice that will surprise you is "precision over convenience": the web UI guesses which module you meant, and the API refuses to.
+
+## Mental model
+
+![A Go client sends GET /v1/route/path with version, module, filter, limit and token parameters; /v1beta redirects to /v1; responses are 200 JSON with items and nextPageToken, 400 with candidates for an ambiguous path, 404 JSON errors, or 429 above 45 QPS per IP block](../../images/diagram-go-pkgsite-api.svg){fig-alt="Your tool builds url.Values with version, module, filter, limit and token, then sends GET to pkg.go.dev /v1/route/path. Old /v1beta paths answer 301 to /v1. Four outcomes: 200 JSON with items and nextPageToken; 400 ambiguous path with candidates, retried with module=; 404 with code and message; 429 when over 45 queries per second per IP block, which means back off. Responses carry Cache-Control public max-age 3600. Pagination: repeat the identical request plus token=nextPageToken until it is empty, since an empty page can still carry a token."}
+
+The routes are `package`, `module`, `versions`, `packages`, `search`, `symbols`, `imported-by` and `vulns`. Except for `search`, the rest of the URL is a module or package path. Everything else goes in query parameters:
+
+- `version`: a semantic version, `latest`, or the default branch names `master`/`main`, which resolve to a pseudo-version. Other branch names aren't accepted. Latest is the default.
+- `module`: disambiguates a package path that more than one module provides.
+- `limit` and `token`: pagination. To get the next page, send the *same* request plus `token=<nextPageToken>`. Changing anything else may fail. A non-empty token means there's another page, even if the current page is empty.
+- `filter`: a small Go-expression language evaluated on the server (`==`, comparisons, `contains`, `hasPrefix`, `hasSuffix`, `matches`, and field selection such as `importedByCounts.packages`).
+
+## Raw requests
+
+A package, at latest and at the default branch:
+
+```bash
+curl -s https://pkg.go.dev/v1/package/github.com/google/go-cmp/cmp
+curl -s "https://pkg.go.dev/v1/package/github.com/google/go-cmp/cmp?version=master"
+```
+
+```text
+{"modulePath":"github.com/google/go-cmp","version":"v0.7.0","isLatest":true,"isStandardLibrary":false,"goos":"all","goarch":"all","path":"github.com/google/go-cmp/cmp","name":"cmp","synopsis":"Package cmp determines equality of values.","isRedistributable":true}
+{"modulePath":"github.com/google/go-cmp","version":"v0.7.1-0.20261029223239-5deca1c7dab7","isLatest":false,"isStandardLibrary":false,"goos":"all","goarch":"all","path":"github.com/google/go-cmp/cmp","name":"cmp","synopsis":"Package cmp determines equality of values.","isRedistributable":true}
+```
+
+An ambiguous path. `cloud.google.com/go/storage` is a package in its own module *and* a directory path inside `cloud.google.com/go`:
+
+```bash
+curl -s https://pkg.go.dev/v1/package/cloud.google.com/go/storage
+curl -s "https://pkg.go.dev/v1/package/cloud.google.com/go/storage?module=cloud.google.com/go/storage"
+```
+
+```text
+{"code":400,"message":"ambiguous package path","fixes":["retry the call with a 'module' query parameter specifying the desired module"],"candidates":[{"modulePath":"cloud.google.com/go/storage","packagePath":"cloud.google.com/go/storage"},{"modulePath":"cloud.google.com/go","packagePath":"cloud.google.com/go/storage"}]}
+{"modulePath":"cloud.google.com/go/storage","version":"v1.70.0","isLatest":true,"isStandardLibrary":false,"goos":"all","goarch":"all","path":"cloud.google.com/go/storage","name":"storage","synopsis":"Package storage provides an easy way to work with Google Cloud Storage.","isRedistributable":true}
+```
+
+A server-side filter that lists the commands in `golang.org/x/tools`. Filters must be percent-encoded:
+
+```bash
+f='name == "main" && hasPrefix(path, "golang.org/x/tools/cmd/")'
+curl -s "https://pkg.go.dev/v1/packages/golang.org/x/tools?filter=$(python3 -c 'import sys,urllib.parse;print(urllib.parse.quote(sys.argv[1]))' "$f")&limit=3"
+```
+
+```text
+{"modulePath":"golang.org/x/tools","version":"v0.52.0","isStandardLibrary":false,"packages":{"items":[{"path":"golang.org/x/tools/cmd/benchcmp","name":"main","synopsis":"Deprecated: benchcmp is deprecated in favor of benchstat: golang.org/x/perf/cmd/benchstat","isRedistributable":true},{"path":"golang.org/x/tools/cmd/bisect","name":"main","synopsis":"Bisect finds changes responsible for causing a failure.","isRedistributable":true},{"path":"golang.org/x/tools/cmd/bundle","name":"main","synopsis":"Bundle creates a single-source-file version of a source package suitable for inclusion in a particular target package.","isRedistributable":true}],"total":27,"nextPageToken":"fb53686c18c7cfb764ec071f2c1821ef"}}
+```
+
+The response shapes differ. `versions`, `vulns` and `search` return `{"items", "total", "nextPageToken"}` at the top level, while `packages`, `symbols` and `imported-by` wrap that page in a field (`packages`, `symbols`, `importedBy`) next to the module and version. A generic page decoder only fits the first group as-is.
+
+## A Go client: `depaudit`
+
+The tool reads a `go.mod` with `go mod edit -json`, which parses the file without downloading anything. For each requirement, it asks the `versions` route for exactly that version, using a `filter` so the server picks the one row. That row carries `latestVersion`, `deprecated` and `retracted`. It then lists `vulns` at that version. It pages with an `iter.Seq2`, builds every query with `url.Values` as the API docs recommend, retries 429s with backoff, and decodes the JSON error body into a typed error. Verified with **go1.27.2 linux/amd64** (`errors.AsType` needs Go 1.26+).
+
+```go
+// depaudit reports, for each requirement in a go.mod, the latest version,
+// deprecation/retraction status, and known vulnerabilities, using the
+// pkg.go.dev API (https://pkg.go.dev/api).
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"iter"
+	"net/http"
+	"net/url"
+	"os"
+	"os/exec"
+	"strconv"
+	"time"
+)
+
+const base = "https://pkg.go.dev/v1/"
+
+// apiError is the JSON error body the API returns with non-2xx statuses.
+type apiError struct {
+	Status     int
+	Code       int      `json:"code"`
+	Message    string   `json:"message"`
+	Fixes      []string `json:"fixes"`
+	Candidates []struct {
+		ModulePath  string `json:"modulePath"`
+		PackagePath string `json:"packagePath"`
+	} `json:"candidates"`
+}
+
+func (e *apiError) Error() string { return fmt.Sprintf("pkg.go.dev %d: %s", e.Status, e.Message) }
+
+type client struct{ http *http.Client }
+
+// get fetches base+route?q into v, retrying on 429 with backoff.
+func (c *client) get(ctx context.Context, route string, q url.Values, v any) error {
+	u := base + route + "?" + q.Encode()
+	for attempt := 0; ; attempt++ {
+		req, err := http.NewRequestWithContext(ctx, "GET", u, nil)
+		if err != nil {
+			return err
+		}
+		resp, err := c.http.Do(req)
+		if err != nil {
+			return err
+		}
+		if resp.StatusCode == http.StatusTooManyRequests && attempt < 4 {
+			resp.Body.Close()
+			wait := time.Duration(1<<attempt) * 250 * time.Millisecond
+			if s, err := strconv.Atoi(resp.Header.Get("Retry-After")); err == nil {
+				wait = time.Duration(s) * time.Second
+			}
+			select {
+			case <-time.After(wait):
+				continue
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			e := &apiError{Status: resp.StatusCode}
+			json.NewDecoder(resp.Body).Decode(e)
+			return e
+		}
+		return json.NewDecoder(resp.Body).Decode(v)
+	}
+}
+
+type page[T any] struct {
+	Items         []T    `json:"items"`
+	NextPageToken string `json:"nextPageToken"`
+}
+
+// all walks every page of a paginated route. Per the API docs, the request is
+// repeated verbatim with only "token" added, and an empty page with a
+// non-empty token still means there is more.
+func all[T any](ctx context.Context, c *client, route string, q url.Values) iter.Seq2[T, error] {
+	return func(yield func(T, error) bool) {
+		q := maps(q)
+		for {
+			var p page[T]
+			if err := c.get(ctx, route, q, &p); err != nil {
+				var zero T
+				yield(zero, err)
+				return
+			}
+			for _, it := range p.Items {
+				if !yield(it, nil) {
+					return
+				}
+			}
+			if p.NextPageToken == "" {
+				return
+			}
+			q.Set("token", p.NextPageToken)
+		}
+	}
+}
+
+func maps(q url.Values) url.Values {
+	out := url.Values{}
+	for k, v := range q {
+		out[k] = append([]string(nil), v...)
+	}
+	return out
+}
+
+type version struct {
+	Version           string `json:"version"`
+	LatestVersion     string `json:"latestVersion"`
+	Deprecated        bool   `json:"deprecated"`
+	DeprecationReason string `json:"deprecationReason"`
+	Retracted         bool   `json:"retracted"`
+	RetractionReason  string `json:"retractionReason"`
+}
+
+type vuln struct {
+	ID      string `json:"id"`
+	Details string `json:"details"`
+}
+
+type gomod struct {
+	Require []struct {
+		Path, Version string
+		Indirect      bool
+	}
+}
+
+func main() {
+	if len(os.Args) != 2 {
+		fmt.Fprintln(os.Stderr, "usage: depaudit path/to/go.mod")
+		os.Exit(2)
+	}
+	out, err := exec.Command("go", "mod", "edit", "-json", os.Args[1]).Output()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "go mod edit:", err)
+		os.Exit(1)
+	}
+	var mf gomod
+	if err := json.Unmarshal(out, &mf); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	c := &client{http: &http.Client{Timeout: 20 * time.Second}}
+	bad := 0
+	for _, r := range mf.Require {
+		// One exact item from the versions route, selected server-side by a filter.
+		q := url.Values{"filter": {fmt.Sprintf("version == %q", r.Version)}, "limit": {"1"}}
+		var info *version
+		for v, err := range all[version](ctx, c, "versions/"+r.Path, q) {
+			if err != nil {
+				fmt.Printf("%-26s %-8s error: %v\n", r.Path, r.Version, err)
+				break
+			}
+			info = &v
+			break
+		}
+		if info == nil {
+			bad++
+			continue
+		}
+		var ids []string
+		for v, err := range all[vuln](ctx, c, "vulns/"+r.Path, url.Values{"version": {r.Version}}) {
+			if err != nil {
+				ids = append(ids, "error: "+err.Error())
+				break
+			}
+			ids = append(ids, v.ID)
+		}
+		status := "ok"
+		switch {
+		case info.Retracted:
+			status = "RETRACTED: " + info.RetractionReason
+		case info.Deprecated:
+			status = "DEPRECATED: " + info.DeprecationReason
+		}
+		if info.Retracted || info.Deprecated || len(ids) > 0 {
+			bad++
+		}
+		fmt.Printf("%-26s %-8s latest %-8s %s, %d vulns %v\n", r.Path, r.Version, info.LatestVersion, status, len(ids), first(ids, 3))
+	}
+	// Ambiguous package paths come back as 400 with candidates.
+	var p map[string]any
+	err = c.get(ctx, "package/cloud.google.com/go/storage", nil, &p)
+	if ae, ok := errors.AsType[*apiError](err); ok {
+		fmt.Printf("\npackage cloud.google.com/go/storage: %s; candidates:", ae.Message)
+		for _, cand := range ae.Candidates {
+			fmt.Printf(" %s", cand.ModulePath)
+		}
+		fmt.Println()
+	}
+	if bad > 0 {
+		os.Exit(1)
+	}
+}
+
+func first(s []string, n int) []string {
+	if len(s) > n {
+		return append(s[:n:n], "…")
+	}
+	return s
+}
+```
+
+The `go.mod` under test:
+
+```text
+module example.com/app
+
+go 1.27
+
+require (
+	github.com/google/go-cmp v0.5.9
+	github.com/google/uuid v1.6.0
+	golang.org/x/net v0.20.0
+	github.com/golang/protobuf v1.5.4
+)
+```
+
+Run on 2026-10-31 (results change as modules release and the vulnerability database grows):
+
+```bash
+go vet . && go build -o depaudit . && ./depaudit sample.mod; echo "exit=$?"
+```
+
+```text
+github.com/google/go-cmp   v0.5.9   latest v0.7.0   ok, 0 vulns []
+github.com/google/uuid     v1.6.0   latest v1.6.0   ok, 0 vulns []
+golang.org/x/net           v0.20.0  latest v0.62.0  ok, 21 vulns [GO-2024-2687 GO-2024-3333 GO-2025-3503 …]
+github.com/golang/protobuf v1.5.4   latest v1.5.4   DEPRECATED: Use the "google.golang.org/protobuf" module instead., 0 vulns []
+
+package cloud.google.com/go/storage: ambiguous package path; candidates: cloud.google.com/go/storage cloud.google.com/go
+exit=1
+```
+
+The deprecation comes from the `// Deprecated:` comment in that module's `go.mod`, and `vulns` reads from the Go vulnerability database (vuln.go.dev). `go list -m -u` can report upgrades and deprecations too, but it needs the module graph downloaded and doesn't report vulnerabilities. Here a single `go.mod` file is enough.
+
+## Things that bite
+
+- **Ambiguity is an error, not a guess.** `go mod tidy` and the web UI use the longest matching module path. The API returns 400 with `candidates`. A tool that already knows the module from `go.mod` should always send `module=`.
+- **Tokens are bound to the request.** Change `limit` or `filter` between pages and the token may be rejected. Clone the query, then only `Set("token", …)`.
+- **`vulns` defaults to latest.** Without `version=`, `golang.org/x/net` returned `{"items":null,"total":0}` in this run, because the latest release has no known vulnerabilities. Always pass the version you actually depend on.
+- **Rate limit.** 45 queries per second per IP block, after which the API returns 429. CI fleets behind one NAT share that budget, so cache responses (the server already marks them cacheable for an hour) and run requests one at a time or with a small limit.
+- **This is not `govulncheck`.** The `vulns` route works at module and version level. `govulncheck` checks whether your code actually reaches the vulnerable symbols. Use the API for inventory and triage, and `govulncheck` for the final decision.
+
+## Try this
+
+1. Add `-module` handling to `depaudit`: on an `apiError` with candidates, retry once with the candidate whose `modulePath` appears in `go.mod`.
+2. Use `search` with `filter=importedByCounts.packages > 100` to find widely used alternatives to a deprecated module.
+3. Put a file-backed cache in front of `client.get` keyed by the full URL, honouring `max-age`, and confirm with a counter that a second run makes no network requests.
+
+## Sources
+
+- Go blog, "Introducing the pkg.go.dev API" (21 May 2026): <https://go.dev/blog/pkgsite-api>
+- pkg.go.dev API reference (routes, filters, pagination, rate limiting): <https://pkg.go.dev/api>
+- OpenAPI specification: <https://pkg.go.dev/v1/openapi.yaml>
+- `go mod edit -json`: <https://go.dev/ref/mod#go-mod-edit>
+- Module deprecation and retraction: <https://go.dev/ref/mod#go-mod-file-module-deprecation>
+- Go vulnerability database: <https://vuln.go.dev>, and `govulncheck`: <https://go.dev/doc/tutorial/govulncheck>
+- `iter` package: <https://pkg.go.dev/iter>
