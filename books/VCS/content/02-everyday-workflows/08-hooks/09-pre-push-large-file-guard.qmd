@@ -1,0 +1,170 @@
+---
+title: "A pre-push guard against large files and runaway LFS uploads"
+author:
+  - name: "K19G"
+  - name: "grok-bot"
+---
+
+# A pre-push guard against large files and runaway LFS uploads
+
+After this page you can install a `pre-push` hook that refuses a push before any bytes leave your machine: if it would add a blob above a size limit, or if its Git LFS pointer files reference more data than a budget allows. You will also know why this check has to run *before* `git lfs pre-push`, and why it is the only cheap moment to catch the mistake.
+
+## Thesis
+
+A large file committed by accident is cheap to fix until it is pushed. After that, the fix is a history rewrite plus a force-push. With Git LFS on GitHub there is no fix you can do yourself. GitHub's documentation says: "To remove Git LFS objects from a repository, delete and recreate the repository. … If you need to purge a removed object and you are unable to delete the repository, please contact support for help." Rewriting history removes the *pointers*, but the stored objects stay and keep counting toward your quota.
+
+So the boring rule is to check what a push would add, locally, in `pre-push`, and only then let Git LFS upload anything.
+
+## Mental model
+
+![git push runs the pre-push hook with the refs on stdin; the guard sizes new objects and LFS pointers, and only on success hands over to git lfs pre-push, which uploads; before that point everything is reversible, after it LFS objects on GitHub are not](../../images/diagram-vcs-pre-push-large-file-guard.svg){fig-alt="git push passes refs on stdin to your pre-push guard. The guard runs rev-list --objects old..new and cat-file --batch-check, refuses any blob over MAX_BYTES, and refuses if the sum of LFS pointer sizes exceeds the budget. If both checks pass, it hands over to git lfs pre-push, which uploads LFS objects, and then Git sends the pack and updates refs. Below, two panels. Reversible: a commit that isn't pushed can be fixed with amend or rm --cached, and pushed history with a rewrite and force-push. Not reversible on GitHub: once LFS objects are uploaded, you have to delete and recreate the repository or ask support. A note says hooks are client-side and skippable with --no-verify, so pair them with server-side limits such as push rulesets or receive hooks."}
+
+`githooks(5)` defines the contract. `pre-push` runs after Git has worked out which refs to update and before anything is sent. It receives the remote's name and URL as `$1` and `$2`, and one line per ref on stdin:
+
+```text
+<local-ref> SP <local-object-name> SP <remote-ref> SP <remote-object-name> LF
+```
+
+A non-zero exit aborts the whole push. The objects to check are exactly the ones reachable from the new tip and not from the old one: `git rev-list --objects <remote-sha>..<local-sha>`. For a brand-new branch the remote object name is all zeros, so the hook falls back to "everything not already on any `refs/remotes/<remote>/*`".
+
+A Git LFS **pointer file** is a small text blob (under 1024 bytes, per the LFS spec) that starts with `version https://git-lfs.github.com/spec/v1` and has a `size <bytes>` line. Git LFS normally installs its own `pre-push` hook, which runs `git lfs pre-push` and uploads the real objects named by those pointers. That's why the size check reads the pointers' `size` fields, and why it must finish before handing over.
+
+## The hook
+
+Verified with **Git 2.47.3** on Debian 13. Save it as `.git/hooks/pre-push` and make it executable:
+
+```sh
+#!/bin/sh
+# pre-push guard: run BEFORE anything is uploaded (including Git LFS objects).
+#  1. refuse any new blob larger than MAX_BYTES (default 5 MiB)
+#  2. refuse if new Git LFS pointers reference more than LFS_BUDGET bytes in total (default 1 GiB)
+# Git feeds one line per ref on stdin: <local-ref> <local-sha> <remote-ref> <remote-sha>
+max=${MAX_BYTES:-5242880}
+budget=${LFS_BUDGET:-1073741824}
+zero=$(git hash-object --stdin </dev/null | tr '0-9a-f' '0')
+input=$(cat)                       # keep stdin so it can be replayed to git-lfs
+status=0
+echo "$input" | while read -r lref lsha rref rsha; do
+  [ -z "$lref" ] && continue
+  [ "$lsha" = "$zero" ] && continue                  # deleting a ref
+  if [ "$rsha" = "$zero" ]; then
+    range="$lsha --not --remotes=$1"                 # new branch: all commits not on the remote
+  else
+    range="$rsha..$lsha"
+  fi
+  objs=$(git rev-list --objects $range |
+         git cat-file --batch-check='%(objecttype) %(objectsize) %(objectname) %(rest)')
+  big=$(echo "$objs" | awk -v max="$max" '$1 == "blob" && $2 > max { printf "  %s  %d bytes  %s\n", substr($3,1,10), $2, $4 }')
+  lfs=$(echo "$objs" | awk '$1 == "blob" && $2 < 1024 { print $3 }' | while read -r oid; do
+          git cat-file blob "$oid" | awk 'NR == 1 && $0 != "version https://git-lfs.github.com/spec/v1" { exit }
+                                          $1 == "size" { print $2 }'
+        done | awk '{ s += $1 } END { print s + 0 }')
+  if [ -n "$big" ]; then
+    echo "pre-push: refusing $lref: blobs over $max bytes:" >&2; echo "$big" >&2; exit 1
+  fi
+  if [ "$lfs" -gt "$budget" ]; then
+    echo "pre-push: refusing $lref: new LFS pointers reference $lfs bytes (budget $budget)" >&2; exit 1
+  fi
+  echo "pre-push: $lref ok (largest-blob limit $max, LFS bytes $lfs/$budget)" >&2
+done || status=1
+[ $status -ne 0 ] && exit $status
+# Hand over to Git LFS only after the checks pass (no-op if git-lfs is absent).
+if command -v git-lfs >/dev/null 2>&1; then
+  echo "$input" | git lfs pre-push "$@" || exit $?
+fi
+exit 0
+```
+
+It reads stdin once and keeps a copy, so the same ref lines can be replayed to `git lfs pre-push` afterwards. `%(rest)` in the `--batch-check` format prints the path that `rev-list --objects` printed next to each object, which is what puts filenames in the error message.
+
+## Worked example
+
+The lab is a bare `remote.git` and a clone, `work`, with `main` already pushed. An 8 MB `shard-000.bin` gets committed by mistake:
+
+```bash
+head -c 8000000 /dev/urandom > shard-000.bin
+echo "small" > notes.txt
+git add . && git commit -q -m "add dataset shard"
+git push origin main
+```
+
+```text
+pre-push: refusing refs/heads/main: blobs over 5242880 bytes:
+  f4e192a92a  8000000 bytes  shard-000.bin
+error: failed to push some refs to '../remote.git'
+```
+
+Nothing has left the machine, so the fix is local. Untrack the file, ignore the pattern, and amend:
+
+```bash
+git rm -q --cached shard-000.bin
+echo 'shard-*.bin' > .gitignore && git add .gitignore
+git commit -q --amend -m "add notes"
+git push -q origin main
+```
+
+```text
+pre-push: refs/heads/main ok (largest-blob limit 5242880, LFS bytes 0/1073741824)
+```
+
+Now LFS. `git-lfs` isn't installed on the lab machine, so the pointers below were written by hand in the spec's format (they're just text). Each one claims a 2 GiB object, and they're pushed on a new branch:
+
+```bash
+git switch -q -c dataset
+for i in 1 2 3; do
+  printf 'version https://git-lfs.github.com/spec/v1\noid sha256:%064d\nsize 2147483648\n' $i > model-$i.safetensors
+done
+git add model-*.safetensors && git commit -q -m "add checkpoints (LFS pointers)"
+cat model-1.safetensors
+git push origin dataset
+```
+
+```text
+version https://git-lfs.github.com/spec/v1
+oid sha256:0000000000000000000000000000000000000000000000000000000000000001
+size 2147483648
+pre-push: refusing refs/heads/dataset: new LFS pointers reference 6442450944 bytes (budget 1073741824)
+error: failed to push some refs to '../remote.git'
+```
+
+The blobs themselves are tiny, so a plain size limit would have let this through. Only the pointer budget catches it. If the push is deliberate, raise the budget for that one command:
+
+```bash
+LFS_BUDGET=8000000000 git push -q origin dataset
+```
+
+```text
+pre-push: refs/heads/dataset ok (largest-blob limit 5242880, LFS bytes 6442450944/8000000000)
+```
+
+With `git-lfs` installed, the hook would now call `git lfs pre-push`, and only at that point would 6 GiB start uploading.
+
+## Installing alongside Git LFS
+
+`git lfs install` installs a `pre-push` hook that runs `git-lfs-pre-push(1)`. It fails if a custom `pre-push` hook already exists. `git lfs update --manual` prints instructions for adding the LFS call to your own hook (`--force` would overwrite yours instead), and the last lines of the guard are that merge. Keep the order (guard first, LFS second). If you append the guard *after* the LFS line, the upload has already happened by the time the guard refuses.
+
+`git lfs pre-push` reads the same ref lines from stdin, which is why the guard saves `$input` instead of consuming stdin in its loop.
+
+## Limits of a client-side hook
+
+- It's skippable. `git push --no-verify` doesn't run `pre-push`, and a fresh clone has no hooks until someone installs them (see the config-based hooks chapter for sharing them). Agents and CI jobs that push should install the hook as part of their setup.
+- It needs a server-side partner. On GitHub, push rulesets offer **Restrict file size** and **Restrict file extensions** rules, but the docs limit push rulesets to private and internal repositories (and their fork networks). On a public repository, the client-side hook is often the only gate. Self-hosted servers can enforce the same check in a `pre-receive` hook.
+- It checks Git's view only. Uploads made directly with `git lfs push --all`, or LFS objects already pushed from another clone, never pass through it.
+- `--remotes=$1` assumes `$1` is a remote name. Pushing to a bare URL makes the new-branch case check the whole history. That's slower, but still correct.
+
+## Try this
+
+1. Set `MAX_BYTES=1000` and push a branch that changes `README.md`. Which blob trips the limit, and why is an *unchanged* file never reported?
+2. Delete the remote branch with `git push origin :dataset` and confirm that the hook skips deletions (the all-zeros local object name).
+3. Port the check to a server-side `pre-receive` hook on `remote.git`, which reads `<old> <new> <ref>` lines, and push with `--no-verify` to see that it still refuses.
+
+## Sources
+
+- `githooks(5)`, pre-push and pre-receive: <https://git-scm.com/docs/githooks>
+- `git-rev-list(1)`, `--objects`: <https://git-scm.com/docs/git-rev-list>
+- `git-cat-file(1)`, `--batch-check` format atoms: <https://git-scm.com/docs/git-cat-file>
+- Git LFS pointer file specification: <https://github.com/git-lfs/git-lfs/blob/main/docs/spec.md>
+- `git-lfs-pre-push(1)`: <https://github.com/git-lfs/git-lfs/blob/main/docs/man/git-lfs-pre-push.adoc>
+- `git-lfs-install(1)` and `git-lfs-update(1)`: <https://github.com/git-lfs/git-lfs/blob/main/docs/man/git-lfs-update.adoc>
+- GitHub Docs, Removing files from Git Large File Storage: <https://docs.github.com/en/repositories/working-with-files/managing-large-files/removing-files-from-git-large-file-storage>
+- GitHub Docs, Available rules for rulesets (push rulesets, Restrict file size): <https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-rulesets/available-rules-for-rulesets>
