@@ -245,6 +245,7 @@ Lab platform (macOS / Linux + Containerlab)
 | 2026-07-24 | Initial multi-syllabus exploration |
 | 2026-07-24 | Vendor-agnostic rewrite; open images only; expert pedagogy; diagrams |
 | 2026-10-30 | Expanded **part 11** (`content/11-bgp-security/`): A Deep Dive into BGP, RPKI, Routing Attacks and Global Internet Defense (Introduction + 29 chapters). |
+| 2026-10-31 | Published **part 12** (`content/12-network-forensics/`): Advanced Behavior-Based Network Forensics Using a Cyber-Behavioral Science Approach (Overview + 13 chapters across 6 parts). |
 
 ---
 
@@ -284,3 +285,28 @@ Sidebar directory: `content/11-bgp-security/`.
 | `27-case-studies-documented-routing-incidents.qmd` | Chapter 27: Case Studies: Documented Routing Incidents |
 | `28-economics-governance-human-dimension.qmd` | Chapter 28: Economics, Governance and the Human Dimension |
 | `29-current-state-and-future-of-internet-routing-security.qmd` | Chapter 29: The Current State and Future of Internet Routing Security |
+
+---
+
+# Published part 12 — Network Forensics: Advanced Behavior-Based Network Forensics Using a Cyber-Behavioral Science Approach
+
+**Cover Image:** © dem10/Getty Images
+
+Sidebar directory: `content/12-network-forensics/`.
+
+| File | Part / Chapter | Description |
+|------|----------------|-------------|
+| `00-advanced-behavior-based-network-forensics.qmd` | Front Matter & Descriptive Outline | Descriptive outline, urgency, preface, acronyms & key terms, 6-part syllabus map |
+| `01-introduction-to-advanced-network-forensics.qmd` | Part 1 — Chapter 1: Introduction to Advanced Network Forensics | Shift from reactive artifact forensics to behavior-based interdisciplinary models |
+| `02-fundamentals-of-network-forensics-and-log-analysis.qmd` | Part 1 — Chapter 2: Fundamentals of Network Forensics and Log Analysis | Packet, flow, and log forensics, capture, DPI, parsing, evidence preservation |
+| `03-building-a-network-forensics-lab-environment.qmd` | Part 1 — Chapter 3: Building a Network Forensics Lab Environment | Safe high-fidelity lab design, adversary emulation, traffic generation, defensible evidence |
+| `04-behavioral-analysis-in-cybersecurity.qmd` | Part 2 — Chapter 4: Behavioral Analysis in Cybersecurity | Forensic cyberpsychology, profiling, emotion, group dynamics, human factors |
+| `05-cyber-forensics-behavioral-analysis-cfba.qmd` | Part 2 — Chapter 5: Cyber Forensics Behavioral Analysis (CFBA) | CFBA model, digital forensics, ML-driven scoring (CBAM / CBS), predictive attribution |
+| `06-advanced-techniques-and-tools.qmd` | Part 3 — Chapter 6: Advanced Techniques and Tools | Deception networks, honeypots, DPI/NTA, insider threat analytics, threat hunting |
+| `07-machine-learning-and-artificial-intelligence-in-forensics.qmd` | Part 3 — Chapter 7: Machine Learning and Artificial Intelligence in Forensics | Unsupervised anomaly detection, time-series forecasting, MAESTRO, XAI |
+| `08-siem-configuration-for-behavioral-log-collection.qmd` | Part 4 — Chapter 8: SIEM Configuration for Behavioral Log Collection | SIEM/UEBA standardization (ECS/OCSF), streaming enrichment, ML baselines, SOAR |
+| `09-collecting-log-streams-enterprise-edge-honeypots-auth.qmd` | Part 4 — Chapter 9: Collecting Log Streams: Enterprise, Edge, Honeypots, and Auth | Hybrid log pipelines, enterprise/edge/identity/honeypot streams, tiered storage |
+| `10-correlation-and-investigation-within-siem.qmd` | Part 4 — Chapter 10: Correlation and Investigation within SIEM | AI correlation, UEBA, NLP on logs, automated SOAR triage, MTTD/MTTR reduction |
+| `11-specialized-forensics-by-domain.qmd` | Part 5 — Chapter 11: Specialized Forensics by Domain | Frameworks and behavioral indicators for ICS/SCADA, IoT, cloud, smart cities, healthcare |
+| `12-case-studies-in-advanced-behavior-based-network-forensics.qmd` | Part 5 — Chapter 12: Case Studies in Advanced Behavior-Based Network Forensics | Case studies showing CFBA, ABS, CBFM in action, dwell time reduction |
+| `13-the-future-of-network-forensics-and-cyberpsychology.qmd` | Part 6 — Chapter 13: The Future of Network Forensics and Cyberpsychology | AI evidence processing, adaptive deception (SPADE), cognitive forensics, quantum, ethics |
