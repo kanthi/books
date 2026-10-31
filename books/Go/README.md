@@ -13,10 +13,16 @@ Go/
 └── _quarto.yml               # GENERATED — do not hand-edit
 ```
 
-Parts under `content/` (ignored dirs start with `_`):  
-01-foundations … 11-security, 12-specialized … 18-performance-engineering, 19-modern-go-book-synthesis, 20-go-deep-dives, **21-concurrency-ground-up**, **22-web-development-in-go**, **23-cli-tools-in-go**, 98-stdlib, 99-projects.
-
-Overlapping “twin” parts (survey vs deep track) are explained on `index.qmd` — prefer one path, not both end-to-end.
+Parts under `content/` (numeric prefixes dictate order, ignored dirs start with `_`):  
+`01-foundations` … `06-testing` (Language Basics)  
+`07-stdlib` … `09-cli-tools-in-go` (Stdlib, DSA, CLI Tools)  
+`10-concurrency-ground-up` … `11-concurrency-parallelism` (Concurrency Mastery)  
+`12-socket-programming` … `14-network-performance` (Sockets & Network Performance)  
+`15-web-development-in-go` … `16-web` (Web & API Architectures)  
+`17-systems-programming` … `20-infrastructure` (Systems, Distributed Infra, SRE, Cloud)  
+`21-security` … `24-performance-engineering` (Security & Performance Engineering)  
+`25-go-deep-dives` … `28-specialized` (Runtime Internals, Longevity, Synthesis, Frontiers)  
+`99-projects` (46 Hands-on Capstone Projects) & `100-appendices` (Glossary & Reference)
 
 ## Local commands
 

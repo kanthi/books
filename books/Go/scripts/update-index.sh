@@ -90,20 +90,28 @@ humanize_dir_title() {
     data-structures)            printf '%s\n' "Data Structures"; return ;;
     modern-c)                   printf '%s\n' "Modern C"; return ;;
     # Go
-    concurrency-parallelism)    printf '%s\n' "Concurrency and Parallelism"; return ;;
-    performance-tooling)        printf '%s\n' "Performance and Tooling"; return ;;
+    stdlib)                     printf '%s\n' "Standard Library Tour"; return ;;
+    data-structures-and-algorithms) printf '%s\n' "Data Structures and Algorithms"; return ;;
+    cli-tools-in-go)            printf '%s\n' "CLI Tools in Go"; return ;;
+    concurrency-ground-up)      printf '%s\n' "Concurrency Ground Up"; return ;;
+    concurrency-parallelism)    printf '%s\n' "Advanced Concurrency Patterns"; return ;;
+    socket-programming)         printf '%s\n' "Socket Programming"; return ;;
     network-systems)            printf '%s\n' "Network Systems"; return ;;
+    network-performance)        printf '%s\n' "Network Performance"; return ;;
+    web-development-in-go)      printf '%s\n' "Web Development in Go"; return ;;
+    web)                        printf '%s\n' "Modern Web Architectures"; return ;;
     systems-programming)        printf '%s\n' "Systems Programming"; return ;;
     distributed-infra)          printf '%s\n' "Distributed Infrastructure"; return ;;
     observability-sre)          printf '%s\n' "Observability and SRE"; return ;;
+    infrastructure)             printf '%s\n' "Cloud and Infrastructure"; return ;;
+    security)                   printf '%s\n' "Security Tools and Design"; return ;;
     security-hardening)         printf '%s\n' "Security Hardening"; return ;;
+    performance-tooling)        printf '%s\n' "Performance and Tooling"; return ;;
     performance-engineering)    printf '%s\n' "Performance Engineering"; return ;;
-    modern-go-book-synthesis)   printf '%s\n' "Modern Go Synthesis"; return ;;
     go-deep-dives)              printf '%s\n' "Go Deep Dives"; return ;;
-    concurrency-ground-up)      printf '%s\n' "Concurrency Ground Up"; return ;;
-    web-development-in-go)      printf '%s\n' "Web Development in Go"; return ;;
-    cli-tools-in-go)            printf '%s\n' "CLI Tools in Go"; return ;;
-    socket-programming)         printf '%s\n' "Socket Programming"; return ;;
+    long-term-maintenance)      printf '%s\n' "Long-Term Maintenance"; return ;;
+    modern-go-book-synthesis)   printf '%s\n' "Modern Go Synthesis"; return ;;
+    specialized)                printf '%s\n' "Specialized Applications"; return ;;
     # NixOS
     front-matter)               printf '%s\n' "Front Matter"; return ;;
     nix-on-linux)               printf '%s\n' "Nix on Linux"; return ;;
