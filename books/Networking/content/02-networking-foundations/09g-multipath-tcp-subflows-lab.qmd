@@ -1,0 +1,318 @@
+---
+title: "Multipath TCP: Subflows, Path Managers and a Rootless Lab"
+author:
+  - name: "K19G"
+  - name: "grok-bot"
+---
+
+# Multipath TCP: Subflows, Path Managers and a Rootless Lab
+
+After reading this chapter, you will be able to configure Linux Multipath TCP (MPTCP) path managers, inspect active MPTCP connections and underlying TCP subflows, observe kernel path-manager event streams, and audit hosts for MPTCP listener exposure without requiring root privileges.
+
+## Concepts: Connections, Subflows, and the Path Manager
+
+Multipath TCP (MPTCP), specified in RFC 8684, extends TCP so that one connection can use several paths at once and survive losing one of them. To an application, an MPTCP socket behaves like a standard byte stream socket. Underneath the hood, the Linux kernel manages one or more individual TCP subflows that traverse distinct network paths or IP addresses.
+
+```
++-------------------------------------------------------------------+
+|                        Application Layer                          |
+|             socket(AF_INET, SOCK_STREAM, IPPROTO_MPTCP)           |
++-------------------------------------------------------------------+
+                                  |
+                                  v
++-------------------------------------------------------------------+
+|                       MPTCP Token / Connection                    |
+|       (one data sequence space; schedules data onto subflows)      |
++-------------------------------------------------------------------+
+                 /                                 \
+                v                                   v
++-------------------------------+   +-------------------------------+
+|   TCP Subflow 1 (Primary)     |   |   TCP Subflow 2 (Secondary)   |
+|   127.0.0.1:48394 -> :7000    |   |   127.0.0.2:58777 -> :7000    |
++-------------------------------+   +-------------------------------+
+```
+
+### The Protocol Handshake and Subflow Join
+
+An MPTCP connection begins when a client opens a socket using the MPTCP protocol family (`IPPROTO_MPTCP`, numeric value 262 on Linux).
+
+1. **Initial Handshake (`MP_CAPABLE`)**: The client initiates a TCP handshake containing the TCP option `MP_CAPABLE` (Option Kind 30, Subtype 0). This option exchanges keying material and capability flags. If the peer supports MPTCP and no middlebox strips the option, both sides establish an MPTCP connection context identified by 32-bit tokens.
+2. **Additional Subflows (`MP_JOIN`)**: Once the initial subflow is established, either host can declare additional IP addresses or initiate new TCP subflows targeting the peer. Secondary subflows perform a standard TCP handshake containing the `MP_JOIN` option (Option Kind 30, Subtype 1), referencing the initial connection's token and presenting an authentication HMAC to prove ownership.
+3. **Fallback to Plain TCP**: If middleboxes (such as firewalls or deep-packet inspection appliances) remove the MPTCP TCP options during the initial SYN exchange, or if the destination server does not support MPTCP, the Linux kernel falls back to plain single-path TCP. The application gets no error.
+
+### The In-Kernel Path Manager
+
+Linux delegates subflow lifecycle decisions to an in-kernel path manager. The path manager decides when to announce local IP addresses to peers, when to accept address announcements from peers, and when to proactively initiate new subflows.
+
+Path management relies on two kernel configuration primitives configured per network namespace:
+
+- **Limits**: Control how many additional subflows can be established or accepted (`subflow` limit) and how many IP addresses advertised by the peer can be accepted (`add_addr_accepted` limit). By default, Linux sets `add_addr_accepted` to 0, preventing automatic subflow creation when a peer advertises new addresses.
+- **Endpoints**: Specific local IP addresses registered with the path manager. An endpoint can act as a **subflow** endpoint (causing the local host to initiate a new subflow from this address toward the peer) or a **signal** endpoint (causing the local host to advertise the address to the remote peer via `ADD_ADDR` TCP options). Endpoints can also carry flags such as `backup` to indicate standby links.
+
+In Python 3.10 and later, MPTCP sockets are created by passing `socket.IPPROTO_MPTCP` (or constant integer `262`) as the protocol argument to `socket.socket()`. Linux allows or refuses MPTCP socket creation per network namespace through the sysctl `net.mptcp.enabled` (1 in the lab below).
+
+## The Rootless Lab Setup
+
+You do not need dedicated hardware, multiple physical network interfaces, or root privileges to build a complete MPTCP laboratory. Using unprivileged network namespaces via `unshare -rn`, an ordinary user account creates an isolated network stack. Because the entire `127.0.0.0/8` block is automatically routed to the loopback interface (`lo`), assigning subflow endpoints to addresses like `127.0.0.2` allows multiple TCP subflows to be established locally over loopback.
+
+The lab consists of two files: a Python echo client/server script (`mptcp_echo.py`) and a Bash orchestration script (`lab.sh`).
+
+<!-- file: mptcp_echo.py -->
+```python
+#!/usr/bin/env python3
+"""Tiny MPTCP echo pair: server on 127.0.0.1:7000, client sends for a few seconds."""
+import socket
+import sys
+import time
+
+IPPROTO_MPTCP = getattr(socket, "IPPROTO_MPTCP", 262)
+
+
+def serve():
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM, IPPROTO_MPTCP)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s.bind(("127.0.0.1", 7000))
+    s.listen()
+    print("server: listening with proto", IPPROTO_MPTCP, flush=True)
+    conn, peer = s.accept()
+    total = 0
+    while data := conn.recv(65536):
+        total += len(data)
+        conn.sendall(data)
+    print("server: echoed", total, "bytes from", peer, flush=True)
+
+
+def client(seconds):
+    c = socket.socket(socket.AF_INET, socket.SOCK_STREAM, IPPROTO_MPTCP)
+    c.connect(("127.0.0.1", 7000))
+    end = time.time() + seconds
+    sent = 0
+    while time.time() < end:
+        c.sendall(b"x" * 4096)
+        c.recv(65536)
+        sent += 4096
+        time.sleep(0.01)
+    c.shutdown(socket.SHUT_WR)
+    while c.recv(65536):
+        pass
+    print("client: done", flush=True)
+
+
+if __name__ == "__main__":
+    if sys.argv[1] == "serve":
+        serve()
+    else:
+        client(float(sys.argv[2]))
+```
+
+The accompanying orchestration script configures the namespace path manager, starts background event monitoring via `ip mptcp monitor`, launches the echo server, executes the client, and inspects the sockets using `ss`.
+
+<!-- file: lab.sh -->
+```bash
+#!/usr/bin/env bash
+# Run inside: unshare -rn bash lab.sh   (unprivileged user + network namespace)
+set -euo pipefail
+ip link set lo up
+echo "net.mptcp.enabled = $(cat /proc/sys/net/mptcp/enabled)"
+echo "--- limits before"
+ip mptcp limits show
+ip mptcp limits set subflow 2 add_addr_accepted 2
+ip mptcp endpoint add 127.0.0.2 dev lo subflow
+echo "--- limits and endpoints after"
+ip mptcp limits show
+ip mptcp endpoint show
+ip mptcp monitor > monitor.log 2>&1 &
+MON=$!
+python3 mptcp_echo.py serve > server.log 2>&1 &
+SRV=$!
+sleep 0.5
+python3 mptcp_echo.py client 3 &
+CLI=$!
+sleep 1.5
+echo "--- ss -M (MPTCP sockets)"
+ss -Mn
+echo "--- ss -tn (the TCP subflows underneath)"
+ss -tn
+wait $CLI
+wait $SRV
+kill $MON
+echo "--- server log"
+cat server.log
+echo "--- monitor events"
+cat monitor.log
+```
+
+## Executing the Lab and Reading Output
+
+To run the experiment, execute `lab.sh` within an unprivileged network namespace user wrapper:
+
+```bash
+unshare -rn bash lab.sh
+```
+
+### Path Manager Initialization
+
+The initial portion of `lab.sh` verifies `net.mptcp.enabled`, displays default path manager limits, increases subflow and address acceptance limits to 2, and registers `127.0.0.2` as a local `subflow` endpoint on interface `lo`.
+
+The following command printed the initial path manager state and the updated limits and endpoint definitions.
+
+```text
+net.mptcp.enabled = 1
+--- limits before
+add_addr_accepted 0 subflows 2 
+--- limits and endpoints after
+add_addr_accepted 2 subflows 2 
+127.0.0.2 id 1 subflow dev lo 
+```
+
+Key things to observe in this output:
+- `net.mptcp.enabled` returns `1`, confirming MPTCP socket creation is active.
+- A fresh namespace starts with `add_addr_accepted 0 subflows 2`. Raising `add_addr_accepted` to 2 lets this namespace act on addresses a peer announces with `ADD_ADDR`. The extra subflow in this lab comes from the local `subflow` endpoint, which the existing `subflows 2` limit already allows.
+- The `ip mptcp endpoint add` command registers `127.0.0.2` with id 1 and flag `subflow`.
+
+### Inspecting MPTCP Sockets (`ss -M`)
+
+While traffic flows between the echo client and server, `ss -Mn` queries the Linux kernel for active MPTCP-level connections (`-M` filters for MPTCP sockets, `-n` prevents port/IP resolution).
+
+The following command displayed the high-level MPTCP socket entries.
+
+```text
+State Recv-Q Send-Q Local Address:Port  Peer Address:Port 
+ESTAB 0      0          127.0.0.1:48394    127.0.0.1:7000 
+ESTAB 0      0          127.0.0.1:7000     127.0.0.1:48394
+```
+
+`ss -M` shows the MPTCP layer: one connection, listed twice because both ends live in this namespace (client port 48394 and server port 7000). It shows one row per MPTCP socket, however many subflows that socket has.
+
+### Inspecting Underlying Subflows (`ss -tn`)
+
+To view the concrete TCP connections carrying the data stream, `ss -tn` queries standard IPv4 TCP sockets.
+
+The following command displayed the active TCP subflows operating beneath the MPTCP connection.
+
+```text
+State Recv-Q Send-Q Local Address:Port  Peer Address:Port 
+ESTAB 0      0          127.0.0.1:7000     127.0.0.2:58777
+ESTAB 0      0          127.0.0.1:48394    127.0.0.1:7000 
+ESTAB 0      0       127.0.0.2%lo:58777    127.0.0.1:7000 
+ESTAB 0      4096       127.0.0.1:7000     127.0.0.1:48394
+```
+
+Observe the difference between `ss -M` and `ss -tn`:
+- `ss -tn` shows four rows: **two** TCP subflows, each seen from both ends.
+- `127.0.0.1:48394 -> 127.0.0.1:7000` is the initial subflow, set up with `MP_CAPABLE`.
+- `127.0.0.2:58777 -> 127.0.0.1:7000` is the second subflow, the `MP_JOIN` that the path manager opened from the `127.0.0.2` endpoint (`%lo` shows it is bound to `dev lo`).
+
+### Application Completion and Event Logs
+
+Once the client completes its timed transmission, it performs a socket shutdown, causing the server to log the total byte count and exit.
+
+The following command printed the completed server execution log.
+
+```text
+client: done
+server: listening with proto 262
+server: echoed 1191936 bytes from ('127.0.0.1', 48394)
+```
+
+Simultaneously, `ip mptcp monitor` captures netlink kernel events emitted by the MPTCP path manager throughout the socket lifecycle.
+
+The following command printed the path-manager event trace captured during execution.
+
+```text
+[LISTENER_CREATED] saddr4=127.0.0.1 sport=7000
+[         CREATED] token=02c31fc4 remid=0 locid=0 saddr4=127.0.0.1 daddr4=127.0.0.1 sport=48394 dport=7000
+[         CREATED] token=096d3203 remid=0 locid=0 saddr4=127.0.0.1 daddr4=127.0.0.1 sport=7000 dport=48394
+[     ESTABLISHED] token=096d3203 remid=0 locid=0 saddr4=127.0.0.1 daddr4=127.0.0.1 sport=7000 dport=48394
+[     ESTABLISHED] token=02c31fc4 remid=0 locid=0 saddr4=127.0.0.1 daddr4=127.0.0.1 sport=48394 dport=7000
+[  SF_ESTABLISHED] token=02c31fc4 remid=0 locid=1 saddr4=127.0.0.2 daddr4=127.0.0.1 sport=58777 dport=7000 backup=0 ifindex=1
+[  SF_ESTABLISHED] token=096d3203 remid=1 locid=0 saddr4=127.0.0.1 daddr4=127.0.0.2 sport=7000 dport=58777 backup=0
+[ LISTENER_CLOSED] saddr4=127.0.0.1 sport=7000
+[          CLOSED] token=096d3203
+[          CLOSED] token=02c31fc4
+```
+
+In the monitor output, look for the chronological sequence of events:
+1. `LISTENER_CREATED`: The server opens an MPTCP listening socket on port 7000.
+2. `CREATED` / `ESTABLISHED`: The initial subflow forms via `MP_CAPABLE`.
+3. `SF_ESTABLISHED`: The path manager detects endpoint `127.0.0.2` and triggers an additional subflow via `MP_JOIN`.
+4. `CLOSED` / `LISTENER_CLOSED`: Sockets tear down cleanly upon transfer completion.
+
+## Production Configuration: Multi-Homed Hosts
+
+In production, hosts typically possess multiple physical network interfaces (for example, `eth0` on 192.168.1.50 and `eth1` on 10.0.0.50). The role of each endpoint depends on whether the host acts primarily as a server or a client.
+
+| Goal | Endpoint Type | Local Command Example | Protocol Action |
+|---|---|---|---|
+| Server announcing an extra IP to clients | `signal` | `ip mptcp endpoint add 10.0.0.50 dev eth1 signal` | Sends an `ADD_ADDR` option to the client over existing subflows. |
+| Client actively opening extra subflows | `subflow` | `ip mptcp endpoint add 10.0.0.50 dev eth1 subflow` | Initiates an outgoing `MP_JOIN` TCP handshake from 10.0.0.50 to the server. |
+| Reserve an interface for failover only | `backup` flag | `ip mptcp endpoint add 10.0.0.50 dev eth1 subflow backup` | Sets the `MP_JOIN` backup bit; traffic stays on primary paths unless they fail. |
+| Permit inbound peer address join requests | Limit adjustment | `ip mptcp limits set subflow 4 add_addr_accepted 4` | Allows the kernel to accept up to 4 peer-advertised addresses and subflows. |
+
+## Operations: Security Auditing and Emergency Mitigation
+
+Understanding where MPTCP listening sockets exist is critical for infrastructure security operations. MPTCP introduces distinct code paths inside the kernel network stack, expanding the attack surface of listening ports.
+
+### CVE-2026-98432 Vulnerability Context
+
+**CVE-2026-98432**, published in October 2026, is a critical (CVSS 9.8) vulnerability in the Linux kernel network subsystem. The defect stems from IPv4 option structures (`inet_opt`/`ireq_opt`) being freed without honoring an RCU (Read-Copy Update) grace period during socket state transitions.
+
+The vulnerability affects Linux kernel versions starting from 4.4. The public exploit released on 27 October 2026 needs a reachable **MPTCP listener socket** (`IPPROTO_MPTCP`). Certain application runtimes and framework defaults create MPTCP listeners automatically when binding stream sockets on supporting kernels.
+
+The vulnerability is resolved in fixed kernel releases:
+- 5.10.272
+- 5.15.223
+- 6.1.190
+- 6.6.159
+- 6.12.113
+- 6.18.56
+- 7.2.10
+- 7.3
+
+### Inventorying MPTCP Listeners
+
+Standard socket tools like `netstat` or default `ss -tnl` output do not explicitly differentiate MPTCP listeners from standard TCP listeners. To inventory active MPTCP listeners across host network namespaces, query the socket statistics utility using the `-M` flag:
+
+```bash
+ss -Mlnp
+```
+
+This command flags listening (`-l`), numeric (`-n`), process-associated (`-p`) MPTCP (`-M`) sockets. Any listening socket reported by `ss -Mlnp` accepts MPTCP option handshakes and exposes the kernel's MPTCP state machine.
+
+### Immediate Emergency Mitigation (Kill Switch)
+
+Until you can reboot into a fixed kernel, the interim mitigation is to stop new MPTCP sockets being created in the host namespace:
+
+```bash
+sysctl -w net.mptcp.enabled=0
+```
+
+::: {.callout-note}
+**Not run here** (it needs root on the host). Setting `net.mptcp.enabled=0` prevents the creation of **new** MPTCP sockets and forces new connection attempts to fall back to standard TCP. It does not retroactively close or alter existing, already-established MPTCP sockets. Restart services whose MPTCP listeners already exist, then check that `ss -Mlnp` is empty. The sysctl is per network namespace, so containers with their own namespace need the same treatment. Add the setting to a sysctl configuration file if it should survive a reboot.
+:::
+
+## Pitfalls
+
+- **Default `add_addr_accepted` is zero**: Fresh network namespaces default to `add_addr_accepted 0`. Even if a remote server advertises additional IP addresses via `ADD_ADDR`, the client kernel silently ignores them until `ip mptcp limits set add_addr_accepted N` is configured.
+- **Middlebox option stripping**: Enterprise firewalls, NAT boxes, or WAN accelerators may strip unknown TCP options (Option Kind 30). When this occurs, MPTCP falls back to single-path TCP during the initial handshake without raising an error to the application.
+- **Per-namespace limits and endpoints**: MPTCP endpoint tables and limits are isolated within network namespaces. Running `ip mptcp endpoint add` in the root namespace does not propagate rules into container namespaces or `unshare` environments.
+- **`ss -M` appears empty after fallback**: If an MPTCP socket falls back to plain TCP due to peer incompatibility or option stripping, `ss -M` no longer tracks the socket. The connection continues operating as a standard TCP socket and appears exclusively under `ss -t`.
+
+## Summary
+
+- MPTCP (`IPPROTO_MPTCP` / 262) wraps multiple TCP subflows into a single logical socket, so it can use several paths and survive losing one.
+- The in-kernel path manager controls subflow creation using per-namespace limits (`ip mptcp limits`) and configured IP endpoints (`ip mptcp endpoint`).
+- Client hosts use `subflow` endpoints to initiate secondary TCP connections (`MP_JOIN`), while servers use `signal` endpoints to advertise IP addresses (`ADD_ADDR`).
+- `ss -M` inspects MPTCP connection tokens and top-level session state; `ss -tn` displays the underlying constituent TCP subflows.
+- For a kernel MPTCP bug such as CVE-2026-98432: inventory listeners with `ss -Mlnp`, use `net.mptcp.enabled=0` plus service restarts as the stopgap, and upgrade the kernel as the fix.
+
+## Sources
+
+- [RFC 8684: TCP Extensions for Multipath Operation with Multiple Addresses](https://www.rfc-editor.org/rfc/rfc8684)
+- [Multipath TCP Upstream Kernel Project](https://www.mptcp.dev/)
+- [ip-mptcp(8) Linux Manual Page](https://man7.org/linux/man-pages/man8/ip-mptcp.8.html)
+- [Linux Kernel Documentation: MPTCP Sysctl](https://docs.kernel.org/networking/mptcp-sysctl.html)
+- [Linux Kernel Documentation: Multipath TCP](https://docs.kernel.org/networking/mptcp.html)
+- [ss(8) Linux Manual Page](https://man7.org/linux/man-pages/man8/ss.8.html)
+- [Python socket library documentation](https://docs.python.org/3/library/socket.html)
+- [AWS security bulletin: CVE-2026-98432, Linux kernel IPv4 TCP use-after-free](https://aws.amazon.com/security/security-bulletins/2026-160-aws/)
