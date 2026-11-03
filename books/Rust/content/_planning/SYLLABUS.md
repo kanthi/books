@@ -205,6 +205,50 @@
 
 ---
 
+## Part 23: Command-Line Tools in Rust
+
+### Part 1 – Foundations
+- 1. Introduction to Command-Line Tools in Rust
+- 2. Setting Up Your Development Environment
+- 3. Command-Line Fundamentals
+- 4. Parsing Arguments with clap
+
+### Part 2 – Core Skills
+- 5. Working with the File System
+- 6. Processing Text Data
+- 7. Error Handling
+- 8. Structuring Your Application
+
+### Part 3 – Networking & Async
+- 9. Running External Processes
+- 10. Building HTTP Clients
+- 11. Async Programming with tokio
+- 12. Terminal User Interfaces with ratatui
+
+### Part 4 – Testing & Distribution
+- 13. Configuration and Persistence
+- 14. Logging and Observability
+- 15. Testing Command-Line Tools
+- 16. Building Cross-Platform Tools
+
+### Part 5 – Advanced
+- 17. Designing for Production
+- 18. Advanced Rust Patterns for CLI Tools
+- 19. Building Developer Tools
+- 20. Distributing and Shipping Your Tool
+
+### Part 6 – Capstone Projects
+- 21. Capstone 1: fsearch, a Fast File Search Tool
+- 22. Capstone 2: tudo, a TUI Task Manager
+- 23. Capstone 3: sysmon, a System Monitor
+- 24. Capstone 4: devkit, a Developer Toolkit
+
+### Part 7 – The Rust CLI Ecosystem
+- 25. Contributing to the Rust Ecosystem
+- 26. The Future of Rust CLI Development
+
+---
+
 ## Conclusion: The Rust Mindset
 - Core Principles
 - Where Rust Shines

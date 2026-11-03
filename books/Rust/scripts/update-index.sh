@@ -89,6 +89,14 @@ humanize_dir_title() {
     advanced-topics)               printf '%s\n' "Advanced Topics: Compiler, Debugging, Security, and Anti-Patterns"; return ;;
     webassembly)                   printf '%s\n' "WebAssembly with Rust"; return ;;
     embedded-rust)                 printf '%s\n' "Embedded Rust and no_std Development"; return ;;
+    command-line-tools)            printf '%s\n' "Command-Line Tools in Rust"; return ;;
+    foundations)                   printf '%s\n' "Part 1 – Foundations"; return ;;
+    core-skills)                   printf '%s\n' "Part 2 – Core Skills"; return ;;
+    networking-and-async)          printf '%s\n' "Part 3 – Networking & Async"; return ;;
+    testing-and-distribution)      printf '%s\n' "Part 4 – Testing & Distribution"; return ;;
+    advanced)                      printf '%s\n' "Part 5 – Advanced"; return ;;
+    capstone-projects)             printf '%s\n' "Part 6 – Capstone Projects"; return ;;
+    the-rust-cli-ecosystem)        printf '%s\n' "Part 7 – The Rust CLI Ecosystem"; return ;;
     conclusion)                    printf '%s\n' "Conclusion: The Rust Mindset"; return ;;
     # Linux
     terminals-and-mux)          printf '%s\n' "Terminals and Multiplexers"; return ;;
