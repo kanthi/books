@@ -1,0 +1,491 @@
+---
+title: "Sharing Iterators Between Threads: serialize_iterator, synchronized_iterator and concurrent_tee"
+author:
+  - name: "K19G"
+  - name: "grok-bot"
+---
+
+# Sharing Iterators Between Threads: serialize_iterator, synchronized_iterator and concurrent_tee
+
+After reading this chapter, you will be able to coordinate shared iterators and generators safely across multiple threads in Python 3.15, distinguish between single-consumer stream partitioning and multi-consumer stream broadcasting, decorate generator factories with thread-safe synchronization, and deploy clean fallback patterns when running on Python 3.14.
+
+## The thread safety problem with iterators
+
+Iterators are ubiquitous in Python pipelines. They offer lazy, memory-efficient access to unbounded streams, file chunks, database cursors, and mathematical series. However, standard Python iterators and generators are inherently stateful and mutable. Advancing an iterator changes internal pointers, frame evaluation offsets, and local variables.
+
+Python 3.15 does not change how generators behave: passing one plain generator object to several worker threads still fails at run time. CPython enforces a strict frame execution check: if a thread calls `next()` on a generator whose evaluation frame is currently active on another thread, CPython raises:
+
+```text
+ValueError: generator already executing
+```
+
+This error is not a bug; it is an intentional assertion guarding the single execution frame inside the CPython evaluation loop. The interpreter detects that the generator's frame is already running on another thread and refuses the second thread's entry. Whether you hit it depends on timing: a generator that never releases the GIL between `yield`s may run thousands of times without a collision, while one that does any I/O collides quickly.
+
+In free-threaded builds (introduced experimentally in Python 3.13 as `python3.13t`), the Global Interpreter Lock (GIL) is disabled. There, threads really run `__next__()` at the same time. CPython's own documentation for the new wrappers uses `itertools.count` as its example of an iterator whose instances are not thread-safe to share, and the free-threading guide warns that sharing an iterator between threads can produce duplicated or skipped items rather than a clean error. Built-in iterators avoid crashing the interpreter, but they don't promise sensible results when shared.
+
+CPython 3.15 introduces three purpose-built synchronization primitives in the standard `threading` module to address iterator sharing systematically:
+
+1. `threading.serialize_iterator(iterable)`: A wrapper class that guards the iterator's `__next__()`, `send()`, `throw()`, and `close()` methods with a non-reentrant mutual exclusion lock. Each generated value is delivered to exactly one thread.
+2. `threading.synchronized_iterator(func)`: A decorator or higher-order wrapper for iterator-producing callables, ensuring every iterator returned by the callable is automatically wrapped in a `serialize_iterator`.
+3. `threading.concurrent_tee(iterable, n=2)`: A concurrent counterpart to `itertools.tee()` that duplicates a single input stream into $n$ independent iterators across threads, buffering unconsumed items until all threads have read them.
+
+The following table summarizes the concurrency characteristics of these tools:
+
+| Primitive | Delivery model | Internal synchronization | Buffering behavior | Thread target |
+|---|---|---|---|---|
+| Plain Generator / Iterator | Single consumer | None (unsafe) | None | Exactly 1 thread |
+| `threading.serialize_iterator` | Partitioned (competing consumers) | Non-reentrant `threading.Lock` | Zero buffering | Multiple threads |
+| `threading.synchronized_iterator` | Factory wrapper for partitioned iterators | Non-reentrant `threading.Lock` | Zero buffering | Multiple threads |
+| `threading.concurrent_tee` | Broadcast (independent consumers) | One shared `threading.Lock` + linked list of items | Grows with the gap between fastest and slowest consumer | One thread per branch |
+| `queue.Queue` | Partitioned work queue | `threading.Condition` objects over one mutex | Bounded or unbounded FIFO buffer | Multiple threads |
+
+## Observing the race: Unsynchronized generators
+
+To observe the generator collision directly, consider a pipeline where eight worker threads attempt to pull items concurrently from a single, unprotected generator.
+
+<!-- file: gen_race.py -->
+```python
+import threading
+import time
+
+
+def source_stream(count):
+    for i in range(count):
+        time.sleep(0)  # stand-in for I/O: lets other threads run mid-frame
+        yield i
+
+
+def consumer(stream, results, worker_id):
+    items_read = 0
+    collisions = 0
+    while True:
+        try:
+            val = next(stream)
+            items_read += 1
+        except StopIteration:
+            break
+        except ValueError as exc:
+            if "generator already executing" in str(exc):
+                collisions += 1
+                # Back off briefly to let the executing thread exit the frame
+                time.sleep(0.00001)
+            else:
+                raise
+    results[worker_id] = (items_read, collisions)
+
+
+def main():
+    total_target = 10_000
+    gen = source_stream(total_target)
+    results = {}
+    threads = []
+
+    for i in range(8):
+        t = threading.Thread(target=consumer, args=(gen, results, i))
+        threads.append(t)
+
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    total_consumed = sum(r[0] for r in results.values())
+    total_collisions = sum(r[1] for r in results.values())
+
+    print(f"Total items consumed: {total_consumed}")
+    print(f"Total collision errors caught: {total_collisions}")
+
+
+if __name__ == "__main__":
+    main()
+```
+
+Run the script under Python 3.15:
+
+```bash
+python3.15 gen_race.py
+```
+
+The following text block shows the output produced by running `python3.15 gen_race.py`.
+
+```text
+Total items consumed: 10000
+Total collision errors caught: 57359
+```
+
+When reviewing the output, observe that `Total items consumed` eventually sums to 10,000 because each thread caught the exception and retried. However, `Total collision errors caught` is far from zero. The `time.sleep(0)` inside the generator releases the GIL while the frame is still running, which is exactly what real I/O does. The count changes from run to run with thread scheduling. Remove that line and the count often drops to zero, which is how this bug survives testing.
+
+## Single-consumer delivery with serialize_iterator
+
+When multiple worker threads pull tasks from a single stream, you generally want each item processed exactly once. You do not want duplicate deliveries, dropped values, or `ValueError` crashes.
+
+`threading.serialize_iterator(iterable)` fulfills this requirement. It is implemented as a standard wrapper class in the `threading` module. Upon instantiation:
+
+```python
+safe_iter = threading.serialize_iterator(iterable)
+```
+
+The wrapper invokes `iter()` on the underlying iterable once and attaches a dedicated, non-reentrant `threading.Lock`. When a thread advances the wrapper via `next(safe_iter)`, the wrapper acquires the lock, calls `next()` on the underlying iterator, and releases the lock in a `finally` block before returning the value.
+
+Crucially, `serialize_iterator` also inspects the underlying object for generator methods:
+- `send(value)`: Acquired under the lock and forwarded if supported; otherwise raises `AttributeError`.
+- `throw(typ, val, tb)`: Acquired under the lock and forwarded if supported; otherwise raises `AttributeError`.
+- `close()`: Acquired under the lock and forwarded if supported; otherwise raises `AttributeError`.
+
+Because `serialize_iterator` uses a primitive lock without an intermediate queue or buffer, memory overhead is negligible. Each item passes directly from the iterator frame to the calling thread.
+
+<!-- file: serialized.py -->
+```python
+import collections
+import threading
+import time
+
+
+def source_stream(count):
+    for i in range(count):
+        time.sleep(0)  # same simulated I/O as gen_race.py
+        yield i
+
+
+def worker(stream, sink, worker_id):
+    batch = []
+    for item in stream:
+        batch.append(item)
+    sink[worker_id] = batch
+
+
+def main():
+    target_items = 10_000
+    source = source_stream(target_items)
+    safe_stream = threading.serialize_iterator(source)
+
+    sink = {}
+    threads = []
+    for i in range(8):
+        t = threading.Thread(target=worker, args=(safe_stream, sink, i))
+        threads.append(t)
+
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    counter = collections.Counter()
+    for batch in sink.values():
+        counter.update(batch)
+
+    total_consumed = sum(counter.values())
+    duplicates = sum(count - 1 for count in counter.values() if count > 1)
+    missing = len(set(range(target_items)) - set(counter.keys()))
+
+    print(f"Total consumed: {total_consumed}")
+    print(f"Duplicate items: {duplicates}")
+    print(f"Missing items: {missing}")
+
+
+if __name__ == "__main__":
+    main()
+```
+
+Run the serialized verification:
+
+```bash
+python3.15 serialized.py
+```
+
+The following text block shows the output produced by running `python3.15 serialized.py`.
+
+```text
+Total consumed: 10000
+Duplicate items: 0
+Missing items: 0
+```
+
+Notice that `Total consumed` matches 10,000, while `Duplicate items` and `Missing items` are both zero. Every element was safely yielded across the thread boundary without contention.
+
+## Function-level synchronization with synchronized_iterator
+
+Managing iterator instances manually can lead to bugs if a developer exposes a raw generator instance before wrapping it. Python 3.15 provides `threading.synchronized_iterator(func)` to eliminate this hazard at the definition site.
+
+`synchronized_iterator` takes a callable that returns an iterator—most commonly a generator function—and returns a new callable. Whenever the decorated function is invoked, its return value is wrapped in `threading.serialize_iterator` before reaching the caller.
+
+This decorator is also useful for wrapping factory functions around non-thread-safe iterators from standard libraries, such as `itertools.count()` or custom C-extension iterators.
+
+The following example decorates a generator producing indexed data batches and processes the output using `concurrent.futures.ThreadPoolExecutor`.
+
+<!-- file: decorated.py -->
+```python
+from concurrent.futures import ThreadPoolExecutor
+import threading
+import time
+
+
+@threading.synchronized_iterator
+def indexed_data_feed(limit):
+    for index in range(limit):
+        yield (index, f"payload-{index}")
+
+
+def worker_task(feed):
+    collected = []
+    for item in feed:
+        collected.append(item)
+        time.sleep(0.0002)  # per-item work, done outside the iterator's lock
+    return collected
+
+
+def main():
+    total_elements = 1_000
+    shared_feed = indexed_data_feed(total_elements)
+
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        futures = [executor.submit(worker_task, shared_feed) for _ in range(4)]
+        results = [f.result() for f in futures]
+
+    combined = []
+    for worker_batch in results:
+        combined.extend(worker_batch)
+
+    combined_sorted = sorted(combined, key=lambda pair: pair[0])
+    indices = [pair[0] for pair in combined_sorted]
+
+    is_contiguous = indices == list(range(total_elements))
+    worker_counts = [len(b) for b in results]
+
+    print(f"Total items gathered: {len(combined)}")
+    print(f"Stream sequence complete and contiguous: {is_contiguous}")
+    print(f"All workers received work: {all(c > 0 for c in worker_counts)}")
+
+
+if __name__ == "__main__":
+    main()
+```
+
+Run the decorated generator script:
+
+```bash
+python3.15 decorated.py
+```
+
+The following text block shows the output produced by running `python3.15 decorated.py`.
+
+```text
+Total items gathered: 1000
+Stream sequence complete and contiguous: True
+All workers received work: True
+```
+
+Look for confirmation that all 1,000 items were collected, the contiguous integrity test evaluates to `True`, and every worker in the pool pulled items from the feed.
+
+## Broadcast streaming with concurrent_tee
+
+`serialize_iterator` splits a stream among workers: if worker A takes item 0, worker B gets item 1. But many architectures require broadcasting: every worker thread must read the entire stream from beginning to end.
+
+In single-threaded Python, this is handled by `itertools.tee(iterable, n=2)`. However, `itertools.tee` is not thread-safe. Its internal linked lists and shared state are subject to race conditions and memory corruption when traversed concurrently by separate threads.
+
+Python 3.15 introduces `threading.concurrent_tee(iterable, n=2)`. It creates $n$ independent iterator handles. Each handle receives the entire sequence generated by the underlying iterable.
+
+Under the hood, all branches share one `threading.Lock` and a singly linked list of items. Whichever branch reaches the end of the list first takes the lock, pulls the next value from the source and appends a new link. The other branches walk the list at their own pace without touching the source. A link becomes garbage once every branch has moved past it, so memory holds exactly the items between the slowest and the fastest branch.
+
+In code, the call signature matches `itertools.tee`:
+
+```python
+it1, it2 = threading.concurrent_tee(source_iterable, 2)
+```
+
+<!-- file: tee.py -->
+```python
+import threading
+
+
+def consumer_sum(stream, results, worker_id):
+    results[worker_id] = sum(stream)
+
+
+def main():
+    target_count = 1000
+    source = range(target_count)
+    it_a, it_b, it_c = threading.concurrent_tee(source, 3)
+
+    results = {}
+    threads = [
+        threading.Thread(target=consumer_sum, args=(it_a, results, 0)),
+        threading.Thread(target=consumer_sum, args=(it_b, results, 1)),
+        threading.Thread(target=consumer_sum, args=(it_c, results, 2)),
+    ]
+
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    expected_sum = (target_count - 1) * target_count // 2
+
+    print(f"Worker 0 sum: {results[0]}")
+    print(f"Worker 1 sum: {results[1]}")
+    print(f"Worker 2 sum: {results[2]}")
+    print(f"All match expected ({expected_sum}): {results[0] == results[1] == results[2] == expected_sum}")
+
+
+if __name__ == "__main__":
+    main()
+```
+
+Run the concurrent tee script:
+
+```bash
+python3.15 tee.py
+```
+
+The following text block shows the output produced by running `python3.15 tee.py`.
+
+```text
+Worker 0 sum: 499500
+Worker 1 sum: 499500
+Worker 2 sum: 499500
+All match expected (499500): True
+```
+
+Notice that Worker 0, Worker 1, and Worker 2 all compute identical sums equal to the mathematical sum of the sequence.
+
+::: {.callout-important}
+Each individual iterator returned by `concurrent_tee` is intended for consumption by **one** thread. If you need multiple threads to share one branch of a `concurrent_tee`, wrap that specific branch in `threading.serialize_iterator`.
+:::
+
+## The throughput reality of serialized iterators
+
+A common misconception among engineers adopting `serialize_iterator` is that wrapping an iterator in a lock will accelerate stream generation across multiple cores.
+
+It will not. A lock serializes access; it does not parallelize execution.
+
+When an iterator is wrapped in `serialize_iterator`, only one thread at a time can execute the iterator's `__next__()` body. If generating an item requires heavy CPU computation, that computation remains strictly single-threaded. Adding more consumer threads merely increases lock acquisition overhead and contention latency.
+
+Consider the lifecycle of an iteration step:
+1. Thread A acquires the lock.
+2. Thread A executes the generator code up to the next `yield`.
+3. Thread A releases the lock and processes the yielded item.
+4. Concurrently, Thread B acquires the lock and advances to the subsequent `yield`.
+
+This model provides high throughput **only when consumer processing time dominates production time**. If generating an item takes 1 millisecond but consuming it (e.g., executing a remote HTTP POST) takes 50 milliseconds, `serialize_iterator` allows 50 worker threads to process tasks concurrently without race conditions.
+
+If production itself is expensive or bound by CPU cycles, iterators should not be shared via locks. Instead, use `concurrent.futures.ProcessPoolExecutor` or pipeline work via chunked `queue.Queue` buffers.
+
+## Backward compatibility: A Python 3.14 fallback
+
+Applications running on Python 3.14 or earlier do not have access to `threading.serialize_iterator` or `threading.synchronized_iterator`. When writing libraries that must span multiple Python versions, you can implement a lightweight compatibility class.
+
+The following listing provides a drop-in fallback class `LockedIterator` that mimics `serialize_iterator` for basic iteration on Python 3.14.
+
+<!-- file: fallback.py -->
+```python
+import threading
+
+
+class LockedIterator:
+    """Thread-safe iterator wrapper compatible with Python 3.14 and earlier."""
+
+    def __init__(self, iterable):
+        self._iterator = iter(iterable)
+        self._lock = threading.Lock()
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        with self._lock:
+            return next(self._iterator)
+
+    def close(self):
+        with self._lock:
+            close_method = getattr(self._iterator, "close", None)
+            if close_method is not None:
+                return close_method()
+
+
+def compatibility_stream(limit):
+    for i in range(limit):
+        yield i
+
+
+def worker(stream, sink, worker_id):
+    count = 0
+    total = 0
+    for value in stream:
+        count += 1
+        total += value
+    sink[worker_id] = (count, total)
+
+
+def main():
+    item_limit = 5_000
+    source = compatibility_stream(item_limit)
+    safe_stream = LockedIterator(source)
+
+    sink = {}
+    threads = []
+    for i in range(4):
+        t = threading.Thread(target=worker, args=(safe_stream, sink, i))
+        threads.append(t)
+
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    total_items = sum(s[0] for s in sink.values())
+    total_sum = sum(s[1] for s in sink.values())
+    expected_sum = (item_limit - 1) * item_limit // 2
+
+    print(f"Total items consumed: {total_items}")
+    print(f"Total sum calculated: {total_sum}")
+    print(f"Integrity verified: {total_items == item_limit and total_sum == expected_sum}")
+
+
+if __name__ == "__main__":
+    main()
+```
+
+Run the fallback script:
+
+```bash
+python3.14 fallback.py
+```
+
+The following text block shows the output produced by running `python3.14 fallback.py`.
+
+```text
+Total items consumed: 5000
+Total sum calculated: 12497500
+Integrity verified: True
+```
+
+Inspect the output to verify that all 5,000 items were accounted for and the computed arithmetic sum matches the theoretical value.
+
+## Pitfalls and common mistakes
+
+### 1. Divergent consumers causing memory leaks in concurrent_tee
+Because `concurrent_tee` retains values in an internal buffer until the slowest consumer reads them, an unbalanced consumer will cause unbounded memory growth. If Consumer 1 processes 1,000,000 items while Consumer 2 hangs or blocks on I/O at item 10, the internal buffer must retain all 999,990 items in memory. Always ensure all consumers of a `concurrent_tee` advance at comparable rates or have configured timeouts.
+
+### 2. Nested yields holding locks
+`threading.serialize_iterator` uses a primitive, non-reentrant lock (`threading.Lock`, not `threading.RLock`). If the generator function itself calls code that attempts to advance the same wrapped iterator directly or indirectly, execution will deadlock instantly. Keep generator bodies self-contained and free from recursive iteration on the shared wrapper.
+
+### 3. Closing a shared generator while workers are using it
+`close()` takes the same lock as `__next__()`, so a supervisor calling `stream.close()` waits for the current item to finish. Workers that call `next()` afterwards get `StopIteration`, and a worker holding a half-processed item finishes it without knowing the stream was cut short. When tearing down worker pools, allow workers to exhaust the iterator naturally via `StopIteration`, or signal shutdown through a coordinated `threading.Event` checked inside the generator body.
+
+### 4. Expecting free-threaded performance gains without decoupling
+On free-threaded builds (`python3.13t` and `python3.15t`), removing the GIL allows true parallel execution on CPU cores. However, wrapping a single generator in `serialize_iterator` forces all worker threads to serialize through the lock. If your generator does CPU-heavy work before yielding, threads will spend most of their time waiting on the mutex. To scale CPU work across cores, split data into discrete slices and instantiate independent iterators per thread.
+
+## Summary
+
+- Iterators and generators maintain mutable internal state; advancing them across threads without synchronization causes `ValueError: generator already executing` or data corruption.
+- Python 3.15 adds `threading.serialize_iterator(iterable)` to protect `__next__()`, `send()`, `throw()`, and `close()` with a non-reentrant mutex, delivering each item to exactly one thread with zero buffering.
+- `threading.synchronized_iterator(func)` acts as a decorator for generator functions and iterator factories, guaranteeing that every instantiated iterator is thread-safe.
+- `threading.concurrent_tee(iterable, n=2)` broadcasts a stream across $n$ independent threads, buffering items dynamically until consumed by all branches.
+- Locking an iterator serializes production. Use these tools to safely coordinate shared sources among threads, not to speed up the generator's internal execution.
+- For Python 3.14 environments, use a custom `LockedIterator` wrapper around `iter()` and `next()` as an effective fallback.
+
+## Sources
+
+- [Python 3.15 threading module documentation](https://docs.python.org/3.15/library/threading.html)
+- [What's New in Python 3.15](https://docs.python.org/3.15/whatsnew/3.15.html)
+- [Python Free-Threading How-To](https://docs.python.org/3/howto/free-threading-python.html)
