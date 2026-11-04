@@ -1,0 +1,452 @@
+---
+title: "A Tiny JIT with Cranelift: From Postfix Expressions to Native Code"
+author:
+  - name: "K19G"
+  - name: "grok-bot"
+---
+
+# A Tiny JIT with Cranelift: From Postfix Expressions to Native Code
+
+After reading this chapter, you will be able to parse a reverse Polish notation (RPN) arithmetic expression, lower it into Cranelift Intermediate Representation (IR) using single static assignment (SSA) values, compile that IR in-process into executable machine code, and invoke the resulting function safely through a Rust function pointer.
+
+## Thesis
+
+A JIT doesn't have to mean writing machine code by hand or linking LLVM. Cranelift is a code generator written in Rust. It is the compiler inside Wasmtime and the backend of `rustc_codegen_cranelift`, which can stand in for LLVM to give faster debug builds. You build SSA-form IR through its API and it emits native code for the host, in-process, at runtime.
+
+In this chapter, a postfix expression typed at runtime becomes a native function you call through a function pointer, in about 150 lines. We check its results against a plain interpreter and time both. Only two lines are `unsafe`, and the chapter explains what each one depends on.
+
+## When a JIT pays off
+
+A JIT is a trade. You pay to compile up front, ship a code generator in your binary and take on `unsafe` code. In return each later evaluation is cheap.
+
+
+JIT compilation pays off when an expression or program is evaluated repeatedly over a large dataset or long runtime:
+
+- **Hot user-supplied expressions**: Database filter predicates, dynamic routing rules, spreadsheet formulas, or financial risk calculations compiled once and run against many records.
+- **Emulators and language runtimes**: Dynamic translation of foreign ISA instructions or language bytecode into host native code.
+- **Small DSLs and rules engines** where an interpreter is the bottleneck.
+
+Conversely, avoid JIT compilation under the following conditions:
+
+- **One-off execution**: If an expression is evaluated only a handful of times, building IR and emitting code costs more than just interpreting it.
+- **Platform restrictions**: Environments enforcing strict W^X (Write XOR Execute) memory policies without permissions for executable heap allocation (such as iOS or locked-down sandbox environments) prohibit in-process JIT compilation.
+- **Security-sensitive boundaries**: Native memory execution increases the attack surface if untrusted inputs can influence codegen in ways that bypass bounds checks or memory isolation.
+
+## The Cranelift crate ecosystem
+
+Cranelift is modularized into several focused crates. The JIT pipeline relies on five primary crates, all at version `0.137.1`:
+
+| Crate | Primary Purpose | Key Types / APIs |
+|-------|-----------------|------------------|
+| `cranelift-codegen` | Core IR definitions, instruction builders, ISA backends, and optimization flags. | `types::I64`, `InstBuilder`, `AbiParam`, `settings` |
+| `cranelift-frontend` | Translates AST/bytecode to Cranelift SSA IR and manages basic block sealing. | `FunctionBuilder`, `FunctionBuilderContext` |
+| `cranelift-module` | Abstract target interface for declaring and defining functions and data objects. | `Module`, `Linkage` |
+| `cranelift-jit` | Concrete `Module` implementation that allocates executable memory in the current process. | `JITModule`, `JITBuilder` |
+| `cranelift-native` | Auto-detects the host CPU instruction set architecture (ISA) and CPU flags. | `cranelift_native::builder()` |
+
+## Program walkthrough
+
+The example project is organized as a standard Cargo binary crate named `tinyjit`. The manifest asks for version 0.137.1 of the five crates (a caret requirement, so `cargo` may pick a later 0.137.x). It was created with `cargo add cranelift-codegen cranelift-frontend cranelift-jit cranelift-module cranelift-native`. The code is in `src/main.rs`.
+
+<!-- file: Cargo.toml -->
+```toml
+[package]
+name = "tinyjit"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+cranelift-codegen = "0.137.1"
+cranelift-frontend = "0.137.1"
+cranelift-jit = "0.137.1"
+cranelift-module = "0.137.1"
+cranelift-native = "0.137.1"
+```
+
+The application parses RPN expressions containing a single variable `x` and 64-bit integer constants, builds Cranelift IR, compiles the function into native code, compares execution against an interpreter, and frees the JIT memory.
+
+<!-- file: main.rs -->
+```rust
+//! tinyjit: compile a postfix (RPN) expression in `x` to native code with
+//! Cranelift, then call it through a function pointer.
+use cranelift_codegen::ir::{types, AbiParam, InstBuilder, Value};
+use cranelift_codegen::settings::{self, Configurable};
+use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
+use cranelift_jit::{JITBuilder, JITModule};
+use cranelift_module::{default_libcall_names, Linkage, Module};
+use std::time::Instant;
+
+#[derive(Debug, Clone, Copy)]
+enum Tok {
+    X,
+    Num(i64),
+    Add,
+    Sub,
+    Mul,
+}
+
+fn parse(src: &str) -> Result<Vec<Tok>, String> {
+    src.split_whitespace()
+        .map(|t| match t {
+            "x" => Ok(Tok::X),
+            "+" => Ok(Tok::Add),
+            "-" => Ok(Tok::Sub),
+            "*" => Ok(Tok::Mul),
+            n => n.parse().map(Tok::Num).map_err(|_| format!("bad token {n:?}")),
+        })
+        .collect()
+}
+
+/// Reference interpreter: walks the token list for every call.
+fn interpret(prog: &[Tok], x: i64) -> i64 {
+    let mut stack = Vec::with_capacity(8);
+    for t in prog {
+        match *t {
+            Tok::X => stack.push(x),
+            Tok::Num(n) => stack.push(n),
+            op => {
+                let b = stack.pop().unwrap();
+                let a = stack.pop().unwrap();
+                stack.push(match op {
+                    Tok::Add => a.wrapping_add(b),
+                    Tok::Sub => a.wrapping_sub(b),
+                    Tok::Mul => a.wrapping_mul(b),
+                    _ => unreachable!(),
+                });
+            }
+        }
+    }
+    stack.pop().unwrap()
+}
+
+/// Compile the program to `extern "C" fn(i64) -> i64`.
+fn compile(prog: &[Tok]) -> Result<(JITModule, extern "C" fn(i64) -> i64, String), String> {
+    let mut flags = settings::builder();
+    flags.set("opt_level", "speed").map_err(|e| e.to_string())?;
+    let isa = cranelift_native::builder()
+        .map_err(|e| e.to_string())?
+        .finish(settings::Flags::new(flags))
+        .map_err(|e| e.to_string())?;
+    let mut module = JITModule::new(JITBuilder::with_isa(isa, default_libcall_names()));
+
+    let mut ctx = module.make_context();
+    ctx.func.signature.params.push(AbiParam::new(types::I64));
+    ctx.func.signature.returns.push(AbiParam::new(types::I64));
+
+    // Pointer width, call conventions etc. the frontend needs from the target.
+    let target = module.target_config();
+    let mut fctx = FunctionBuilderContext::new();
+    {
+        let mut b = FunctionBuilder::new(&mut ctx.func, &mut fctx);
+        let entry = b.create_block();
+        b.append_block_params_for_function_params(entry);
+        b.switch_to_block(entry);
+        b.seal_block(entry);
+        let x = b.block_params(entry)[0];
+
+        // The RPN stack exists only at compile time: it holds SSA values.
+        let mut stack: Vec<Value> = Vec::new();
+        for t in prog {
+            let v = match *t {
+                Tok::X => x,
+                Tok::Num(n) => b.ins().iconst(types::I64, n),
+                op => {
+                    let rhs = stack.pop().ok_or("stack underflow")?;
+                    let lhs = stack.pop().ok_or("stack underflow")?;
+                    match op {
+                        Tok::Add => b.ins().iadd(lhs, rhs),
+                        Tok::Sub => b.ins().isub(lhs, rhs),
+                        Tok::Mul => b.ins().imul(lhs, rhs),
+                        _ => unreachable!(),
+                    }
+                }
+            };
+            stack.push(v);
+        }
+        if stack.len() != 1 {
+            return Err(format!("expression leaves {} values", stack.len()));
+        }
+        b.ins().return_(&[stack[0]]);
+        b.finalize(target);
+    }
+    let ir = ctx.func.display().to_string();
+
+    let id = module
+        .declare_function("expr", Linkage::Export, &ctx.func.signature)
+        .map_err(|e| e.to_string())?;
+    module.define_function(id, &mut ctx).map_err(|e| e.to_string())?;
+    module.clear_context(&mut ctx);
+    module.finalize_definitions().map_err(|e| e.to_string())?;
+
+    let code = module.get_finalized_function(id);
+    // SAFETY: we built this function with exactly this signature.
+    let f = unsafe { std::mem::transmute::<*const u8, extern "C" fn(i64) -> i64>(code) };
+    Ok((module, f, ir))
+}
+
+fn main() -> Result<(), String> {
+    let src = std::env::args().nth(1).unwrap_or_else(|| "x x * 3 x * + 7 -".into());
+    let prog = parse(&src)?;
+    let (module, f, ir) = compile(&prog)?;
+    println!("expression: {src}");
+    println!("{ir}");
+
+    for x in [0, 1, 2, 10] {
+        println!("f({x}) = {} (interpreter: {})", f(x), interpret(&prog, x));
+    }
+
+    let n = 5_000_000i64;
+    let t = Instant::now();
+    let mut acc = 0i64;
+    for x in 0..n {
+        acc = acc.wrapping_add(interpret(&prog, x));
+    }
+    let ti = t.elapsed();
+    let t = Instant::now();
+    let mut acc2 = 0i64;
+    for x in 0..n {
+        acc2 = acc2.wrapping_add(f(std::hint::black_box(x)));
+    }
+    let tj = t.elapsed();
+    println!("checksums equal: {}", acc == acc2);
+    println!("interpreter {:?}, jit {:?} for {n} calls", ti, tj);
+
+    // Freeing the module unmaps the code; `f` must not be called after this.
+    unsafe { module.free_memory() };
+    Ok(())
+}
+```
+
+### Parsing and reference interpretation
+
+The parser splits whitespace-delimited strings into tokens representing values (`x`, integer literals) or stack operations (`+`, `-`, `*`).
+
+The reference interpreter maintains an evaluation stack at runtime. For every function evaluation, it iterates over the token array, pushing values and popping operands to perform arithmetic operations. Notice that `interpret` uses wrapping arithmetic (`wrapping_add`, `wrapping_sub`, `wrapping_mul`). This guarantees two's-complement overflow behaviour identical to native machine instructions emitted by Cranelift's `iadd`, `isub`, and `imul`.
+
+### Setting up the Cranelift JIT environment
+
+The `compile` function establishes the target platform ISA and configures compilation flags:
+
+```rust
+let mut flags = settings::builder();
+flags.set("opt_level", "speed").map_err(|e| e.to_string())?;
+let isa = cranelift_native::builder()
+    .map_err(|e| e.to_string())?
+    .finish(settings::Flags::new(flags))
+    .map_err(|e| e.to_string())?;
+let mut module = JITModule::new(JITBuilder::with_isa(isa, default_libcall_names()));
+```
+
+1. `settings::builder()` initializes code generator flags, where `opt_level` is set to `"speed"`.
+2. `cranelift_native::builder()` detects the host architecture and CPU features; `finish` combines that with the flags into an `OwnedTargetIsa`.
+3. `JITBuilder::with_isa` takes the ISA plus `default_libcall_names()`, the symbol names to use if generated code needs runtime helper calls such as `memcpy`. `JITModule::new` then gives us a module that puts code in this process's memory.
+
+### Constructing SSA IR with FunctionBuilder
+
+Cranelift IR is built around blocks and SSA values. The input expression uses postfix notation, which operates on an evaluation stack. However, in our JIT compiler, the evaluation stack exists **only at compile time**. The stack stores SSA `cranelift_codegen::ir::Value` handles rather than runtime integers.
+
+```rust
+let mut ctx = module.make_context();
+ctx.func.signature.params.push(AbiParam::new(types::I64));
+ctx.func.signature.returns.push(AbiParam::new(types::I64));
+
+let target = module.target_config();
+let mut fctx = FunctionBuilderContext::new();
+{
+    let mut b = FunctionBuilder::new(&mut ctx.func, &mut fctx);
+    let entry = b.create_block();
+    b.append_block_params_for_function_params(entry);
+    b.switch_to_block(entry);
+    b.seal_block(entry);
+    let x = b.block_params(entry)[0];
+```
+
+The function signature is configured for an input parameter of `i64` and a return type of `i64`. 
+
+Block construction follows four steps:
+1. `create_block()` allocates an entry basic block.
+2. `append_block_params_for_function_params(entry)` assigns block parameter values corresponding to incoming ABI function parameters (`x`).
+3. `switch_to_block(entry)` instructs the builder to append subsequent IR instructions to this block.
+4. `seal_block(entry)` promises that no more branches into this block will be added. That lets the frontend finish SSA construction for it. The entry block has no predecessors, so we can seal it at once.
+
+As the compiler iterates through the RPN token stream:
+- `Tok::X` pushes the entry block parameter `x`.
+- `Tok::Num(n)` emits an `iconst` instruction producing a new `Value`.
+- Binary operators (`+`, `-`, `*`) pop two `Value` handles off the compile-time stack, emit an `iadd`, `isub`, or `imul` instruction, and push the resulting `Value` back onto the stack.
+
+Finally, `b.ins().return_(&[stack[0]])` generates the return instruction, and `b.finalize(target)` ends building. In debug builds it checks that every block is sealed.
+
+::: {.callout-note}
+**API Change in Cranelift 0.137**: In older versions of Cranelift, `FunctionBuilder::finalize()` took no arguments. In 0.137, `finalize` takes a `TargetFrontendConfig`, which you get from `module.target_config()`. Code written for older Cranelift releases will fail to compile without this argument.
+:::
+
+### Finalizing compilation and function transmutation
+
+Once the IR representation is constructed, `compile` submits the function context to the JIT module:
+
+```rust
+let id = module
+    .declare_function("expr", Linkage::Export, &ctx.func.signature)
+    .map_err(|e| e.to_string())?;
+module.define_function(id, &mut ctx).map_err(|e| e.to_string())?;
+module.clear_context(&mut ctx);
+module.finalize_definitions().map_err(|e| e.to_string())?;
+
+let code = module.get_finalized_function(id);
+let f = unsafe { std::mem::transmute::<*const u8, extern "C" fn(i64) -> i64>(code) };
+```
+
+- `declare_function` registers the function symbol `"expr"` with `Linkage::Export` within the module.
+- `define_function` compiles the function's IR into native machine code buffers.
+- `finalize_definitions` applies relocations and then switches the code memory from writable to executable.
+- `get_finalized_function` returns a raw pointer (`*const u8`) to the executable instruction buffer.
+- `std::mem::transmute` turns the raw pointer into an `extern "C" fn(i64) -> i64`. This is sound only because the type matches the signature the function was built with.
+
+## Reading the Cranelift IR
+
+Build with `cargo build --release`. These are the toolchain and the direct dependencies it resolved to:
+
+```bash
+rustc --version; cargo --version
+```
+
+```text
+rustc 1.99.1 (58cf8f9c3 2026-10-13)
+cargo 1.99.1 (5f94df478 2026-08-27)
+```
+
+
+```bash
+cargo tree --depth 1 -e normal
+```
+
+```text
+tinyjit v0.1.0 (/home/box/sand-data/books-scout/runs/2026-11-03-runnow/lab/rust-jit/jit)
+├── cranelift-codegen v0.137.1
+├── cranelift-frontend v0.137.1
+├── cranelift-jit v0.137.1
+├── cranelift-module v0.137.1
+└── cranelift-native v0.137.1
+```
+
+(The project path in the first line is just where the lab happened to live.)
+
+With no argument, the program compiles `x x * 3 x * + 7 -`, which is $x^2 + 3x - 7$. It prints the IR from `ctx.func.display()`, then some values and the timings:
+
+```bash
+./target/release/tinyjit
+```
+
+```text
+expression: x x * 3 x * + 7 -
+function u0:0(i64) -> i64 system_v {
+block0(v0: i64):
+    v1 = imul v0, v0
+    v2 = iconst.i64 3
+    v3 = imul v2, v0  ; v2 = 3
+    v4 = iadd v1, v3
+    v5 = iconst.i64 7
+    v6 = isub v4, v5  ; v5 = 7
+    return v6
+}
+
+f(0) = -7 (interpreter: -7)
+f(1) = -3 (interpreter: -3)
+f(2) = 3 (interpreter: 3)
+f(10) = 123 (interpreter: 123)
+checksums equal: true
+interpreter 106.790602ms, jit 8.698466ms for 5000000 calls
+```
+
+### Analyzing the IR output
+
+Examining the printed IR reveals how high-level RPN expressions translate into flat SSA form:
+
+1. **Signature**: `function u0:0(i64) -> i64 system_v`. `u0:0` is a default name, because the symbol name `expr` belongs to the module, not the IR. `system_v` is the host's default calling convention on x86_64 Linux, the same one `extern "C"` uses there.
+2. **Block Parameters**: `block0(v0: i64):` defines entry block parameter `v0`, representing argument `x`.
+3. **Instruction Stream**:
+   - `v1 = imul v0, v0` computes $x \times x$ ($x^2$).
+   - `v2 = iconst.i64 3` makes the constant 3. The `; v2 = 3` comment on the next line is Cranelift noting a constant operand where it is used.
+   - `v3 = imul v2, v0` computes $3 \times x$.
+   - `v4 = iadd v1, v3` sums $x^2 + 3x$.
+   - `v5 = iconst.i64 7` loads constant value 7.
+   - `v6 = isub v4, v5` subtracts 7 ($x^2 + 3x - 7$).
+   - `return v6` returns the computed 64-bit value.
+
+Notice that no stack manipulation instructions (`push`, `pop`) exist in the generated IR. Cranelift maps the compile-time token stack directly to SSA value bindings (`v0` through `v6`), which the register allocator then puts in machine registers.
+
+## Performance and timing analysis
+
+The benchmark section of `main.rs` executes 5,000,000 iterations comparing `interpret` against the JIT compiled function `f`. Both loops add up the results with wrapping adds, so the checksums can be compared. `std::hint::black_box` keeps the argument opaque to the optimiser.
+
+The interpreter incurs overhead on every iteration:
+- Re-walking slice elements.
+- Pattern matching on token enum variants.
+- Pushing and popping elements on a dynamic heap/stack buffer.
+- Performing branch checks for stack bounds.
+
+The JIT version is one indirect call to a few straight-line instructions. In this run the interpreter took about 107 ms and the JIT about 8.7 ms for 5,000,000 calls, roughly 12 times faster. That is one run on one machine, so read it as a rough guide, not a benchmark. Compile time isn't included, which is fair only because we compile once.
+
+## Error handling
+
+Expression validation occurs during both parsing and IR construction. If an invalid expression is passed—such as `"x +"`—the parser succeeds, but IR construction fails because the operation requires two operands while only one exists on the compile-time stack.
+
+Evaluating an invalid expression returns an error and sets a non-zero exit status:
+
+```bash
+./target/release/tinyjit "x +"; echo "exit status: $?"
+```
+
+```text
+Error: "stack underflow"
+exit status: 1
+```
+
+`compile` returns `Err("stack underflow")` before any code is defined or transmuted. `main` returns that `Result`, so Rust prints the error with `Debug` (hence the quotes) and exits with status 1.
+
+## Safety rules for JIT code
+
+Executing dynamically generated machine code requires raw pointer transmutes and manual lifetime management. To maintain sound Rust execution, adhere to four core safety rules:
+
+1. **Exact Signature Matching**: The function type target of `std::mem::transmute` MUST match the ABI parameters and return values declared in `ctx.func.signature`. A mismatch is undefined behaviour: wrong registers, garbage results, or a crash. Use `extern "C"` so the Rust side uses the platform calling convention the IR was built for.
+2. **Module Lifetime and Freeing Memory**: The returned function pointer `f` points directly to executable memory buffers allocated and managed by `JITModule`.
+   
+   ::: {.callout-note}
+   Calling `unsafe { module.free_memory() }` unmaps or deallocates executable memory pages. Calling `f` after `free_memory()` is a use-after-free: undefined behaviour, which may crash or may run whatever is now at that address. Keep `module` alive for as long as you use `f`, as `main` does.
+   :::
+
+3. **Keep it single-threaded unless the docs say otherwise**: this program compiles and calls on one thread. Before sharing a module or its function pointers across threads, check what `cranelift-jit` guarantees for your version.
+4. **Let the module handle permissions**: don't write into code memory yourself. `finalize_definitions()` makes it executable (on Linux by changing page protections) once writing is done.
+
+## Common mistakes
+
+When working with Cranelift, several pitfalls regularly trap engineers:
+
+- **Using outdated `finalize()` signatures**: Calling `builder.finalize()` without passing `module.target_config()` fails to compile on Cranelift `0.137.1`.
+- **Forgetting `seal_block`**: If a block is never sealed, `finalize` in a debug build panics with "FunctionBuilder finalized, but block … is not sealed". With more than one block, seal each one once all its predecessors exist.
+- **Calling function pointers post-deallocation**: Invoking `f` after `module.free_memory()` or after `JITModule` has been dropped is undefined behaviour.
+- **Transmuting to Rust standard ABI**: Omitting `extern "C"` from the function pointer declaration (e.g., `fn(i64) -> i64` instead of `extern "C" fn(i64) -> i64`) uses Rust's unspecified ABI, which need not match `system_v`, so calling it is undefined behaviour.
+- **Including JIT compilation latency in hot execution loops**: Recompiling inside the evaluation loop throws the gain away. Always compile expressions once, store the finalized function pointer, and invoke the pointer repeatedly.
+
+## Exercises
+
+To expand upon this minimal JIT compiler, consider implementing the following enhancements:
+
+1. **Add Control Flow**: Extend the parser and IR builder to support conditional expressions (`if` / `else`) using Cranelift's block parameters, `b.ins().brif(...)`, and `b.ins().jump(...)`.
+2. **Variable Binding Tables**: Replace single-variable `x` support with arbitrary named variables using Cranelift's `Variable`, `b.declare_var(...)`, `b.def_var(...)`, and `b.use_var(...)` APIs.
+3. **Host Function Imports**: Declare external C-ABI host functions (such as `sin` or `print_i64`) using `module.declare_function` with `Linkage::Import`, register their host address via `JITBuilder::symbol`, and emit function calls with `b.ins().call(...)`.
+4. **Checked Division**: Add a `/` division operator using `b.ins().sdiv(...)`. `sdiv` traps on division by zero (and on `i64::MIN / -1`). With no trap handler installed, the trap kills the process, so check the divisor in the generated code or reject such input.
+5. **Machine Code Disassembly**: Call `ctx.set_disasm(true)` before `define_function`. Before `clear_context`, print the text in `ctx.compiled_code().unwrap().vcode` (an `Option<String>`) to see the machine code generated for the host.
+
+## Summary
+
+Cranelift lets a Rust program generate native code at runtime without LLVM. The postfix stack lives only at compile time and holds SSA `Value`s, so each token becomes at most one instruction and the generated code has no stack machine. `JITModule` owns the code memory. The two `unsafe` operations, the transmute and `free_memory`, are sound only if the signature matches and the module outlives every call.
+
+## Sources
+
+- [Cranelift JIT Documentation (`cranelift-jit`)](https://docs.rs/cranelift-jit/0.137.1/cranelift_jit/)
+- [Cranelift Frontend Documentation (`cranelift-frontend`)](https://docs.rs/cranelift-frontend/0.137.1/cranelift_frontend/)
+- [Cranelift Official Website](https://cranelift.dev/)
+- [Cranelift Source Repository (Bytecode Alliance)](https://github.com/bytecodealliance/wasmtime/tree/main/cranelift)
+- [Cranelift JIT Demo Repository](https://github.com/bytecodealliance/cranelift-jit-demo)
+- [Cranelift Backend for rustc (`rustc_codegen_cranelift`)](https://github.com/rust-lang/rustc_codegen_cranelift)
