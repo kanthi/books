@@ -1,0 +1,297 @@
+---
+title: "HashMap Hashers and Hash Flooding: Why the Default Is SipHash"
+author:
+  - name: "K19G"
+  - name: "grok-bot"
+---
+
+# HashMap Hashers and Hash Flooding: Why the Default Is SipHash
+
+After reading this chapter, you will understand why Rust's standard `HashMap` uses a keyed, randomly seeded hash (currently SipHash-1-3) by default, how hash-flooding (HashDoS) attacks exploit deterministic hash collisions to degrade table operations to $O(n^2)$, how Rust's SwissTable architecture behaves under attack, and when it is safe to swap in non-cryptographic hashers like `foldhash` or `FxHash`.
+
+## Thesis
+
+A hash table promises $O(1)$ average-time lookups and insertions by mapping keys to buckets using a hash function. If an attacker can force many keys into the same bucket or probing sequence, insertion cost degrades to $O(n)$ per operation—turning an $O(n)$ workload into an $O(n^2)$ CPU-exhaustion denial of service.
+
+To prevent this vulnerability—known as a HashDoS attack—Rust's standard library parameterizes `HashMap<K, V, S = RandomState>` with a keyed, randomly seeded hasher (`SipHash-1-3`) by default. The keys come from the operating system's secure random source at runtime, so someone outside the process can't work out which keys will collide.
+
+That protection isn't free: SipHash is slower than simple non-keyed hashes. When you generate the keys yourself (compiler symbols, internal integer IDs) and profiling shows hashing matters, a faster hasher can be worth it. The hasher is part of the map's type, so this is a deliberate choice you make per map, after asking where its keys come from.
+
+## How a Hash Table Degrades
+
+Standard hash tables map high-cardinality keys to finite table slots using two steps:
+1. Hash the key into a 64-bit integer using a `Hasher`.
+2. Map the 64-bit hash to a specific table index and control tag.
+
+Rust's `std::collections::HashMap` is a port of Google's [SwissTable](https://github.com/rust-lang/hashbrown) design (via the `hashbrown` crate). SwissTable divides the 64-bit hash into two components:
+- **$h_1$ (lower bits):** Used to determine the starting group index in the control byte array.
+- **$h_2$ (top 7 bits):** stored as a one-byte tag in the control bytes, which are scanned a group at a time (16 bytes with SSE2, smaller groups on some platforms).
+
+
+A lookup compares $h_2$ with a whole group of control bytes at once. Each tag match is checked against the real key. If the key isn't in that group and the group has no empty slot, the search moves to the next group in a fixed probe sequence. An insert follows the same path until it finds the key or a free slot.
+
+### The Attack Mechanics
+
+In a normal distribution, hash values spread uniformly across buckets, resulting in short probe sequences and $O(1)$ amortized insertions. 
+
+If an attacker knows the exact hashing algorithm and its seed (or if the algorithm is unseeded), they can precalculate a sequence of keys $K = \{k_1, k_2, \dots, k_n\}$ such that every key produces identical low bits ($h_1$) and identical top bits ($h_2$). 
+
+When inserting $n$ colliding keys into an empty SwissTable:
+1. The 1st key goes straight into the first slot of its probe sequence.
+2. The 2nd key has the same tag as the 1st, so the table compares the two keys, finds they differ, and takes the next slot.
+3. The $i$-th key walks past all $i-1$ earlier keys, with a tag match and a key comparison for each, before it finds a free slot.
+
+(This is a simplified count, ignoring resizes and group-at-a-time scanning, but the shape is right.)
+
+Total insertion steps for $n$ keys:
+$$\sum_{i=1}^{n} i = \frac{n(n + 1)}{2} \in O(n^2)$$
+
+At $n = 20{,}000$ that is about 200 million key comparisons, for work that should take well under a millisecond. And the attacker only had to send the keys.
+
+## Why a Keyed Random Hash Stops HashDoS
+
+The root cause of HashDoS is **predictability**. If an attacker cannot predict the hash output for a given key, they cannot precalculate colliding key sets.
+
+SipHash (introduced by Jean-Philippe Aumasson and Daniel J. Bernstein in 2012) is a family of pseudorandom functions designed specifically for short inputs like hash table keys. It mixes the input with a 128-bit secret key through rounds of add, rotate and xor (ARX) operations. Without the key you can't predict the output.
+
+`std::hash::RandomState` (also re-exported as `std::collections::hash_map::RandomState`) seeds SipHash with keys from a secure random source on the host, taken without blocking. The std docs describe this as "a reasonable best-effort". Keys are generated once per thread and changed slightly for every new `RandomState`.
+
+Because the key is secret and generated at runtime:
+- An attacker sending JSON payloads or HTTP headers cannot determine which string keys will collide in the server's memory.
+- Two `RandomState`s, and so two maps made with `HashMap::new()`, hash the same key differently, even in one process.
+- Iteration order changes from run to run, and can differ between maps holding the same keys.
+
+### Historical Context
+
+The HashDoS attack vector was popularized at the 28C3 conference in December 2011 by Alexander Klink and Julian Wälde (*"Efficient Denial of Service Attacks on Web Application Platforms"*). They showed hash flooding working against web platforms in many languages.
+
+Afterwards:
+- Aumasson and Bernstein introduced SipHash in 2012, a fast keyed function meant for exactly this job.
+- Python switched `str` and `bytes` hashing to SipHash in Python 3.4 ([PEP 456](https://peps.python.org/pep-0456/)).
+- Rust's `HashMap` uses SipHash-1-3 today. The std docs say the algorithm "is subject to change at any point in the future".
+
+A keyed hash stops the classic attack, where the attacker computes colliding keys offline. It does not make a table immune to every complexity attack. In October 2026 Orson Peters described a "black-box" HashDoS that never learns the hash function. It works on string keys that share a long common prefix: it times lookups to tell when a key comparison happened, uses that to map which buckets are occupied, and then builds keys that form one long probe chain. He demonstrated it against Rust's standard-library table. It needs a lot of interactive access: `lookup`, `insert` and `clear` on the same table, with no other users disturbing it, and O(n log n) preparation steps. His suggested mitigation is to compare a full 64-bit hash before comparing keys. He also says it is unclear how far the access requirements protect you. So keep the default hasher for untrusted keys, and also cap how many entries one client can put into a table.
+
+## Code Walkthrough: Demonstrating the Vulnerability
+
+The program below shows an unseeded hasher going quadratic on chosen keys, while `RandomState` (SipHash) and `foldhash` stay linear on the same keys. Its only dependency is `foldhash`, added with `cargo add foldhash`. It was tested with rustc 1.99.1, edition 2024.
+
+### Project Setup
+
+<!-- file: Cargo.toml -->
+```toml
+[package]
+name = "hashdos"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+foldhash = "0.2.0"
+```
+
+The code resides at `src/main.rs`:
+
+<!-- file: main.rs -->
+```rust
+//! hashdos: what HashMap's default hasher protects you from.
+use std::collections::HashMap;
+use std::hash::{BuildHasher, BuildHasherDefault, Hasher, RandomState};
+use std::time::{Duration, Instant};
+
+/// A deliberately terrible hasher: the hash of a u64 is the u64 itself.
+/// Fast, deterministic, and trivially attackable.
+#[derive(Default)]
+struct IdentityHasher(u64);
+
+impl Hasher for IdentityHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 = (self.0 << 8) | u64::from(b);
+        }
+    }
+    fn write_u64(&mut self, n: u64) {
+        self.0 = n;
+    }
+}
+
+type Identity = BuildHasherDefault<IdentityHasher>;
+
+fn time_inserts<S: BuildHasher>(build: S, keys: &[u64]) -> Duration {
+    let mut m: HashMap<u64, u64, S> = HashMap::with_hasher(build);
+    let t = Instant::now();
+    for &k in keys {
+        m.insert(k, k);
+    }
+    let d = t.elapsed();
+    assert_eq!(m.len(), keys.len());
+    d
+}
+
+fn main() {
+    // 1. The default hasher is keyed per HashMap with random keys.
+    let a = RandomState::new();
+    let b = RandomState::new();
+    println!("same key, two RandomStates: {:016x} vs {:016x}", a.hash_one(42u64), b.hash_one(42u64));
+
+    // 2. Iteration order therefore differs between runs of the program.
+    let m: HashMap<&str, i32> = [("apple", 1), ("banana", 2), ("cherry", 3), ("date", 4)].into();
+    println!("iteration order this run: {:?}", m.keys().collect::<Vec<_>>());
+
+    // 3. An attacker who knows the hash function picks colliding keys.
+    // With the identity hash, multiples of 2^32 share the low bits the table
+    // uses to pick a bucket and the top 7 bits it uses as a tag (all zero
+    // for small multipliers), so every key collides with every other.
+    for n in [5_000u64, 10_000, 20_000] {
+        let evil: Vec<u64> = (0..n).map(|i| i << 32).collect();
+        let benign: Vec<u64> = (0..n).collect();
+        println!(
+            "n={n:>6}  identity/benign {:>9.2?}  identity/evil {:>10.2?}  siphash/evil {:>9.2?}  foldhash/evil {:>9.2?}",
+            time_inserts(Identity::default(), &benign),
+            time_inserts(Identity::default(), &evil),
+            time_inserts(RandomState::new(), &evil),
+            time_inserts(foldhash::fast::RandomState::default(), &evil),
+        );
+    }
+}
+```
+
+### Key Components
+
+1. **`IdentityHasher`**: `Hasher` needs only `finish` and `write(&[u8])`. Methods like `write_u64` have default implementations that call `write`, so overriding `write_u64` lets a `u64` key become its own hash with no byte shifting.
+2. **`BuildHasherDefault<IdentityHasher>`**: Turns a `Hasher` that implements `Default` into a `BuildHasher` that makes fresh, unseeded `IdentityHasher`s. `time_inserts` is generic over the `BuildHasher` and builds its map with `HashMap::with_hasher`, because the hasher is the map's third type parameter: `HashMap<K, V, S>`.
+3. **`BuildHasher::hash_one`**: A standard library convenience method (stable since Rust 1.71) that computes the hash of a single value without manually constructing a hasher.
+4. **Attacker Key Construction (`i << 32`)**: Because `IdentityHasher` returns the raw `u64`, keys of the form $i \times 2^{32}$ have 32 trailing zero bits (filling $h_1$ with zero) and zero top bits for small $i$ (filling $h_2$ with zero). So every key starts at the same group with the same tag.
+
+## Program Execution Results
+
+Build and run it:
+
+```bash
+cargo build --release
+./target/release/hashdos
+```
+
+```text
+same key, two RandomStates: a521e11b44355f6d vs bc8555747fa86f7e
+iteration order this run: ["cherry", "date", "banana", "apple"]
+n=  5000  identity/benign  123.46µs  identity/evil    11.13ms  siphash/evil  175.54µs  foldhash/evil   94.72µs
+n= 10000  identity/benign  228.74µs  identity/evil    49.00ms  siphash/evil  397.28µs  foldhash/evil  201.11µs
+n= 20000  identity/benign  454.52µs  identity/evil   185.61ms  siphash/evil  830.29µs  foldhash/evil  433.46µs
+```
+
+Running it again gave different first two lines:
+```text
+same key, two RandomStates: 982862aac45c489c vs b6ac8abef2f118c8
+iteration order this run: ["cherry", "banana", "apple", "date"]
+```
+
+### Analyzing the Output Pattern
+
+When reviewing execution output across problem sizes ($n = 5{,}000$, $10{,}000$, $20{,}000$):
+
+The times are from one release build on one machine. Treat them as indicative; the growth pattern matters more than the exact figures.
+
+1. **`identity/benign`**: the keys $0, 1, 2, \dots$ have different low bits, so the identity hash spreads them out. Time grows linearly and stays under a millisecond. A weak hash can look fine on friendly data.
+2. **`identity/evil`**: As input size $n$ doubles from 5,000 to 10,000 and then to 20,000, the time goes from 11.13 ms to 49.00 ms to 185.61 ms, roughly **4x for each doubling**. This 4x scaling is the classic signature of quadratic $O(n^2)$ complexity.
+3. **`siphash/evil`**: For the same keys, the keyed hash scatters them, so time grows linearly (175 µs to 830 µs).
+4. **`foldhash/evil`**: `foldhash::fast::RandomState` is seeded too, so this naive attack fails against it as well, and it is the fastest column here. That doesn't make it SipHash's equal against an attacker who adapts.
+5. **Randomness across runs**: comparing the two runs shows two things:
+   - `a.hash_one(42)` and `b.hash_one(42)` produce completely different hex values within the same execution.
+   - The key iteration order of `m` changes between independent runs of the program.
+
+## Non-Deterministic Iteration Order
+
+Because `RandomState` generates new seeds at runtime, `HashMap` iteration order is non-deterministic. Never write tests or application code that depend on key ordering.
+
+```rust
+// BAD: Flaky test! Will fail randomly across test runs or Rust versions.
+#[test]
+fn test_key_order() {
+    let mut map = std::collections::HashMap::new();
+    map.insert("a", 1);
+    map.insert("b", 2);
+    assert_eq!(map.keys().copied().collect::<Vec<_>>(), vec!["a", "b"]);
+}
+```
+
+If deterministic iteration or ordering is required:
+- **`std::collections::BTreeMap`**: Keys are kept sorted in $O(\log n)$ time.
+- **`indexmap::IndexMap`** (from the `indexmap` crate): keeps insertion order, with hash-table lookups.
+- **Explicit Sorting**: Collect keys into a `Vec` and invoke `.sort()` prior to comparison.
+
+## Choosing a Hasher
+
+You choose the hasher through the third type parameter. `FastMap::default()` works because the `S` type implements `Default`; otherwise use `HashMap::with_hasher(s)`:
+
+```rust
+use std::collections::HashMap;
+use foldhash::fast::RandomState as FoldRandomState;
+
+// A HashMap type using foldhash instead of RandomState
+type FastMap<K, V> = HashMap<K, V, FoldRandomState>;
+
+let map: FastMap<String, usize> = FastMap::default();
+```
+
+| Hasher | Algorithm Type | Seeded? | Intended Use Case |
+|---|---|---|---|
+| **`std::hash::RandomState`** | SipHash-1-3 today (may change) | Yes, random keys per thread, varied per instance | **The default.** Anything keyed by outside input: HTTP headers, JSON object keys, query parameters, user files. Designed to resist HashDoS. |
+| **`foldhash`** (`foldhash::fast::RandomState`) | Fast non-cryptographic hash | Yes, per process | The default hasher of the `hashbrown` crate (0.17.1). The crate calls itself "minimally DoS-resistant": enough for naive attacks like the one above, not a claim of SipHash-level resistance. |
+| **`FxHash`** (`rustc-hash` crate) | Fast non-cryptographic hash used inside rustc | **No**, deterministic | Keys you generate yourself, such as interned IDs in a compiler pass. Never attacker-controlled keys. |
+
+### Decision Rules
+
+
+1. **Untrusted Input Rule:** If keys originate from HTTP headers, URL queries, JSON body payloads, or external files, or anything else influenced by the outside world, **keep the default `RandomState`**.
+2. **Trusted Pass Rule:** If keys are internal integer IDs, compiler symbols, or generated in a closed loop, and profiling shows hashing is a real cost, `foldhash` or `FxHash` is a reasonable swap. For small integer keys, consider a `Vec` indexed by ID, which needs no hashing at all.
+
+## Pitfalls and Common Mistakes
+
+### Global Hasher Overrides in Web Services
+A crate-wide `type HashMap = FxHashMap` meant for one hot internal table ends up on maps that hold request data too. Then any client can flood them. Use the fast hasher on the specific maps that need it, by name.
+
+### Implementing `Hasher` by Ignoring Bytes
+A `Hasher` that ignores some of its input is still *correct*: equal keys hash equally, so the map gives right answers. But every key collides, so ordinary data hits the quadratic path, no attacker needed:
+
+```rust
+// DANGEROUS: Ignores write data and returns constant
+struct BrokenHasher;
+impl Hasher for BrokenHasher {
+    fn finish(&self) -> u64 { 42 }
+    fn write(&mut self, _bytes: &[u8]) {}
+}
+```
+
+### Assuming Default Hasher Stability
+The Rust standard library explicitly does not guarantee that `SipHash-1-3` will remain the default hasher in future releases. Never rely on specific hash outputs matching across different toolchain versions.
+
+### Floating-Point Keys
+`f32` and `f64` implement neither `Eq` nor `Hash`. `NaN != NaN` breaks `Eq`, and `+0.0 == -0.0` although their bits differ (`0x00000000` and `0x80000000` for `f32`), so hashing the bits would break the rule that equal values hash equally. If you must key on floats, use a wrapper such as `ordered-float`'s `OrderedFloat` that defines both, or key on `to_bits()` after deciding how to treat `-0.0` and NaN.
+
+## Exercises
+
+1. **Measure Collision Depths:** Change the evil keys to `i << 16`, then `i << 4`. Before you run each one, work out from the table size (a power of two above $n$) whether the low bits the table uses still all match, and predict the timings.
+2. **Build a Custom `BuildHasher`:** Write a custom type implementing `BuildHasher` that accepts a manual 64-bit seed at construction, and use it to demonstrate deterministic hashing within a single run.
+3. **Profile Hasher Overhead:** Create a benchmark using `criterion` comparing lookup times for $1{,}000{,}000$ random string keys between `SipHash-1-3`, `foldhash`, and `FxHash`.
+
+## Key Takeaways
+
+- Rust's `HashMap` defaults to `SipHash-1-3` parameterized by `RandomState` to defend against HashDoS CPU exhaustion attacks.
+- Untrusted inputs forcing $h_1$ and $h_2$ collisions in SwissTable degrade $O(1)$ operations to $O(n)$, causing overall insertion workloads to balloon to quadratic $O(n^2)$ time.
+- The random keys mean an outsider can't predict which keys collide, and they also make iteration order change between runs.
+- `foldhash` and `FxHash` can be faster for keys you control. `FxHash` must never see attacker-chosen keys, and `foldhash` only claims minimal DoS resistance.
+- `HashMap` iteration order is non-deterministic by design; use `BTreeMap` or `IndexMap` when deterministic key ordering is required.
+
+## Sources
+
+- [Rust std::collections::HashMap Documentation](https://doc.rust-lang.org/std/collections/struct.HashMap.html)
+- [Rust std::hash::RandomState Documentation](https://doc.rust-lang.org/std/hash/struct.RandomState.html)
+- [Rust std::hash::BuildHasher::hash_one Documentation](https://doc.rust-lang.org/std/hash/trait.BuildHasher.html#method.hash_one)
+- [foldhash Crate Documentation](https://docs.rs/foldhash/0.2.0/foldhash/)
+- [hashbrown GitHub Repository (SwissTable Port)](https://github.com/rust-lang/hashbrown)
+- [PEP 456 – Secure & Interchangeable Hash Algorithm](https://peps.python.org/pep-0456/)
+- [SipHash: a high-speed pseudorandom function (Aumasson & Bernstein, 2012)](https://www.aumasson.jp/siphash/siphash.pdf)
+- [Orson Peters: Black-Box HashDoS: Attacking Hash Tables Without Knowing the Hash Function (October 2026)](https://orlp.net/blog/black-box-hashdos/)
