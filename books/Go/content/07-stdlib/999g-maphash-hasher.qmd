@@ -1,0 +1,572 @@
+---
+title: "hash/maphash.Hasher: Custom Equality for Hash-Based Containers"
+author:
+  - name: "K19G"
+  - name: "grok-bot"
+---
+
+# hash/maphash.Hasher: Custom Equality for Hash-Based Containers
+
+After reading this chapter, you will be able to implement custom hash-based containers using Go 1.27's `maphash.Hasher` interface, allowing non-comparable types as keys and supporting custom equivalence relations like case-insensitive strings and field-scoped struct comparison.
+
+## Thesis
+
+For over a decade, Go developers designing hash tables or sets were bound to the built-in `map[K]V` type. Built-in maps require `K` to satisfy the language-level `comparable` constraint, and equivalence is strictly determined by the `==` operator. If you needed case-insensitive string lookups, equality over floating-point values with a tolerance, or struct comparisons that ignored mutable metadata slices, you had two suboptimal choices: serialize your keys into canonical strings, or manage manual hash buckets beside slices of key-value pairs.
+
+Go 1.27 resolves this limitation by adding `maphash.Hasher[T any]` to the standard library's `hash/maphash` package. By decoupling hash-based containers from Go's built-in `==` operator, `Hasher[T]` formalizes the bridge between container algorithms and element semantics. While the standard library does not yet include a generic `hash.Set` or `hash.Map`, `Hasher[T]` sets the contract that third-party hash tables, sets and other hash-based structures such as Bloom filters can share, as the package documentation puts it.
+
+Verified with **Go 1.27.2** (`linux/amd64`). Primary sources: [Go 1.27 release notes](https://go.dev/doc/go1.27), [`hash/maphash` package docs](https://pkg.go.dev/hash/maphash), and [issue #70471](https://github.com/golang/go/issues/70471).
+
+## Learning goals
+
+- Explain the interface contract of `maphash.Hasher[T any]` and why its `Hash` method receives `*maphash.Hash` rather than returning `uint64`.
+- Distinguish between standard Go equality (`==`) and custom equivalence relations, recognizing why `strings.ToLower` satisfies the hasher contract while `strings.EqualFold` breaks it.
+- Build a generic, separate-chaining `HashSet[T, H]` that resizes at a defined load factor and maintains a per-container seed.
+- Use non-comparable structs containing slice headers as container keys by implementing custom hashers that inspect only relevant fields.
+- Apply `maphash.ComparableHasher[T comparable]` for standard types while avoiding runtime panics with interface values.
+- Construct a two-seed Bloom filter driven by `maphash.Hasher`.
+
+## The `hash/maphash` additions in Go 1.27
+
+Go 1.27 introduces two fundamental additions to `hash/maphash`:
+
+```go
+type Hasher[T any] interface {
+	Hash(*Hash, T)
+	Equal(x, y T) bool
+}
+
+type ComparableHasher[T comparable] struct{}
+
+func (ComparableHasher[T]) Hash(h *Hash, v T)
+func (ComparableHasher[T]) Equal(x, y T) bool
+```
+
+The `Hasher[T]` interface defines two capabilities:
+1. `Hash(*Hash, T)`: Appends the representation of an element `T` into the provided `*maphash.Hash` state.
+2. `Equal(x, y T) bool`: Determines whether two elements are equivalent under the container's equivalence relation.
+
+### Why `Hash` takes `*maphash.Hash` instead of returning `uint64`
+
+Many languages give a type a hash method that simply returns an integer. Go 1.24's `maphash.Comparable(seed, v) uint64` also returns a number, but it takes a seed. `Hasher.Hash` instead writes into a `*maphash.Hash` that the container owns, which has three advantages:
+
+- **Zero-allocation streaming**: Composite types can write multiple sub-fields sequentially using `h.WriteString()`, `h.WriteByte()`, and `h.Write()`. The hasher does not need to allocate intermediate byte slices or pack fields into temporary buffers before hashing.
+- **State reuse**: Containers maintain their own `maphash.Hash` instances or pass pointers to pooled hash state, reusing internal buffers across thousands of insertions and queries.
+- **Unified seed control**: The container controls the hash seed via `h.SetSeed(seed)` or `maphash.MakeSeed()`. Elements do not inspect or manage the seed, which prevents hash-collision denial-of-service vulnerabilities across instances.
+
+| Capability | Built-in `map[K]V` | Container with `maphash.Hasher[T]` |
+| :--- | :--- | :--- |
+| **Key constraint** | `comparable` (compile-time) | `any` (unconstrained) |
+| **Equality rule** | Language `==` operator | `Hasher.Equal(x, y)` |
+| **Hash algorithm** | Runtime hash (AES-based where the CPU supports it) | `maphash.Hash`, backed by the same runtime hash functions |
+| **Non-comparable types** | Compiler error | Supported via selective hashing |
+| **Case insensitivity** | Requires manual canonicalization | Built into hasher |
+| **Per-instance seeding** | Random seed per map, chosen by the runtime | Chosen by the container, typically `MakeSeed()` per instance |
+
+### The fundamental contract
+
+Any type implementing `maphash.Hasher[T]` must satisfy the equivalence contract:
+
+$$\forall x, y \in T, \quad \text{Equal}(x, y) = \text{true} \implies \text{Hash}(h, x) \equiv \text{Hash}(h, y)$$
+
+If two values are equal under `Equal`, writing their contents into a `*maphash.Hash` seeded with identical initial states must produce identical byte sequences, and therefore identical `Sum64()` digests. If two values yield `Equal(x, y) == true` but write different inputs into the hash buffer, they land in different buckets, making retrieval impossible. The inverse need not hold: hash collisions (different inputs producing the same 64-bit integer) are unavoidable, but false negatives break the container. The documentation adds one more rule: hashers must be *logically stateless*, so `Hash` and `Equal` depend only on their arguments.
+
+### `strings.ToLower` vs. `strings.EqualFold`
+
+A frequent pitfall when writing case-insensitive hashers is pairing `strings.ToLower` with `strings.EqualFold`.
+
+Unicode case-folding under `strings.EqualFold` is a broader equivalence relation than simple lowercase conversion. For example, the Greek uppercase letter sigma (`'Σ'`) folds to both the medial lowercase sigma (`'σ'`) and the final lowercase sigma (`'ς'`). Under `strings.EqualFold`:
+
+```go
+strings.EqualFold("Σ", "ς") // returns true
+```
+
+However, standard lowercase mapping behaves as follows:
+
+```go
+strings.ToLower("Σ") // returns "σ"
+strings.ToLower("ς") // returns "ς"
+```
+
+If `Hash` writes `strings.ToLower(s)` into the hash buffer while `Equal` returns `strings.EqualFold(x, y)`, the contract breaks: `"Σ"` and `"ς"` are reported as equal, but `"Σ"` writes `"σ"` into the hasher while `"ς"` writes `"ς"`. Because their hashed data differs, their 64-bit digests diverge. A container searching for `"ς"` will check a different bucket and fail to find `"Σ"`.
+
+To preserve the contract, both `Hash` and `Equal` must reduce inputs to the same canonical form. This is the example from the package documentation, which notes that it avoids `strings.EqualFold` for exactly this reason:
+
+```go
+type CaseInsensitiveHasher struct{}
+
+func (CaseInsensitiveHasher) Hash(h *maphash.Hash, s string) {
+	h.WriteString(strings.ToLower(s))
+}
+
+func (CaseInsensitiveHasher) Equal(x, y string) bool {
+	return strings.ToLower(x) == strings.ToLower(y)
+}
+```
+
+## Lab: Building a generic `HashSet`
+
+We begin by setting up a minimal Go 1.27 module.
+
+<!-- file: go.mod -->
+```text
+module example.com/hasherdemo
+
+go 1.27
+```
+
+We now construct `HashSet[T any, H maphash.Hasher[T]]` in package `hashset`. The container uses separate chaining over buckets represented by slices of `T`. It tracks its own `maphash.Seed` and dynamically doubles its bucket array when the load factor exceeds 0.75.
+
+<!-- file: hashset/hashset.go -->
+```go
+package hashset
+
+import (
+	"hash/maphash"
+)
+
+// HashSet is a generic hash set that uses separate chaining.
+// T represents the element type, and H provides custom hashing and equality.
+type HashSet[T any, H maphash.Hasher[T]] struct {
+	hasher  H
+	seed    maphash.Seed
+	buckets [][]T
+	size    int
+}
+
+// New constructs an empty HashSet using the supplied hasher instance.
+func New[T any, H maphash.Hasher[T]](hasher H) *HashSet[T, H] {
+	return &HashSet[T, H]{
+		hasher:  hasher,
+		seed:    maphash.MakeSeed(),
+		buckets: make([][]T, 8),
+	}
+}
+
+// hashOf calculates the 64-bit hash of an element using the set's per-instance seed.
+func (s *HashSet[T, H]) hashOf(v T) uint64 {
+	var h maphash.Hash
+	h.SetSeed(s.seed)
+	s.hasher.Hash(&h, v)
+	return h.Sum64()
+}
+
+// Contains reports whether the set contains an element equal to v under H.Equal.
+func (s *HashSet[T, H]) Contains(v T) bool {
+	if len(s.buckets) == 0 {
+		return false
+	}
+	idx := s.hashOf(v) % uint64(len(s.buckets))
+	for _, item := range s.buckets[idx] {
+		if s.hasher.Equal(item, v) {
+			return true
+		}
+	}
+	return false
+}
+
+// Add inserts v into the set. It reports true if v was added,
+// or false if an equal element already exists.
+func (s *HashSet[T, H]) Add(v T) bool {
+	if s.Contains(v) {
+		return false
+	}
+	if float64(s.size+1) > float64(len(s.buckets))*0.75 {
+		s.grow()
+	}
+	idx := s.hashOf(v) % uint64(len(s.buckets))
+	s.buckets[idx] = append(s.buckets[idx], v)
+	s.size++
+	return true
+}
+
+// Remove deletes an element equal to v from the set. It reports true if found and removed.
+func (s *HashSet[T, H]) Remove(v T) bool {
+	if len(s.buckets) == 0 {
+		return false
+	}
+	idx := s.hashOf(v) % uint64(len(s.buckets))
+	bucket := s.buckets[idx]
+	for i, item := range bucket {
+		if s.hasher.Equal(item, v) {
+			s.buckets[idx] = append(bucket[:i], bucket[i+1:]...)
+			s.size--
+			return true
+		}
+	}
+	return false
+}
+
+// Len returns the current number of elements stored in the set.
+func (s *HashSet[T, H]) Len() int {
+	return s.size
+}
+
+// grow doubles the bucket array capacity and rehashes all elements.
+func (s *HashSet[T, H]) grow() {
+	newCap := len(s.buckets) * 2
+	if newCap == 0 {
+		newCap = 8
+	}
+	oldBuckets := s.buckets
+	s.buckets = make([][]T, newCap)
+	for _, bucket := range oldBuckets {
+		for _, item := range bucket {
+			idx := s.hashOf(item) % uint64(newCap)
+			s.buckets[idx] = append(s.buckets[idx], item)
+		}
+	}
+}
+```
+
+## Applying custom hashers and a two-seed Bloom filter
+
+Next, we create `main.go` to test three distinct hashing scenarios:
+1. `CaseInsensitiveHasher`: Custom equivalence for standard strings.
+2. `PointHasher`: Custom hashing and equality for a non-comparable struct `Point` containing a slice field (`Tags []string`).
+3. `maphash.ComparableHasher[int]`: Standard library hasher for comparable integers.
+4. `BloomFilter`: A two-seed probabilistic filter using `maphash.Hasher`.
+
+<!-- file: main.go -->
+```go
+package main
+
+import (
+	"encoding/binary"
+	"fmt"
+	"hash/maphash"
+	"strings"
+
+	"example.com/hasherdemo/hashset"
+)
+
+// CaseInsensitiveHasher implements maphash.Hasher[string].
+// It normalizes strings with strings.ToLower for both hashing and comparison.
+type CaseInsensitiveHasher struct{}
+
+func (CaseInsensitiveHasher) Hash(h *maphash.Hash, s string) {
+	h.WriteString(strings.ToLower(s))
+}
+
+func (CaseInsensitiveHasher) Equal(x, y string) bool {
+	return strings.ToLower(x) == strings.ToLower(y)
+}
+
+// Point is non-comparable because it contains a slice field ([]string).
+type Point struct {
+	Tags []string
+	X, Y int
+}
+
+// PointHasher hashes and compares only the coordinate fields X and Y.
+type PointHasher struct{}
+
+func (PointHasher) Hash(h *maphash.Hash, p Point) {
+	var buf [16]byte
+	binary.LittleEndian.PutUint64(buf[0:8], uint64(p.X))
+	binary.LittleEndian.PutUint64(buf[8:16], uint64(p.Y))
+	h.Write(buf[:])
+}
+
+func (PointHasher) Equal(x, y Point) bool {
+	return x.X == y.X && x.Y == y.Y
+}
+
+// BloomFilter is a minimal two-seed probabilistic membership filter.
+type BloomFilter[T any, H maphash.Hasher[T]] struct {
+	hasher  H
+	seed1   maphash.Seed
+	seed2   maphash.Seed
+	bits    []uint64
+	numBits uint64
+}
+
+func NewBloomFilter[T any, H maphash.Hasher[T]](hasher H, numBits uint64) *BloomFilter[T, H] {
+	return &BloomFilter[T, H]{
+		hasher:  hasher,
+		seed1:   maphash.MakeSeed(),
+		seed2:   maphash.MakeSeed(),
+		bits:    make([]uint64, (numBits+63)/64),
+		numBits: numBits,
+	}
+}
+
+func (bf *BloomFilter[T, H]) hashWith(seed maphash.Seed, v T) uint64 {
+	var h maphash.Hash
+	h.SetSeed(seed)
+	bf.hasher.Hash(&h, v)
+	return h.Sum64()
+}
+
+func (bf *BloomFilter[T, H]) Add(v T) {
+	i1 := bf.hashWith(bf.seed1, v) % bf.numBits
+	i2 := bf.hashWith(bf.seed2, v) % bf.numBits
+	bf.bits[i1/64] |= 1 << (i1 % 64)
+	bf.bits[i2/64] |= 1 << (i2 % 64)
+}
+
+func (bf *BloomFilter[T, H]) MayContain(v T) bool {
+	i1 := bf.hashWith(bf.seed1, v) % bf.numBits
+	i2 := bf.hashWith(bf.seed2, v) % bf.numBits
+	if (bf.bits[i1/64] & (1 << (i1 % 64))) == 0 {
+		return false
+	}
+	if (bf.bits[i2/64] & (1 << (i2 % 64))) == 0 {
+		return false
+	}
+	return true
+}
+
+func main() {
+	// 1. Case-insensitive string set
+	ciSet := hashset.New[string, CaseInsensitiveHasher](CaseInsensitiveHasher{})
+	ciSet.Add("Go")
+	ciSet.Add("golang")
+	ciSet.Add("GO") // duplicate under CaseInsensitiveHasher
+	fmt.Printf("ciSet size: %d\n", ciSet.Len())
+	fmt.Printf("ciSet contains 'go': %t\n", ciSet.Contains("go"))
+	fmt.Printf("ciSet contains 'GOLANG': %t\n", ciSet.Contains("GOLANG"))
+	fmt.Printf("ciSet contains 'rust': %t\n", ciSet.Contains("rust"))
+
+	// 2. Non-comparable Point struct set
+	pointSet := hashset.New[Point, PointHasher](PointHasher{})
+	p1 := Point{Tags: []string{"origin", "alpha"}, X: 10, Y: 20}
+	p2 := Point{Tags: []string{"beta"}, X: 10, Y: 20} // identical X, Y; different tags
+	p3 := Point{Tags: []string{"other"}, X: 30, Y: 40}
+	pointSet.Add(p1)
+	pointSet.Add(p2) // rejected as duplicate because X, Y match
+	pointSet.Add(p3)
+	fmt.Printf("pointSet size: %d\n", pointSet.Len())
+	probe := Point{Tags: nil, X: 10, Y: 20}
+	fmt.Printf("pointSet contains probe(10, 20): %t\n", pointSet.Contains(probe))
+	probeMissing := Point{Tags: nil, X: 99, Y: 99}
+	fmt.Printf("pointSet contains probe(99, 99): %t\n", pointSet.Contains(probeMissing))
+
+	// 3. ComparableHasher[int]
+	intSet := hashset.New[int, maphash.ComparableHasher[int]](maphash.ComparableHasher[int]{})
+	intSet.Add(100)
+	intSet.Add(200)
+	intSet.Add(100) // duplicate
+	fmt.Printf("intSet size: %d\n", intSet.Len())
+	fmt.Printf("intSet contains 100: %t\n", intSet.Contains(100))
+	fmt.Printf("intSet contains 300: %t\n", intSet.Contains(300))
+
+	// 4. Bloom filter with two seeds and CaseInsensitiveHasher
+	bf := NewBloomFilter[string, CaseInsensitiveHasher](CaseInsensitiveHasher{}, 1024)
+	bf.Add("ServiceA")
+	bf.Add("WorkerPool")
+	fmt.Printf("bloom filter may contain 'servicea': %t\n", bf.MayContain("servicea"))
+	fmt.Printf("bloom filter may contain 'WORKERPOOL': %t\n", bf.MayContain("WORKERPOOL"))
+	fmt.Printf("bloom filter may contain 'Database': %t\n", bf.MayContain("Database"))
+}
+```
+
+Execute the program with:
+
+```bash
+go run .
+```
+
+The following output was produced by running `go run .`:
+
+```text
+ciSet size: 2
+ciSet contains 'go': true
+ciSet contains 'GOLANG': true
+ciSet contains 'rust': false
+pointSet size: 2
+pointSet contains probe(10, 20): true
+pointSet contains probe(99, 99): false
+intSet size: 2
+intSet contains 100: true
+intSet contains 300: false
+bloom filter may contain 'servicea': true
+bloom filter may contain 'WORKERPOOL': true
+bloom filter may contain 'Database': false
+```
+
+Notice the behavior across the outputs:
+- For `ciSet`, the reported size is 2, confirming that `"GO"` was deduplicated against `"Go"`. Lookups for `"go"` and `"GOLANG"` both evaluate to `true`, while uninserted keys evaluate to `false`.
+- For `pointSet`, `p2` is rejected even though its `Tags` slice differs from `p1`. The size is 2, and querying with an uninitialized slice (`Tags: nil`) matches `(10, 20)` successfully.
+- For `intSet`, `maphash.ComparableHasher[int]` operates identically to built-in integer comparison.
+- In the Bloom filter, the two independent seeds hash the same normalized bytes into distinct bit positions, confirming membership for case-folded variants while rejecting uninserted strings.
+
+## Contract testing and performance benchmarks
+
+To verify that an implementation adheres to the required contract, write randomized property tests that assert:
+
+$$\text{Equal}(a, b) \implies \text{Hash}(seed, a) == \text{Hash}(seed, b)$$
+
+Below, `hashset_test.go` checks this contract across randomized casing patterns and benchmarks `HashSet` with `maphash.ComparableHasher[string]` against Go's built-in `map[string]struct{}`.
+
+<!-- file: hashset/hashset_test.go -->
+```go
+package hashset_test
+
+import (
+	"hash/maphash"
+	"math/rand/v2"
+	"strconv"
+	"strings"
+	"testing"
+
+	"example.com/hasherdemo/hashset"
+)
+
+type CaseInsensitiveHasher struct{}
+
+func (CaseInsensitiveHasher) Hash(h *maphash.Hash, s string) {
+	h.WriteString(strings.ToLower(s))
+}
+
+func (CaseInsensitiveHasher) Equal(x, y string) bool {
+	return strings.ToLower(x) == strings.ToLower(y)
+}
+
+func TestHasherContract(t *testing.T) {
+	hasher := CaseInsensitiveHasher{}
+	seed := maphash.MakeSeed()
+
+	hashOf := func(s string) uint64 {
+		var h maphash.Hash
+		h.SetSeed(seed)
+		hasher.Hash(&h, s)
+		return h.Sum64()
+	}
+
+	letters := []rune("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ")
+	for i := range 500 {
+		length := rand.IntN(12) + 1
+		runes := make([]rune, length)
+		for j := range runes {
+			runes[j] = letters[rand.IntN(len(letters))]
+		}
+		original := string(runes)
+		lower := strings.ToLower(original)
+		upper := strings.ToUpper(original)
+
+		if !hasher.Equal(original, lower) {
+			t.Fatalf("iteration %d: expected Equal(%q, %q) to be true", i, original, lower)
+		}
+		if hashOf(original) != hashOf(lower) {
+			t.Fatalf("iteration %d: hash contract violated for %q and %q (%d != %d)",
+				i, original, lower, hashOf(original), hashOf(lower))
+		}
+
+		if !hasher.Equal(original, upper) {
+			t.Fatalf("iteration %d: expected Equal(%q, %q) to be true", i, original, upper)
+		}
+		if hashOf(original) != hashOf(upper) {
+			t.Fatalf("iteration %d: hash contract violated for %q and %q (%d != %d)",
+				i, original, upper, hashOf(original), hashOf(upper))
+		}
+	}
+}
+
+func BenchmarkComparableHasher(b *testing.B) {
+	keys := make([]string, 1000)
+	for i := range keys {
+		keys[i] = "item-" + strconv.Itoa(i)
+	}
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		set := hashset.New[string, maphash.ComparableHasher[string]](maphash.ComparableHasher[string]{})
+		for _, k := range keys {
+			set.Add(k)
+		}
+		for _, k := range keys {
+			if !set.Contains(k) {
+				b.Fatalf("expected key %s to exist", k)
+			}
+		}
+	}
+}
+
+func BenchmarkBuiltinMap(b *testing.B) {
+	keys := make([]string, 1000)
+	for i := range keys {
+		keys[i] = "item-" + strconv.Itoa(i)
+	}
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		m := make(map[string]struct{}, 8)
+		for _, k := range keys {
+			m[k] = struct{}{}
+		}
+		for _, k := range keys {
+			if _, ok := m[k]; !ok {
+				b.Fatalf("expected key %s to exist", k)
+			}
+		}
+	}
+}
+```
+
+Run tests and benchmarks with:
+
+```bash
+go test ./hashset -run . -bench . -benchtime=200ms
+```
+
+The following output was produced by running `go test ./hashset -run . -bench . -benchtime=200ms`:
+
+```text
+goos: linux
+goarch: amd64
+pkg: example.com/hasherdemo/hashset
+cpu: Intel(R) Xeon(R) Processor
+BenchmarkComparableHasher-8   	     613	    482728 ns/op
+BenchmarkBuiltinMap-8         	    3183	     68043 ns/op
+PASS
+ok  	example.com/hasherdemo/hashset	0.568s
+```
+
+When reviewing the benchmark output:
+- The `PASS` / `ok` lines include `TestHasherContract`; add `-v` to see each test by name.
+- On the run above, the hand-written `HashSet` took roughly 7x the `ns/op` of the built-in map, about 480 µs against 68 µs per benchmark iteration. Expect the ratio to vary between machines and runs.
+- The built-in `map` is a Swiss-table implementation in the runtime (since Go 1.24). The compiler specializes access for common key types and calls the hash function directly.
+- Our user-space `HashSet` relies on separate chaining with generic slice buckets, heap slice reallocations during resizing, and calls into `H` through Go's generic implementation, which may use runtime dictionaries instead of fully specialized code. While `ComparableHasher` adds a modest layer of indirection, it gives callers complete control over data types and custom equality semantics.
+
+## Pitfalls
+
+### 1. Inconsistent equality and hashing projections
+
+If `Equal` normalizes data differently than `Hash`, equal keys will generate distinct hashes. This can occur when `Equal` performs case folding while `Hash` writes raw strings, or when floating-point hashers round values in `Hash` but use strict equality in `Equal`.
+
+**Rule:** If `Equal` maps values to an equivalence class, `Hash` must write the canonical representative of that exact class to the hash buffer.
+
+### 2. Passing dynamic non-comparable types to `ComparableHasher[any]`
+
+The type constraint on `ComparableHasher[T comparable]` is checked at compile time. However, in Go, the `any` (`interface{}`) type satisfies `comparable`.
+
+If you declare:
+
+```go
+hasher := maphash.ComparableHasher[any]{}
+```
+
+and pass values whose dynamic types are non-comparable (such as a slice `[]byte` or a map), you break the documented rule ("you must not pass non-comparable argument values to its Hash or Equal methods"). In practice this panics at run time, just as comparing two interface values holding slices with `==` panics.
+
+### 3. Mutating fields used in custom hashes
+
+If an element is stored inside a hash container and a field that contributes to its hash or equality is subsequently modified, the element's bucket index changes. The container will fail to locate the element on lookup and will fail to remove it, leading to silent memory leaks and data duplication.
+
+### 4. Forgetting per-instance seeds in custom containers
+
+Containers should generate a new seed per instance via `maphash.MakeSeed()`. Reusing a static, hardcoded seed across all instances exposes the container to algorithmic complexity attacks where adversarial inputs intentionally target identical bucket chains.
+
+## Key takeaways
+
+- `maphash.Hasher[T any]` decouples hash-based containers from Go's language-level `==` operator and `comparable` constraint.
+- The `Hash(*maphash.Hash, T)` method receives a pointer to a streaming hash state, allowing composite and variable-length data to be hashed with zero intermediate heap allocations.
+- Implementations must maintain the contract: if `Equal(x, y)` returns true, `Hash` must write identical byte representations for both inputs.
+- `maphash.ComparableHasher[T comparable]` provides standard `==` behavior for comparable types, matching Go's default map semantics.
+- Non-comparable types—such as structs containing slices—can act as container keys by selectively hashing and comparing their comparable subsets.
+
+## Sources
+
+- [Go 1.27 release notes](https://go.dev/doc/go1.27)
+- [`hash/maphash` package documentation](https://pkg.go.dev/hash/maphash)
+- [Proposal golang/go#70471: hash/maphash: add Hasher interface](https://github.com/golang/go/issues/70471)
