@@ -1,0 +1,327 @@
+---
+title: "Mocks and Overrides in tofu test"
+author:
+  - name: "K19G"
+  - name: "grok-bot"
+---
+
+# Mocks and Overrides in tofu test
+
+After reading this chapter, you will be able to isolate your `tofu test` suites completely from remote infrastructure APIs by defining `mock_provider`, `override_data`, `override_resource`, and `override_module` blocks. You will also know how to structure module validation rules so `expect_failures` assertions reliably catch invalid inputs without falling into a scope trap.
+
+Every example here was run with this OpenTofu version (`tofu version`):
+
+```text
+OpenTofu v1.13.2
+on linux_amd64
+```
+
+## Thesis
+
+The default `tofu test` behavior executes real provider logic: it authenticates against remote APIs, provisions cloud infrastructure during `apply` runs, and makes real network queries for `data` sources. While integration testing against real infrastructure is necessary before production releases, fast feedback loops during local development demand unit-style tests. OpenTofu provides built-in mocking and overriding primitives directly within `.tftest.hcl` files. By combining `mock_provider`, `override_data`, `override_resource`, and `override_module`, you can test module logic, locals, conditions and variable validation without cloud credentials, without a bill, and without depending on the network.
+
+## When to Mock vs. Use Real or Cheap Providers
+
+OpenTofu testing spans a spectrum between full unit testing and end-to-end integration testing. Deciding when to mock hinges on identifying boundaries of external non-determinism and side effects.
+
+| Testing Goal | Preferred Mechanism | Why |
+|---|---|---|
+| Local HCL syntax, expressions, local validation, and output construction | Mocks (`mock_provider`, `override_data`, `override_module`) | Zero external dependencies, deterministic outputs, instant execution. |
+| Infrastructure lifecycle (creation, updates, deletions) | Real low-cost providers (e.g., local state, null provider, local file) or ephemeral sandbox environments | Verifies provider plugin interaction and cloud API responses without heavy costs. |
+| Final verification before release pipelines | Full integration tests against real cloud infrastructure | Verifies IAM permissions, API quota, networking, and cloud provider API changes. |
+
+Mocks are designed specifically for API-bound dependencies. When a module calls an external endpoint via the `http` provider, queries a database, or provisions an AWS S3 bucket, unit testing that module's internal naming conventions or logic should not depend on network availability or API credentials. A mocked provider never calls its API. It returns generated values for computed attributes instead.
+
+## The Module Under Test
+
+To examine how mocks, data overrides, and module stubs function in practice, consider a root module that retrieves release information over HTTP, generates a unique bucket name using a random suffix, and delegates naming prefix generation to a child module.
+
+The child module lives at `modules/naming/main.tf`. It declares its own `env` input variable along with a custom validation rule.
+
+<!-- file: modules/naming/main.tf -->
+```hcl
+variable "env" {
+  type = string
+  validation {
+    condition     = contains(["dev", "prod"], var.env)
+    error_message = "env must be dev or prod."
+  }
+}
+
+output "prefix" {
+  value = "acme-${var.env}"
+}
+```
+
+The root module passes `env` straight through to the child. Its own `env` variable carries the same validation rule. The first version of this file, `main.before.tf`, had no validation on the root variable (just `variable "env" { type = string }`). That difference matters later.
+
+<!-- file: main.tf -->
+```hcl
+terraform {
+  required_providers {
+    http   = { source = "hashicorp/http", version = "~> 3.5" }
+    random = { source = "hashicorp/random", version = "~> 3.7" }
+  }
+}
+
+variable "env" {
+  type = string
+  validation {
+    condition     = contains(["dev", "prod"], var.env)
+    error_message = "env must be dev or prod."
+  }
+}
+
+data "http" "release" {
+  url = "https://api.github.com/repos/opentofu/opentofu/releases/latest"
+  request_headers = { Accept = "application/json" }
+}
+
+module "naming" {
+  source = "./modules/naming"
+  env    = var.env
+}
+
+resource "random_id" "suffix" {
+  byte_length = 4
+}
+
+locals {
+  release = jsondecode(data.http.release.response_body).tag_name
+}
+
+output "bucket_name" {
+  value = "${module.naming.prefix}-${random_id.suffix.hex}"
+}
+
+output "pinned_release" {
+  value = local.release
+}
+```
+
+## Test File Walk-Through
+
+The test file `tests/mocks.tftest.hcl` defines mock provider settings, explicit data source overrides, default module inputs, and individual test runs.
+
+<!-- file: tests/mocks.tftest.hcl -->
+```hcl
+mock_provider "random" {
+  mock_resource "random_id" {
+    defaults = {
+      hex = "cafef00d"
+    }
+  }
+}
+
+override_data {
+  target = data.http.release
+  values = {
+    response_body = "{\"tag_name\": \"v1.13.2\"}"
+  }
+}
+
+variables {
+  env = "dev"
+}
+
+run "names_use_prefix_and_suffix" {
+  command = plan
+
+  assert {
+    condition     = output.pinned_release == "v1.13.2"
+    error_message = "release tag should come from the overridden data source"
+  }
+}
+
+run "apply_with_mocks" {
+  assert {
+    condition     = output.bucket_name == "acme-dev-cafef00d"
+    error_message = "unexpected bucket name: ${output.bucket_name}"
+  }
+}
+
+run "override_the_module" {
+  override_module {
+    target  = module.naming
+    outputs = { prefix = "stub" }
+  }
+
+  assert {
+    condition     = output.bucket_name == "stub-cafef00d"
+    error_message = "module override was not used"
+  }
+}
+
+run "bad_env_is_rejected" {
+  command = plan
+  variables {
+    env = "staging"
+  }
+  expect_failures = [var.env]
+}
+```
+
+Analyzing this test file block by block reveals how OpenTofu evaluates test specifications:
+
+1. **`mock_provider "random"`**: Replaces the real `hashicorp/random` provider executable with a mock provider. Inside it, `mock_resource "random_id"` sets a default value for the computed attribute `hex` to `"cafef00d"`. Any instance of `random_id` generated during the test run uses this default instead of generating a pseudo-random value.
+2. **`override_data`**: Targets the `data.http.release` data source. It completely bypasses HTTP GET requests to GitHub. Instead, OpenTofu injects the specified payload into `response_body`.
+3. **`variables`**: Sets global test scope inputs (here, `env = "dev"`).
+4. **`run "names_use_prefix_and_suffix"`**: Executes a `plan` command. It evaluates local variables against the overridden HTTP response and verifies that `output.pinned_release` matches `"v1.13.2"`.
+5. **`run "apply_with_mocks"`**: Executes an `apply` run (the default command when `command` is omitted). Because all providers are mocked or overridden, no infrastructure is created. It validates that `output.bucket_name` evaluates to `"acme-dev-cafef00d"`.
+6. **`run "override_the_module"`**: Uses `override_module` to replace the execution of `module.naming`. The child module configuration is ignored, and its `prefix` output is hardcoded to `"stub"`. The assertion validates that `output.bucket_name` becomes `"stub-cafef00d"`.
+7. **`run "bad_env_is_rejected"`**: Passes an invalid variable (`env = "staging"`). The `expect_failures` block lists `var.env` as the expected failure target.
+
+## Running the Tests
+
+Mocks do not remove the need for `tofu init`. The configuration still has a local child module to install and providers to resolve. Here `hashicorp/http` 3.6.3 and `hashicorp/random` 3.9.1 were installed, and the `http` provider itself is real; only its data source is overridden. Run `tofu test` in a fresh copy of the module before `tofu init` and it stops straight away:
+
+```text
+
+Error: Module not installed
+
+  on main.tf line 21:
+  21: module "naming" {
+
+This module is not yet installed. Run "tofu init" to install all modules
+required by this configuration.
+exit 1
+```
+
+To run a single test file, pass `-filter=tests/mocks.tftest.hcl`. OpenTofu 1.13.2 has no `-run` flag for picking individual run blocks; passing it fails with `flag provided but not defined: -run`.
+
+### Failure Case: Missing Root Validation
+
+When running the test against `main.before.tf` (where variable validation was declared *only* inside `modules/naming/main.tf`), the fourth test run (`bad_env_is_rejected`) fails.
+
+Running `tofu test` with `main.before.tf` in place of `main.tf` gives:
+
+```text
+tests/mocks.tftest.hcl... fail
+  run "names_use_prefix_and_suffix"... pass
+  run "apply_with_mocks"... pass
+  run "override_the_module"... pass
+  run "bad_env_is_rejected"... fail
+
+Error: Invalid value for variable
+
+  on main.tf line 19, in module "naming":
+  19:   env    = var.env
+    ├────────────────
+    │ var.env is "staging"
+
+env must be dev or prod.
+
+This was checked by the validation rule at modules/naming/main.tf:3,3-13.
+
+Error: Missing expected failure
+
+  on tests/mocks.tftest.hcl line 53, in run "bad_env_is_rejected":
+  53:   expect_failures = [var.env]
+
+The checkable object, var.env, was expected to report an error but did not.
+
+Failure! 3 passed, 1 failed.
+exit status: 1
+```
+
+The failure highlights an essential rule of `expect_failures`: the checkable object declared in `expect_failures = [var.env]` must refer to a checkable object in the root configuration under test. With the rule only in `modules/naming/main.tf`, the error came from the child module's `var.env` (note `in module "naming"` in the output), not from the root `var.env`. Because root `var.env` had no validation block, OpenTofu reported that `var.env` failed to report an error as expected.
+
+### Success Case: Root Variable Validation Added
+
+Adding the same `validation` block to the root `var.env` fixes the mismatch. The failure now belongs to the object that `expect_failures` names.
+
+Running `tofu test` again with the corrected `main.tf` gives:
+
+```text
+tests/mocks.tftest.hcl... pass
+  run "names_use_prefix_and_suffix"... pass
+  run "apply_with_mocks"... pass
+  run "override_the_module"... pass
+  run "bad_env_is_rejected"... pass
+
+Success! 4 passed, 0 failed.
+exit status: 0
+```
+
+## Precedence Rules and Default Values
+
+When configuring mocks and overrides, multiple definitions might target the same resource or attribute. The OpenTofu documentation sets out which definition wins.
+
+### Precedence Hierarchy
+
+Overrides at higher specificity levels override broader mock defaults.
+
+| Precedence Level | Mock / Override Primitive | Scope | Description |
+|---|---|---|---|
+| 1 (Lowest) | `mock_resource` / `mock_data` inside `mock_provider` | Global to provider | Defines fallback default values for computed attributes across all instances of a resource or data source type. |
+| 2 | `override_resource` / `override_data` inside `mock_provider` | Global to provider instance | Targets specific resource instances inside a mock provider block. |
+| 3 | File-level `override_resource` / `override_data` | Entire `.tftest.hcl` file | Overrides a specific resource or data source target across all `run` blocks in the file. |
+| 4 (Highest) | Run-level `override_resource` / `override_data` | Single `run` block | Overrides a target specifically inside a single `run` block; takes precedence over file-level and provider-level definitions. |
+
+`mock_provider` blocks support `alias` and `for_each` meta-arguments. Note that `for_each` on a `mock_provider` can only be used in conjunction with an `alias`.
+
+### Auto-Generated Mock Values
+
+When a resource attribute is computed and no explicit mock default or override value is provided, OpenTofu automatically synthesizes primitive values based on the data type schema.
+
+| Data Type Schema | Auto-Generated Synthetic Default |
+|---|---|
+| `number` | `0` |
+| `bool` | `false` |
+| `string` | Random alphanumeric string (e.g., `"a1b2c3d4"`) |
+| `list` / `set` / `map` / `tuple` | Empty collection (`[]` or `{}`) |
+| `object` | Recursively populated object with default attributes |
+
+Because auto-generated strings produce random alphanumeric characters on each evaluation, making direct equality assertions (such as `assert { condition = output.bucket_name == "acme-dev-a1b2c3d4" }`) on unset mocked strings will fail unpredictably. Always specify explicit `defaults` inside `mock_resource` or `override_resource` when testing string outputs.
+
+## Plan vs. Apply Runs with Mocks
+
+The CLI help for `tofu test` indicates that the command "creates real infrastructure and will attempt to clean up." However, when providers, data sources, and resources are fully mocked or overridden, no real infrastructure operations occur.
+
+- **`command = plan`**: OpenTofu plans against the mocked and overridden values. Validation rules, locals and outputs that are known at plan time can be asserted. With OpenTofu 1.13.2, mocked computed values are already known at plan time: adding `command = plan` to `apply_with_mocks` still gives `4 passed`. A plan run is the cheaper choice when that is all you need.
+- **`command = apply`** (the default): resources from the mocked `random` provider are "created" in the test's own state with the mocked values, and nothing outside it changes. The `http` provider is real, but its one data source is overridden, so no request leaves the machine.
+
+Be careful which parts are real. A resource from a provider that is neither mocked nor overridden is created for real in an `apply` run, and `tofu test` then tries to destroy it.
+
+## Common Mistakes
+
+### 1. Asserting on Auto-Generated Mock Strings
+Relying on OpenTofu's auto-generated string defaults leads to test flakiness because auto-generated mock strings are randomized across runs.
+*Fix*: Always supply explicit values using `mock_resource` defaults or `override_resource`.
+
+### 2. Misidentifying Validation Targets in `expect_failures`
+Listing a root variable in `expect_failures` when the validation rule resides exclusively inside a child module causes test failures. OpenTofu will report `Missing expected failure` because the root variable itself had no failing rule.
+*Fix*: Ensure custom validation rules exist on the checkable object specified in `expect_failures` (e.g., add variable validation at the root module boundary).
+
+### 3. Attempting to Override Non-Computed Configuration Arguments
+Mock defaults only fill in **computed** attributes. Arguments you set in the configuration keep their configured values, so a mock cannot change them.
+*Fix*: Use test `variables` blocks or HCL input parameters to alter configuration inputs.
+
+### 4. Expecting `override_module` to Target a Single Instance
+According to the OpenTofu documentation, `override_module` applies to **every instance** of a module that uses `count` or `for_each`. You can't override just one instance.
+*Fix*: Design module tests assuming all instances of the target module take the overridden outputs.
+
+### 5. Forgetting `tofu init` Before Running Mocked Tests
+Mocking does not install anything. As shown above, a fresh checkout fails with `Module not installed` until `tofu init` has run.
+*Fix*: Run `tofu init` prior to executing `tofu test`.
+
+## Exercises
+
+1. **Add a Mocked Resource Default**: Modify `tests/mocks.tftest.hcl` to add a second `mock_resource` block inside `mock_provider "random"` for a `random_password` resource type, setting its computed `result` attribute to `"supersecret123"`. Write a `run` block asserting its value.
+2. **Run-Level Overrides**: Create a `run` block in `tests/mocks.tftest.hcl` that overrides `data.http.release` at the run level with a response body containing `"{\"tag_name\": \"v2.0.0\"}"`. Verify that the run-level override takes precedence over the file-level `override_data` block.
+3. **Module Override Output Variation**: Add a second `override_module` block inside a new `run` block that sets `prefix = "production-test"`. Assert that `output.bucket_name` evaluates to `"production-test-cafef00d"`.
+
+## Key takeaways
+
+- `mock_provider` swaps a real provider for a mocked one, so its resources and data sources make no API calls and need no credentials.
+- `override_data` and `override_resource` substitute synthetic attribute values for specific data sources and resources at either the file or run level.
+- `override_module` stubs out entire child modules by replacing their evaluation with fixed output maps.
+- Auto-generated mock defaults produce random strings for unset string attributes; explicit `defaults` must be defined for stable assertions.
+- `expect_failures` targets must match the exact checkable object where the validation rule is defined.
+- Run `tofu init` before `tofu test`, even when everything is mocked.
+
+## Sources
+
+- [OpenTofu CLI: test command documentation](https://opentofu.org/docs/cli/commands/test/)
+- [OpenTofu test command source documentation](https://github.com/opentofu/opentofu/blob/main/website/docs/cli/commands/test/index.mdx)
+- [OpenTofu Custom Variable Validation Rules](https://opentofu.org/docs/language/values/variables/#custom-validation-rules)
