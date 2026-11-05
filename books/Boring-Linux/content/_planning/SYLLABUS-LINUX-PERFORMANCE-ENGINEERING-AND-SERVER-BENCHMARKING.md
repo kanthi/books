@@ -13,6 +13,12 @@ This curriculum delivers an exhaustive, production-grade guide to Linux systems 
 
 ---
 
+## Position in Boring Linux
+
+This is optional Part 34. The [master syllabus](SYLLABUS.md) owns prerequisites, routes and scope: complete resource, storage and networking foundations (07, 09–10, 12), observation (23) and the performance method (24); use relevant internals/tracing in 29–30 for deeper experiments. This track supplies subsystem experiments and benchmark case studies rather than a second introduction to every host facility.
+
+Each experiment records workload and objective, architecture, firmware, kernel/configuration, tool versions, warm-up/cache conditions, repeated raw measurements, variation and a controlled comparison. State what result would reject the hypothesis. Finish with a regression or capacity decision and a recovery criterion. NUMA, RDMA, accelerators, distributed clusters and hardware counters unavailable to a guest are selectable extensions with explicit access and equipment requirements.
+
 ## Detailed Table of Contents
 
 ### Introduction: The Discipline of Performance Engineering

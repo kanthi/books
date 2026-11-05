@@ -1,12 +1,12 @@
 # Boring Linux — Progressive Systems Curriculum
 
-Status: **accepted syllabus; writing restarted from Part 01**. The old reader-facing chapter tree has been removed. Parts use the progressive order below, with only written chapters placed in the content tree. The previous plan is retained under `archive/SYLLABUS-v2-before-restart.md` as a historical planning record.
+Status: **accepted curriculum; structure reviewed 2026-11-03**. Parts 01–05 have complete chapter sequences; Part 06 has nine chapters. Parts 07–32 remain planned. Parts 33–38 already have separate chapter sequences and are optional depth tracks; their presence does not mean the intervening curriculum is written or that those tracks have passed technical review. See [INDEX.md](../../INDEX.md) for the writing queue. The previous plan remains under `archive/SYLLABUS-v2-before-restart.md`.
 
 ## Purpose and reader
 
 A detailed, broad Linux systems book that takes a reader from their first administered machine to advanced systems engineering and production operations. The subject is Linux as an operating system and as a platform for services, storage, networks, security, virtual machines, containers and fleets.
 
-The reader can use a terminal, edit a text file and run a simple shell script. Those abilities do not imply knowledge of boot, processes, storage, authentication or network services. Define those concepts from the beginning. Include any small command, path, shell or protocol explanation needed to complete the current task so the book is independently usable.
+The reader can open a terminal, edit a text file and run a simple command. Prior shell-programming knowledge is not required. Those abilities do not imply knowledge of boot, processes, storage, authentication or network services. Define those concepts from the beginning. Include any small command, path, shell or protocol explanation needed to complete the current task so the book is independently usable.
 
 The core question for every subject is: **How does this Linux facility work, how do I configure and operate it, how do I prove that it works, and how do I diagnose and recover it when it fails?**
 
@@ -32,9 +32,57 @@ The core question for every subject is: **How does this Linux facility work, how
 | E — Enforce and verify security | 17–18 | Apply access policy, protect keys, harden systems and investigate security events |
 | F — Run applications and isolated workloads | 19–22 | Operate data services, VMs, containers and clusters with understood dependencies |
 | G — Operate and improve production systems | 23–28 | Observe, tune, automate, upgrade, scale and recover complete environments |
-| H — Investigate deeply and specialize | 29–33 | Connect kernel mechanisms to evidence, handle multikernel bare-metal setups, specialist systems and complete integrated projects |
+| H — Investigate deeply and integrate | 29–32 | Connect kernel mechanisms to evidence, choose a specialist branch and complete integrated projects |
+| I — Optional depth tracks | 33–38 | Investigate a selected architecture, performance, security, filesystem, memory or Ubuntu-specific question |
 
 These stages describe the main reading route. Troubleshooting, verification and security start in Stage A and recur throughout; the later dedicated parts develop the earlier habits into broader methods.
+
+### Reading routes and scope
+
+Part numbers are stable curriculum addresses, not a requirement to finish every branch. Parts 01–19 establish the host, data, network, security and application foundations. Parts 20–22 are workload branches; Parts 23–28 develop production operation. Parts 29–38 supply investigation, projects and optional depth. All routes stay inside this book.
+
+| Goal | Selected progression | Completion evidence |
+|---|---|---|
+| Administer one recoverable host | 01–11, then the host-network and SSH/TLS essentials in 12–15, then 17–18 | A supervised service, bounded access, persistent configuration and an independent restore |
+| Operate a small site and application | 01–19 → 23 → 25 → 24 → 26–28 | Rebuild, monitor, update and recover a networked application; select the relevant services in 16 and 19 |
+| Operate VMs or containers | 01–19 → 20 and/or 21 → 23–28 | Preserve identity, data, network policy and recovery across workload replacement |
+| Operate Kubernetes on Linux | 01–19 → 21 → 22 → 23–28 | Explain node behavior, replace a failed node and recover persistent/control-plane state |
+| Investigate Linux mechanisms | Relevant foundations → 23–24 → 29–30 → selected 33–37 track | A reproducible investigation tied to a pinned kernel and measured evidence |
+| Administer Ubuntu-specific systems | Relevant foundations → selected 31 branches and 38 chapters | A verified distribution-specific deployment or upgrade with a recovery path |
+
+Part 32 projects are used at the milestones below, rather than saved for the end. A route omitting Kubernetes uses host-based delivery and recovery in 25–28; cluster controllers, Ceph and cluster-specific recovery remain optional branches.
+
+**Bound the first implementation.** Teach one complete implementation before comparisons: ext4 before the alternative filesystems in 09; a local versioned backup before remote targets in 11; one resolver and one authoritative DNS implementation in 13; one file-sharing protocol in 16; AppArmor on the reference guest before a separate SELinux guest in 17; and one proxy plus PostgreSQL in 19. Alternatives retain operational depth when expanded, but are independently selectable. RAID, multipath, public mail delivery, distributed storage, cloud accounts and specialized devices are extensions with their own prerequisites.
+
+### Prerequisites that must be supplied early
+
+Later depth must never be required to finish an earlier lab. These are authoring requirements; review existing chapters against them before calling the foundations fully reviewed.
+
+| Before the reader does this | Supply this minimum at the point of use | Deeper treatment |
+|---|---|---|
+| Creates service users or stores credentials | File/directory permission bits, traversal, ownership, `umask`, `chmod`, `chown` and a failed-access check in 04; build on the existing UID/GID chapter | ACLs, special bits, capabilities and policy composition in 17 |
+| Installs software or starts a network listener | Existing console access, package origin, bind address, exposure check and the lab's connectivity assumptions in 02, 05 and 06 | Host networking in 12; full SSH/TLS operation in 14; packet policy in 15 |
+| Changes boot, accounts, packages or storage | Identify the target, preserve required state, name the rollback boundary and rehearse recovery in the relevant lab | Independent backup design and restore in 11; full service recovery in 28 |
+| Restarts or limits a service | Capture exit status, unit state, journal evidence, listening endpoint and a client-visible check in 06 | Local log policy in 08; cross-host telemetry in 23 |
+| Builds a multi-host or cluster lab | Unique identities, addresses, name/time service, trust, baseline service checks and declared resources | 12–15; then the node-specific prerequisites in 20–22 |
+| Tunes, automates or fails over a service | A repeatable baseline, health test, saved configuration and recovery criterion | Measurement in 24; repeatable builds in 25; failure domains in 27 |
+
+Part 04 introduces central identity through local lookup and a dependency map only. A live directory-join lab belongs in 14, after DNS, time and certificate trust. First-VM construction uses the narrow hypervisor recipe in 01; managing a virtualization platform remains the job of 20.
+
+### Milestones and project reuse
+
+A milestone is an observable demonstration, not a quiz score or a promise that every chapter has been read. Keep an evidence bundle: starting state, configuration change, expected result, observed result, failure diagnosis and recovery result.
+
+| Finish | Demonstrate | Part 32 project to attempt or extend |
+|---|---|---|
+| 03 | Install, inventory, follow boot and recover a broken lab boot | Begin project 1, recoverable single server |
+| 08 | Run the recurring service under a dedicated identity, schedule work, bound resources and explain a failure from local evidence | Extend project 1 |
+| 11 | Restore data and service configuration to a fresh guest from an independent copy; record elapsed time and data loss | Complete project 1 |
+| 16 | Prove a client/server traffic matrix, name/time service, remote access and one controlled share | Project 2, small Linux site |
+| 19 and 23 | Serve a TLS application with protected data; detect a failed dependency using an external probe and host evidence | Project 3, secure application; optional projects 4–6 after 20–22 |
+| 25–26 | Rebuild from declared inputs and stop a failed rollout at a health gate | Project 7, reproducible fleet |
+| 27–28 | Exercise failover and disaster recovery while checking authoritative data and measured recovery objectives | Projects 8 and 10 |
+| 24, then selected 29–30 | Explain a measured regression and support the explanation with scoped profiling or tracing | Project 9, performance investigation |
 
 ## Chapter and lab design
 
@@ -60,6 +108,20 @@ Do not force irrelevant headings into every page. Concept chapters can center on
 - Use separate, clearly identified environments for hypervisor, clustering and destructive recovery exercises. Describe hardware and nested-virtualization requirements before those branches begin.
 - Supply resource budgets, addressing plans, configuration files, expected results, cleanup and reset instructions. Separate minimum labs from resource-intensive extensions.
 - Never expose an intentionally vulnerable service or turn a personal workstation into the destructive test target.
+
+### Lab continuity and resource tiers
+
+Use the existing names: `bl01` is the first observation guest; `bl02` is the installed baseline; `bl06-service-lab` is the service-work clone. `labapp` is the recurring supervised workload. Do not silently replace these with new names in later parts. Existing baseline clones retain copied identities and run alone; before simultaneous multi-host use, teach how to assign distinct hostname, machine identity, SSH host keys, addresses and any workload identity. Never attach the same writable disk to two independent guests.
+
+| Tier | Intended work | Budget and limits to state in each lab |
+|---|---|---|
+| One active guest | 01–11 and host policy | Preserve the first lab's 2 vCPU, 4096 MiB and 32-GiB guest-disk teaching budget; reserve host resources and space for full recovery copies |
+| Two to four active guests | Network services, application, monitoring and automation | Provide the sum of guest RAM, CPU assumptions, disk growth and the isolated traffic/address plan; rotate roles when the host cannot run them together |
+| Dedicated extension | Nested hypervisor, multi-node cluster, distributed storage or hardware isolation | Publish a separate resource manifest and hardware checks; omit this branch without blocking the ordinary server route |
+
+These are teaching tiers, not vendor minimums or promises of performance. Retain the first lab's roughly 100-GiB free-space allowance for the guest and full copies; later storage labs add explicitly sized disposable data disks. Add hardware-specific NUMA, SR-IOV and passthrough checks only to the branches that use them.
+
+Carry `labapp` through durable storage in 09–11, client reachability in 12–15, access policy in 17–18, an application/database dependency in 19, optional containerization in 21, telemetry in 23 and reconstruction in 25. Each transition states what changed, what remains persistent and which client check proves continuity. Introduce the database with a supplied tiny application; application programming is not a prerequisite.
 
 ## Stage A — Bring a machine to life
 
@@ -116,7 +178,7 @@ Lab: follow one successful boot with evidence, then recover a deliberately broke
 
 Outcome: establish human and service identities with understandable authentication and privilege boundaries.
 
-1. UIDs, GIDs, supplementary groups and ownership
+1. UIDs, GIDs, supplementary groups, ownership and basic file/directory access checks
 2. Account databases, NSS and identity lookup
 3. Account lifecycle: creation, expiration, locking, migration and removal
 4. Home directories, skeleton configuration and session environments
@@ -125,7 +187,7 @@ Outcome: establish human and service identities with understandable authenticati
 7. Administrative privilege: sudo policies, root access and available alternatives
 8. Service accounts, noninteractive identities and runtime credentials
 9. Sessions, logind, polkit and authorization beyond the terminal
-10. Central identity foundations: LDAP, Kerberos, SSSD and directory integration
+10. Central identity foundations: LDAP, Kerberos and SSSD roles, local lookup and network/time/trust dependencies; defer a live join to 14
 
 Lab: create a small user/service-account model, delegate a bounded administrative task, and diagnose a failed login. Local accounts come first; directory integration is revisited after network services and certificates are understood.
 
@@ -359,7 +421,7 @@ Lab: expose a controlled file share, mount it from another host, test identity/p
 Outcome: identify which enforcement layer allowed or denied an operation and implement an appropriate policy.
 
 1. Threat modeling a Linux host: assets, exposure, trust and administrator access
-2. File permissions, ownership, special bits, inheritance and access checks
+2. Access-check composition, special bits and inheritance; build on the basic permissions and ownership taught in 04
 3. POSIX ACLs, extended attributes and service data directories
 4. Capabilities, privileged operations and replacing unnecessary root access
 5. Linux Security Modules and stacking: locating the policy that applies
@@ -598,7 +660,7 @@ Outcome: turn individual repair skills into a repeatable operational practice fo
 
 Lab: recover the full application environment from a documented disaster scenario, measure the recovery and record missing dependencies. Compare the demonstrated recovery with the objectives set in Part 11.
 
-## Stage H — Investigate deeply and specialize
+## Stage H — Investigate deeply and integrate
 
 ### Part 29 — Advanced Linux Architecture and Kernel Internals
 
@@ -681,117 +743,48 @@ Outcome: demonstrate independent design, operation, diagnosis and recovery acros
 
 Every project includes a design diagram, assumptions, capacity/resource budget, configuration sources, acceptance tests, monitoring, failure exercises, rollback, backup/restore and an operator handover. Give a minimum implementation and advanced extensions; do not make every project depend on completing every specialist branch.
 
+## Stage I — Optional depth tracks
+
+Parts 33–38 are independent selections after their prerequisites. They do not restart the introductory course. Existing chapter sequences remain in place; their next revision should follow these scope contracts and consolidate repeated explanations into the owning chapters within this book.
+
+| Track | Prerequisites | Distinct contribution | Required evidence |
+|---|---|---|---|
+| 33 — Multiple kernels | 03, 07, 15, 20; selected 29–30 for internals and crash work | Compare concurrent guest kernels, sequential kernel handoff and hardware partitioning | Ownership map, isolation limits, recovery and one controlled comparison |
+| 34 — Performance depth | 07, 09–10, 12, 23–24; relevant 29–30 chapters | Reproducible subsystem experiments and benchmark case studies | Raw measurements, variation, environment manifest and a regression decision |
+| 35 — Security depth | 04, 14–18; 20–22 only for the selected workload | Threat-led integrated cases and evidence of enforcement across layers | Working allowed path, denied path, audit evidence and trusted recovery |
+| 36 — ext4 internals | 09–11 and VFS/block topics in 29 | Connect on-disk structures, allocation and journaling to observed behavior | An inspected disposable image, integrity checks and a recovery experiment |
+| 37 — Memory internals | 07, memory topics in 29 and relevant 30 tools | Source-backed allocation, reclaim and fault investigations | A bounded reproducer, accounting evidence and a pinned source/configuration |
+| 38 — Ubuntu integration | Relevant core chapters; 31 for desktop/cloud branches | Release-specific defaults, packaging, compatibility, upgrades and enterprise integration | An installed-system manifest and a verified deployment or migration |
+
+Do not repeat a general boot, networking, security or performance tutorial in each track. State the prerequisite, recap only the mechanism needed for the current experiment, and link to its owning chapter when that chapter exists. Every experiment records distribution/image, architecture, kernel package/configuration, tool versions and source tag where relevant.
+
 ### Part 33 — Running Multiple Kernels on One Bare-Metal Server
 
-Outcome: partition physical bare-metal hardware to run concurrent isolated Linux kernel instances, configure hardware-assisted virtualization and true bare-metal partitioning, isolate CPUs/memory/devices with VFIO and NUMA tuning, and operate multi-kernel environments reliably. Detailed syllabus: [SYLLABUS-RUNNING-MULTIPLE-KERNELS-ON-ONE-BARE-METAL-SERVER.md](SYLLABUS-RUNNING-MULTIPLE-KERNELS-ON-ONE-BARE-METAL-SERVER.md).
+Outcome: distinguish concurrent kernels in KVM guests from sequential `kexec` handoff and platform-specific hardware partitioning, then verify isolation, lifecycle and recovery for the selected model. KVM/VFIO is a virtualization deployment, not proof of independently partitioned bare-metal kernels. Detailed chapter briefs: [SYLLABUS-RUNNING-MULTIPLE-KERNELS-ON-ONE-BARE-METAL-SERVER.md](SYLLABUS-RUNNING-MULTIPLE-KERNELS-ON-ONE-BARE-METAL-SERVER.md).
 
 - **Introduction: The Multikernel Problem**
-  1. Why You Want Multiple Kernels
-  2. What Multikernel Actually Means
-  3. The Landscape of Approaches
-  4. How to Use This Book
 - **Chapter 1: Linux Kernel Fundamentals**
-  5. The Kernel as Resource Monopolist
-  6. Boot and Initialization Sequence
-  7. Hardware Discovery and Enumeration
-  8. CPU Topology and NUMA Architecture
-  9. Memory Management Fundamentals
 - **Chapter 2: The Boot Process in Depth**
-  10. Firmware and the EFI Environment
-  11. Bootloaders: GRUB, systemd-boot, and Others
-  12. Kernel Command-Line Parameters
-  13. Initramfs Construction and Role
-  14. The Handoff to Userspace
 - **Chapter 3: Virtualization vs True Bare-Metal Multi-Kernel**
-  15. Type-1 Hypervisors: ESXi, Xen, KVM in Bare-Metal Mode
-  16. KVM Architecture Deep Dive
-  17. Linux Containers and Shared-Kernel Architectures
-  18. MicroVMs and Lightweight Virtualization
-  19. True Bare-Metal Partitioning Concepts
 - **Chapter 4: kexec and Kernel-to-Kernel Transitions**
-  20. How kexec Works
-  21. kexec-tools Configuration and Usage
-  22. kdump for Crash Dumping
-  23. Limitations of kexec for Multi-Kernel Goals
-  24. Production Use Cases for kexec
 - **Chapter 5: Hardware-Assisted Multi-Kernel with KVM/QEMU**
-  25. KVM Setup and Kernel Module Configuration
-  26. Guest Kernel Installation and Configuration
-  27. CPU Pinning and NUMA-Aware VM Placement
-  28. Memory Ballooning vs Static Allocation
-  29. Complete Working Deployment Example
 - **Chapter 6: Device Assignment and I/O Isolation**
-  30. PCI Passthrough (VFIO) Fundamentals
-  31. SR-IOV and Virtual Functions
-  32. Network Interface Assignment
-  33. Storage Device Partitioning
-  34. Specialized Hardware: GPUs, FPGAs, Accelerators
 - **Chapter 7: Networking Between Kernel Instances**
-  35. Internal Networking Architectures
-  36. External Network Configuration
-  37. Network Performance Optimization
-  38. Inter-Kernel Communication Patterns
-  39. Complete Networking Configuration Example
 - **Chapter 8: Resource Isolation Strategies**
-  40. CPU Isolation: isolcpus, nohz_full, rcu_nocbs
-  41. Cpusets and Cgroup-Based CPU Management
-  42. Memory Isolation and NUMA Policies
-  43. Interrupt Routing and IRQ Affinity
-  44. I/O Scheduling and Storage Contention
-  45. What Can and Cannot Be Safely Shared
 - **Chapter 9: Security Analysis and Threat Modeling**
-  46. Attack Surfaces in Multi-Kernel Architectures
-  47. VM Escape Vulnerabilities and Recent CVEs
-  48. Secure Boot and Kernel Trust
-  49. DMA Protection and IOMMU Security
-  50. Secrets and Credential Isolation
-  51. Comparing Multi-Kernel vs VM Security Posture
 - **Chapter 10: Observability and Operations**
-  52. Metrics and Monitoring Architecture
-  53. Logging Strategy Across Kernel Instances
-  54. Crash Diagnostics and kdump Integration
-  55. Performance Profiling Methodology
-  56. Health Checks and Alerting Design
 - **Chapter 11: Performance Engineering**
-  57. Boot Time Analysis
-  58. CPU Overhead and Virtualization Tax
-  59. Cache Effects and NUMA Locality
-  60. I/O Performance: Virtio vs Passthrough
-  61. Benchmarking Methodology for Multi-Kernel Systems
 - **Chapter 12: Production Operations and Lifecycle Management**
-  62. Kernel Upgrade Strategies
-  63. Configuration Management at Scale
-  64. Disaster Recovery Architecture
-  65. Maintenance Windows and Change Management
-  66. Decommissioning and Migration Procedures
 - **Chapter 13: Troubleshooting Guide**
-  67. Boot Failures and Recovery
-  68. Device Assignment and VFIO Issues
-  69. Networking Problems
-  70. Performance Degradation Diagnosis
-  71. Kernel Panics and Crashes
-  72. Resource Exhaustion
 - **Chapter 14: Architecture Comparisons and Decision Framework**
-  73. Multi-Kernel vs Multiple Physical Servers
-  74. KVM vs Xen vs ESXi for Multi-Kernel Workloads
-  75. Containers vs VMs vs Multi-Kernel: When to Use What
-  76. MicroVMs and Unikernels as Alternatives
-  77. Hardware Partitioning Approaches
-  78. A Decision Matrix for Architecture Selection
 - **Chapter 15: Complete Project Plan: From Requirements to Decommissioning**
-  79. Phase 1: Requirements Gathering and Hardware Assessment
-  80. Phase 2: Architecture Selection and Lab Validation
-  81. Phase 3: Kernel Preparation and Configuration
-  82. Phase 4: Deployment and Verification
-  83. Phase 5: Operations, Maintenance, and Decommissioning
 - **Conclusion**
-  84. Multikernel trade-offs, future disaggregated hardware (CXL), and operational principles
 
-Lab: deploy a dual-kernel bare-metal architecture on a dedicated host using KVM/VFIO with CPU pinning, NUMA isolation, SR-IOV network partitioning, and dedicated NVMe passthrough. Demonstrate inter-kernel networking, measure virtualization tax vs bare metal, simulate a guest kernel panic, and execute an isolated kernel upgrade without interrupting the primary instance.
+Lab: on a suitable lab host, run two KVM guests with distinct kernels, observe host/guest resource ownership and recover a failed guest without restarting its peer. Add CPU/NUMA placement, VFIO, SR-IOV and dedicated storage only when the hardware supports the extension. Compare the same workload and document shared dependencies; measure overhead rather than promising bare-metal equivalence. A hardware-partitioning extension must name and verify the actual platform and partition manager. `kexec`/kdump exercises are separate handoff/recovery experiments, not concurrent execution. See the [kernel kdump documentation](https://docs.kernel.org/admin-guide/kdump/kdump.html).
 
 ### Part 34 — Linux Performance Engineering & Server Benchmarking
 
-Outcome: master low-level Linux performance analysis, subsystem profiling, kernel optimization, and empirical benchmarking. Move methodically from queueing theory and statistical analysis through CPU scheduling, NUMA memory architectures, page cache mechanics, block I/O schedulers, and network stack tuning to production eBPF tracing, PSI metrics, and performance regression automation. Detailed syllabus: [SYLLABUS-LINUX-PERFORMANCE-ENGINEERING-AND-SERVER-BENCHMARKING.md](SYLLABUS-LINUX-PERFORMANCE-ENGINEERING-AND-SERVER-BENCHMARKING.md).
+Outcome: extend the operational method in 24 through subsystem experiments, reproducible server benchmarks and performance-regression case studies. Explain which additional question each experiment answers; reuse the tool introductions in 23 and 30. Detailed syllabus: [SYLLABUS-LINUX-PERFORMANCE-ENGINEERING-AND-SERVER-BENCHMARKING.md](SYLLABUS-LINUX-PERFORMANCE-ENGINEERING-AND-SERVER-BENCHMARKING.md).
 
 - **Introduction: The Discipline of Performance Engineering**
 - **Chapter 1: The Performance Engineering Methodology**
@@ -825,7 +818,7 @@ Outcome: master low-level Linux performance analysis, subsystem profiling, kerne
 
 ### Part 35 — A Practical Guide to Securing Linux from Kernel to Cloud
 
-Outcome: master defense-in-depth Linux security engineering from hardware roots of trust and kernel mitigations up to container runtimes, cloud instance metadata, and enterprise fleet orchestration.
+Outcome: evaluate an integrated Linux deployment against an explicit threat model, prove how its controls interact and recover trust after a bounded security incident. Use the identity, trust and enforcement mechanisms established in 04 and 14–18; cloud and cluster cases are optional. Compliance evidence describes the scope of a control rather than claiming that a checklist proves security.
 
 - **Introduction: Why Linux Security Is Not a Given**
 - **Chapter 1: The State of Linux Security**
@@ -847,7 +840,7 @@ Outcome: master defense-in-depth Linux security engineering from hardware roots 
 
 ### Part 36 — The ext4 Filesystem: Architecture, Internals, and Implementation
 
-Outcome: master on-disk filesystem engineering, block group geometries, 256-byte inode layouts, B+ extent trees, HTree directory indexing, Multi-Block allocation (mballoc), delayed allocation, JBD2 journaling internals, metadata checksumming, and C/Rust parsing implementations.
+Outcome: inspect ext4 on-disk structures, allocation, extents, directory indexing, JBD2 journaling, metadata integrity and VFS integration on a disposable filesystem image. Pin filesystem features, tool versions and kernel source; connect each mechanism to an observation or recovery decision. C/Rust parsing implementations are optional extensions with their own programming prerequisites.
 
 - **Introduction**
 - **Chapter 1: The Story of ext**
@@ -867,17 +860,17 @@ Outcome: master on-disk filesystem engineering, block group geometries, 256-byte
 
 ### Part 37 — A Complete Guide to Virtual Memory, Allocators, Paging, and Performance in the Modern Linux Kernel
 
-Outcome: master low-level virtual memory, hardware MMUs, multi-level page table walks, physical frame tracking in struct page, the buddy allocator, SLUB/SLAB/SLOB caches, user-space allocators, demand paging and copy-on-write, unified page caching with XArrays/folios, LRU swap/reclaim, compaction and huge pages (THP/HugeTLB), NUMA policies, cgroups v2 memory limits, OOM badness heuristics, concurrency synchronization/locking, profiling with perf/eBPF/ftrace, memory exploitation mitigations, architecture-specific MM across x86-64/ARM64/RISC-V, and emerging tiered CXL memory architectures.
+Outcome: connect address translation, physical allocation, current slab allocation, user-space allocation, page cache, reclaim, NUMA and memory cgroups to source-backed experiments on a pinned kernel. Separate user-space allocators from kernel `vmalloc`; treat SLAB/SLOB as historical comparisons rather than current lab choices. Use the [kernel slab allocator guide](https://docs.kernel.org/admin-guide/mm/slab.html) and documentation matching the tested source. Architecture and emerging-memory branches state their hardware and kernel requirements.
 
 - **Introduction**
 - **Chapter 1: Foundations of Memory Abstraction**
 - **Chapter 2: Hardware Foundations and Address Translation**
 - **Chapter 3: Linux Address Spaces and the Virtual Memory Layout**
 - **Chapter 4: Physical Memory Management and the Buddy Allocator**
-- **Chapter 5: Kernel Memory Allocators: Slab, Slub, and SLOB**
-- **Chapter 6: User-Space Memory Allocation and vmalloc**
+- **Chapter 5: Kernel Object Allocation: SLUB, with Historical SLAB/SLOB Comparisons**
+- **Chapter 6: User-Space Allocation and Kernel vmalloc: Separate Interfaces and Accounting**
 - **Chapter 7: Demand Paging, Page Faults, and Copy-on-Write**
-- **Chapter 8: The Page Cache and Buffer Head Architecture**
+- **Chapter 8: The Page Cache: Folios, XArrays, Writeback and Filesystem Interfaces**
 - **Chapter 9: Swapping, Reclaim, and Page Replacement Policies**
 - **Chapter 10: Memory Compaction, Defragmentation, and Huge Pages**
 - **Chapter 11: NUMA, Memory Policy, and Scalability**
@@ -891,7 +884,9 @@ Outcome: master low-level virtual memory, hardware MMUs, multi-level page table 
 
 ### Part 38 — Ubuntu 26.04 LTS: From Desktop to Enterprise Cloud
 
-Outcome: master the 2026–2038 Long Term Support baseline of Ubuntu across developer workstations, headless bare-metal servers, containerized microservices, and multi-region enterprise clouds. Covers GNOME 50 on Wayland, memory-safe userspace primitives in Rust (sudo-rs, uutils), TPM 2.0-backed full-disk encryption, systemd 259 with unified cgroups v2, Netplan 1.2, AppArmor 4, nftables, OpenSSH 10.2, KVM/QEMU and LXD, confidential computing with Intel TDX / AMD SEV-SNP, cloud-init multi-cloud deployments, toolchains for Python 3.14 (free-threaded), Rust, Go 1.25, AI acceleration (NVIDIA CUDA 13, AMD ROCm), kdump forensics, performance tuning on amd64-v3, custom image crafting with ubuntu-image, and enterprise fleet management with Canonical Landscape, authd, and ADSys.
+Outcome: apply the core curriculum to Ubuntu 26.04 LTS, verifying the installed release, package versions, defaults, support entitlements and upgrade constraints. Organize selectable workstation, server/cloud and enterprise-management cases around what is specific to Ubuntu. Use the [official release notes](https://documentation.ubuntu.com/release-notes/26.04/) as the release baseline; record installed versions instead of turning an unverified tool-version list or support end date into a syllabus promise. TPM-backed encryption, confidential computing, accelerators and managed enterprise identity each require a separate compatibility check.
+
+Existing introductory chapter titles are retained as migration targets. On revision, installation and command chapters become Ubuntu-specific decision/compatibility notes building on 01–08; security, network, container and performance chapters become integration cases building on their core owners. Do not add a second command-line or language-programming course.
 
 - **Introduction: Why Ubuntu 26.04 Matters**
 - **Chapter 1: What Is Ubuntu 26.04 LTS?**
@@ -926,6 +921,39 @@ Reference material supports the progressive chapters and is not required pre-rea
 - Recovery media, rescue toolkit and offline documentation
 - Recall cards and glossary, linked back to their owning chapters
 
+## Section structure for the next writing passes
+
+Parts 01–06 retain their existing section directories. Finish Part 06 with section `04-lifecycle-and-recovery` for briefs 10–12. For Parts 07–30, use the groups below as the outline before writing individual chapters. Ranges refer to the numbered briefs in this syllabus, not global chapter numbers. Prefix each section `01-`, `02-`, etc. in the displayed order, and number files locally within that section. Split a large brief into multiple chapters without changing its part identity.
+
+| Part | Ordered sections and brief ranges |
+|---|---|
+| 07 | Process lifecycle (1–3); Memory behavior (4–7); Resource boundaries (8–10); Pressure and placement (11–12) |
+| 08 | Configuration and host identity (1–3); Devices and kernel settings (4–6); Local evidence and retention (7–8); Runtime care and change records (9–11) |
+| 09 | Devices and partitions (1–3); Filesystem objects and mounts (4–6); Filesystem families (7–10, selectable chapters); Capacity and migration (11–12) |
+| 10 | Layering and logical volumes (1–3); Redundancy and fault domains (4–5); Encryption and recovery material (6–7); Paths, health and maintenance (8–12) |
+| 11 | Recovery objectives and copy design (1–4); Backup implementations and targets (5–6); Restore workflows (7–8); Integrity, retention and retirement (9–11) |
+| 12 | Links and addressing (1–4); Routes and configuration ownership (5–7); Reachability and safe changes (8–10) |
+| 13 | Dependencies and DNS (1–5); Address assignment (6–9); Time and operational recovery (10–11) |
+| 14 | SSH access lifecycle (1–4); Certificates and trust (5–8); Directory integration and continuity (9–10) |
+| 15 | Packet paths and filtering (1–4); Gateways and virtual links (5–8); Tunnels and traffic behavior (9–12) |
+| 16 | File sharing and identities (1–5); Block storage and transfer (6–8); Mail delivery (9–10, optional); Service recovery (11) |
+| 17 | Access decisions and capabilities (1–4); Mandatory access policy (5–7); Isolation and service sandboxing (8–10); Policy verification (11–12) |
+| 18 | Baseline, credentials and boot trust (1–4); Exposure and evidence (5–9); Response and trusted rebuild (10–12) |
+| 19 | Web and application lifecycle (1–5); Databases and state (6–9); Queues and object storage (10–11, selectable); Upgrades and diagnosis (12–13) |
+| 20 | Host and guest lifecycle (1–4); Guest data and connectivity (5–8); Recovery and migration (9–10); Hardware and platform extensions (11–14) |
+| 21 | Kernel primitives and runtime stack (1–6); Application container workflows (7–8); State, connectivity and confinement (9–11); Integration and system containers (12–15) |
+| 22 | Architecture and bootstrap (1–4); Workloads, resources and connectivity (5–9); Policy and evidence (10–11); Delivery and cluster recovery (12–14) |
+| 23 | Questions, baselines and host evidence (1–5); Service telemetry and collection (6–8); Correlation and actionable alerts (9–12); Telemetry limits and handover (13–14) |
+| 24 | Workloads and experiment design (1–2); Resource bottlenecks (3–8); Application limits and profiling (9–11); Latency, capacity and regressions (12–14) |
+| 25 | Inventory and bootstrap (1–3); Configuration and validation (4–6); Images and provisioning state (7–10); Disconnected builds and proof (11–12) |
+| 26 | Inventory and update policy (1–4); Coordinated delivery (5–6); Artifacts and trust (7–10); Drift and failed rollout recovery (11–12) |
+| 27 | Failure models and service failover (1–4); Data replication and shared storage (5–9, selectable); Degraded operation and recovery (10–12) |
+| 28 | Objectives and incident practice (1–4); Dependencies and disaster recovery (5–8); Exercises, improvement and retirement (9–12) |
+| 29 | Execution and kernel source (1–5); Memory, files and block I/O (6–10); Events, networking and synchronization (11–13); Boundaries, devices and interfaces (14–16) |
+| 30 | Questions and basic tracing (1–4); Dynamic probes and eBPF (5–8); Profiles, crashes and stalls (9–12); Measurement limits (13) |
+
+Part 31 uses one section per selected specialist branch. Part 32 uses one section per project, expanded only when there is written material. Parts 33–38 keep their existing chapter paths during technical revision; group them into sections only in a separate move that checks links and regenerates the sidebar. No empty directories or placeholder pages are needed for this plan.
+
 ## Topic ownership and prerequisite rules
 
 Breadth must not turn into repeated introductions or mutually dependent chapters.
@@ -934,7 +962,7 @@ Breadth must not turn into repeated introductions or mutually dependent chapters
 |---|---|---|
 | Minimal process/kernel/userspace model | 01 and 03 | Services, resources, security and containers |
 | Boot and recovery environments | 03 | Storage, updates, encryption and incident exercises |
-| Local identities, NSS and PAM | 04 | SSH, shares, directory integration and service identities |
+| Local identities, basic permissions, NSS and PAM | 04 | SSH, shares, directory integration and service identities |
 | Service lifecycle and systemd | 06 | Every later server and host agent |
 | Practical resource accounting/cgroups | 07 | Databases, VMs, containers and performance |
 | Local logging and configuration ownership | 08 | Service diagnosis and centralized telemetry |
@@ -945,7 +973,7 @@ Breadth must not turn into repeated introductions or mutually dependent chapters
 | SSH, PKI and certificate operation | 14 | TLS services, secrets rotation and cluster trust |
 | Packet policy, gateways and network virtualization | 15 | Hypervisors, containers and cluster networking |
 | Network file/block service operation | 16 | Application state, virtualization and shared infrastructure |
-| Access-control mechanisms | 17 | Per-workload hardening and security investigations |
+| Advanced access-control composition and isolation | 17, building on 04 | Per-workload hardening and security investigations |
 | Application/database lifecycle | 19 | Containers, delivery, monitoring and availability |
 | Container primitives and runtimes | 21 | Kubernetes node and workload operation |
 | Whole-system observability | 23 | Performance, incidents and deeper tracing |
@@ -960,14 +988,14 @@ Early chapters supply the mechanism required to understand their current task. L
 - Keep the progressive sequence and each part's practical outcome visible when expanding sections into individual chapter files.
 - The numbered entries are chapter briefs. Split a brief when its working configuration, mechanism and recovery need several substantial pages. There is no fixed total chapter count or chapter word cap.
 - Do not pre-create empty reader-facing sections or placeholder chapters to make the proposed contents appear published.
-- Preserve a three-level organization: part → section → chapter. Section boundaries are chosen during the next outline pass from coherent chapter groups, rather than using generic repeated headings for all subjects.
+- Use part → section → chapter for new core writing, following the section map above. Existing depth-track paths remain stable until a dedicated link-checked migration.
 - Keep boot, storage, networking, identity, trust and service prerequisites explicit in every integrated lab.
 - Verify tool versions, project status, defaults and distribution behavior against primary sources when writing implementation-specific chapters.
 - All subjects require diagnosis and recovery; the dedicated troubleshooting parts teach broader methods rather than being the first place failures appear.
 - Maintain the monorepo diagram standard, accessible descriptions and light/dark variants where required.
 - After every content update batch, render with `indipub.sh Boring-Linux`, refresh this book's local published artifacts, and regenerate the local portal once, following `README.md`. Repository scripts own generated configuration; never hand-edit `_quarto.yml` or commit build artifacts.
 
-### Decisions established by this conversation
+### Established curriculum decisions
 
 1. Audience spans beginner systems administration through expert Linux operation and investigation.
 2. The main organization is progressive learning.
@@ -979,39 +1007,6 @@ Early chapters supply the mechanism required to understand their current task. L
 
 ### Writing progress and next chapters
 
-Part 01 is complete: six System Foundations chapters and two Building and Observing the Lab chapters:
+Progress is maintained in [INDEX.md](../../INDEX.md), using actual chapter files as evidence. Parts 01–05 have complete sequences; Part 06 has briefs 1–9 written. The next writing pass covers briefs 10–12: reload/restart and graceful shutdown; user services and lingering; service failure diagnosis and recovery. Parts 33–38 have existing chapter sequences requiring the scope and technical review described above. Presence on disk and technical verification are separate statuses.
 
-1. What Linux consists of: kernel, userspace, distribution and installed system.
-2. Hardware, firmware, virtual hardware and the role of a hypervisor.
-3. CPU, memory, storage and network devices: the first working model.
-
-4. System paths, filesystems, configuration and persistent versus runtime state.
-5. Processes, services, sessions and the administrator's view of the machine.
-6. Distribution releases, support, repositories and documentation ownership.
-
-7. Building the first VM: console, disks, isolated networking and checkpoints.
-8. Inventory, change notes, evidence collection and a first troubleshooting method.
-
-Part 02 / Installation Foundations now contains four written chapters:
-
-1. Installation media, authenticity and integrity.
-2. Planning firmware, storage, identity and networking.
-3. Guided installation and the resulting storage layout.
-
-4. Manual storage choices, encryption and swap.
-
-Part 02 / First Boot and Device Readiness now contains the fifth and sixth chapter briefs: first-boot administrative access, initial updates and service inventory; hardware and virtual-device discovery, including missing drivers and firmware. The new labs preserve `bl02`, use `bl02-manual` for custom storage and optionally `bl02-crypt` for an encrypted-install comparison.
-
-Part 02 / Provisioning and Recovery contains the seventh and eighth chapter briefs: image-based and unattended installation, with a local-seed installer lab on `bl02-auto`; and reinstallation with selected host configuration and data recovery to `bl02-recovery`. Part 02 is complete.
-
-Part 03 / Firmware and Boot Selection contains its first two chapters: firmware, UEFI variables, GPT and the EFI System Partition; and bootloader selection and configuration with GRUB and systemd-boot. The Kernel and Early Userspace section contains kernel images, command lines and matching modules; initramfs construction and reaching the real root; and root handoff, PID 1 and systemd's boot transaction. Startup and Shutdown contains targets, readiness and boot timing, plus shutdown and delayed stop diagnosis. Boot Trust and Recovery contains Secure Boot, unified images and measured boot; rescue environments; and offline inspection and chroot repair. Part 03 is complete.
-
-Part 04 / Local Identities and Account Lifecycle contains numeric identities and ownership; account databases and NSS; account creation, locking, expiration and removal; and home directories and session environments. Authentication and Privilege contains passwords, PAM and bounded sudo delegation. Service Identities contains noninteractive accounts and runtime credentials. Sessions and Central Identity covers logind, polkit, LDAP, Kerberos and SSSD foundations. Part 04 is complete.
-
-Part 05 / Package State and Transactions contains package metadata and file ownership, plus dpkg/APT dependency resolution. Sources, Selection and Configuration covers repository trust, version selection and holds, and configuration files, alternatives and package hooks.
-
-Part 05 / Updates and Kernel Lifecycle covers security updates, maintenance windows, kernel transitions and livepatch. Other Formats and Software Supply covers Snap and Flatpak inventories, local packaging and reproducibility, and disconnected software supply.
-
-Part 05 / Transaction Recovery covers interrupted package transactions and rollback boundaries, completing Part 05. Part 06 / Service Supervision and Execution introduces unit types, managers and execution context. Readiness and Dependencies covers startup types, restart behavior, requirements and ordering.
-
-Next: Part 06 chapter 5, vendor and local units, drop-ins, generators and effective configuration. Later entries remain planning briefs until written. Expand the section/chapter hierarchy in writing order and keep numbering consistent with the progressive parts.
+Before expanding Part 07, review the early prerequisite requirements, complete the Part 06 service lifecycle, and verify that its lab leaves a reusable `labapp` baseline. New core chapters should follow the stage milestones; additions to depth tracks should answer a distinct question rather than repeat the foundation sequence.

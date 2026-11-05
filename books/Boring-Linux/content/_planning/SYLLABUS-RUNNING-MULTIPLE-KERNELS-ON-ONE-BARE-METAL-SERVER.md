@@ -10,9 +10,17 @@
 
 This syllabus defines an advanced curriculum for systems architects, kernel engineers, and infrastructure operators who need to run multiple operating system kernels concurrently or transitionally on a single physical bare-metal server. It moves systematically from kernel-level resource fundamentals through hardware partitioning, virtualization boundaries, device assignment (VFIO/SR-IOV), CPU/memory isolation, secure multi-tenant boundaries, performance benchmarking, and production operations.
 
-The core question for every chapter: **How do we isolate, assign, observe, and recover distinct kernel execution environments on unified physical hardware without sacrificing bare-metal performance guarantees?**
+The core question for every chapter: **Which kernel owns each resource, which boundary enforces isolation, and how can we verify performance, failure containment and recovery?**
 
 ---
+
+## Position in Boring Linux
+
+This is optional Part 33, governed by the reading routes and scope contracts in [SYLLABUS.md](SYLLABUS.md). Prerequisites: boot/recovery (03), resource accounting (07), virtual networking (15) and KVM operation (20); use selected kernel/tracing topics in 29–30 for source and crash investigations.
+
+Distinguish three models throughout: concurrent guest kernels under KVM; sequential handoff with `kexec` (including crash capture); and platform-specific hardware partitioning. A KVM/VFIO deployment demonstrates virtualization and device assignment. A hardware-partitioning claim must identify the actual platform and partition manager. Containers share a host kernel and are a comparison, not a multiple-kernel implementation. The [kernel kdump documentation](https://docs.kernel.org/admin-guide/kdump/kdump.html) describes the capture-kernel handoff.
+
+The first experiment needs two guests with distinct kernels and a verified recovery path. NUMA, SR-IOV and device passthrough are separately budgeted extensions, not requirements for every reader. Record shared host dependencies and measure overhead; do not promise bare-metal performance or zero interruption. Reuse core boot, networking, trust and tracing explanations; keep only the recap needed to answer the current experiment's question.
 
 ## Detailed Table of Contents
 
@@ -37,7 +45,7 @@ The core question for every chapter: **How do we isolate, assign, observe, and r
 - **The Handoff to Userspace:** PID 1 initialization, systemd boot transactions, device readiness waiting, and target activation.
 
 ### Chapter 3: Virtualization vs True Bare-Metal Multi-Kernel
-- **Type-1 Hypervisors: ESXi, Xen, KVM in Bare-Metal Mode:** Hypervisor topologies, privilege rings (Ring -1 / VMX root mode), control plane footprints, and CPU scheduling models.
+- **Hypervisor Architectures: KVM, Xen and Platform Comparisons:** Hypervisor topologies, privilege rings (Ring -1 / VMX root mode), control plane footprints, and CPU scheduling models.
 - **KVM Architecture Deep Dive:** `/dev/kvm` ioctls, vCPU threads, memory mapping (`EPT` / `NPT`), exit handling, and vmexit performance costs.
 - **Linux Containers and Shared-Kernel Architectures:** Namespaces, cgroups v2, shared page caches, and why shared-kernel isolation fails multi-kernel and kernel-fault isolation requirements.
 - **MicroVMs and Lightweight Virtualization:** Minimal device models, virtio-over-MMIO, rapid boot (<50ms), and constrained guest footprints (Firecracker, Cloud-Hypervisor).
@@ -48,7 +56,7 @@ The core question for every chapter: **How do we isolate, assign, observe, and r
 - **kexec-tools Configuration and Usage:** Preparing images (`vmlinuz`, initramfs, command line), loading with `kexec -l`, and triggering warm reboots with `kexec -e`.
 - **kdump for Crash Dumping:** Crash kernel memory reservation (`crashkernel=`), NMI generation, capturing `/proc/vmcore`, and makedumpfile optimization.
 - **Limitations of kexec for Multi-Kernel Goals:** Sequential execution vs. concurrent multi-kernel execution; state leakage and hardware cleanup challenges.
-- **Production Use Cases for kexec:** Zero-downtime micro-updates, hypervisor live patching, crash analytics pipelines, and fast cluster node recovery.
+- **Production Use Cases for kexec:** Warm kernel transitions, crash analytics pipelines and cluster-node recovery; distinguish reduced reboot time from application continuity, which needs a separate service failover or redundancy mechanism.
 
 ### Chapter 5: Hardware-Assisted Multi-Kernel with KVM/QEMU
 - **KVM Setup and Kernel Module Configuration:** CPU virtualization flags (`vmx`/`svm`), loading `kvm_intel`/`kvm_amd`, nested virtualization parameters, and device permissions.

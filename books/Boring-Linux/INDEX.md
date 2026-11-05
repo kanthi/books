@@ -1,134 +1,69 @@
 # Boring Linux — Authoring Roadmap
 
-Canonical curriculum: [content/_planning/SYLLABUS.md](content/_planning/SYLLABUS.md).
-
-The accepted syllabus defines a progressive Linux systems book: beginner administration through advanced operation and investigation. It covers mechanisms, installation, configuration, lifecycle, security, verification, troubleshooting and recovery across Linux domains.
-
-The previous reader-facing chapter and overview tree was removed at the author's request. Only newly written material is present in the live content tree. The old syllabus is retained as historical planning under `content/_planning/archive/`; it is not the current writing plan.
+Canonical curriculum: [content/_planning/SYLLABUS.md](content/_planning/SYLLABUS.md). The syllabus owns scope, prerequisites, reading routes, milestones and section outlines. This file owns writing status and the next batch.
 
 ## Current content
 
-Part 01, The Linux Machine and the Administration Lab, is complete, with two sections: **System Foundations** and **Building and Observing the Lab**.
+Inventory checked against the content tree on **2026-11-03**. A complete chapter sequence is a writing status; it does not imply that every command, lab and output has been reverified on the reference image.
 
-1. What Linux Consists Of
-2. Hardware, Firmware and Virtual Machines
-3. CPU, Memory, Storage and Network Resources
-4. System Paths, Configuration and State
-5. Processes, Services and Sessions
-6. Distributions, Releases and Documentation
-7. Building the First Virtual Machine
-8. Inventory, Evidence and First Troubleshooting
+| Part | Chapter files | Writing status |
+|---|---:|---|
+| 01 — The Linux Machine and the Administration Lab | 8 | Complete sequence |
+| 02 — Installing and Provisioning Linux | 8 | Complete sequence |
+| 03 — Boot, Shutdown and Recovery | 10 | Complete sequence |
+| 04 — Users, Identity and Administrative Access | 10 | Complete sequence; review the early permission/task prerequisites |
+| 05 — Packages, Software and Updates | 11 | Complete sequence |
+| 06 — Services, systemd and Scheduled Work | 9 | Briefs 1–9 present; briefs 10–12 next |
+| 07–32 | 0 | Planned; no placeholder chapters |
+| 33–38 | 119 | Existing optional depth-track pages, including introductions and part indexes; technical review pending |
 
-Each chapter includes diagrams, worked examples, an observation/practice exercise, diagnosis and a recall card. Foundation examples can be studied before lab setup and repeated on the disposable VM afterward. The lab section supplies setup, isolated networking, a recovery rehearsal and a bounded troubleshooting exercise.
-
-Part 02, Installing and Provisioning Linux, is complete. Its **Installation Foundations** section contains:
-
-1. Installation Media, Authenticity and Integrity
-2. Planning Firmware, Storage, Identity and Networking
-3. Guided Installation and the Resulting Storage Layout
-4. Manual Storage Choices, Encryption and Swap
-
-A second section, **First Boot and Device Readiness**, contains:
-
-5. First Boot: Administrative Access, Updates and Service Inventory
-6. Hardware and Virtual-Device Discovery
-
-A third section, **Provisioning and Recovery**, contains:
-
-7. Image-Based and Unattended Installation
-8. Reinstallation and Host Configuration Recovery
-
-The labs install `bl02` alongside `bl01`, add a disposable `bl02-manual` storage comparison (with an optional `bl02-crypt` extension), establish a verified first-boot baseline on `bl02`, use a separate `bl02-auto` guest for the local-seed installation, and restore selected state to a fresh `bl02-recovery` guest.
-
-Part 03, Boot, Shutdown and Recovery, begins with **Firmware and Boot Selection**:
-
-1. Firmware, UEFI Variables, GPT and the EFI System Partition
-2. Bootloader Selection: GRUB and systemd-boot
-
-The **Kernel and Early Userspace** section contains:
-
-3. Kernel Images, Command Lines and Matching Modules
-4. Initramfs and Reaching the Real Root
-5. Root Handoff, PID 1 and the Boot Transaction
-
-**Startup and Shutdown** contains:
-
-6. Targets, Activation, Readiness and Boot Timing
-7. Shutdown, Reboot and Services That Delay Shutdown
-
-**Boot Trust and Recovery** begins with:
-
-8. Secure Boot, Unified Images and Measured Boot
-9. Rescue, Emergency and External-Media Recovery
-10. Offline Inspection, Chroot Repair and the Next Normal Boot
-
-Part 03 is complete. Part 04, Users, Identity and Administrative Access, begins with **Local Identities and Account Lifecycle**:
-
-1. UIDs, GIDs, Groups and Ownership
-2. Account Databases, NSS and Identity Lookup
-3. Account Creation, Locking, Expiration and Removal
-4. Home Directories, Skeletons and Session Environments
-
-**Authentication and Privilege** contains:
-
-5. Passwords, Credential Storage and Policy
-6. PAM Stacks and Diagnosing Login Failures
-7. Administrative Privilege and Bounded Delegation
-
-**Service Identities** begins with:
-
-8. Service Accounts and Runtime Credentials
-
-**Sessions and Central Identity** contains:
-
-9. Sessions, logind and Authorization Beyond the Terminal
-10. Central Identity: LDAP, Kerberos and SSSD Foundations
-
-Part 04 is complete. Part 05, Packages, Software and Updates, begins with **Package State and Transactions**:
-
-1. Package Metadata, File Ownership and Installed State
-2. dpkg, APT and Dependency Resolution
-
-**Sources, Selection and Configuration** contains:
-
-3. Repositories, Signatures and Source Configuration
-4. Version Selection, Holds, Pinning and Dependency Conflicts
-5. Configuration Files, Alternatives and Package Hooks
-
-6. Security Updates and Maintenance Windows
-7. Kernel Updates, Reboots and Livepatch
-
-8. Snaps, Flatpak and Other Software Formats
-9. Source Builds, Local Packages and Reproducibility
-10. Offline Repositories, Mirrors and Disconnected Installation
-
-11. Interrupted Package Transactions and Recovery
-
-Part 05 is complete. Part 06 begins with **Service Supervision and Execution**:
-
-1. Service Supervision, Units and Managers
-2. Execution Environment, Identity and Exit Status
-
-**Readiness and Dependencies** contains:
-
-3. Startup Types, Readiness, Watchdogs and Restarts
-4. Requirements, Ordering and Failure Propagation
+The core has **56 chapter files** across Parts 01–06. Part 06 already covers vendor/local units and drop-ins; socket/path/device activation; timers/cron/anacron; mount/automount/swap units; and service cgroups with an initial sandbox. Do not rewrite these as missing chapters.
 
 ## Next writing pass
 
-Continue Part 06 with vendor units, local units, drop-ins, generators and effective configuration.
+Complete Part 06 in a new section, `04-lifecycle-and-recovery`, with:
 
-Add coherent sections only when they have written chapters. Keep numeric prefixes for deterministic ordering. Do not add placeholder overview pages or empty planned parts.
+1. `01-reloads-restarts-and-graceful-shutdown.qmd` — distinguish reload, restart and daemon-reload; validate configuration; prove graceful shutdown and the behavior of in-flight work.
+2. `02-user-services-lingering-and-session-lifecycle.qmd` — system versus user manager, login environment, lingering, logout/reboot behavior and cleanup.
+3. `03-service-failures-diagnosis-and-recovery.qmd` — dependency cycles, start-rate limits, restart storms, timeouts and a controlled repair with client-visible verification.
+
+Carry forward `bl06-service-lab` and `labapp`. Reuse the current configuration and scheduled work; end with a documented baseline for Part 07. Each new chapter supplies mechanism, worked evidence, a bounded failure, recovery, observable acceptance criteria and cleanup.
+
+Before beginning Part 07:
+
+- Review basic permissions and directory traversal in Part 04, including the small `chmod`/`chown`/`umask` workflow needed by service labs. The existing identity chapter already introduces access checks; extend only what the exercises need.
+- Verify that service labs teach their own endpoint, log and health checks without requiring the unwritten observability part.
+- Record which VM is active and which copies must remain off. Teach unique host identities before clones run together in the later multi-host lab.
+
+Use the syllabus section map for Part 07 onward. Create a section only when it has written chapters. Keep the first implementation bounded; expand alternative technologies as selectable sequences rather than one mixed survey chapter.
+
+## Depth-track review queue
+
+Existing Parts 33–38 stay at their current paths. Review them against the syllabus contracts before treating them as a continuation of the core:
+
+| Part | Review focus |
+|---|---|
+| 33 | Distinguish KVM guest kernels, `kexec` handoff and actual hardware partitioning; separate the basic lab from NUMA/VFIO/SR-IOV extensions |
+| 34 | Build on 24 and 30; concentrate on reproducible subsystem experiments, raw data and regression decisions |
+| 35 | Build on 14–18; use integrated threat/control/recovery cases rather than a second general security course |
+| 36 | Pin filesystem features and source; inspect disposable images and verify recovery |
+| 37 | Pin kernel/source/configuration; distinguish current SLUB from historical allocators and user-space allocation from `vmalloc` |
+| 38 | Verify release defaults, compatibility, support entitlements and installed versions; turn repeated foundations into Ubuntu-specific integration cases |
+
+These are scoped follow-up authoring tasks, not a claim that the existing track prose has been repaired by the syllabus review.
 
 ## Authoring boundaries
 
-- Keep the book independently usable; include the command details needed by the current task.
+- Keep the book independently usable; explain command and protocol details needed by the present task.
+- Keep numeric part identities and current chapter paths stable. A later reorganization needs an explicit link-checked mapping.
+- Use part → section → chapter for new core writing. Do not create empty planned parts or placeholder overviews.
 - Follow the monorepo illustrated-diagram standard.
-- Content and source assets are the work of the authoring pass.
-- After each content update batch, use `indipub.sh Boring-Linux` to render, refresh this book's local published artifacts, and regenerate the local portal once. Follow the commands in `README.md`; never hand-edit `_quarto.yml` or commit build artifacts.
-- Part numbers now describe this accepted 01–38 learning sequence, including the specialized tracks [Running Multiple Kernels on One Bare-Metal Server](content/_planning/SYLLABUS-RUNNING-MULTIPLE-KERNELS-ON-ONE-BARE-METAL-SERVER.md), [Linux Performance Engineering & Server Benchmarking](content/_planning/SYLLABUS-LINUX-PERFORMANCE-ENGINEERING-AND-SERVER-BENCHMARKING.md), [A Practical Guide to Securing Linux from Kernel to Cloud](content/35-a-practical-guide-to-securing-linux-from-kernel-to-cloud/index.qmd), [The ext4 Filesystem: Architecture, Internals, and Implementation](content/36-the-ext4-filesystem-architecture-internals-and-implementation/index.qmd), [A Complete Guide to Virtual Memory, Allocators, Paging, and Performance in the Modern Linux Kernel](content/37-a-complete-guide-to-virtual-memory-allocators-paging-and-performance-in-the-modern-linux-kernel/index.qmd), and [Ubuntu 26.04 LTS: From Desktop to Enterprise Cloud](content/38-ubuntu-26-04-lts-from-desktop-to-enterprise-cloud/index.qmd). A future integration with another book requires its own deliberate mapping; the old fixed 04–19 arrangement is retired.
+- After a reader-facing content batch, render and refresh local published artifacts once using [README.md](README.md). Never hand-edit `_quarto.yml` or commit build artifacts.
+- Any future integration into another book requires its own mapping. Historical fixed 05–13 and 04–19 arrangements do not describe this curriculum.
 
 ## Full progression
+
+Parts 01–32 contain the progressive foundations, workload branches, production operation, investigation and projects. Parts 33–38 are optional depth tracks with explicit prerequisites. The reading-route and milestone tables in the syllabus explain which parts to select and when to attempt projects.
 
 | Part | Subject |
 |---|---|
