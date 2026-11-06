@@ -1,0 +1,150 @@
+---
+title: "memfd_create and file seals: anonymous files peers cannot rewrite"
+author:
+  - name: "K19G"
+  - name: "grok-bot"
+---
+
+# memfd_create and file seals: anonymous files peers cannot rewrite
+
+After this page you can create an anonymous tmpfs file with `memfd_create`, enable sealing with `MFD_ALLOW_SEALING`, apply `F_ADD_SEALS`, and verify that a sealed write fails while reads still succeed. That is the legitimate shared-memory handoff pattern: one process fills a buffer, seals it, and passes the fd to a peer that can trust the bytes will not change underfoot.
+
+## Thesis
+
+Ordinary shared memory between processes that do not fully trust each other is painful. A peer can shrink the mapping (`SIGBUS` on touch) or rewrite bytes after you checked them (TOCTOU). **File seals** on a `memfd` let the producer freeze growth, shrinkage, and/or writes before the consumer maps the fd. The consumer calls `F_GET_SEALS` and proceeds without copying everything defensively.
+
+`memfd_create` (Linux 3.17+, glibc 2.27+) returns a file descriptor to a volatile anonymous file — like a tmpfs file that never had a path. Sealing is optional and **off** unless you pass `MFD_ALLOW_SEALING`.
+
+Verified below with **gcc** on the authoring Linux box.
+
+## Flags that matter
+
+| Flag / seal | Role |
+|-------------|------|
+| `MFD_CLOEXEC` | Close-on-exec on the new fd |
+| `MFD_ALLOW_SEALING` | Allow later `F_ADD_SEALS`; without it the fd starts with `F_SEAL_SEAL` already set and further seals fail with `EPERM` |
+| `F_SEAL_WRITE` | No more writes; existing shared writable maps must be gone first (or use `F_SEAL_FUTURE_WRITE`) |
+| `F_SEAL_SHRINK` / `F_SEAL_GROW` | Block `ftruncate` in that direction |
+| `F_SEAL_SEAL` | Block further seal changes |
+| `F_SEAL_FUTURE_WRITE` | Block new writes/maps while keeping current writable maps |
+
+## Lab: seal, then fail a write
+
+<!-- file: seal_demo.c -->
+```c
+#define _GNU_SOURCE
+#include <errno.h>
+#include <fcntl.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <unistd.h>
+
+#ifndef MFD_CLOEXEC
+#define MFD_CLOEXEC 0x0001U
+#endif
+#ifndef MFD_ALLOW_SEALING
+#define MFD_ALLOW_SEALING 0x0002U
+#endif
+#ifndef F_ADD_SEALS
+#define F_ADD_SEALS 1033
+#define F_GET_SEALS 1034
+#define F_SEAL_SEAL 0x0001
+#define F_SEAL_SHRINK 0x0002
+#define F_SEAL_GROW 0x0004
+#define F_SEAL_WRITE 0x0008
+#endif
+
+int main(void) {
+  int fd = memfd_create("demo", MFD_CLOEXEC | MFD_ALLOW_SEALING);
+  if (fd < 0) { perror("memfd_create"); return 1; }
+  const char *msg = "sealed-bytes\n";
+  if (write(fd, msg, strlen(msg)) < 0) { perror("write"); return 1; }
+  if (fcntl(fd, F_ADD_SEALS, F_SEAL_WRITE | F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_SEAL) < 0) {
+    perror("F_ADD_SEALS"); return 1;
+  }
+  int seals = fcntl(fd, F_GET_SEALS);
+  printf("seals=0x%x\n", seals);
+  errno = 0;
+  if (write(fd, "x", 1) < 0)
+    printf("write_after_seal_errno=%d (%s)\n", errno, strerror(errno));
+  else
+    printf("unexpected_write_ok\n");
+  char buf[64]={0};
+  lseek(fd, 0, SEEK_SET);
+  ssize_t n = read(fd, buf, sizeof buf - 1);
+  printf("read_n=%zd data=%s", n, buf);
+  close(fd);
+  return 0;
+}
+
+```
+
+Build and run:
+
+```bash
+gcc -O2 -Wall seal_demo.c -o seal_demo
+./seal_demo
+```
+
+Verified output:
+
+```text
+seals=0xf
+write_after_seal_errno=1 (Operation not permitted)
+read_n=13 data=sealed-bytes
+```
+
+`seals=0xf` is the bitmask of `SEAL|SHRINK|GROW|WRITE` (bits 0–3). The post-seal `write` returns `-1` with `errno == EPERM` (`Operation not permitted`). The earlier bytes remain readable.
+
+### Gotcha we hit first
+
+Calling `memfd_create("demo", MFD_CLOEXEC)` *without* `MFD_ALLOW_SEALING` makes `F_ADD_SEALS` fail immediately with `Operation not permitted`. The man page states the default seal set is `F_SEAL_SEAL` when allowing seals was not requested — you locked yourself out before you started.
+
+## Producer / consumer sketch
+
+1. Producer: `memfd_create(name, MFD_CLOEXEC | MFD_ALLOW_SEALING)`.
+2. `ftruncate` or `write` the payload; `mmap` if you fill by store.
+3. Unmap writable mappings if you need `F_SEAL_WRITE` (or prefer `F_SEAL_FUTURE_WRITE`).
+4. `fcntl(fd, F_ADD_SEALS, … | F_SEAL_SEAL)`.
+5. Pass `fd` over a Unix socket with `SCM_RIGHTS`, or let a child inherit it, or open `/proc/<pid>/fd/<n>` when that trust model fits.
+6. Consumer: `F_GET_SEALS`, refuse to proceed if expected seals are missing, then `mmap` read-only.
+
+## Security note (short)
+
+Attackers abuse `memfd_create` for fileless executable staging (`fexecve` on an anonymous fd). That is why defenders watch for odd `memfd:` entries under `/proc/*/fd` and why you should combine `MFD_CLOEXEC` with least privilege when you use memfds yourself. This page teaches the sealing API for honest IPC — not loaders.
+
+## Pitfalls
+
+1. **Forgetting `MFD_ALLOW_SEALING`.** Seals fail with `EPERM`.
+2. **`F_SEAL_WRITE` while a writable `mmap` still exists.** The add-seals call fails; unmap first or use `F_SEAL_FUTURE_WRITE`.
+3. **Assuming seals survive a fresh `memfd_create`.** Each fd starts empty (when allowed) or fully seal-locked (when not).
+4. **Leaking the fd across `exec`.** Use `MFD_CLOEXEC` unless inheritance is intentional.
+5. **Treating `/proc/self/fd/N` names as stable paths.** The `memfd:` symlink is for debugging; pass the fd, do not reopen by guessed path from another user.
+
+
+## Relation to `shm_open` and `mmap(MAP_ANONYMOUS)`
+
+`shm_open` creates a named POSIX shared-memory object that appears under `/dev/shm` on Linux. `memfd_create` skips the name and the directory entry: the only handles are file descriptors. Plain `mmap(..., MAP_ANONYMOUS)` never gives you an fd to send over a socket. When you need "anonymous *and* sendable *and* sealable", `memfd_create` is the syscall that hits all three.
+
+## Checklist for a sealed handoff
+
+1. Create with `MFD_CLOEXEC | MFD_ALLOW_SEALING`.
+2. Size and fill; drop writable maps before `F_SEAL_WRITE`.
+3. Add seals including `F_SEAL_SEAL` last if you want them frozen.
+4. Transfer the fd; consumer verifies `F_GET_SEALS`.
+5. Consumer maps read-only and never calls `F_ADD_SEALS` unless you designed a two-step seal.
+
+
+## Summary
+
+- `memfd_create` gives an anonymous tmpfs-backed fd for IPC and sealing.
+- Pass `MFD_ALLOW_SEALING` or you cannot add seals later.
+- `F_ADD_SEALS` freezes write/shrink/grow; verify with `F_GET_SEALS` and a failed write.
+- Hand the sealed fd to the consumer; they can trust contents without defensive copies.
+- Use CLOEXEC; do not confuse this API with fileless-malware recipes.
+
+## Sources
+
+- [memfd_create(2)](https://man7.org/linux/man-pages/man2/memfd_create.2.html)
+- [fcntl(2)](https://man7.org/linux/man-pages/man2/fcntl.2.html)
