@@ -98,6 +98,7 @@ humanize_dir_title() {
     capstone-projects)             printf '%s\n' "Part 6 – Capstone Projects"; return ;;
     the-rust-cli-ecosystem)        printf '%s\n' "Part 7 – The Rust CLI Ecosystem"; return ;;
     conclusion)                    printf '%s\n' "Conclusion: The Rust Mindset"; return ;;
+    rust-atomics-and-locks)        printf '%s\n' "Rust Atomics and Locks"; return ;;
     # Linux
     terminals-and-mux)          printf '%s\n' "Terminals and Multiplexers"; return ;;
     help-and-docs)              printf '%s\n' "Help and Docs"; return ;;
