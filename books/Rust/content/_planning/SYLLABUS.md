@@ -115,6 +115,9 @@
 - Lazy Evaluation and Performance
 - Summary
 
+## Iterator Cookbook
+Sits inside the iterators part (`content/13-iterators-and-closures/iterator-cookbook/`). Runnable recipes: how `next` works, which iterator to choose, laziness, transforms, filters, folds, pipelines, custom `Iterator` and adaptors, `DoubleEnded` / `Peekable` / `FusedIterator`, performance, rayon, `futures` streams, `Result` pipelines, itertools, when a loop is clearer, and exercises.
+
 ## Chapter 13: Concurrency: Fearless Parallelism
 - Spawning Threads with std::thread
 - Message Passing with Channels

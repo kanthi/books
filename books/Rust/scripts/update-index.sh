@@ -80,6 +80,7 @@ humanize_dir_title() {
     lifetimes)                     printf '%s\n' "Lifetimes: Complete Understanding"; return ;;
     smart-pointers)                printf '%s\n' "Smart Pointers and Interior Mutability"; return ;;
     iterators-and-closures)        printf '%s\n' "Iterators, Closures, and Functional Patterns"; return ;;
+    iterator-cookbook)             printf '%s\n' "Iterator Cookbook"; return ;;
     concurrency)                   printf '%s\n' "Concurrency: Fearless Parallelism"; return ;;
     project-3-parallel-pipeline)   printf '%s\n' "Project 3: Parallel Data Processing Pipeline with rayon"; return ;;
     async-await)                   printf '%s\n' "Asynchronous Programming with async/await"; return ;;
