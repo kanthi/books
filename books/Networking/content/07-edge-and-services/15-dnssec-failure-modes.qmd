@@ -1,0 +1,301 @@
+---
+title: "DNSSEC Failure Modes: SERVFAIL, Extended DNS Errors, Serve-Stale and NTAs"
+author:
+  - name: "K19G"
+  - name: "grok-bot"
+---
+
+# DNSSEC Failure Modes: SERVFAIL, Extended DNS Errors, Serve-Stale and NTAs
+
+When DNSSEC validation fails, a validating resolver does the safe thing: it refuses to answer and returns **SERVFAIL**. From a user's point of view the name has vanished. From an operator's point of view SERVFAIL is the least informative answer DNS has, because a dead authoritative server, a firewall dropping TCP/53, an expired signature and a botched key rollover all look identical. This chapter takes public test zones that are broken on purpose, asks two large validating resolvers about them, and reads the **Extended DNS Errors** (EDE, RFC 8914) that say *why*. It then covers what validator operators can do in the minutes after a zone they depend on breaks (serve-stale, negative trust anchors) and what zone operators should monitor so they are not that zone.
+
+[DNS authoritative and recursive](05-dns-authoritative-and-recursive.qmd) introduces the chain of trust and the AD bit; [the 2026 root KSK rollover](11-root-ksk-rollover-rfc5011.qmd) covers trust anchors. This chapter assumes both and stays on failure.
+
+## Learning goals
+
+- Map the common DNSSEC breakages to the EDE codes a resolver returns, and tell DNSSEC failures from reachability failures
+- Use the CD bit to separate "the data is there" from "the data does not validate"
+- Explain why two validators can disagree about the same zone (unsupported algorithms)
+- Configure serve-stale and a negative trust anchor, and know the risk each one takes
+- Monitor signature expiry in a way that works for both offline and online signers
+
+**Version note.** The probes ran on 2026-11-13 around 03:45 IST from the writing host with Python 3.13.5 and dnspython 2.9.1 (message building and parsing only), sending DNS-over-HTTPS POSTs with the standard library to `cloudflare-dns.com` and `dns.google`. The broken names are maintained test zones (`dnssec-failed.org` by Comcast, and the `extended-dns-errors.com` suite); their exact breakage and the resolvers' wording can change. The resolver configuration snippets near the end are from the Unbound and BIND documentation and were not run (no resolver daemons, no root on the writing host).
+
+## What can fail, and where
+
+```text
+  trust anchor ──► root DNSKEY ──► .org DS ──► .org DNSKEY ──► example.org DS
+                                                                    │  (parent)
+  ─────────────────────────────────────────────────────────────────┼─────────
+                                                                    ▼  (child)
+                          example.org DNSKEY (KSK, ZSK) ──► RRSIG over every RRset
+                                    ▲                              ▲
+               DS must match a KSK ─┘        signatures have an inception
+                                             and an expiration time
+```
+
+| Failure | Typical cause | Validator result | EDE |
+|---|---|---|---|
+| DS at parent matches no DNSKEY in the child | KSK rolled without updating DS; DS published for the wrong key; registrar typo | Bogus → SERVFAIL | 9 DNSKEY Missing (sometimes 6) |
+| RRSIG expired | Signer stopped (cron died, HSM offline), zone transferred unsigned copies stopped updating | Bogus → SERVFAIL | 7 Signature Expired |
+| RRSIG not yet valid | Signer clock in the future, **or validator clock in the past** | Bogus → SERVFAIL | 8 Signature Not Yet Valid |
+| Signature does not verify | Zone edited after signing, mangled by a middlebox, wrong key | Bogus → SERVFAIL | 6 DNSSEC Bogus |
+| Missing RRSIGs or NSEC/NSEC3 proofs | Partial signing, broken secondaries | Bogus → SERVFAIL | 10 RRSIGs Missing, 12 NSEC Missing |
+| Only unknown algorithms in DS / DNSKEY | New or retired algorithm | **Insecure** (RFC 4035 5.2, RFC 6840 5.2): answer without AD | 1 Unsupported DNSKEY Algorithm, 2 Unsupported DS Digest Type |
+| Authoritative servers refuse or unreachable | ACLs, outage, firewall | SERVFAIL (not a DNSSEC problem at all) | 18 Prohibited, 22 No Reachable Authority, 23 Network Error |
+
+The last row is there on purpose. Half of the SERVFAILs blamed on DNSSEC are not DNSSEC.
+
+## Lab: ask two validators about broken zones
+
+For each name the probe asks Cloudflare and Google with the DO bit set, then asks Cloudflare again with **CD** (Checking Disabled, RFC 4035 3.2.2), which tells the resolver "give me the data even if it does not validate". It prints the RCODE, whether the AD (validated) bit is set, the first A record, and every EDE option with the first part of its free-text explanation.
+
+```python
+# probe.py NAME...: ask DoH resolvers about broken-DNSSEC test names; show RCODE, AD, EDE (RFC 8914).
+import sys, time, urllib.request
+import dns.edns, dns.flags, dns.message, dns.rcode, dns.rdatatype
+
+RESOLVERS = {"cloudflare": "https://cloudflare-dns.com/dns-query",
+             "google": "https://dns.google/dns-query"}
+
+def doh(url, q):
+    req = urllib.request.Request(url, data=q.to_wire(), headers={
+        "Content-Type": "application/dns-message", "Accept": "application/dns-message"})
+    with urllib.request.urlopen(req, timeout=8) as r:
+        return dns.message.from_wire(r.read())
+
+def ask(url, name, rtype="A", cd=False):
+    q = dns.message.make_query(name, rtype, want_dnssec=True, use_edns=0)
+    if cd:
+        q.flags |= dns.flags.CD
+    t0 = time.perf_counter()
+    r = doh(url, q)
+    ms = (time.perf_counter() - t0) * 1000
+    ad = "AD" if r.flags & dns.flags.AD else "--"
+    ede = [f"EDE {o.code} {dns.edns.EDECode.to_text(o.code)}" + (f' "{o.text[:44]}"' if o.text else "")
+           for o in r.options if o.otype == dns.edns.OptionType.EDE]
+    ans = [str(rd) for rrset in r.answer for rd in rrset if rrset.rdtype == dns.rdatatype.from_text(rtype)]
+    out = f"{dns.rcode.to_text(r.rcode()):8} {ad} {ms:5.0f} ms {','.join(ans[:1]) or '-':15}"
+    return out + ("".join(f"\n{'':24}{e}" for e in ede))
+
+names = sys.argv[1:]
+for name in names:
+    print(name)
+    for rn, url in RESOLVERS.items():
+        print(f"  {rn:10}    {ask(url, name)}")
+    print(f"  {'cloudflare':10} CD {ask(RESOLVERS['cloudflare'], name, cd=True)}")
+```
+
+```text
+$ python3 probe.py example.com unsigned.extended-dns-errors.com dnssec-failed.org rrsig-exp-all.extended-dns-errors.com rrsig-not-yet-all.extended-dns-errors.com ds-unassigned-key-algo.extended-dns-errors.com ds-unassigned-digest-algo.extended-dns-errors.com allow-query-none.extended-dns-errors.com
+example.com
+  cloudflare    NOERROR  AD    99 ms 104.20.23.154  
+  google        NOERROR  AD    77 ms 104.20.23.154  
+  cloudflare CD NOERROR  --    80 ms 172.66.147.243 
+unsigned.extended-dns-errors.com
+  cloudflare    NOERROR  --   437 ms 65.109.160.190 
+  google        NOERROR  --   622 ms 65.109.160.190 
+  cloudflare CD NOERROR  --   430 ms 65.109.160.190 
+dnssec-failed.org
+  cloudflare    SERVFAIL --   120 ms -              
+                        EDE 9 DNSKEY_MISSING "no SEP matching the DS found for dnssec-fail"
+  google        SERVFAIL --   154 ms -              
+                        EDE 9 DNSKEY_MISSING "No DNSKEY matches DS RRs of dnssec-failed.or"
+  cloudflare CD NOERROR  --    89 ms 96.99.227.255  
+                        EDE 9 DNSKEY_MISSING "no SEP matching the DS found for dnssec-fail"
+rrsig-exp-all.extended-dns-errors.com
+  cloudflare    SERVFAIL --   674 ms -              
+                        EDE 7 SIGNATURE_EXPIRED "for DNSKEY rrsig-exp-all.extended-dns-errors"
+  google        SERVFAIL --   673 ms -              
+                        EDE 7 SIGNATURE_EXPIRED "Expired RRSIG found for rrsig-exp-all.extend"
+  cloudflare CD NOERROR  --   625 ms 65.109.160.190 
+                        EDE 7 SIGNATURE_EXPIRED "for DNSKEY rrsig-exp-all.extended-dns-errors"
+rrsig-not-yet-all.extended-dns-errors.com
+  cloudflare    SERVFAIL --   665 ms -              
+                        EDE 8 SIGNATURE_NOT_YET_VALID "for DNSKEY rrsig-not-yet-all.extended-dns-er"
+  google        SERVFAIL --   614 ms -              
+                        EDE 8 SIGNATURE_NOT_YET_VALID "RRSIG found not yet valid for rrsig-not-yet-"
+  cloudflare CD NOERROR  --   675 ms 65.109.160.190 
+                        EDE 8 SIGNATURE_NOT_YET_VALID "for DNSKEY rrsig-not-yet-all.extended-dns-er"
+ds-unassigned-key-algo.extended-dns-errors.com
+  cloudflare    SERVFAIL --   653 ms -              
+                        EDE 9 DNSKEY_MISSING "no SEP matching the DS found for ds-unassign"
+  google        NOERROR  --   926 ms 65.109.160.190 
+  cloudflare CD NOERROR  --   672 ms 65.109.160.190 
+                        EDE 9 DNSKEY_MISSING "no SEP matching the DS found for ds-unassign"
+ds-unassigned-digest-algo.extended-dns-errors.com
+  cloudflare    NOERROR  --   660 ms 65.109.160.190 
+                        EDE 2 UNSUPPORTED_DS_DIGEST_TYPE "for DS ds-unassigned-digest-algo.extended-dn"
+  google        NOERROR  --   883 ms 65.109.160.190 
+  cloudflare CD NOERROR  --   654 ms 65.109.160.190 
+                        EDE 2 UNSUPPORTED_DS_DIGEST_TYPE "for DS ds-unassigned-digest-algo.extended-dn"
+allow-query-none.extended-dns-errors.com
+  cloudflare    SERVFAIL --   432 ms -              
+                        EDE 18 PROHIBITED
+                        EDE 22 NO_REACHABLE_AUTHORITY "at delegation allow-query-none.extended-dns-"
+  google        SERVFAIL --   404 ms -              
+                        EDE 18 PROHIBITED
+                        EDE 23 NETWORK_ERROR "[65.21.51.117] rcode=REFUSED for allow-query"
+                        EDE 22 NO_REACHABLE_AUTHORITY "At delegation allow-query-none.extended-dns-"
+  cloudflare CD SERVFAIL --   442 ms -              
+                        EDE 18 PROHIBITED
+                        EDE 22 NO_REACHABLE_AUTHORITY "at delegation allow-query-none.extended-dns-"
+```
+
+### Reading it, name by name
+
+- **`example.com`**: validated (`AD`) at both. With CD the answer comes back without AD, because the resolver was told not to validate. This is the baseline to compare everything else to.
+- **`unsigned.extended-dns-errors.com`**: no AD, NOERROR. Unsigned is not broken. A zone without a DS at its parent is **insecure**, and validators answer normally.
+- **`dnssec-failed.org`**: the parent publishes a DS that matches no DNSKEY in the zone, the classic botched-rollover state. Both validators return SERVFAIL with **EDE 9**; their texts differ, the code does not. With CD the A record `96.99.227.255` is right there. *That is the diagnostic*: if CD gets an answer and normal resolution does not, the data exists and validation is the problem.
+- **`rrsig-exp-all`**: signatures expired. EDE 7 at both, and Cloudflare's text includes the expiry as a Unix timestamp (`1782814088` = 2026-06-30 10:08 UTC). The `sigcheck.py` lab below reads those timestamps directly.
+- **`rrsig-not-yet-all`**: signatures whose inception is in the future (2027-06-30). EDE 8. On a real network the same code appears when a *validator's* clock is a year behind, for example a lab VM restored from an old snapshot without NTP. Every signed zone on the internet then fails at once. Check the validator's clock before you blame the zone.
+- **`ds-unassigned-key-algo`**: the validators **disagree**. The DS names an algorithm number that is not assigned. RFC 4035 section 5.2 and RFC 6840 section 5.2 say a validator that supports none of the algorithms in the DS set must treat the zone as insecure. Google did that (NOERROR, no AD). Cloudflare failed closed with EDE 9. Neither is "down", and a user on one resolver sees the site while a user on the other does not. When a ticket says "works for some users", ask which resolver.
+- **`ds-unassigned-digest-algo`**: an unknown DS *digest* type. Both treat the zone as insecure and answer; Cloudflare adds **EDE 2** as an informational note to a successful answer. EDE is not only for failures.
+- **`allow-query-none`**: the authoritative servers refuse queries. SERVFAIL at both, *with and without CD*, and the EDE codes (18 Prohibited, 22 No Reachable Authority, 23 Network Error with the server IP and `REFUSED`) say plainly that this is reachability, not DNSSEC. CD does not help here because there is no data to return.
+
+Two rules fall out. **CD separates data problems from validation problems.** And **EDE separates DNSSEC from everything else**, when the resolver sends it. Clients see EDE only if they look: recent BIND `dig` versions print an `EDE:` line in the OPT pseudosection, `kdig` decodes it too, and browsers and stub resolvers mostly throw it away.
+
+## Extended DNS Errors worth knowing
+
+| Code | Name | What to do |
+|---|---|---|
+| 1 / 2 | Unsupported DNSKEY Algorithm / DS Digest Type | Usually informational: zone treated as insecure. Check whether the zone moved to an algorithm your validator lacks. |
+| 3 | Stale Answer | The resolver served expired cache (serve-stale). Upstream is broken; you are on borrowed time. |
+| 6 | DNSSEC Bogus | Generic validation failure. Read the text. |
+| 7 / 8 | Signature Expired / Not Yet Valid | Zone signer stopped, or a clock is wrong (signer or validator). |
+| 9 | DNSKEY Missing | DS ↔ DNSKEY mismatch. Rollover or registrar problem at the zone owner. |
+| 10 / 12 | RRSIGs Missing / NSEC Missing | Partially signed zone or a broken secondary. |
+| 13 | Cached Error | The resolver is returning a cached SERVFAIL; fixing the zone may not show for a while. |
+| 15–17 | Blocked / Censored / Filtered | Policy on the resolver (RPZ, filtering service), not the zone. |
+| 18 | Prohibited | The resolver or an upstream refused you or it. |
+| 22 / 23 | No Reachable Authority / Network Error | Authoritative servers down or unreachable. Not DNSSEC. |
+
+## Lab: watch signature expiry
+
+Expired signatures are the most common self-inflicted DNSSEC outage, and the easiest to see coming. This check asks for the RRSIGs over the SOA and DNSKEY sets, with CD so that already-broken zones still answer, and prints how long each signature has left.
+
+```python
+# sigcheck.py ZONE...: days left on the RRSIGs over SOA and DNSKEY (asked with CD so bogus data still comes back).
+import datetime as dt, sys, urllib.request
+import dns.flags, dns.message, dns.rdatatype
+
+def doh(q, url="https://cloudflare-dns.com/dns-query"):
+    req = urllib.request.Request(url, data=q.to_wire(), headers={
+        "Content-Type": "application/dns-message", "Accept": "application/dns-message"})
+    with urllib.request.urlopen(req, timeout=8) as r:
+        return dns.message.from_wire(r.read())
+
+now = dt.datetime.now(dt.timezone.utc)
+for zone in sys.argv[1:]:
+    for rtype in ("SOA", "DNSKEY"):
+        q = dns.message.make_query(zone, rtype, want_dnssec=True)
+        q.flags |= dns.flags.CD
+        for rrset in doh(q).answer:
+            if rrset.rdtype != dns.rdatatype.RRSIG:
+                continue
+            for sig in rrset:
+                inc = dt.datetime.fromtimestamp(sig.inception, dt.timezone.utc)
+                exp = dt.datetime.fromtimestamp(sig.expiration, dt.timezone.utc)
+                left = (exp - now).total_seconds() / 86400
+                state = "EXPIRED" if left < 0 else ("NOT YET VALID" if inc > now else
+                        ("WARN <7d" if left < 7 else "ok"))
+                print(f"{zone:40} {rtype:6} key {sig.key_tag:5} alg {sig.algorithm:2} "
+                      f"inc {inc:%Y-%m-%d} exp {exp:%Y-%m-%d} {left:7.1f} d  {state}")
+```
+
+```text
+$ python3 sigcheck.py example.com rrsig-exp-all.extended-dns-errors.com rrsig-not-yet-all.extended-dns-errors.com
+example.com                              SOA    key 34505 alg 13 inc 2026-11-11 exp 2026-11-13     1.0 d  WARN <7d
+example.com                              DNSKEY key  2371 alg 13 inc 2026-10-19 exp 2026-12-19    36.8 d  ok
+rrsig-exp-all.extended-dns-errors.com    SOA    key 50880 alg  8 inc 2026-06-30 exp 2026-06-30  -135.5 d  EXPIRED
+rrsig-exp-all.extended-dns-errors.com    DNSKEY key 16126 alg  8 inc 2026-06-30 exp 2026-06-30  -135.5 d  EXPIRED
+rrsig-exp-all.extended-dns-errors.com    DNSKEY key 50880 alg  8 inc 2026-06-30 exp 2026-06-30  -135.5 d  EXPIRED
+rrsig-not-yet-all.extended-dns-errors.com SOA    key 53458 alg  8 inc 2027-06-30 exp 2028-06-30   595.5 d  NOT YET VALID
+rrsig-not-yet-all.extended-dns-errors.com DNSKEY key 53458 alg  8 inc 2027-06-30 exp 2028-06-30   595.5 d  NOT YET VALID
+rrsig-not-yet-all.extended-dns-errors.com DNSKEY key 54334 alg  8 inc 2027-06-30 exp 2028-06-30   595.5 d  NOT YET VALID
+```
+
+The broken test zones are flagged correctly. The surprise is `example.com`: its SOA signature was made two days ago and expires in one, so a fixed "warn at 7 days" threshold calls a healthy zone unhealthy. Zones signed by an **online signer** (most large DNS providers sign on the fly) use short validity periods and re-sign continuously; zones signed **offline** (a nightly `dnssec-signzone` run, an HSM ceremony) typically carry weeks. The DNSKEY signature on the same zone has 36 days. Alert on the **fraction** of the validity period remaining (for example, warn below 25%, page below 10%), and alert on *any* signature already expired or not yet valid. Run the check from outside your own network, against every authoritative server separately, because one stale secondary is enough to fail validation for the resolvers that pick it.
+
+## When a zone you depend on breaks: options for validator operators
+
+You run the resolver. A partner's zone just went bogus and your users cannot reach it. In order of preference:
+
+1. **Tell the zone owner**, with the EDE code and text. EDE 9 means "your DS and DNSKEY do not match": that is a five-minute fix at their registrar once they know.
+2. **Serve-stale (RFC 8767)** keeps answering from cache with expired records when upstream resolution fails, and marks them with EDE 3. It helps when the authoritative servers are *unreachable*, and for records already in cache. It does not rescue names that were never cached. RFC 8767 recommends a stale TTL of 30 seconds and a cap of one to three days on how stale data may get.
+3. **A negative trust anchor (RFC 7646)** tells your validator to treat one zone as insecure for a limited time. Users get answers again; they also lose DNSSEC protection for that zone, which is exactly what an attacker would want if the "breakage" is an attack. Scope it to the one zone, give it a lifetime, log it, and remove it when the owner fixes the zone.
+
+Not run here; from the Unbound and BIND documentation:
+
+```text
+# unbound.conf: serve-stale per RFC 8767
+server:
+    serve-expired: yes
+    serve-expired-ttl: 86400             # do not serve data more than a day past expiry
+    serve-expired-client-timeout: 1800   # try upstream for 1.8 s first, then serve stale
+
+# Unbound: negative trust anchor at runtime (and remove it later)
+unbound-control insecure_add partner.example
+unbound-control insecure_remove partner.example
+```
+
+```text
+# BIND 9 named.conf options
+    stale-answer-enable yes;
+    stale-cache-enable yes;
+    max-stale-ttl 1d;
+
+# BIND 9: NTA with an explicit lifetime
+rndc nta -lifetime 2h partner.example
+rndc nta -dump
+```
+
+What you should **not** do: turn validation off globally, or point users at a non-validating resolver "until it is fixed". That trades one partner's outage for every user's exposure.
+
+## For zone operators: not being the outage
+
+| Practice | Why |
+|---|---|
+| Automate signing and re-signing; monitor it as in `sigcheck.py` | Expired signatures are the top cause |
+| Use algorithm 13 (ECDSA P-256) or 8 (RSA/SHA-256) for new zones; plan any algorithm change as a double-signature rollover | RFC 8624 algorithm guidance; validators that do not know a new algorithm treat you as insecure, which is safe but silent |
+| Change the DS at the parent *only after* the new KSK is published and cached; remove the old DS before the old KSK | DS mismatch (EDE 9) is the classic rollover failure |
+| Use CDS/CDNSKEY (RFC 7344, RFC 8078) if your parent supports it | Removes the human from DS updates |
+| Check every authoritative server, not the one behind your nearest anycast node | Secondaries can serve stale signatures |
+| Keep signer and validator clocks on NTP | EDE 7/8 for everyone |
+
+## Gotchas
+
+- **SERVFAIL is not proof of a DNSSEC problem.** Check EDE, then retry with CD. If CD also fails, look at reachability.
+- **CD is for diagnosis, not a workaround.** Applications that set CD to "fix" DNS turn validation off for themselves.
+- **Validators can legitimately disagree.** Unsupported-algorithm handling and resolver policy differ. Ask users which resolver they use.
+- **A wrong validator clock breaks every signed zone at once.** EDE 8 (or 7) for names that are fine elsewhere points at your own clock.
+- **Fixed expiry thresholds fail for online signers.** Use the fraction of validity left.
+- **Negative cache of errors.** Resolvers cache SERVFAIL briefly (EDE 13). After a fix, expect a delay, or flush the resolver cache for that name.
+- **NTAs are security exceptions.** Time-limit them, log them, and remove them.
+- **EDE text is free-form.** Match on the code in automation, not on the string.
+
+## Boring rule
+
+Validate, and let it fail closed. When it fails, read the EDE code, retry with CD, and fix the zone or ask its owner to; use a time-limited NTA only for a zone you have confirmed is broken rather than attacked. If you sign zones, automate re-signing and monitor the fraction of signature validity left on every authoritative server.
+
+## Try this
+
+1. Run `probe.py` against your own resolver (change the URL list, or add a plain-UDP path). Does it return EDE at all? Which codes?
+2. Change `sigcheck.py` to warn when less than 25% of each signature's validity period remains. Re-run it against `example.com` and a zone you know is signed offline.
+3. Query `dnssec-failed.org` with CD set and DO set, and print the RRSIG and DNSKEY records you get back. Compute the key tag of each DNSKEY with `dns.dnssec.key_id()` and compare it with the DS at `.org`.
+4. Write a short runbook entry for "partner zone bogus": the commands to confirm (EDE, CD), who to contact, the exact NTA command with its lifetime, and the removal step.
+5. Set a lab VM's clock one year back and query a signed name through a validating resolver on that VM. Which EDE do you get? Restore the clock.
+
+## Sources
+
+- RFC 8914, Extended DNS Errors: <https://www.rfc-editor.org/rfc/rfc8914>; IANA EDE code registry: <https://www.iana.org/assignments/dns-parameters/dns-parameters.xhtml#extended-dns-error-codes>
+- RFC 4033, 4034, 4035, DNS Security Introduction, Resource Records, Protocol Modifications: <https://www.rfc-editor.org/rfc/rfc4035>
+- RFC 6840, Clarifications and Implementation Notes for DNSSEC (section 5.2, unsupported algorithms): <https://www.rfc-editor.org/rfc/rfc6840>
+- RFC 8767, Serving Stale Data to Improve DNS Resiliency: <https://www.rfc-editor.org/rfc/rfc8767>
+- RFC 7646, Definition and Use of DNSSEC Negative Trust Anchors: <https://www.rfc-editor.org/rfc/rfc7646>
+- RFC 8624, Algorithm Implementation Requirements and Usage Guidance for DNSSEC: <https://www.rfc-editor.org/rfc/rfc8624>
+- RFC 7344 and RFC 8078, CDS/CDNSKEY automation: <https://www.rfc-editor.org/rfc/rfc8078>
+- RFC 7583, DNSSEC Key Rollover Timing Considerations: <https://www.rfc-editor.org/rfc/rfc7583>
+- Unbound `unbound.conf(5)` (`serve-expired*`, `domain-insecure`) and `unbound-control(8)` (`insecure_add`): <https://unbound.docs.nlnetlabs.nl/en/latest/manpages/unbound.conf.html>
+- BIND 9 reference (`stale-answer-enable`, `rndc nta`): <https://bind9.readthedocs.io/en/latest/reference.html>
+- Extended DNS Errors test zones: <https://extended-dns-errors.com/>; Comcast `dnssec-failed.org` test domain
