@@ -1,0 +1,578 @@
+---
+title: "Underlay Design Choices: eBGP, OSPF or IS-IS Under a Clos Fabric"
+author:
+  - name: "K19G"
+  - name: "grok-bot"
+---
+
+# Underlay Design Choices: eBGP, OSPF or IS-IS Under a Clos Fabric
+
+A data-centre Clos fabric relies entirely on its underlay routing protocol to provide predictable reachability between loopback interface addresses. These loopbacks host the tunnel endpoints (such as VXLAN Network Encapsulation endpoints, or VTEPs) for overlay network services like BGP EVPN. Choosing the underlay protocol—External BGP (eBGP), Open Shortest Path First (OSPF), or Intermediate System to Intermediate System (IS-IS)—determines how the physical topology handles ECMP (Equal-Cost Multi-Path) forwarding, failure convergence, link addressing, and operational complexity. This chapter is the decision chapter. [Clos leaf-spine](01-clos-leaf-spine.qmd) introduced the roles and a 2×2 fabric, and [Fabric with FRR](03-fabric-with-frr.qmd) has working FRR configurations and verify scripts. Here the question is *which* underlay to run and why, with the numbers and failure behaviour that decide it.
+
+## Learning goals
+
+- Differentiate the operational boundaries and duties of underlay IP reachability versus overlay service transport.
+- Evaluate the tradeoffs between eBGP, OSPF (single area), and IS-IS (Level-2 only) across convergence speed, flooding scope, and policy control.
+- Design an RFC 7938 compliant Autonomous System Number (ASN) and IP addressing scheme using 4-byte private ASNs and BFD integration.
+- Implement IPv6 link-local unnumbered peering under RFC 8950 to eliminate IPv4 point-to-point subnets across fabric links.
+- Apply a concrete decision procedure to select an underlay routing protocol based on scale, multi-vendor constraints, and operational familiarity.
+
+**Version note.** The plan generator below ran on 2026-11-13 with Python 3.13.5 on Linux 6.12.94+; no FRR, containerlab or netlab on the writing host, so router configs are written from FRR 10.x docs and marked "not run".
+
+## What the underlay has to do
+
+The underlay network exists to establish reachability between physical interface addresses and logical loopback addresses across every switch in the Clos topology. In a modern leaf-spine architecture, all user workload traffic, multi-tenant virtual networks, and MAC/IP reachability tables are encapsulated within overlay tunnels (typically VXLAN).
+
+The underlay must satisfy four specific requirements:
+
+1. **Loopback Reachability for Overlay Next Hops**: The primary function of the underlay routing protocol is advertising switch loopback addresses (typically `/32` for IPv4 or `/128` for IPv6). These loopbacks serve as the Source and Destination IP addresses for VXLAN encapsulation. If a leaf cannot reach another leaf's loopback, overlay encapsulation fails.
+2. **Deterministic Equal-Cost Multi-Path (ECMP)**: A Clos topology relies on horizontal scale rather than vertical chassis size. Traffic must be spread across all available paths between any leaf and spine. The underlay must install all equal-cost routes into the Routing Information Base (RIB) and Forwarding Information Base (FIB) to enable packet hashing across all available uplinks.
+3. **Fast Failure Detection and Isolation**: When a physical link or spine switch fails, the underlay must detect the fault in sub-second timeframes and remove the affected path from the ECMP set. Slow failure recovery causes packet drop during flow hashing across dead paths.
+4. **Operational Simplicity**: The underlay should require minimal configuration state, standard parameters across all nodes, and zero manual metric manipulation during scale-out operations.
+
+Separating underlay routing from overlay routing prevents routing table bloat. The underlay carries only physical link subnets and switch loopbacks (typically tens to hundreds of routes). The overlay carries thousands of tenant routes, host MAC addresses, and subnet prefixes.
+
+```text
++-------------------------------------------------------------------+
+|                        OVERLAY (BGP EVPN)                         |
+|   Carries: Tenant MACs, Host IPs, VNI mappings, L2/L3 VIFs        |
+|   Endpoints: VTEP Loopbacks (e.g., 10.0.0.5 <-> 10.0.0.6)        |
++-------------------------------------------------------------------+
+                                  |
+               Uses Underlay Paths for Encapsulation
+                                  v
++-------------------------------------------------------------------+
+|                     UNDERLAY (eBGP / OSPF / IS-IS)                |
+|   Carries: Switch Loopbacks (/32), Physical Interconnects (/31)   |
+|   Goal: Fast ECMP forwarding, quick link failover                 |
++-------------------------------------------------------------------+
+```
+
+## The three candidates
+
+The three dominant protocol choices for Clos fabric underlays are eBGP (designed according to RFC 7938 recommendations), OSPFv2/OSPFv3 (configured as a single area), and IS-IS (configured as Level-2 only).
+
+| Feature / Metric | eBGP (RFC 7938) | OSPFv2 / OSPFv3 | IS-IS (Level-2 Only) |
+| :--- | :--- | :--- | :--- |
+| **Adjacency Discovery** | Manual peer IP or RFC 5549 IPv6 Link-Local Interface config. | Automatic via IP Hello packets on subnets. | Automatic via CLNS Hello PDUs (Layer 2 frame). |
+| **Flooding / Scope** | Hop-by-hop path vector. No global Link-State Database (LSDB). | Link-State Advertisements (LSAs) flooded across the entire single area. | Link State PDUs (LSPs) flooded across the entire Level-2 domain. |
+| **Failure Propagation** | Prefix withdrawal propagated hop-by-hop. Loop detection stops propagation. | LSA generation and link-state flooding trigger SPF calculation on all nodes. | LSP generation and LSP flooding trigger SPF calculation on all nodes. |
+| **Policy Control** | Rich policy capability via AS_PATH, BGP Communities, and Route Maps. | Limited to metric tuning and summary filtering (at area boundaries). | TLV-based metric manipulation; limited path filtering within an area. |
+| **Unnumbered Support** | Supported natively via RFC 8950 (IPv6 link-local peering for IPv4 NLRI). | Supported (Point-to-Point unnumbered using loopback IP). | Native (IS-IS operates over L2 Ethernet frame headers directly). |
+| **IPv6 Capabilities** | Native multi-protocol BGP (MP-BGP) carrying IPv4 and IPv6 over same session. | Separate protocol stacks required (OSPFv2 for IPv4, OSPFv3 for IPv6). | Integrated IS-IS carries IPv4 and IPv6 concurrently using Multi-Topology TLVs. |
+| **Operational Tooling** | Standard BGP commands (`show ip bgp summary`, `show bgp neighbors`). | Standard OSPF commands (`show ip ospf neighbor`, `show ip ospf database`). | Standard IS-IS commands (`show isis neighbors`, `show isis database`). |
+| **Typical Overlay Pairing** | eBGP Underlay + eBGP/iBGP EVPN Overlay. | OSPF Underlay + iBGP EVPN Overlay. | IS-IS Underlay + iBGP EVPN Overlay. |
+
+## eBGP the RFC 7938 way
+
+RFC 7938 describes the design of BGP-based IP fabrics within data centres. It leverages eBGP across physical links to prevent path-hunting and isolate link state.
+
+```text
+               +-------------------+   +-------------------+
+               |      Spine 1      |   |      Spine 2      |
+               |  AS 4200000000    |   |  AS 4200000000    |
+               +---------+---------+   +---------+---------+
+                         |                       |
+            +------------+-----------+-----------+------------+
+            |                        |                        |
+  +---------+---------+    +---------+---------+    +---------+---------+
+  |       Leaf 01     |    |       Leaf 02     |    |       Leaf 03     |
+  |   AS 4200000101   |    |   AS 4200000102   |    |   AS 4200000103   |
+  +-------------------+    +-------------------+    +-------------------+
+```
+
+### ASN Allocation Scheme
+
+RFC 7938 Section 5.2.1 specifies a two-tier ASN allocation scheme:
+- **Spine Tier**: All spine switches share a single, identical Autonomous System Number (e.g., `4200000000`).
+- **Leaf Tier**: Every leaf switch is assigned a unique Autonomous System Number (e.g., `4200000101`, `4200000102`).
+
+Because all spines share one ASN, any route that has already crossed a spine carries that ASN. If a leaf re-advertises such a route to a different spine, that spine sees its own ASN in the `AS_PATH` and discards it (RFC 4271 9.1.2). Spines therefore only ever hold paths learned *directly* from the originating leaf, and never a path of the shape spine → leaf → spine → leaf. That is the property that keeps the fabric's paths short and its convergence bounded; the failure section below shows its one cost.
+
+### Path Hunting Prevention and AS_PATH Loop Detection
+
+Path hunting occurs in path-vector protocols when a node loses its primary route to a prefix and sequentially tries alternate paths received from peers. In a dense mesh where every router has a distinct ASN, a withdrawn prefix can make each router fall back to successively longer alternative paths it had learned from other neighbours (spine → leaf → spine → leaf ...), advertise each one, and withdraw it again, before the prefix is finally gone. RFC 7938 section 5.1 calls this "BGP path hunting" and cites Jakma (2008). Each step is an UPDATE and a FIB change on many devices.
+
+Standard BGP `AS_PATH` loop detection (RFC 4271 Section 9.1.2) discards any update containing the local router's ASN. With unique leaf ASNs and a uniform spine ASN:
+1. Leaf 01 advertises `10.0.0.5/32` with `AS_PATH: 4200000101` to Spine 1 and Spine 2.
+2. Spine 1 prepends its ASN and sends the route to Leaf 02 with `AS_PATH: 4200000000 4200000101`.
+3. If Leaf 02 advertises this path on to Spine 2, Spine 2 sees `4200000000` already in the `AS_PATH` and drops the update.
+
+Every usable leaf-to-leaf path is therefore exactly `spine ASN, origin leaf ASN` long. There are no longer alternatives to hunt through.
+
+### Private Autonomous System Numbers
+
+Using 2-byte private ASNs (`64512` to `65534`) provides only 1,023 usable values. Large fabrics with hundreds of leaves exhaust this space quickly. RFC 6996 reserves 4-byte private ASNs in the range `4200000000` to `4294967294` (94,967,295 available ASNs), accommodating large multi-pod data centre topologies.
+
+### Reuse of Leaf ASNs and `allowas-in` Risks
+
+With only 2-byte private ASNs, RFC 7938 section 5.2.2 suggests reusing the same leaf ASN set in every cluster (for example `65001`–`65032` in each pod). A leaf in pod 1 with AS `65001` then receives routes from the leaf with AS `65001` in pod 2, sees its own ASN in the path and drops them, so the upstream sessions on such leaves need `allowas-in`. 
+
+`allowas-in` disables the default BGP loop prevention check for a specific number of ASN occurrences. 
+
+**Caution.** RFC 7938 argues this does not make loops more likely in a clean Clos, because the `AS_PATH` still grows at every tier. It does remove a safety net: a miscabled or misconfigured leaf can now accept paths that loop through itself. With 4-byte private ASNs (below) there are enough numbers for every leaf in every pod, and `allowas-in` is not needed.
+
+### BGP Multipath Relax
+
+Without extra configuration, FRR (and most implementations) only treats paths as multipath candidates if their whole `AS_PATH` is identical. For ordinary leaf-to-leaf traffic in an RFC 7938 fabric that already holds: Leaf 01 hears Leaf 02's loopback via Spine 1 and via Spine 2, both as `4200000000 4200000102`, so it installs both.
+
+The paths differ as soon as one prefix is originated by *more than one leaf*: an anycast service address, a subnet advertised by both leaves of an MLAG or EVPN multihoming pair, or a default route from two border leaves. Each copy carries a different origin ASN (`4200000000 4200000101` versus `4200000000 4200000102`), so without help only one is used. `bgp bestpath as-path multipath-relax` makes paths of equal `AS_PATH` *length* eligible for ECMP whatever the ASNs. It is in almost every fabric configuration for that reason. Designs that give each spine its own ASN need it even for plain leaf-to-leaf paths.
+
+### Timers, BFD, and MRAI
+
+Default eBGP Keepalive (60s) and Hold (180s) timers are unsuited for modern fabrics. Underlay eBGP relies on two adjustments for fast convergence:
+1. **Bidirectional Forwarding Detection (BFD)**: RFC 5880 / RFC 5881 BFD sessions register directly with BGP to provide sub-second link failure detection (typically 300ms failure detection window).
+2. **Minimum Route Advertisement Interval (MRAI)**: RFC 4271 suggests 30 seconds between advertisements to an eBGP peer, and some network operating systems still default to that. A 30-second MRAI on a fabric turns a sub-second failure into a half-minute event. FRR's default `advertisement-interval` is already `0`; on other platforms check and set it to `0` on fabric sessions.
+
+### Lab: an addressing and ASN plan you can generate
+
+The Python script below generates an RFC 7938 eBGP IP addressing and 4-byte ASN plan for a specified number of spines and leaves.
+
+```python
+# plan.py SPINES LEAVES: an RFC 7938-style eBGP underlay plan (ASNs, /31 links, loopbacks)
+# and the arithmetic that decides between "one ASN per leaf" and the alternatives.
+import ipaddress, itertools, sys
+
+S, L = (int(x) for x in sys.argv[1:3]) if len(sys.argv) > 2 else (4, 16)
+SPINE_ASN = 4200000000                 # RFC 6996 private 4-byte range 4200000000-4294967294
+LEAF_ASN0 = 4200000100
+links = ipaddress.ip_network("10.255.0.0/20").subnets(new_prefix=31)
+lo = ipaddress.ip_network("10.0.0.0/24").hosts()
+
+print(f"fabric: {S} spines x {L} leaves = {S * L} point-to-point links, "
+      f"{S * L * 2} BGP session endpoints, {S + L} loopbacks")
+print(f"ECMP width leaf->leaf: {S} paths; spine failure removes {100 / S:.0f}% of capacity\n")
+print("node      ASN         loopback      first two links")
+rows = []
+for s in range(1, S + 1):
+    rows.append((f"spine{s}", SPINE_ASN, next(lo)))
+for l in range(1, L + 1):
+    rows.append((f"leaf{l:02}", LEAF_ASN0 + l, next(lo)))
+p2p = {}
+for (si, li) in itertools.product(range(1, S + 1), range(1, L + 1)):
+    net = next(links); a, b = list(net)
+    p2p[(si, li)] = (net, a, b)
+for name, asn, ip in rows[:2] + rows[S:S + 3]:
+    if name.startswith("spine"):
+        si = int(name[5:]); mine = [f"{p2p[(si, li)][1]}/31" for li in (1, 2)]
+    else:
+        li = int(name[4:]); mine = [f"{p2p[(si, li)][2]}/31" for si in (1, 2)]
+    print(f"{name:9} {asn:<11} {str(ip) + '/32':13} {', '.join(mine)}")
+print("...")
+used = ipaddress.ip_network(f"10.255.0.0/{32 - (S * L * 2 - 1).bit_length()}")
+print(f"\np2p pool actually used: {S * L} x /31 = {S * L * 2} addresses (fits in {used})")
+print(f"with unnumbered (RFC 5549/8950 over IPv6 link-local): 0 p2p addresses, {S + L} /32 loopbacks")
+
+print("\nwhy every spine shares one ASN (RFC 7938 5.2.1): a leaf-to-leaf path is always")
+print(f"  leaf A (AS {LEAF_ASN0 + 1}) -> spine (AS {SPINE_ASN}) -> leaf B (AS {LEAF_ASN0 + 2})")
+print("  a path leaf->spine1->leafX->spine2 would carry AS", SPINE_ASN, "twice -> loop-rejected,")
+print("  so spines never learn each other's routes via a leaf (no path hunting through leaves).")
+
+print("\nprivate 2-byte ASNs (64512-65534):", 65534 - 64512 + 1,
+      "| private 4-byte:", 4294967294 - 4200000000 + 1)
+for leaves in (16, 512, 1100):
+    need = leaves + 1
+    print(f"  {leaves:5} leaves + 1 spine ASN = {need:5} ASNs -> 2-byte private {'fits' if need <= 1023 else 'DOES NOT fit'}")
+```
+
+Executing this script yields the explicit fabric assignment plan:
+
+```text
+fabric: 4 spines x 16 leaves = 64 point-to-point links, 128 BGP session endpoints, 20 loopbacks
+ECMP width leaf->leaf: 4 paths; spine failure removes 25% of capacity
+
+node      ASN         loopback      first two links
+spine1    4200000000  10.0.0.1/32   10.255.0.0/31, 10.255.0.2/31
+spine2    4200000000  10.0.0.2/32   10.255.0.32/31, 10.255.0.34/31
+leaf01    4200000101  10.0.0.5/32   10.255.0.1/31, 10.255.0.33/31
+leaf02    4200000102  10.0.0.6/32   10.255.0.3/31, 10.255.0.35/31
+leaf03    4200000103  10.0.0.7/32   10.255.0.5/31, 10.255.0.37/31
+...
+
+p2p pool actually used: 64 x /31 = 128 addresses (fits in 10.255.0.0/25)
+with unnumbered (RFC 5549/8950 over IPv6 link-local): 0 p2p addresses, 20 /32 loopbacks
+
+why every spine shares one ASN (RFC 7938 5.2.1): a leaf-to-leaf path is always
+  leaf A (AS 4200000101) -> spine (AS 4200000000) -> leaf B (AS 4200000102)
+  a path leaf->spine1->leafX->spine2 would carry AS 4200000000 twice -> loop-rejected,
+  so spines never learn each other's routes via a leaf (no path hunting through leaves).
+
+private 2-byte ASNs (64512-65534): 1023 | private 4-byte: 94967295
+     16 leaves + 1 spine ASN =    17 ASNs -> 2-byte private fits
+    512 leaves + 1 spine ASN =   513 ASNs -> 2-byte private fits
+   1100 leaves + 1 spine ASN =  1101 ASNs -> 2-byte private DOES NOT fit
+```
+
+### Explaining the Output Line by Line
+
+1. `fabric: 4 spines x 16 leaves...`: 4 × 16 = 64 links, one eBGP session per link, so 128 session endpoints to configure and monitor, and 20 loopbacks. In a full mesh between tiers, links and sessions grow as spines × leaves.
+2. `ECMP width leaf->leaf: 4 paths...`: Leaf-to-leaf traffic hashes across 4 spines. Losing one spine removes a quarter of the leaf-to-leaf capacity, so spine count is a capacity *and* a failure-domain decision.
+3. `node ASN loopback first two links`: Headers for the physical topology plan. Spines 1 and 2 share `AS 4200000000`. Leaves increment sequentially starting at `4200000101`. Loopbacks draw from `10.0.0.0/24`.
+4. Point-to-Point IPv4 subnets (`10.255.0.0/31`, `10.255.0.2/31`, etc.): Shows how standard numbered underlays consume IP subnets per link. `spine1` takes `10.255.0.0/31` (using `.0`), while `leaf01` takes `.1`.
+5. `p2p pool actually used...`: Summarises IP consumption. Numbered interfaces use 128 IPv4 addresses (`10.255.0.0/25`).
+6. `with unnumbered (RFC 5549/8950...`: Highlights operational efficiency. Switching to BGP unnumbered reduces physical interface address allocation to zero, consuming only the 20 `/32` loopback IPs.
+7. `why every spine shares one ASN...`: Documents the loop prevention behavior. The path `Leaf A -> Spine 1 -> Leaf B -> Spine 2` carries `AS 4200000000` twice, triggering automatic loop rejection.
+8. `private 2-byte ASNs...`: Illustrates scale limits. At 1,100 leaves, the required 1,101 ASNs exceed the 1,023 2-byte private ASN limit (`64512-65534`), demonstrating why 4-byte ASNs (`4200000000+`) must be used.
+
+## Unnumbered: the address plan that disappears
+
+Numbered underlays need an IPv4 `/31` (RFC 3021) on every point-to-point link. In a fabric with 16 spines and 128 leaves that is 2,048 subnets, each one written into two device configs and an IPAM, and each one a chance for a typo that the routing protocol will happily expose as a missing session.
+
+### RFC 8950 (Extended Next Hop Encoding) over IPv6 Link-Local
+
+RFC 8950 (which obsoletes RFC 5549) defines capabilities that allow BGP to advertise an IPv4 Network Layer Reachability Information (NLRI) prefix alongside an IPv6 Next Hop address. 
+
+Combined with the IPv6 link-local address every interface already has (`fe80::/64`), a BGP speaker can peer over a link that has no IPv4 address at all. FRR learns the neighbour's link-local address from its IPv6 Router Advertisements, which is why RAs must be enabled on fabric ports. The IPv4 routes it installs then point at an IPv6 next hop. Linux (5.2+) can hold such routes natively (`via inet6 fe80::...`); older stacks and some ASIC SDKs instead use a placeholder IPv4 next hop such as `169.254.0.1` with a permanent neighbour entry that maps to the peer's MAC.
+
+```text
++-------------------+                           +-------------------+
+|      Spine 1      |                           |      Leaf 01      |
+|  lo: 10.0.0.1/32  |                           |  lo: 10.0.0.5/32  |
+|                   |                           |                   |
+|   Interface swp1  |   IPv6 RA (fe80::1)       |   Interface swp1  |
+|   (No IPv4 IP)    |==========================>|   (No IPv4 IP)    |
+|   (fe80::1/64)    |<==========================|   (fe80::2/64)    |
+|                   |   IPv6 RA (fe80::2)       |                   |
+|                   |                           |                   |
+|                   |  BGP Session over fe80    |                   |
+|                   |  Advertises: 10.0.0.1/32  |                   |
+|                   |  Next Hop: fe80::1        |                   |
++-------------------+                           +-------------------+
+```
+
+In FRR, configuring an unnumbered eBGP peer interface requires a single command line:
+```text
+neighbor swp1 interface remote-as external
+```
+FRR automatically listens for IPv6 RAs on interface `swp1`, extracts the remote link-local address, forms an eBGP session, and negotiates RFC 8950 Extended Next Hop capability to exchange IPv4 routes.
+
+### Operational Caveats of Unnumbered Underlays
+
+While unnumbered fabrics eliminate subnet allocation, they introduce operational tradeoffs:
+
+1. **Traceroute shows nodes, not links**: An unnumbered interface has no IPv4 address to source ICMP Time Exceeded from, so each hop answers from its loopback (or, on some platforms, not at all). You learn *which switch*, but not *which of its links*, the packet crossed. Per-link monitoring has to come from interface counters or LLDP, not from traceroute.
+2. **ICMP depends on loopback reachability**: Because errors are sourced from the loopback, a node whose loopback is not yet advertised (early in boot, or a leaking route-map) sends ICMP that cannot be routed back.
+3. **IPv6 Requirement**: IPv6 stack processing must be active on all physical switch ports, even if the data centre carries 100% IPv4 workload traffic.
+4. **ASIC and NOS Hardware Compatibility**: Older ASIC packet pipelines or legacy Network Operating Systems (NOS) cannot perform route lookups where an IPv4 route points directly to an IPv6 link-local next-hop address in the hardware FIB.
+
+### When to Retain Numbered `/31` Addresses
+
+You should retain standard `/31` IPv4 subnets on interconnect links if:
+- Legacy hardware ASICs cannot execute dual-stack next-hop translation in line-rate hardware.
+- Operational teams rely heavily on per-interface ICMP monitoring and interface-specific IPv4 traceroute targets.
+- Multi-vendor environments contain devices lacking RFC 8950 implementation.
+
+## IGP underlays: OSPF or IS-IS
+
+Instead of BGP, link-state Interior Gateway Protocols (IGPs) such as OSPF or IS-IS can serve as the underlay routing protocol.
+
+### OSPF in the Underlay
+
+Single-area OSPF (Area `0.0.0.0`) provides rapid automatic neighbor discovery without manual peering configurations. 
+
+#### Where OSPF Fits Best
+OSPF is suitable for small-to-medium fabrics (up to ~30-50 switches) managed by teams with deep IGP operational expertise. In this model, the underlay runs single-area OSPF to establish loopback reachability, while an **iBGP EVPN overlay** runs on top, using spine switches as BGP Route Reflectors (RRs).
+
+#### Flooding and Scale Limits
+Link-State Protocols flood topology changes globally across an area. In a Clos fabric, if a single leaf-spine link flaps, an LSA (Type-1 Router LSA or Type-2 Network LSA) is generated and flooded to *every* node in the area. Each node must execute the Shortest Path First (SPF) algorithm.
+
+In a fabric with 128 leaves and 16 spines, one link flap floods a new Router LSA to all 144 devices, and in a dense mesh each device receives that LSA over every one of its links. Every device then reruns SPF. eBGP also notifies many devices, but only with the prefixes whose best paths changed, and some failures stop at the first tier (RFC 7938 section 7.4). Flooding volume, not SPF cost, is what limits single-area link-state underlays in very wide fabrics.
+
+#### Optimizing OSPF Settings
+- `ip ospf network point-to-point`: Configure it on every fabric interface. Ethernet defaults to the broadcast type, which runs a DR/BDR election (and its wait timer) and originates Network LSAs on links that only ever have two routers.
+- **Unnumbered OSPF**: On Linux/FRR there is no `ip unnumbered` command; you put the loopback's `/32` on each fabric interface as well, with the point-to-point network type, and OSPF forms adjacencies between those `/32`s. See the sketch at the end of the chapter.
+
+### IS-IS in the Underlay
+
+IS-IS (Intermediate System to Intermediate System) is an alternative link-state protocol widely used in large enterprise and service provider data centres.
+
+#### Why IS-IS is Preferred Over OSPF for IGP Fabrics
+1. **Not carried over IP**: IS-IS PDUs travel directly in Ethernet frames with an 802.2 LLC header (OSI SAP `0xFE`), not inside IP packets. Adjacencies do not depend on IP addressing, so an IP typo on a link does not take the IGP down with it, and the protocol cannot be attacked or filtered by IP rules. It also means IP ACLs and `tcpdump 'ip'` filters will not show it.
+2. **Native Dual-Stack (IPv4 and IPv6)**: IS-IS carries IPv4 and IPv6 routing information concurrently within standard Type-Length-Value (TLV) attributes (RFC 5308 / RFC 5120). OSPF requires running two separate protocol daemons (OSPFv2 for IPv4 and OSPFv3 for IPv6).
+3. **TLV Extensibility**: IS-IS features a simple, extensible TLV structure that simplifies adding operational extensions.
+
+#### IS-IS Fabric Design: Level-2 Only
+In a Clos fabric, IS-IS should be deployed as a single **Level-2 (L2-only)** routing domain. Standardizing on Level-2 avoids unnecessary L1/L2 area boundary processing and metric leaking complexities. Interfaces are configured as `isis network point-to-point` and `isis circuit-type level-2-only`.
+
+```text
+               +-------------------+   +-------------------+
+               |      Spine 1      |   |      Spine 2      |
+               | IS-IS Level-2 Only|   | IS-IS Level-2 Only|
+               +---------+---------+   +---------+---------+
+                         |                       |
+            +------------+-----------+-----------+------------+
+            |                        |                        |
+  +---------+---------+    +---------+---------+    +---------+---------+
+  |       Leaf 01     |    |       Leaf 02     |    |       Leaf 03     |
+  | IS-IS Level-2 Only|    | IS-IS Level-2 Only|    | IS-IS Level-2 Only|
+  +-------------------+    +-------------------+    +-------------------+
+```
+
+### Dynamic flooding (RFC 9667, awareness)
+
+RFC 9667, "Dynamic Flooding on Dense Graphs", attacks exactly that flooding cost for IS-IS and OSPF. An area leader computes a sparse *flooding topology*, a connected subset of the links, and LSPs/LSAs are flooded only over it. All links still carry traffic and still appear in SPF. Implementation support varies by vendor and release; treat it as something to ask for in a large IGP fabric, not a default.
+
+## Failure behaviour you should predict
+
+Understanding how underlays react to physical failures ensures predictable convergence times and prevents black-holing.
+
+```text
+Physical Failures:
+1. Spine Failure      -> Removes 1 ECMP path from ALL leaves simultaneously.
+2. Leaf Uplink Failure -> Removes 1 ECMP path from single affected leaf.
+```
+
+### Spine Failure vs. Leaf Uplink Failure
+
+- **Spine Switch Failure**: If Spine 1 crashes, all attached leaves lose their link to Spine 1 simultaneously via hardware link down or BFD timeout. Each leaf immediately updates its FIB to remove Spine 1 from its ECMP next-hop group. Traffic redistributes evenly across remaining active spines.
+- **Leaf Uplink Failure**: If Leaf 01 loses its interface to Spine 1, only Leaf 01 modifies its egress FIB table. Spine 1 still has active links to all other leaves.
+
+**The one cost of the shared spine ASN.** When the Leaf 01 – Spine 1 link fails, Spine 1 has *no* other path to Leaf 01: the only alternatives would go through another leaf and another spine, and those carry Spine 1's own ASN. Until Spine 1's withdrawal reaches every other leaf and they drop Spine 1 from their ECMP group for Leaf 01's prefixes, traffic they hash to Spine 1 for Leaf 01 is dropped. With BFD and an MRAI of 0 that window is short, but it exists. An IGP underlay would let Spine 1 detour via another leaf and spine, which avoids the drop but makes a leaf a transit hop, which is the path shape most fabric designs try to forbid.
+
+### Convergence Timers and Mechanisms
+
+| Parameter / Mechanism | eBGP (RFC 7938) | OSPF (Single Area) | IS-IS (Level-2) |
+| :--- | :--- | :--- | :--- |
+| **Primary Failure Detector** | BFD (300ms: 100ms x 3) or Hardware Link Down. | BFD (300ms: 100ms x 3) or Hardware Link Down. | BFD (300ms: 100ms x 3) or Hardware Link Down. |
+| **Control Plane Event** | BGP NOTIFICATION / Link Down triggers withdrawal. | Link-down triggers Type-1 LSA update generation. | Link-down triggers Level-2 LSP update generation. |
+| **Information Distribution** | Hop-by-hop UPDATE distribution along path vectors. | Global flooding of LSA to all area nodes. | Global flooding of LSP to all Level-2 nodes. |
+| **Routing Calculation** | Best-path selection per affected prefix (path vector). | SPF over the area's LSDB, throttled by SPF timers. | SPF (or partial route calculation for leaf-only changes), throttled by SPF timers. |
+| **What sets convergence time** | Detection + UPDATE propagation per tier (MRAI 0) + FIB update. | Detection + LSA flooding + SPF delay/hold timers + FIB update. | Detection + LSP flooding + SPF delay timers + FIB update. |
+
+### Micro-loops (RFC 7938 Section 7.5)
+
+Micro-loops are short-lived forwarding loops while devices update their FIBs at different moments. RFC 7938 section 7.5 describes the one that BGP fabrics do get: a lower-tier switch loses all paths for a prefix and falls back to its **default route** toward the tier above, while the upper switch still points that prefix back down. Packets bounce between the two until the upper switch updates. The RFC's fix is a static discard (null) route for the summary of the relevant server subnets on each tier, more specific than the default, so a missing prefix is dropped locally instead of looped.
+
+Link-state underlays can micro-loop whenever two neighbours run SPF at slightly different times after the same event. In a two-tier Clos with point-to-point links and equal costs, the shapes that loop are few, but they exist if a leaf can become a transit hop (for example during maintenance with metrics raised on one spine).
+
+### Predicted Event Chains for Link Failures
+
+```text
+Event: Single Leaf Uplink Failure (Leaf 01 <-> Spine 1 link cuts)
+-----------------------------------------------------------------------------------------------------------------
+Step | eBGP (RFC 7938)                       | OSPFv2 (Single Area)                  | IS-IS (Level-2)
+-----|---------------------------------------|---------------------------------------|-----------------------------------
+1    | Physical link down detected by ASIC.  | Physical link down detected by ASIC.  | Physical link down detected by ASIC.
+2    | BFD session breaks (if no link down). | BFD session breaks (if no link down). | BFD session breaks (if no link down).
+3    | Leaf 01 removes Spine 1 from ECMP.    | Leaf 01 removes Spine 1 from ECMP.    | Leaf 01 removes Spine 1 from ECMP.
+4    | Both ends drop the BGP session.       | Leaf 01 and Spine 1 flood new         | Leaf 01 and Spine 1 flood new
+     | Spine 1 loses its only path to L01.   | Router LSAs without the link.         | LSPs without the adjacency.
+5    | Spine 1 sends WITHDRAW 10.0.0.5/32    | Every node runs SPF; Spine 1 now      | Every node runs SPF; Spine 1 now
+     | to every other leaf.                  | reaches L01 via leafX->spine2.        | reaches L01 via leafX->spine2.
+6    | Other leaves drop Spine 1 from their  | Other leaves drop Spine 1 from their  | Other leaves drop Spine 1 from their
+     | ECMP group for 10.0.0.5/32.           | ECMP group for 10.0.0.5/32 (cost).    | ECMP group for 10.0.0.5/32 (cost).
+```
+
+## A decision procedure
+
+Use this checklist to select the optimal underlay protocol for your network fabric:
+
+1. **Evaluate Overlay Protocol Architecture**:
+   - *Requirement*: The overlay is BGP EVPN (RFC 7432, RFC 8365) and the team is comfortable with BGP.
+   - *Recommendation*: Consider **eBGP for the underlay** too, with EVPN either on the same sessions or on separate loopback sessions. One protocol, one set of `show bgp` habits. Keep it a choice, not a reflex: the EVPN overlay works just as well over an IGP.
+
+2. **Assess Operational Skillsets**:
+   - *Requirement*: If the operational team has extensive experience with OSPF/IS-IS, but limited BGP operational history, and the fabric scale is small (roughly 32 switches or fewer).
+   - *Recommendation*: Choose **OSPF** (single area, point-to-point) or **IS-IS** (Level-2 only). Run an **iBGP EVPN overlay** on top using spines as Route Reflectors.
+
+3. **Determine Scale Bounds**:
+   - *Requirement*: The fabric is heading past a few dozen switches, or into multiple pods.
+   - *Recommendation*: Prefer **eBGP**, or IS-IS with flooding reduction if your platforms support it. The threshold is guidance, not law; measure LSDB size and flooding rate in your own lab before deciding.
+
+4. **Verify Multi-Vendor Support for Unnumbered Interconnects**:
+   - *Requirement*: Deployment requires IPv6 unnumbered interfaces (RFC 8950) to eliminate IPv4 subnets across physical links.
+   - *Action*: Confirm all vendor hardware platforms support RFC 8950 Extended Next Hop capability in line-rate forwarding hardware. If supported, choose **eBGP Unnumbered**. If vendor support is mixed, implement **eBGP with `/31` IPv4 link addressing**.
+
+5. **Assess IPv6 Transport Requirements**:
+   - *Requirement*: Native dual-stack routing (IPv4 and IPv6) without running dual protocol daemons.
+   - *Recommendation*: Choose **eBGP** (via MP-BGP) or **IS-IS** (via Multi-Topology TLVs). Avoid OSPFv2/v3 dual-stack setups due to duplicate daemon overhead.
+
+```text
+                                  +---------------------------------+
+                                  | Is fabric size > 64 devices OR  |
+                                  | running BGP EVPN Overlay?       |
+                                  +----------------+----------------+
+                                                   |
+                                       +-----------+-----------+
+                                       |                       |
+                                      YES                      NO
+                                       |                       |
+                                       v                       v
+                         +---------------------------+   +---------------------------+
+                         | Do all vendors support    |   | Does operations team      |
+                         | RFC 8950 IPv6 Unnumbered? |   | prefer IGP (OSPF/IS-IS)?  |
+                         +-------------+-------------+   +-------------+-------------+
+                                       |                               |
+                           +-----------+-----------+       +-----------+-----------+
+                           |                       |       |                       |
+                          YES                      NO     YES                      NO
+                           |                       |       |                       |
+                           v                       v       v                       v
+                    +--------------+        +--------------+ +--------------+  +--------------+
+                    | eBGP         |        | eBGP         | | OSPF Area 0  |  | eBGP         |
+                    | Unnumbered   |        | Numbered     | | or IS-IS L2  |  | Numbered     |
+                    | (RFC 8950)   |        | (/31 IPv4)   | | (iBGP EVPN)  |  | (/31 IPv4)   |
+                    +--------------+        +--------------+ +--------------+  +--------------+
+```
+
+## Config sketches (FRR 10.x, not run)
+
+The following configuration snippets sketch leaf underlay configurations for FRRouting (FRR) version 10.x.
+
+**Not run.** These snippets were written from the FRR documentation (docs.frrouting.org, BGP, OSPFv2 and IS-IS pages) and were not run on the writing host, which has no FRR or Containerlab. The OSPF sketch is unnumbered: the loopback `/32` is repeated on each fabric port, and interface-level `ip ospf area` is used instead of `network` statements (FRR does not let you mix the two). [Fabric with FRR](03-fabric-with-frr.qmd) has numbered and unnumbered eBGP configurations you can deploy.
+
+### 1. eBGP Unnumbered Leaf Configuration (RFC 7938 + RFC 8950)
+
+```text
+! FRR 10.x eBGP Unnumbered Leaf Configuration (Not Run)
+frr version 10.0
+hostname leaf01
+!
+interface swp1
+ description link-to-spine1
+ ipv6 nd ra-interval 3
+ no ipv6 nd suppress-ra
+!
+interface swp2
+ description link-to-spine2
+ ipv6 nd ra-interval 3
+ no ipv6 nd suppress-ra
+!
+interface lo
+ ip address 10.0.0.5/32
+!
+ip prefix-list LOOPBACKS permit 10.0.0.0/24 le 32
+!
+route-map LOOPBACKS permit 10
+ match ip address prefix-list LOOPBACKS
+!
+router bgp 4200000101
+ bgp router-id 10.0.0.5
+ bgp bestpath as-path multipath-relax
+ !
+ neighbor fabric peer-group
+ neighbor fabric remote-as external
+ neighbor fabric bfd
+ neighbor fabric capability extended-nexthop
+ !
+ neighbor swp1 interface peer-group fabric
+ neighbor swp2 interface peer-group fabric
+ !
+ address-family ipv4 unicast
+  redistribute connected route-map LOOPBACKS
+  neighbor fabric activate
+ exit-address-family
+!
+```
+
+### 2. OSPF Point-to-Point Unnumbered Leaf Configuration
+
+```text
+! FRR 10.x OSPFv2 Point-to-Point Leaf Configuration (Not Run)
+frr version 10.0
+hostname leaf01
+!
+interface lo
+ ip address 10.0.0.5/32
+ ip ospf area 0.0.0.0
+ ip ospf passive
+!
+interface swp1
+ description link-to-spine1
+ ip address 10.0.0.5/32
+ ip ospf network point-to-point
+ ip ospf area 0.0.0.0
+ ip ospf bfd
+!
+interface swp2
+ description link-to-spine2
+ ip address 10.0.0.5/32
+ ip ospf network point-to-point
+ ip ospf area 0.0.0.0
+ ip ospf bfd
+!
+router ospf
+ ospf router-id 10.0.0.5
+!
+```
+
+### 3. IS-IS Level-2 Leaf Configuration
+
+```text
+! FRR 10.x IS-IS Level-2 Leaf Configuration (Not Run)
+frr version 10.0
+hostname leaf01
+!
+interface lo
+ ip address 10.0.0.5/32
+ ip router isis FABRIC
+ isis passive
+!
+interface swp1
+ description link-to-spine1
+ ip router isis FABRIC
+ ipv6 router isis FABRIC
+ isis network point-to-point
+ isis circuit-type level-2-only
+ isis bfd
+!
+interface swp2
+ description link-to-spine2
+ ip router isis FABRIC
+ ipv6 router isis FABRIC
+ isis network point-to-point
+ isis circuit-type level-2-only
+ isis bfd
+!
+router isis FABRIC
+ net 49.0001.0100.0000.0005.00
+ is-type level-2-only
+ metric-style wide
+!
+```
+
+## Gotchas
+
+- **Missing `bgp bestpath as-path multipath-relax`**: Anycast, MLAG/multihomed subnets and dual border leaves silently lose ECMP, because their copies have different origin ASNs. With per-spine ASNs, even leaf-to-leaf ECMP collapses to one path.
+- **A 30-second MRAI**: On platforms that default eBGP `advertisement-interval` to 30 s, a withdrawal can wait half a minute at each hop. Set it to 0 on fabric sessions.
+- **`redistribute connected` without a route-map**: Leaks every `/31`, management and host subnet into the underlay. Match loopbacks only, as the sketch does.
+- **MTU Mismatches on Unnumbered Links**: IPv6 Neighbor Discovery and BGP sessions may establish over unnumbered links, but VXLAN packets will drop if interface MTUs are mismatched (e.g., standard 1500 byte MTU vs required 9216 jumbo frames for overlay encapsulation).
+- **Default OSPF Network Types**: Leaving OSPF interface types set to default `broadcast` triggers unnecessary DR/BDR elections and Type-2 LSA generation on point-to-point fabric links.
+- **Over-using `allowas-in`**: Enabling `allowas-in` to reuse ASNs across leaves removes standard BGP loop protection. Misconfigured links will cause routing loops.
+- **BFD Timer Aggression**: Setting BFD timers below CPU handling capacity (e.g., 10ms intervals without hardware offload) causes false BFD session drops during control plane CPU spikes.
+
+## Boring rule
+
+One shared spine ASN, a unique 4-byte private ASN per leaf, eBGP on every link (unnumbered where every platform supports RFC 8950), BFD, MRAI 0, multipath-relax, and a route-map that advertises loopbacks only. Pick an IGP instead only for a small fabric run by a team that already lives in OSPF or IS-IS, and then use point-to-point links and one area or level. Whichever you choose, write down the predicted failure chain before you build it, and test it in the lab.
+
+## Try this
+
+1. Run `python3 plan.py 8 64` to calculate the link, session, and ASN parameters for an 8-spine by 64-leaf fabric. Determine if 2-byte private ASNs fit this topology.
+2. Run `python3 plan.py 2 4` to inspect the minimum 2x4 fabric footprint. Trace the link allocations and ASN numbering.
+3. **Predicting AS_PATH on a Spine Failure**: Given Leaf 01 (AS `4200000101`), Spine 1 (AS `4200000000`), Spine 2 (AS `4200000000`), and Leaf 02 (AS `4200000102`):
+   - Trace the exact `AS_PATH` Leaf 02 receives for Leaf 01's loopback (`10.0.0.5/32`) under normal conditions via Spine 1.
+   - Predict what happens to the `AS_PATH` and FIB if Spine 1 fails and traffic fails over to Spine 2.
+4. Modify `plan.py` to output FRR syntax lines for the eBGP neighbor peering statements generated by the loop.
+5. In a Containerlab 2×2 with FRR (the topology in [Fabric with FRR](03-fabric-with-frr.qmd)), switch the leaves to unnumbered peering. Check `show bgp neighbors swp1` for the extended next-hop capability, then `ip route` on a leaf: what does an IPv4 route's next hop look like?
+
+## Sources
+
+- RFC 7938: [Use of BGP for Routing in Large-Scale Data Centers](https://www.rfc-editor.org/rfc/rfc7938) (sections 5.1, 5.2.1, 5.2.2, 7.4, 7.5)
+- RFC 6996: [Autonomous System (AS) Reservation for Private Use](https://www.rfc-editor.org/rfc/rfc6996)
+- RFC 8950: [Advertising IPv4 Network Layer Reachability Information (NLRI) with an IPv6 Next Hop](https://www.rfc-editor.org/rfc/rfc8950)
+- RFC 5549: [Advertising IPv4 Network Layer Reachability Information with an IPv6 Next Hop (Obsoleted by RFC 8950)](https://www.rfc-editor.org/rfc/rfc5549)
+- RFC 4271: [A Border Gateway Protocol 4 (BGP-4)](https://www.rfc-editor.org/rfc/rfc4271)
+- RFC 5880: [Bidirectional Forwarding Detection (BFD)](https://www.rfc-editor.org/rfc/rfc5880)
+- RFC 5881: [Bidirectional Forwarding Detection (BFD) for IPv4 and IPv6 (Single Hop)](https://www.rfc-editor.org/rfc/rfc5881)
+- RFC 2328: [OSPF Version 2](https://www.rfc-editor.org/rfc/rfc2328)
+- RFC 5340: [OSPF for IPv6](https://www.rfc-editor.org/rfc/rfc5340)
+- ISO/IEC 10589: Intermediate System to Intermediate System Intra-Domain Routing Information Exchange Protocol.
+- RFC 1195: [Use of OSI IS-IS for Routing in TCP/IP and Dual Environments](https://www.rfc-editor.org/rfc/rfc1195)
+- RFC 5308: [Routing IPv6 with IS-IS](https://www.rfc-editor.org/rfc/rfc5308)
+- RFC 5120: [M-ISIS: Multi-Topology (MT) Routing in Intermediate System to Intermediate Systems (IS-IS)](https://www.rfc-editor.org/rfc/rfc5120)
+- RFC 9667: [Dynamic Flooding on Dense Graphs](https://www.rfc-editor.org/rfc/rfc9667)
+- FRR BGP Documentation: [FRRouting BGP User Guide](https://docs.frrouting.org/en/latest/bgp.html)
+- P. Jakma, "BGP Path Hunting", 2008, as cited in RFC 7938 section 5.1 ([JAKMA2008])
+- RFC 3021, Using 31-Bit Prefixes on IPv4 Point-to-Point Links: <https://www.rfc-editor.org/rfc/rfc3021>
+- RFC 8365, A Network Virtualization Overlay Solution Using EVPN: <https://www.rfc-editor.org/rfc/rfc8365>
+- FRR OSPFv2: <https://docs.frrouting.org/en/latest/ospfd.html>; FRR IS-IS: <https://docs.frrouting.org/en/latest/isisd.html>
