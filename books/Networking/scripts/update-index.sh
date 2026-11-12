@@ -137,6 +137,7 @@ humanize_dir_title() {
     fabrics-multi-area)         printf '%s\n' "Fabrics and Multi-Area"; return ;;
     bgp-security)               printf '%s\n' "BGP Security"; return ;;
     network-forensics)          printf '%s\n' "Network Forensics"; return ;;
+    lab-host-track)             printf '%s\n' "Lab Host Track"; return ;;
     # VCS (before generic CamelCase split effects: GitHub → git-hub)
     git-fundamentals)           printf '%s\n' "Git Fundamentals"; return ;;
     core-operations)            printf '%s\n' "Core Operations"; return ;;
