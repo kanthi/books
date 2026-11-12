@@ -1,0 +1,179 @@
+---
+title: "Conntrack Exhaustion: Limits, Timeouts and the Table-Full Drop"
+author:
+  - name: "K19G"
+  - name: "grok-bot"
+---
+
+# Conntrack Exhaustion: Limits, Timeouts and the Table-Full Drop
+
+Netfilter connection tracking (`nf_conntrack`) is a table of *flows*, not of sockets. NAT, stateful firewall rules, and many “related” helpers consult it on every packet. When the table cannot hold a new entry, the kernel logs `nf_conntrack: table full, dropping packet` and the *new* flow dies. Existing entries keep working, which is why the symptom is so confusing: SSH sessions that are already up stay up, pings to the host may still answer, and a fresh TCP handshake or a burst of short UDP (DNS is the classic) starts failing.
+
+A system-level nftables chapter (in review, or already in this part) is where tables, chains, and `ct` matchers live. This chapter is the table underneath: how big it is, how long an entry lives, why it fills, and what to change without guessing.
+
+## Learning goals
+
+- Read `nf_conntrack_max`, `nf_conntrack_count`, and `nf_conntrack_buckets`, and interpret the “table full” log line
+- Explain that each flow occupies the hash table in both directions, so a full table has an average chain length of about two with the default `max == buckets`
+- Use timeouts (`tcp_timeout_established`, `udp_timeout`, `udp_timeout_stream`, `tcp_timeout_time_wait`) as the other half of capacity planning
+- Know which sysctls are only writable in the initial network namespace, and that a namespace without nft/iptables rules may not track local sockets at all
+- Distinguish “raise `max`” from “shorten timeouts,” “do not track this traffic,” and “stop making so many flows”
+
+**Version note.** Host sysctls were read on 2026-11-13 on Linux **6.12.94+**. This writing user cannot read `/proc/net/nf_conntrack` (permission denied) and must not paste other tenants’ tuples in any case. A throwaway netns (`unshare -urnm`, root in a user namespace) showed a *separate* `nf_conntrack_count` of 0, read-only `nf_conntrack_max` and `nf_conntrack_buckets`, and still `count = 0` after eight localhost TCP connections — there is no nftables/iptables on this host, so no conntrack hook was attached and no table-full event could be produced. **A genuine exhaustion run was not performed** (and must not be performed on a shared host). Timeouts, the log message, and the “entries are inserted twice” hash-table note are from the kernel’s *Netfilter Conntrack Sysfs variables* documentation. `nft` and the `conntrack` userspace tool are not installed.
+
+## The table, the hash, and the counter
+
+Three numbers matter first:
+
+| Sysctl | This host | Meaning |
+|--------|-----------|---------|
+| `net.netfilter.nf_conntrack_count` | 393 (it moves) | Entries currently allocated (read-only) |
+| `net.netfilter.nf_conntrack_max` | 262144 | Hard cap; a new flow is dropped when it would exceed this |
+| `net.netfilter.nf_conntrack_buckets` | 262144 | Hash-table size |
+
+On this host, at 00:45 IST:
+
+```text
+# uname -r
+6.12.94+
+# cat /proc/sys/net/netfilter/nf_conntrack_max
+262144
+# cat /proc/sys/net/netfilter/nf_conntrack_count
+393
+# cat /proc/sys/net/netfilter/nf_conntrack_buckets
+262144
+# cat /proc/sys/net/netfilter/nf_conntrack_expect_max
+4096
+```
+
+The kernel documentation is explicit about two things operators regularly get backwards.
+
+First, **`nf_conntrack_max` defaults to `nf_conntrack_buckets`.** Raising `max` without raising `buckets` makes each hash chain longer and lookups slower. `nf_conntrack_buckets` is **only writable in the initial network namespace**. It may also be set as a module parameter at load time. The default bucket count is derived from memory (total RAM / 16384), then clamped to \[1024, 262144]. This host is already at the documented clamp for buckets.
+
+Second, **each flow is entered twice** — once for the original direction and once for the reply (addresses reversed). With `max == buckets`, a full table has an *average* hash chain length of two, not one. That is expected, not a misconfiguration.
+
+`nf_conntrack_count` approaching `nf_conntrack_max` is the warning. The log line when a new insertion fails is:
+
+```text
+nf_conntrack: table full, dropping packet
+```
+
+(older kernels said `ip_conntrack: table full, dropping packet`). Established flows already in the table are not evicted to make room. That is why a “the server is down” ticket can coexist with a working ping and an existing SSH session.
+
+This host’s count was a few hundred against a 262144 cap — not in danger. A busy NAT gateway, a DNS recursive resolver, or a node doing per-flow NAT for many short connections will be.
+
+## Timeouts are capacity
+
+An entry lives until its *protocol timer* expires without traffic. The documented defaults, and the values on this host, agree:
+
+```text
+net.netfilter.nf_conntrack_tcp_timeout_established = 432000
+net.netfilter.nf_conntrack_tcp_timeout_time_wait = 120
+net.netfilter.nf_conntrack_tcp_timeout_close_wait = 60
+net.netfilter.nf_conntrack_tcp_timeout_fin_wait = 120
+net.netfilter.nf_conntrack_tcp_timeout_syn_sent = 120
+net.netfilter.nf_conntrack_tcp_timeout_syn_recv = 60
+net.netfilter.nf_conntrack_udp_timeout = 30
+net.netfilter.nf_conntrack_udp_timeout_stream = 120
+net.netfilter.nf_conntrack_icmp_timeout = 30
+net.netfilter.nf_conntrack_generic_timeout = 600
+net.netfilter.nf_conntrack_tcp_loose = 1
+```
+
+`tcp_timeout_established = 432000` is **five days**. A long-lived TCP flow is cheap in *count* (one entry) and expensive only if you have a huge number of them. The usual exhaustion pattern is the opposite: **many short flows** that still occupy a slot.
+
+- TCP that open and close quickly still sit in `TIME_WAIT` in conntrack for `tcp_timeout_time_wait` (120 s here), which is a different timer from the socket’s `TCP_TIMEWAIT` and can outlast what the application expects.
+- UDP is worse for churn. A single DNS query is a flow. The default `udp_timeout` is 30 s; once the kernel decides the 4-tuple looks like a *stream*, `udp_timeout_stream` (120 s) applies. A resolver or a log shipper that talks to many destinations can fill the table with entries that are already application-done.
+- `tcp_loose` defaults to 1: conntrack will *pick up* an already-established TCP session that it did not see the handshake for (common after a failover or a ruleset reload). Set it to 0 only if you understand that mid-flow packets may then be invalid.
+
+Capacity is roughly “how many new flows per second × how long each entry lives.” Raising `max` is one lever. Shortening `udp_timeout` or `tcp_timeout_time_wait` is another, and it has a correctness cost (late packets may no longer match). Not tracking traffic that does not need NAT or stateful policy is a third.
+
+## What fills the table in real networks
+
+Typical causes, in the order they are usually worth checking:
+
+1. **NAT of high-churn UDP**, especially DNS from many sources through one gateway, or a node that SNATs a fleet of short connections.
+2. **A ruleset that attached conntrack as a side effect.** Loading a NAT table, or even listing one on some systems, can start tracking *all* seen flows, not just the ones you intended to translate. A router that did not need conntrack yesterday can start filling a table after one diagnostic command. (This host already had 393 entries, so something in the environment already attached hooks in the initial netns. We did not inspect those tuples.)
+3. **Expect table growth** (`nf_conntrack_expect_max`, 4096 here) from helpers (FTP, SIP, …). Exhaustion of *expects* is a different cap, but it shows up as “related” traffic failing first.
+4. **Scanning or a flood of new 4-tuples** aimed at a stateful filter. Each SYN can become an entry until `tcp_timeout_syn_sent` / `syn_recv` expires.
+
+“Just raise `max`” without looking at *which* entries dominate (TCP established, UDP, SYN-sent) postpones the same outage. The `conntrack` userspace tool (`conntrack -C`, `conntrack -L -o extended`, counts by state) is the usual way to see that mix. It is not installed here and was not run. `nft list ruleset` plus `ct` matchers belong to the nftables chapter; `notrack` in the `raw` table (or `nft` equivalent) is how you exempt a class of traffic, for example a host-local DNS resolver talking to a known forwarder, *if* you do not also need to NAT it.
+
+## Lab — what this host can and cannot show
+
+In a fresh netns the count starts at zero, which already tells you conntrack accounting is **per-netns** on this 6.12 kernel:
+
+```text
+# unshare -urnm, then:
+# ls -l /proc/sys/net/netfilter/nf_conntrack_max /proc/sys/net/netfilter/nf_conntrack_buckets
+-r--r--r-- 1 root root 0 Nov 13 00:46 /proc/sys/net/netfilter/nf_conntrack_max
+-r--r--r-- 1 root root 0 Nov 13 00:46 /proc/sys/net/netfilter/nf_conntrack_buckets
+# cat ...
+net.netfilter.nf_conntrack_max = 262144
+net.netfilter.nf_conntrack_count = 0
+net.netfilter.nf_conntrack_buckets = 262144
+```
+
+Writing a lower `max` (to exhaust the table safely) is not permitted in that namespace:
+
+```text
+# echo 64 > /proc/sys/net/netfilter/nf_conntrack_max
+bash: .../nf_conntrack_max: Permission denied
+# echo 128 > /proc/sys/net/netfilter/nf_conntrack_buckets
+bash: .../nf_conntrack_buckets: Permission denied
+```
+
+That matches the kernel documentation for `nf_conntrack_buckets` (initial netns only). On this kernel `nf_conntrack_max` was similarly read-only for the unprivileged user namespace. **Do not lower `max` in the initial netns of a shared machine** to force a table-full event.
+
+Eight localhost TCP connections, with `lo` up, left the counter at zero:
+
+```text
+# 8 localhost TCP connections on 127.0.0.1:34279
+net.netfilter.nf_conntrack_count = 0
+```
+
+No nft/iptables hook, no tracking. `/proc/net/nf_conntrack` was also unreadable in that namespace (`PermissionError`). An exhaustion lab therefore needs three things this writing host does not offer: a writable cap (or a dedicated machine), a ruleset that attaches conntrack, and enough new flows to hit the cap. On a machine where you *can* do that, the shape is:
+
+1. Isolated netns or a dedicated lab VM, never a shared production table.
+2. Attach a minimal stateful rule (a simple `nft` `ct state` filter or a masquerade).
+3. Set a *small* `nf_conntrack_max` *in a namespace where it is writable*, or use a fresh VM.
+4. Open more flows than `max` (many short TCP or UDP 4-tuples).
+5. Confirm `count` sticks at `max`, new connects fail, `dmesg` shows `table full, dropping packet`, and a flow that was already established still works.
+6. Restore `max`, tear the namespace down.
+
+That procedure was **not run** here.
+
+## What to change, in order
+
+1. **Look at `count / max`** and at recent `table full` lines in the kernel log. If you are not actually full, you are debugging a different failure.
+2. **See which states dominate**, with `conntrack -L` or a distribution’s conntrack exporter, before you move a cap.
+3. **Fix the creator of churn** if you can: a DNS `ndots` pattern that generates bursts of useless queries, a client that opens a new 4-tuple per request, a NAT that should not be in the path.
+4. **Exempt traffic that does not need a state table** (`notrack` / `nft` equivalent), especially high-rate UDP that you are not NATing.
+5. **Tune timeouts** only with a reason: shortening `udp_timeout` on a busy resolver is common; shortening `tcp_timeout_established` from five days is rarely the first fix for a churn problem.
+6. **Raise `nf_conntrack_max` and `nf_conntrack_buckets` together**, in the initial netns, as a planned change. Memory: each entry is on the order of a few hundred bytes, and both directions are hashed. Persist the values in `/etc/sysctl.d/` so a reboot does not surprise you. On this host buckets is already at the documented 262144 clamp; a larger `max` here would mean longer chains unless the kernel you run allows a bigger hash.
+
+## Gotchas
+
+- **Raising only `max`.** Longer hash chains, slower packet path, same timeout-driven accumulation.
+- **Tuning timeouts on a shared gateway without measuring.** Late DNS replies or a hung TCP close can break in ways that look like an application bug.
+- **Assuming a new netns is a safe place to lower `max`.** On this kernel those sysctls were not writable there, and local sockets were not tracked without a hook.
+- **Reading `count` as “number of client connections.”** It is flows × directions in the hash, including NAT, forwarded traffic, and mid-stream pickups (`tcp_loose`).
+- **Clearing the table as a fix** (`conntrack -F`) drops *stateful* NAT and firewall memory; existing NAT sessions break. Use it only as a lab or last-resort tool.
+- **Forgetting that listing or loading a NAT ruleset can *start* tracking** on a box that was previously stateless.
+
+## Boring rule
+
+Treat `nf_conntrack_count / nf_conntrack_max` as a first-class capacity signal. When it is high, ask what is *creating* flows and how long they live before you add zeros to `max`.
+
+## Try this
+
+1. On a disposable VM with `nft`, attach a simple `ct state` filter, watch `nf_conntrack_count` as you make a few TCP and UDP flows, and identify them with `conntrack -L` (or by reading `/proc/net/nf_conntrack` as root).
+2. Without touching production, compute “new UDP flows per second × `udp_timeout`” for a resolver you run and compare it to `max`.
+3. Confirm whether `nf_conntrack_buckets` is writable on your kernel, and whether it is already at 262144.
+4. After you have a test ruleset, use `notrack` for one UDP port and confirm those 4-tuples stop appearing in the table.
+
+## Sources
+
+- Linux kernel documentation, *Netfilter Conntrack Sysfs variables*: <https://docs.kernel.org/networking/nf_conntrack-sysctl.html>
+- The `nf_conntrack: table full, dropping packet` diagnostic, as documented by distributions and the kernel log
+- `nft(8)` / nftables wiki for `ct` matching and `notrack` (see also the nftables fundamentals chapter in this part)
