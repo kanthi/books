@@ -1,0 +1,447 @@
+---
+title: "nftables Fundamentals: Tables, Chains, Sets and NAT"
+author:
+  - name: "K19G"
+  - name: "grok-bot"
+---
+
+# nftables Fundamentals: Tables, Chains, Sets and NAT
+
+Every Linux router, lab host and server in this book filters and translates packets in netfilter, the kernel's packet-hook framework. nftables is the current way to program it. ACL Thinking taught the policy: what to allow, in which direction, and in what order. This chapter is the tool underneath: how nftables is built, how to write a host firewall and a NAT gateway that load atomically, and how to find out which rule just dropped your packet.
+
+The later chapter QUIC Load Balancing with nftables is a specialised use of the same machinery. Read this one first.
+
+## Learning goals
+
+By the end of this chapter you can:
+
+- Explain families, tables, base chains, hooks and priorities, and predict what happens when two tables hook the same point
+- Write a default-drop host firewall for a server as one file that loads atomically and does not break IPv6
+- Use named sets, interval sets, verdict maps and concatenations instead of long rule lists, and change set elements without reloading
+- Build source NAT and a port forward on a gateway and say which chain each rule belongs in
+- Trace a packet through the ruleset with `nftrace`, and change a remote firewall with an automatic rollback
+
+**Version note.** `nft` is not installed on the writing host, and nothing could be installed there. **No ruleset in this chapter was loaded or run on the writing host.** Every listing is written from the nftables wiki and `nft(8)`. Before loading any file, check it with `nft -c -f <file>` (parse and validate without committing). Where the chapter shows what `nft` prints, it is labelled illustrative.
+
+## The model in one table
+
+| Concept | What it is | iptables equivalent |
+|---------|-----------|---------------------|
+| Family | Which packets a table sees: `ip`, `ip6`, `inet` (both), `arp`, `bridge`, `netdev` | Separate `iptables`, `ip6tables`, `ebtables`, `arptables` binaries |
+| Table | A namespace you create. Holds chains, sets, maps. No built-in tables. | Fixed `filter`, `nat`, `mangle`, `raw` tables |
+| Base chain | A chain attached to a netfilter hook, with a type, a priority and a policy | Built-in chains `INPUT`, `FORWARD`, ... |
+| Regular chain | A chain with no hook. Reached only by `jump` or `goto` | User-defined chains |
+| Rule | Matches plus a statement (verdict, counter, log, NAT, set update) | Rule |
+| Set / map | Named or anonymous collection, looked up in one step | `ipset` (separate tool) |
+
+A base chain is declared with three properties:
+
+```nft
+chain input {
+    type filter hook input priority filter; policy drop;
+}
+```
+
+- **type** is `filter`, `nat` or `route`. NAT statements only work in `nat` chains.
+- **hook** is where the chain attaches.
+- **priority** orders chains on the same hook. Lower numbers run first. Names stand for numbers: `raw` -300, `mangle` -150, `dstnat` -100, `filter` 0, `security` 50, `srcnat` 100.
+- **policy** is what happens to packets that reach the end of the chain: `accept` (the default) or `drop`.
+
+### Hooks and the path of a packet
+
+```text
+ [ingress] -> prerouting -> routing decision -+-> forward ----------> postrouting -> [egress]
+  (netdev)    (dstnat)                         |                          ^ (srcnat)    (netdev)
+                                               v                          |
+                                             input -> local process -> output
+```
+
+- `prerouting` sees everything that arrives, before the routing decision. Destination NAT goes here, so the routing decision sees the new address.
+- `input` sees packets addressed to this host. `forward` sees packets being routed through. `output` sees locally generated packets.
+- `postrouting` sees everything leaving. Source NAT goes here, after routing has chosen the outgoing interface.
+- `ingress` and `egress` belong to the `netdev` family and attach to one device. They run before `prerouting` and after `postrouting`. Use them for early drops on a specific interface.
+
+### Verdicts, and the rule that surprises everyone
+
+| Verdict | Effect |
+|---------|--------|
+| `accept` | Stop evaluating **this base chain**. The packet continues to the next base chain on the hook, if any. |
+| `drop` | The packet is discarded. Final. Nothing later sees it. |
+| `reject` | Drop and send an ICMP error or TCP RST. Only in `input`, `forward`, `output` (and `prerouting` in some families). |
+| `jump <chain>` | Evaluate another chain, then come back. |
+| `goto <chain>` | Evaluate another chain and do not come back. |
+| `return` | Leave the current regular chain. In a base chain this means "apply the policy". |
+| `continue` | Carry on with the next rule (the default after a non-verdict statement). |
+| `queue` | Hand the packet to a user-space program. |
+
+The surprise: **`accept` is not final across tables.** If a distribution firewall creates `table inet firewalld` with an input chain at priority 0, and you create `table inet host` with an input chain at priority 0, a packet must be accepted by **both**. A drop in either is final. Two people each adding "their" accept rule to a different table is how a port stays closed after someone "opened it". `nft list ruleset` shows every table on the host. Read all of it before you debug one.
+
+## A host firewall that loads atomically
+
+`nft -f file` reads the whole file and commits it as one transaction. Either every line applies or none does, and there is never a moment with half a firewall. That is the main operational win over a shell script of `iptables` commands.
+
+This file is for a server with SSH from a management network, and HTTP and HTTPS from anywhere:
+
+```{.nft filename="host-firewall.nft"}
+#!/usr/sbin/nft -f
+
+# Recreate only our own table. Never "flush ruleset" on a host that
+# also runs Docker, a container runtime, or a distro firewall:
+# it deletes their tables too.
+table inet host
+delete table inet host
+
+table inet host {
+    set mgmt_v4 {
+        type ipv4_addr
+        flags interval
+        elements = { 192.0.2.0/24, 198.51.100.7 }
+    }
+
+    set mgmt_v6 {
+        type ipv6_addr
+        flags interval
+        elements = { 2001:db8:100::/56 }
+    }
+
+    set public_tcp {
+        type inet_service
+        elements = { 80, 443 }
+    }
+
+    chain input {
+        type filter hook input priority filter; policy drop;
+
+        ct state established,related accept
+        ct state invalid drop
+        iif lo accept
+
+        # IPv4 diagnostics: allow, but rate-limit echo
+        ip protocol icmp icmp type { destination-unreachable, time-exceeded, parameter-problem } accept
+        ip protocol icmp icmp type echo-request limit rate 10/second accept
+
+        # IPv6 does not work without these (RFC 4890)
+        meta l4proto ipv6-icmp icmpv6 type { destination-unreachable, packet-too-big, time-exceeded, parameter-problem } accept
+        meta l4proto ipv6-icmp icmpv6 type { nd-neighbor-solicit, nd-neighbor-advert, nd-router-advert } ip6 hoplimit 255 accept
+        meta l4proto ipv6-icmp icmpv6 type echo-request limit rate 10/second accept
+
+        ip saddr @mgmt_v4 tcp dport 22 ct state new counter accept
+        ip6 saddr @mgmt_v6 tcp dport 22 ct state new counter accept
+
+        tcp dport @public_tcp ct state new counter accept
+
+        limit rate 5/minute log prefix "host-drop: " level info
+        counter
+    }
+
+    chain forward {
+        type filter hook forward priority filter; policy drop;
+    }
+
+    chain output {
+        type filter hook output priority filter; policy accept;
+    }
+}
+```
+
+What each block is doing:
+
+- **`table inet host` then `delete table inet host`.** The first line creates the table if it is missing, so the delete never fails. The second removes it with everything inside. The block that follows recreates it. All three happen in one transaction. This is the safe replacement for `flush ruleset`.
+- **`inet` family.** One table, one set of chains, both IPv4 and IPv6. Rules that use `ip saddr` only match IPv4 packets; `ip6 saddr` only IPv6.
+- **`ct state established,related accept` first.** Most packets belong to existing flows. Accepting them first keeps the chain short for nearly every packet. `related` covers ICMP errors about an existing flow and helper-tracked connections.
+- **`ct state invalid drop`.** Packets conntrack cannot place, for example a TCP segment that is not part of any known connection and is not a SYN.
+- **ICMPv6 neighbour discovery with `hoplimit 255`.** ND messages must be sent with hop limit 255, so anything lower came from off-link. Dropping ND means the host cannot resolve its neighbours and IPv6 stops working; dropping `packet-too-big` breaks path MTU discovery.
+- **`limit rate 5/minute log ...`** before the policy drop. A log rule without a limit is a disk-filling denial-of-service you wrote yourself.
+- **The final bare `counter`** counts what the policy is about to drop. It costs nothing and answers "is anything hitting the drop?".
+
+Check it, load it, read it back:
+
+```bash
+nft -c -f host-firewall.nft        # parse and validate only
+nft -f host-firewall.nft           # commit atomically
+nft list table inet host
+nft -a list chain inet host input  # -a shows rule handles
+```
+
+Illustrative, not captured: `nft -a list chain` prints each rule followed by `# handle N`. The handle is how you delete or insert next to a single rule:
+
+```text
+table inet host {
+    chain input {
+        type filter hook input priority filter; policy drop;
+        ct state established,related accept # handle 7
+        ct state invalid drop # handle 8
+        ...
+```
+
+```bash
+nft delete rule inet host input handle 8
+nft insert rule inet host input position 7 tcp dport 9100 ip saddr @mgmt_v4 accept
+```
+
+`insert ... position N` adds before handle N; `add ... position N` adds after it.
+
+## Sets, maps and concatenations
+
+A list of twenty `ip saddr X accept` rules is evaluated one rule at a time. A set is one lookup, whatever its size. Use sets for anything that is a list.
+
+| Form | Example | Use |
+|------|---------|-----|
+| Anonymous set | `tcp dport { 22, 80, 443 }` | A fixed list inside one rule |
+| Named set | `set public_tcp { type inet_service; ... }` and `tcp dport @public_tcp` | A list you change at runtime, or use in several rules |
+| Interval set | `flags interval` with `192.0.2.0/24` or `1000-2000` | Prefixes and ranges |
+| Timeout set | `flags timeout; timeout 10m` | Entries that expire, such as temporary bans |
+| Map | `ip daddr map { 10.0.0.1 : 10.1.0.1 }` | Look up a value, for example a NAT target |
+| Verdict map | `iifname vmap { "lan0" : jump from_lan, "wan0" : jump from_wan }` | Dispatch to a chain by key in one lookup |
+| Concatenation | `ip saddr . tcp dport { 192.0.2.10 . 22, 192.0.2.11 . 5432 }` | Match a tuple, not two independent lists |
+
+Change a named set without touching the rules:
+
+```bash
+nft add element inet host mgmt_v4 { 203.0.113.50 }
+nft delete element inet host mgmt_v4 { 198.51.100.7 }
+nft list set inet host mgmt_v4
+```
+
+The concatenation row matters for correctness, not just speed. `ip saddr { A, B } tcp dport { 22, 5432 }` allows A to 5432 and B to 22 as well. `ip saddr . tcp dport { A . 22, B . 5432 }` allows exactly the two pairs you meant.
+
+A verdict map turns an interface-by-interface ruleset into a dispatcher. Each zone gets its own regular chain:
+
+```{.nft filename="zones-fragment.nft"}
+table inet edge {
+    chain from_lan {
+        accept
+    }
+
+    chain from_wan {
+        tcp dport 22 drop
+        return
+    }
+
+    chain forward {
+        type filter hook forward priority filter; policy drop;
+        ct state established,related accept
+        iifname vmap { "lan0" : jump from_lan, "wan0" : jump from_wan }
+    }
+}
+```
+
+A packet from `wan0` jumps to `from_wan`. If nothing there decides, `return` comes back to `forward`, which reaches its policy and drops.
+
+### Dynamic sets: per-source rate limits
+
+A rule can add to a set as packets pass. This one tracks each source address that opens new SSH connections and drops a source once it exceeds three new connections a minute:
+
+```{.nft filename="ssh-meter.nft"}
+table inet host {
+    set ssh_meter {
+        type ipv4_addr
+        flags dynamic, timeout
+        timeout 5m
+    }
+
+    chain input {
+        tcp dport 22 ct state new add @ssh_meter { ip saddr limit rate over 3/minute } drop
+    }
+}
+```
+
+The `limit` is kept per element, so one noisy source does not affect anyone else. If you load this fragment on top of the earlier file, it adds a second rule to the existing `input` chain, after the accepts. Place it before the SSH accept rules (`insert` or by editing the main file) or it will never be reached.
+
+## NAT on a gateway
+
+NAT needs a `nat`-type chain on the right hook. Conntrack makes the decision on the **first packet of a flow**. Every later packet of that flow, in both directions, is translated from the conntrack entry without visiting the NAT chains again. That is why changing a NAT rule does not affect existing connections until they end.
+
+```{.nft filename="gateway-nat.nft"}
+table ip nat
+delete table ip nat
+
+table ip nat {
+    chain prerouting {
+        type nat hook prerouting priority dstnat; policy accept;
+        iifname "wan0" tcp dport 8080 dnat to 10.0.0.10:80
+    }
+
+    chain postrouting {
+        type nat hook postrouting priority srcnat; policy accept;
+        oifname "wan0" ip saddr 10.0.0.0/24 masquerade
+    }
+}
+
+table inet gwfilter
+delete table inet gwfilter
+
+table inet gwfilter {
+    chain forward {
+        type filter hook forward priority filter; policy drop;
+        ct state established,related accept
+        ct state invalid drop
+        iifname "lan0" oifname "wan0" accept
+        iifname "wan0" oifname "lan0" ct status dnat accept
+    }
+}
+```
+
+- `dnat to` in **prerouting** rewrites the destination before routing, so the kernel routes the packet to 10.0.0.10.
+- `masquerade` in **postrouting** rewrites the source to the address of `wan0` at the time the flow starts. Use `snat to 203.0.113.5` instead when the WAN address is static: masquerade has to look up the interface address for each new flow and flushes its entries when the interface goes down.
+- **NAT does not open the firewall.** The `forward` chain must still allow the translated traffic. `ct status dnat` accepts only flows that were destination-NATed, so the WAN side cannot reach any other LAN host.
+- Forwarding must be on: `sysctl -w net.ipv4.ip_forward=1` (and persist it in `/etc/sysctl.d/`).
+
+The `ip` family is used here for NAT because the example is IPv4 only. Recent kernels also support NAT in the `inet` family; with IPv6 you rarely want NAT at all.
+
+## Conntrack as nftables sees it
+
+| Match | Meaning |
+|-------|---------|
+| `ct state new` | First packet of a flow conntrack has not seen |
+| `ct state established` | Packets after the flow has seen traffic both ways |
+| `ct state related` | A new flow related to an existing one (ICMP errors, FTP data with a helper) |
+| `ct state invalid` | Could not be classified. Drop it |
+| `ct status dnat` / `snat` | The flow was translated |
+| `ct mark`, `ct zone` | Per-flow mark and conntrack zone, for policy routing and overlapping address spaces |
+
+Conntrack is a table with a size limit, `net.netfilter.nf_conntrack_max`. When it is full, new flows are dropped and the kernel logs `nf_conntrack: table full, dropping packet`. A busy DNS resolver or a host under a UDP flood can fill it. For traffic that never needs state or NAT, skip tracking in a `raw` priority chain:
+
+```{.nft filename="notrack-dns.nft"}
+table inet raw {
+    chain prerouting {
+        type filter hook prerouting priority raw; policy accept;
+        udp dport 53 notrack
+    }
+    chain output {
+        type filter hook output priority raw; policy accept;
+        udp sport 53 notrack
+    }
+}
+```
+
+Untracked packets match neither `established` nor `new`. The host firewall above would drop them, so it needs an explicit `udp dport 53 accept`. And untracked flows cannot be NATed. `conntrack -L` (from conntrack-tools) lists current entries, and `conntrack -S` shows per-CPU counters including drops.
+
+## Operating it
+
+### Seeing what happened
+
+```bash
+nft list ruleset                  # everything, every table
+nft list counters                 # named counters, if you use them
+nft monitor                       # print ruleset changes as they happen
+```
+
+Rule counters only go up. Recent nft releases can zero them with `nft reset rules`; check `nft(8)` for the form your version accepts, or simply reload the table, which recreates every counter at zero.
+
+To find which rule decides a packet, mark the packets you care about for tracing, then watch the trace:
+
+```bash
+nft add table inet trace
+nft add chain inet trace pre '{ type filter hook prerouting priority -350; }'
+nft add rule inet trace pre ip saddr 192.0.2.99 meta nftrace set 1
+nft monitor trace
+```
+
+The trace chain runs at priority -350, before everything else, and sets `nftrace` on matching packets. `nft monitor trace` then prints each chain and rule the packet passes, with the final verdict. Remove the trace table when you are done: `nft delete table inet trace`.
+
+### Persisting
+
+| Distribution | Service | File it loads |
+|--------------|---------|---------------|
+| Debian, Ubuntu | `nftables.service` | `/etc/nftables.conf` |
+| RHEL, Fedora (without firewalld) | `nftables.service` | `/etc/sysconfig/nftables.conf` |
+
+`/etc/nftables.conf` usually starts with `flush ruleset`. That is fine on a host where nftables owns everything. On a host with Docker, it deletes Docker's tables at boot or on reload. Replace it with the per-table `delete table` pattern, or include your own files with `include "/etc/nftables.d/*.nft"`.
+
+### iptables is probably nftables already
+
+On current distributions `iptables` is usually `iptables-nft`: the old command syntax, programming nftables underneath.
+
+```bash
+iptables -V     # "iptables v1.8.x (nf_tables)" means the nft backend
+```
+
+Rules added that way appear in `nft list ruleset` as tables named `filter`, `nat` and so on, using compatibility expressions. Two rules: do not mix `iptables-legacy` and `iptables-nft` on one host, because they are separate kernel subsystems and both get evaluated; and migrate with `iptables-save | iptables-restore-translate` (or `iptables-translate` for one rule), then review the output by hand.
+
+### Changing a remote firewall without locking yourself out
+
+Schedule the rollback **before** you load the new file. Cancel it once you have proved a new SSH session works.
+
+```bash
+cp /etc/nftables.conf /root/nftables.known-good
+systemd-run --unit=nft-rollback --on-active=120 /usr/sbin/nft -f /root/nftables.known-good
+nft -c -f /etc/nftables.conf && nft -f /etc/nftables.conf
+# open a NEW ssh session from your workstation; if it works:
+systemctl stop nft-rollback.timer
+```
+
+`systemd-run --on-active=` creates a transient timer and service; stopping the timer cancels the rollback. If the new rules cut you off, the old ones return in two minutes. Your existing SSH session usually survives a bad change because `established` is accepted, which is exactly why you must test with a **new** session.
+
+## Lab: a NAT gateway in three namespaces (not run on the writing host)
+
+Run this as root on your lab host. It was not run on the writing host: `ip netns add` needs root there, and `nft` is not installed. No output is shown; the expected observations follow each step.
+
+```text
+ client (10.0.0.10/24) --- lan0 [gw] wan0 --- server (203.0.113.20/24)
+                          10.0.0.1   203.0.113.1
+```
+
+```bash
+ip netns add client; ip netns add gw; ip netns add server
+
+ip link add c0 netns client type veth peer name lan0 netns gw
+ip link add s0 netns server type veth peer name wan0 netns gw
+
+ip -n client addr add 10.0.0.10/24 dev c0
+ip -n gw addr add 10.0.0.1/24 dev lan0
+ip -n gw addr add 203.0.113.1/24 dev wan0
+ip -n server addr add 203.0.113.20/24 dev s0
+for ns in client gw server; do ip -n $ns link set lo up; done
+ip -n client link set c0 up; ip -n server link set s0 up
+ip -n gw link set lan0 up; ip -n gw link set wan0 up
+
+ip -n client route add default via 10.0.0.1
+ip netns exec gw sh -c 'echo 1 > /proc/sys/net/ipv4/ip_forward'
+# server has NO route back to 10.0.0.0/24 on purpose
+```
+
+1. **Before NAT.** `ip netns exec client ping -c2 203.0.113.20`. Expected: no replies. The server receives the request but has no route back to 10.0.0.10.
+2. **Load `gateway-nat.nft` in gw** with `ip netns exec gw nft -f gateway-nat.nft`. Ping again. Expected: replies. The server now sees the source as 203.0.113.1.
+3. **Port forward.** In this lab the client also plays the internal web server, and the `dnat` rule already points at 10.0.0.10:80. Start a listener: `ip netns exec client python3 -m http.server 80 --bind 10.0.0.10`. From the server run `ip netns exec server curl -s http://203.0.113.1:8080/`. Expected: the directory listing.
+4. **Counters.** Add `counter` to the `dnat` rule, reload, repeat the curl, and run `ip netns exec gw nft list table ip nat`. Expected: one packet per connection, not one per packet, because only the first packet of each flow visits the NAT chain.
+5. **Trace a drop.** Give the server a route to the LAN (`ip -n server route add 10.0.0.0/24 via 203.0.113.1`) and ping 10.0.0.10 directly, without the port forward. Add the trace table in gw for `ip saddr 203.0.113.20` and run `ip netns exec gw nft monitor trace`. Expected: the trace passes `nat prerouting` without a match and ends in `gwfilter forward` with the policy drop, because the flow was not destination-NATed.
+6. Clean up: `ip netns del client; ip netns del gw; ip netns del server`.
+
+## Gotchas
+
+- **Two tables, one hook.** Accept in one table does not override drop in another. Read `nft list ruleset`, not just your own table.
+- **`flush ruleset` deletes other tools' rules.** Docker, libvirt, firewalld and Kubernetes components all create their own tables.
+- **Dropping ICMPv6** breaks neighbour discovery and path MTU discovery. IPv6 then fails in ways that look like routing problems.
+- **Interval sets need `flags interval`.** Without it, adding `192.0.2.0/24` fails.
+- **`reject` is not allowed everywhere.** Use it in `input`, `forward` and `output`; use `drop` in `prerouting`.
+- **Rules after a terminal verdict never run.** A dynamic-set rate limit placed after the accept for the same port does nothing.
+- **NAT rules only see new flows.** After changing a NAT rule, existing connections keep the old translation until they end. `conntrack -D` removes entries if you must force it.
+- **Interface names in rules.** `iifname`/`oifname` compare strings and work for interfaces that do not exist yet (VPNs, VLANs). `iif`/`oif` compare interface indexes, are faster, and fail to load if the interface is missing at load time.
+
+## Boring rule
+
+One file per table, loaded with `nft -f` after `nft -c -f`, with a scheduled rollback on any remote host. Accept established first, drop invalid second, and never drop ICMPv6 wholesale.
+
+## Try this
+
+1. Load `host-firewall.nft` on a test VM, then add an `inet` table of your own with an input chain that has `policy drop` and no rules. Expected: SSH and HTTP stop working, even though `table inet host` still accepts them.
+2. Replace the two SSH rules with one rule using a concatenation of address and port, and allow 5432 only from 192.0.2.10. Expected: `nft -c` accepts it, and `nft list set` shows tuples.
+3. Add a timeout set `banned` (`type ipv4_addr; flags timeout`) and a rule `ip saddr @banned drop` near the top of `input`. Add an address with `nft add element inet host banned { 192.0.2.66 timeout 1m }`. Expected: `nft list set inet host banned` shows the remaining time, and the entry disappears after a minute.
+4. On the lab gateway, change `masquerade` to `snat to 203.0.113.1`. Expected: no visible difference to the server. Then delete and re-add wan0's address. Expected: with masquerade, existing flows are flushed; with snat, they are not.
+5. Run `iptables-translate -A INPUT -p tcp --dport 22 -s 192.0.2.0/24 -j ACCEPT` on a host that has iptables-nft. Expected: the equivalent `nft add rule ip filter INPUT ...` line. Compare it with the inet-table rule in this chapter.
+
+## Sources
+
+- nftables wiki, Quick reference: <https://wiki.nftables.org/wiki-nftables/index.php/Quick_reference-nftables_in_10_minutes>
+- nftables wiki, Netfilter hooks: <https://wiki.nftables.org/wiki-nftables/index.php/Netfilter_hooks>
+- nftables wiki, Configuring chains (types, priorities, policies): <https://wiki.nftables.org/wiki-nftables/index.php/Configuring_chains>
+- nftables wiki, Sets, Maps, Verdict maps, Concatenations: <https://wiki.nftables.org/wiki-nftables/index.php/Sets>
+- nftables wiki, Performing Network Address Translation: <https://wiki.nftables.org/wiki-nftables/index.php/Performing_Network_Address_Translation_(NAT)>
+- nftables wiki, Matching connection tracking stateful metainformation: <https://wiki.nftables.org/wiki-nftables/index.php/Matching_connection_tracking_stateful_metainformation>
+- nftables wiki, Ruleset debug/tracing: <https://wiki.nftables.org/wiki-nftables/index.php/Ruleset_debug/tracing>
+- nftables wiki, Atomic rule replacement: <https://wiki.nftables.org/wiki-nftables/index.php/Atomic_rule_replacement>
+- `nft(8)` manual page: <https://www.netfilter.org/projects/nftables/manpage.html>
+- RFC 4890, Recommendations for Filtering ICMPv6 Messages in Firewalls: <https://www.rfc-editor.org/rfc/rfc4890>
+- `conntrack(8)`, conntrack-tools: <https://conntrack-tools.netfilter.org/>
+- Linux kernel, nf_conntrack sysctls: <https://docs.kernel.org/networking/nf_conntrack-sysctl.html>
