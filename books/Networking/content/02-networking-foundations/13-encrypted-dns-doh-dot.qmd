@@ -1,46 +1,250 @@
 ---
-title: "Encrypted DNS — DoH and DoT"
+title: "Encrypted DNS: DoT, DoH and Discovering Them"
 author:
   - name: "K19G"
   - name: "grok-bot"
 ---
 
-# Encrypted DNS — DoH and DoT
+# Encrypted DNS: DoT, DoH and Discovering Them
 
-## Thesis
+Classic DNS goes over UDP port 53 in clear text. Anyone on the path can read every name a host looks up, and anyone on the path can answer first. That second point is not theoretical: the lab in this chapter sent a plain query to `1.1.1.1` from the writing host and got an answer, in about a millisecond, that Cloudflare never sent. **DNS over TLS** (DoT, RFC 7858) and **DNS over HTTPS** (DoH, RFC 8484) put the same DNS messages inside an authenticated, encrypted channel to a resolver you chose. This chapter sends one question over all of them by hand, shows the wire formats, pads the query, asks a resolver which encrypted endpoints it offers (DDR, RFC 9462), and ends with how to run encrypted DNS on Linux hosts without breaking split-horizon names.
 
-Plain DNS on port 53 is readable on path. **DoT (RFC 7858)** wraps DNS in TLS on 853. **DoH (RFC 8484)** carries DNS in HTTPS. This chapter resolves via the OS stub and via Cloudflare DoH JSON. DoT is marked not run (`dig` absent).
+## Learning goals
 
-## Mental model
+- Say exactly what DoT and DoH protect, and what they do not (the resolver still sees everything; ECH and the IP still leak)
+- Build DoT and DoH requests from the RFCs with the Python standard library and read the replies
+- Explain EDNS(0) padding and why encrypted DNS without it still leaks names by size
+- Use Discovery of Designated Resolvers to upgrade from a plain resolver address to its encrypted endpoints
+- Choose between OS-level and application-level encrypted DNS for a fleet, and know what breaks with split-horizon DNS
+
+**Version note.** The lab ran on 2026-11-13 from the writing host (Linux 6.12.94+, Python 3.13.5, OpenSSL 3.5.7, dnspython 2.9.1 used only to build and parse DNS messages). The transports themselves are standard library: `socket`, `ssl` and `urllib`. dnspython's own DoH client was not used because its HTTP dependency is not installed and no installs are allowed. `dig` and `kdig` are not installed either. The resolver is Cloudflare's public service. Timings are one run from one place and only useful as relative values.
+
+## The four transports
+
+| | Classic | DoT | DoH | DoQ |
+|---|---|---|---|---|
+| RFC | 1035 | 7858 (+ 8310 profiles) | 8484 | 9250 |
+| Port | 53 UDP/TCP | 853 TCP | 443 TCP (HTTP/2) or UDP (HTTP/3) | 853 UDP |
+| Framing | raw message (TCP: 2-byte length) | same as DNS over TCP, inside TLS | `application/dns-message` body or `?dns=` base64url | one DNS message per QUIC stream |
+| Looks like | DNS | "something on 853" | any other HTTPS | QUIC on 853 |
+| Easy to block selectively | yes | yes (port) | only by resolver IP/name | yes (port) |
+| Typical client | OS stub | OS stub (systemd-resolved, Android Private DNS) | browsers, apps, some OS stubs | resolvers, some stubs |
+
+DoT and DoH carry *the same DNS message bytes*. What changes is the wrapper and, with it, who can see or block the traffic. DoT on its own port is easy for a network to recognise, allow or block. DoH shares port 443 and often the same IPs with web traffic, which is exactly why browsers adopted it and why enterprises dislike it.
+
+What none of them hide: the **resolver** still sees every query and the client IP; the **destination IP** of the connection you then open is visible; and the **server name** goes in clear in the TLS ClientHello unless Encrypted Client Hello is in use. Encrypted DNS moves trust from "every network on the path" to "the resolver operator". That is a real improvement on hostile Wi-Fi and a policy question everywhere else.
+
+## Lab: one question, four ways
+
+The script sends a query for `example.com A` four ways, then repeats DoT with padding and asks for DDR records. Each request is built from the RFC text, not from a DNS library's transport helpers, so you can see the framing.
+
+```python
+# edns.py: one question, four transports (UDP/53, DoT/853, DoH POST, DoH GET), plus padding and DDR.
+import base64, socket, ssl, struct, time, urllib.request
+import dns.edns, dns.message, dns.rcode, dns.rdatatype
+
+NAME = "example.com"
+
+def q(name=NAME, rtype="A", pad=0):
+    opts = [dns.edns.GenericOption(dns.edns.OptionType.PADDING, b"")] if pad else []
+    m = dns.message.make_query(name, rtype, use_edns=0, options=opts, pad=pad)
+    m.id = 0                                       # RFC 8484 4.1: id 0 for cache-friendly GET
+    return m
+
+def show(label, wire_q, wire_r, ms):
+    r = dns.message.from_wire(wire_r)
+    ans = [str(rd) for rr in r.answer for rd in rr][:2]
+    print(f"{label:16} q={len(wire_q):3}B r={len(wire_r):4}B {ms:6.1f} ms "
+          f"{dns.rcode.to_text(r.rcode())} {ans}")
+
+def udp53(server="1.1.1.1"):
+    w = q().to_wire(); s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.settimeout(3)
+    t = time.perf_counter(); s.sendto(w, (server, 53)); r, _ = s.recvfrom(4096)
+    show("UDP 53", w, r, (time.perf_counter() - t) * 1000)
+
+def dot(server="1.1.1.1", sni="one.one.one.one", pad=0):
+    w = q(pad=pad).to_wire()
+    ctx = ssl.create_default_context()
+    t = time.perf_counter()
+    with socket.create_connection((server, 853), timeout=5) as raw, \
+         ctx.wrap_socket(raw, server_hostname=sni) as s:
+        hs = (time.perf_counter() - t) * 1000
+        t = time.perf_counter()
+        s.sendall(struct.pack("!H", len(w)) + w)      # RFC 7858: 2-byte length prefix, as DNS/TCP
+        ln = struct.unpack("!H", s.recv(2))[0]; r = b""
+        while len(r) < ln: r += s.recv(ln - len(r))
+        show(f"DoT 853 pad={pad}", w, r, (time.perf_counter() - t) * 1000)
+        print(f"{'':16} TLS {s.version()} {s.cipher()[0]}, handshake {hs:.1f} ms, "
+              f"cert CN={dict(x[0] for x in s.getpeercert()['subject'])['commonName']}")
+
+def doh_post(url="https://cloudflare-dns.com/dns-query"):
+    w = q().to_wire()
+    req = urllib.request.Request(url, data=w, headers={"Content-Type": "application/dns-message",
+                                                        "Accept": "application/dns-message"})
+    t = time.perf_counter()
+    with urllib.request.urlopen(req, timeout=5) as resp:
+        r = resp.read(); ct = resp.headers["Content-Type"]; cc = resp.headers.get("Cache-Control")
+    show("DoH POST", w, r, (time.perf_counter() - t) * 1000)
+    print(f"{'':16} Content-Type: {ct}  Cache-Control: {cc}")
+
+def doh_get(url="https://cloudflare-dns.com/dns-query"):
+    w = q().to_wire()
+    b64 = base64.urlsafe_b64encode(w).rstrip(b"=").decode()   # RFC 8484 4.1: base64url, no padding
+    print(f"{'':16} GET {url}?dns={b64}")
+    req = urllib.request.Request(f"{url}?dns={b64}", headers={"Accept": "application/dns-message"})
+    t = time.perf_counter()
+    with urllib.request.urlopen(req, timeout=5) as resp:
+        r = resp.read(); age = resp.headers.get("Age")
+    show("DoH GET", w, r, (time.perf_counter() - t) * 1000)
+
+def ddr(server="1.1.1.1", via="udp"):
+    """RFC 9462: ask a resolver which encrypted endpoints it offers."""
+    w = q("_dns.resolver.arpa", "SVCB").to_wire()
+    if via == "udp":
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.settimeout(3)
+        s.sendto(w, (server, 53)); r = dns.message.from_wire(s.recvfrom(4096)[0])
+    else:
+        req = urllib.request.Request("https://cloudflare-dns.com/dns-query", data=w, headers={
+            "Content-Type": "application/dns-message", "Accept": "application/dns-message"})
+        r = dns.message.from_wire(urllib.request.urlopen(req, timeout=5).read())
+    print(f"  via {via}: {dns.rcode.to_text(r.rcode())}, {sum(len(x) for x in r.answer)} SVCB records")
+    for rr in r.answer:
+        for rd in rr:
+            print(f"  SVCB {rd.priority} {rd.target} {' '.join(str(rd).split()[2:])}")
+
+print("-- same query, four transports (resolver 1.1.1.1 / cloudflare-dns.com)")
+udp53(); dot(); doh_post(); doh_get()
+print("-- RFC 8467 padding: query padded to a multiple of 128 octets")
+dot(pad=128)
+print("-- RFC 9462 DDR: _dns.resolver.arpa SVCB, plain UDP to 1.1.1.1 vs DoH")
+ddr(via="udp"); ddr(via="doh")
+```
 
 ```text
-  app → stub → plain :53 | DoT :853 | DoH :443
+$ python3 edns.py
+-- same query, four transports (resolver 1.1.1.1 / cloudflare-dns.com)
+UDP 53           q= 40B r=  45B    1.1 ms NOERROR ['198.18.0.1']
+DoT 853 pad=0    q= 40B r= 468B   45.6 ms NOERROR ['104.20.23.154', '172.66.147.243']
+                 TLS TLSv1.3 TLS_AES_256_GCM_SHA384, handshake 8.2 ms, cert CN=cloudflare-dns.com
+DoH POST         q= 40B r=  72B   82.5 ms NOERROR ['172.66.147.243', '104.20.23.154']
+                 Content-Type: application/dns-message  Cache-Control: None
+                 GET https://cloudflare-dns.com/dns-query?dns=AAABAAABAAAAAAABB2V4YW1wbGUDY29tAAABAAEAACkE0AAAAAAAAA
+DoH GET          q= 40B r=  72B   72.2 ms NOERROR ['172.66.147.243', '104.20.23.154']
+-- RFC 8467 padding: query padded to a multiple of 128 octets
+DoT 853 pad=128  q=128B r= 468B   47.0 ms NOERROR ['104.20.23.154', '172.66.147.243']
+                 TLS TLSv1.3 TLS_AES_256_GCM_SHA384, handshake 7.4 ms, cert CN=cloudflare-dns.com
+-- RFC 9462 DDR: _dns.resolver.arpa SVCB, plain UDP to 1.1.1.1 vs DoH
+  via udp: NOERROR, 0 SVCB records
+  via doh: NOERROR, 2 SVCB records
+  SVCB 1 one.one.one.one. alpn="h2,h3" port="443" ipv4hint="1.1.1.1,1.0.0.1" ipv6hint="2606:4700:4700::1111,2606:4700:4700::1001" dohpath="/dns-query{?dns}"
+  SVCB 2 one.one.one.one. alpn="dot" port="853" ipv4hint="1.1.1.1,1.0.0.1" ipv6hint="2606:4700:4700::1111,2606:4700:4700::1001"
 ```
 
-## Worked examples
+### Reading it
 
+**UDP 53 was not answered by Cloudflare.** The reply came back in 1.1 ms with `198.18.0.1`, an address from the benchmarking range `198.18.0.0/15` that Cloudflare does not hand out for `example.com`. The writing host's network intercepts plain DNS to *any* address and answers it locally. The DoT and DoH replies, authenticated by a certificate for `cloudflare-dns.com`, give the real answer. This is the threat model in one line: plain DNS cannot tell you who answered. Corporate networks, hotel Wi-Fi, container sandboxes and some ISPs all do this, for reasons that range from captive portals to censorship.
+
+**DoT** is DNS over TCP inside TLS: a 2-byte length, then the message (RFC 7858 3.3). The TLS handshake (about 8 ms here) is paid once per connection; real stubs keep the connection open and pipeline queries, so the steady-state cost is one round trip per query, like UDP. The 468-byte reply is padded by the server (below).
+
+**DoH POST** sends the raw message as the HTTP body with `Content-Type: application/dns-message`. The reply is the same 72-byte wire message you would get over TCP.
+
+**DoH GET** puts the message in the `dns` query parameter, base64url-encoded **without padding** (RFC 8484 4.1). The script sets the DNS ID to 0, as RFC 8484 recommends, so that identical questions produce identical URLs and HTTP caches can serve them. The base64 string above decodes to exactly the 40-byte query. GET is cache-friendly; POST is smaller for big queries and never cached by intermediaries.
+
+### Padding: encryption does not hide size
+
+A TLS record hides content, not length. An observer who sees a 40-byte query and a 72-byte answer can often guess the name from sizes alone, especially for popular names. RFC 7830 defines an EDNS(0) Padding option, and RFC 8467 recommends a policy: pad **queries to a multiple of 128 bytes** and **responses to a multiple of 468 bytes**.
+
+In the padded run the query grew from 40 to exactly 128 bytes. The responses were 468 bytes in *both* DoT runs: Cloudflare pads every DoT response to the 468-byte block, even when the query was not padded. Its DoH replies to the same unpadded query were 72 bytes: no padding. A client that wants size privacy must pad its own queries (which also signals that it wants padded replies, RFC 7830 section 4); it cannot assume every resolver or transport pads. Unbound pads queries and responses over TLS by default (`pad-queries`, `pad-responses`); check what your own stub does.
+
+### DDR: from "1.1.1.1" to its encrypted endpoints
+
+A DHCP server or a router advertisement usually gives a host a resolver *IP address*. To use DoT or DoH the host needs a *name* to validate a certificate against, a port and, for DoH, a URI path. **Discovery of Designated Resolvers** (RFC 9462) lets the client ask the resolver itself: query `_dns.resolver.arpa` for `SVCB` records. The answers (RFC 9461 defines the DNS-specific keys) list the encrypted endpoints:
+
+- priority 1: `one.one.one.one`, `alpn="h2,h3"`, `dohpath="/dns-query{?dns}"`: DoH over HTTP/2 or HTTP/3,
+- priority 2: same name, `alpn="dot"`, port 853: DoT,
+- with `ipv4hint`/`ipv6hint` addresses that include the IP the client already uses.
+
+The client must then connect to the designated resolver and verify that its certificate covers **both** the name and the original IP address (`1.1.1.1`); that is what stops an on-path attacker from "designating" its own resolver. In the lab, the **plain-UDP** DDR query returned zero records: the intercepting network answered it, too, with an empty reply. A client that relied on DDR over unencrypted transport here would simply never upgrade, which is the designed, safe failure. The DoH query reached the real resolver and returned both records.
+
+DDR is how Windows 11, Apple platforms and others auto-upgrade a configured resolver to encrypted transport. Its sibling, **DNR** (RFC 9463), carries the same information in DHCPv4, DHCPv6 and RA options, so the network can advertise an encrypted resolver directly.
+
+## Running encrypted DNS on Linux hosts
+
+**systemd-resolved (DoT only).** In `/etc/systemd/resolved.conf` or a drop-in:
+
+```ini
+[Resolve]
+DNS=1.1.1.1#cloudflare-dns.com 2606:4700:4700::1111#cloudflare-dns.com
+DNSOverTLS=yes
+DNSSEC=allow-downgrade
 ```
-getaddrinfo example.com: 2.91 ms -> ('198.18.0.1', 443)
-DoH cloudflare-dns.com: 86.50 ms status=0 answers=[{'name': 'example.com', 'type': 1, 'TTL': 19, 'data': '104.20.23.154'}, {'name': 'example.com', 'type': 1, 'TTL': 19, 'data': '172.66.147.243'}]
-DoT: dig +tls not available on this host; chapter shows the wire form from RFC 7858.
+
+The `#name` suffix is the name to validate the certificate against. `DNSOverTLS=opportunistic` tries TLS and falls back to clear text, which protects against passive observers only; `yes` fails closed. `resolvectl status` shows `+DNSOverTLS` per link. resolved does not speak DoH.
+
+**Unbound as a local forwarder (DoT upstream).**
+
+```text
+server:
+    tls-cert-bundle: /etc/ssl/certs/ca-certificates.crt
+forward-zone:
+    name: "."
+    forward-tls-upstream: yes
+    forward-addr: 1.1.1.1@853#cloudflare-dns.com
+    forward-addr: 2606:4700:4700::1111@853#cloudflare-dns.com
 ```
 
-Local stub returned `198.18.0.0/15` lab space; DoH returned public A records (~86 ms).
+Both snippets are written from the systemd-resolved and Unbound documentation and were not run here (no root on the writing host, and its resolver is fixed by the sandbox).
 
-## Trap
+**Applications with their own DoH.** Browsers resolve names themselves when DoH is on, bypassing the OS stub entirely. Firefox checks the canary domain `use-application-dns.net`: if the local resolver returns NXDOMAIN for it, Firefox leaves DoH off by default, which is how a network signals "use my resolver". Enterprise browser policies can force or forbid DoH and pin the provider.
 
-**Assuming DoH always matches corporate DNS.** Split-horizon breaks when browsers bypass the stub.
+## Split horizon, filtering and operations
+
+| Situation | What goes wrong | Fix |
+|---|---|---|
+| Internal names (`*.corp.example`) only on the internal resolver | App-level DoH to a public resolver returns NXDOMAIN | Run DoT/DoH on the *internal* resolver and point clients at it; browser policy; canary domain |
+| VPN pushes a resolver | OS stub uses it, browser DoH does not | Per-domain routing in the stub (resolved `Domains=~corp.example`); browser policy |
+| Security filtering by resolver logs | Hosts using another DoH provider vanish from logs | Block known DoH endpoints by IP/SNI at egress *and* offer your own encrypted resolver |
+| Captive portal intercepts DNS | `yes` (strict) DoT fails until login | Portal detection, or `opportunistic` on guest networks only |
+| Troubleshooting | `tcpdump port 53` shows nothing | Query the stub's logs (`resolvectl monitor`), or use the client's key log |
+
+The operator rule underneath all of them: encrypted DNS is a transport choice. Decide **which resolver** a host must use for **which names**, then encrypt the path to that resolver. Do not let each application decide.
+
+## Gotchas
+
+- **"DoH is on" can mean the OS stub is ignored.** Check which resolver the *application* is using, not just `resolv.conf`.
+- **Opportunistic means unauthenticated.** It defeats passive snooping, not interception like the one in this lab.
+- **No padding, little privacy.** Sizes identify names. Pad queries to 128 and ask for padded replies.
+- **Certificate names matter.** `1.1.1.1@853` without a name to verify against accepts any certificate in many configs. Always give the `#name`.
+- **DDR over clear text can be suppressed, not forged.** A hostile network can stop the upgrade (as here); it cannot redirect you to its resolver if the client checks the certificate covers the original IP.
+- **Port 853 is easy to block; 443 is not.** Expect DoT to fail on restrictive networks where DoH works.
+- **DNSSEC is still separate.** Encrypted transport authenticates the *resolver*, not the *data*. Validate DNSSEC on the resolver, or locally if you do not trust it.
 
 ## Boring rule
 
-Prefer OS-managed DoT/DoH for fleets over browser-only DoH.
+Run your own validating resolver, offer it over DoT (and DoH if browsers matter), pad, and point managed hosts at it through the OS stub with strict TLS and a certificate name. Use DDR or DNR so unmanaged clients can find it. Treat any application that brings its own resolver as a policy exception, not a default.
 
 ## Try this
 
-1. `dig +tls @1.1.1.1 example.com` where dig exists.
-2. Compare browser DoH vs OS resolver.
-3. Read RFC 8484.
+1. Change `udp53()` to query `9.9.9.9` and `8.8.8.8`. Is your network intercepting plain DNS to every address, or only some? Compare with DoT to the same providers (`dns.quad9.net`, `dns.google`).
+2. Add `pad=468` to a DoH POST query. What sizes do the query and the response have now?
+3. Decode the `?dns=` string from the output with `base64.urlsafe_b64decode` (add the missing `=` padding) and parse it with `dns.message.from_wire`. Confirm the ID is 0.
+4. Open one DoT connection and send ten queries on it, measuring each. How does the per-query time compare with the first one that included the handshake?
+5. For your home or lab resolver, ask `_dns.resolver.arpa SVCB` over plain UDP. Does it advertise anything? What would a client have to validate before using it?
 
 ## Sources
 
-- RFC 7858, RFC 8484
+- RFC 7858, DNS over TLS: <https://www.rfc-editor.org/rfc/rfc7858>
+- RFC 8310, Usage Profiles for DNS over TLS and DNS over DTLS: <https://www.rfc-editor.org/rfc/rfc8310>
+- RFC 8484, DNS Queries over HTTPS: <https://www.rfc-editor.org/rfc/rfc8484>
+- RFC 9250, DNS over Dedicated QUIC Connections: <https://www.rfc-editor.org/rfc/rfc9250>
+- RFC 7830, The EDNS(0) Padding Option: <https://www.rfc-editor.org/rfc/rfc7830>
+- RFC 8467, Padding Policies for EDNS(0): <https://www.rfc-editor.org/rfc/rfc8467>
+- RFC 9460, SVCB and HTTPS Resource Records: <https://www.rfc-editor.org/rfc/rfc9460>
+- RFC 9461, Service Binding Mapping for DNS Servers: <https://www.rfc-editor.org/rfc/rfc9461>
+- RFC 9462, Discovery of Designated Resolvers: <https://www.rfc-editor.org/rfc/rfc9462>
+- RFC 9463, DHCP and Router Advertisement Options for the Discovery of Network-designated Resolvers (DNR): <https://www.rfc-editor.org/rfc/rfc9463>
+- RFC 6890 / IANA special-purpose registry (`198.18.0.0/15`, RFC 2544 benchmarking): <https://www.iana.org/assignments/iana-ipv4-special-registry/>
+- `resolved.conf(5)` (`DNSOverTLS=`): <https://www.freedesktop.org/software/systemd/man/latest/resolved.conf.html>
+- Unbound `unbound.conf(5)` (`forward-tls-upstream`, `tls-cert-bundle`): <https://unbound.docs.nlnetlabs.nl/en/latest/manpages/unbound.conf.html>
+- Mozilla, canary domain `use-application-dns.net`: <https://support.mozilla.org/kb/canary-domain-use-application-dnsnet>
+- Cloudflare 1.1.1.1 DoT/DoH documentation: <https://developers.cloudflare.com/1.1.1.1/encryption/>
