@@ -1,0 +1,469 @@
+---
+title: "The Linux Stub Resolver Measured: resolv.conf, Search Lists, ndots, Timeouts and nsswitch"
+author:
+  - name: "K19G"
+  - name: "grok-bot"
+---
+
+# The Linux Stub Resolver Measured: resolv.conf, Search Lists, ndots, Timeouts and nsswitch
+
+## Learning goals
+
+- Understand the order of operations in glibc host resolution via `nsswitch.conf` and `/etc/hosts`.
+- Trace how `ndots` and `search` lists in `resolv.conf` multiply outbound DNS query volume and total lookup latency.
+- Measure the latency and socket behavior of `single-request`, `single-request-reopen`, and `AI_ADDRCONFIG`.
+- Analyze how glibc handles dead upstream nameservers, timeout options, attempt counters, and the `rotate` option.
+- Observe how `SERVFAIL` responses differ from `NXDOMAIN` within search list traversals.
+
+## Version note
+
+The measurements in this chapter were gathered on a system running Debian with glibc 2.41, Linux kernel 6.12.94, iproute2 6.15.0, and Python 3.13.5 (standard library only). The environment was isolated using rootless `unshare -urnm` to create a private network namespace and a mount namespace where `/etc/resolv.conf`, `/etc/hosts`, and `/etc/nsswitch.conf` were bind-mounted from scratch files. A Python DNS responder listening on `10.0.0.53` logged every query and responded after a deliberate 100 ms delay; `10.0.0.54` acted as a silent "dead" server. Each test executed a fresh Python process calling `socket.getaddrinfo()`. `systemd-resolved` is not present on this box; its section is written from the docs and marked not run.
+
+When an application on Linux calls `getaddrinfo()`, it does not send raw DNS packets directly to an authoritative DNS server on the Internet. Instead, the glibc C library executes a structured host lookup process governed by configuration files in `/etc`. Before a single UDP packet leaves the network interface, glibc checks `/etc/nsswitch.conf` to determine the lookup sequence. If DNS is specified, glibc reads `/etc/resolv.conf` to configure its stub resolver behavior: which nameservers to query, how search lists append domain suffixes, how many dot thresholds (`ndots`) trigger search order shifts, and how socket timeouts or parallelism behave.
+
+This chapter measures the exact network behavior of the Linux stub resolver under various glibc options and configuration parameters.
+
+## Resolution Pipeline and Architecture
+
+When an application requests IP addresses for a host name, glibc standard C library functions like `getaddrinfo(3)` consult the Name Service Switch configuration defined in `nsswitch.conf(5)`.
+
+```text
+Application -> getaddrinfo() -> /etc/nsswitch.conf
+                                     |
+              +----------------------+----------------------+
+              |                                             |
+       "hosts: files dns"                            "hosts: dns files"
+              |                                             |
+     1. Read /etc/hosts                            1. Consult resolv.conf
+        - Match -> Return immediately                 - Query DNS servers
+     2. Consult resolv.conf                        2. Read /etc/hosts
+        - Query DNS servers                           - Fallback match
+```
+
+### The Name Service Switch: `nsswitch.conf(5)`
+
+The database entry `hosts` in `/etc/nsswitch.conf` specifies the sources to search and their precedence. A standard entry reads:
+
+```text
+hosts: files dns
+```
+
+This instructs glibc to consult local files (`/etc/hosts`) first. If an exact match is found, resolution succeeds immediately without sending any network traffic. If `files` returns `NOTFOUND`, control passes to the `dns` service plugin (`nss_dns`), which reads `/etc/resolv.conf` and constructs DNS query packets.
+
+Each service in `nsswitch.conf` returns one of four status codes: `SUCCESS`, `NOTFOUND`, `UNAVAIL`, or `TRYAGAIN`. The default action for `SUCCESS` is `return`, meaning the first source to successfully resolve the name terminates the lookup chain.
+
+### The Stub Resolver Configuration: `resolv.conf(5)`
+
+When `nss_dns` is invoked, it configures the glibc stub resolver using `/etc/resolv.conf`. Key directives include:
+
+- **`nameserver`**: IP address of an upstream DNS server. Up to 3 (`MAXNS`) nameservers can be listed. By default, glibc queries them sequentially in the order listed.
+- **`search`**: Search list for host-name lookup. Suffixes are appended to non-absolute queries. Since glibc 2.26, the search list length and total length are unlimited (previously capped at 6 domains and 256 characters).
+- **`options ndots:n`**: Sets a threshold for the number of dots that must appear in a name before an initial absolute lookup is attempted. Default is `1`, capped at `15`.
+- **`options timeout:n`**: Sets the initial socket read timeout in seconds before retrying or switching nameservers. Default is `5` seconds, capped at `30`.
+- **`options attempts:n`**: Sets the number of times glibc sends a query to its nameservers before giving up. Default is `2`, capped at `5`.
+- **`options rotate`**: Enables round-robin selection among configured nameservers across lookups.
+- **`options single-request`**: Forces sequential execution of IPv4 (`A`) and IPv6 (`AAAA`) queries on a single socket.
+- **`options single-request-reopen`**: Forces glibc to close the socket and open a new source port before issuing the second request in a sequential pair.
+- **`options no-aaaa`**: Suppresses `AAAA` queries entirely (glibc 2.36+).
+- **`options use-vc`**: Forces the use of TCP for all DNS queries.
+- **`options no-reload`**: Disables automatic re-reading of `/etc/resolv.conf` when the file modified timestamp changes (glibc reloads changed configurations by default since 2.26).
+- **`options trust-ad`**: Passes the AD (Authenticated Data) bit through to the application (glibc 2.31+).
+
+Per-process overrides can be applied via environment variables: `LOCALDOMAIN` overrides the search list, and `RES_OPTIONS` overrides resolver options.
+
+## Environment and Lab Scripts
+
+The experimental setup isolates network namespace configuration and mounts custom `/etc` files to observe actual glibc DNS wire format and socket timing without altering system state.
+
+### Execution Script: `lab.sh`
+
+```{.sh filename="lab.sh"}
+#!/bin/sh
+# Run as: unshare -urnm sh lab.sh   (unprivileged: user, net and mount namespaces; no sudo)
+# The mount namespace lets us bind-mount our own /etc/resolv.conf, /etc/hosts and /etc/nsswitch.conf.
+H=$(pwd); W=$(mktemp -d); LOG=$W/q.log; : > $LOG
+ip link set lo up; ip link add d0 type veth peer name d1   # d1 stays down; d0 is just somewhere to hang 10.0.0.2
+ip addr add 10.0.0.2/24 dev d0; ip addr add 10.0.0.53/32 dev lo; ip addr add 10.0.0.54/32 dev lo; ip link set d0 up
+ip route add default dev d0
+cp /etc/hosts $W/hosts; cp /etc/nsswitch.conf $W/nss; printf 'nameserver 10.0.0.53\n' > $W/rc
+mount --bind $W/rc /etc/resolv.conf; mount --bind $W/hosts /etc/hosts; mount --bind $W/nss /etc/nsswitch.conf
+python3 $H/dnsd.py $LOG & D=$!; sleep 0.4
+rc() { printf "$1" > $W/rc; echo "   resolv.conf: $(tr '\n' ';' < $W/rc)"; }
+show() { sed 's/^/      /' $LOG; echo "      ($(wc -l < $LOG) queries)"; : > $LOG; }
+R() { python3 $H/resolve.py "$@"; show; }
+
+echo "== 1. search list and ndots: how many queries does one short-looking name cost?"
+rc 'nameserver 10.0.0.53\nsearch corp.example svc.example\noptions ndots:5\n'; R api.example.com
+rc 'nameserver 10.0.0.53\nsearch corp.example svc.example\noptions ndots:1\n'; R api.example.com
+rc 'nameserver 10.0.0.53\nsearch corp.example svc.example\noptions ndots:5\n'; R api.example.com.
+R db
+R nosuch
+
+echo "== 2. A and AAAA: parallel on one socket, or one at a time"
+rc 'nameserver 10.0.0.53\n'; R api.example.com
+rc 'nameserver 10.0.0.53\noptions single-request\n'; R api.example.com
+rc 'nameserver 10.0.0.53\noptions single-request-reopen\n'; R api.example.com
+echo "   AI_ADDRCONFIG; IPv6 addresses on this host: $(ip -6 -o addr show | awk '{print $4"("$6")"}' | tr '\n' ' ')"
+rc 'nameserver 10.0.0.53\n'; R api.example.com addrconfig
+
+echo "== 3. a dead first nameserver: timeout, attempts, rotate"
+rc 'nameserver 10.0.0.54\nnameserver 10.0.0.53\n'; R api.example.com
+rc 'nameserver 10.0.0.54\nnameserver 10.0.0.53\noptions timeout:1 attempts:1\n'; R api.example.com
+rc 'nameserver 10.0.0.54\nnameserver 10.0.0.53\noptions timeout:1 attempts:1 rotate\n'
+for i in 1 2 3 4 5 6 7 8; do python3 $H/resolve.py api.example.com; done; show
+
+echo "== 4. SERVFAIL inside the search list"
+rc 'nameserver 10.0.0.53\nsearch broken.example corp.example\noptions ndots:1\n'; R db
+
+echo "== 5. nsswitch order and /etc/hosts"
+echo '192.0.2.99 api.example.com' >> $W/hosts
+rc 'nameserver 10.0.0.53\n'; echo "   nsswitch: $(grep ^hosts $W/nss)"; R api.example.com
+sed 's/^hosts:.*/hosts:          dns files/' $W/nss > $W/nss.new; cat $W/nss.new > $W/nss   # keep the inode: it is bind-mounted
+ echo "   nsswitch: $(grep ^hosts $W/nss)"; R api.example.com
+kill $D
+```
+
+### Responder Daemon: `dnsd.py`
+
+```{.python filename="dnsd.py"}
+# dnsd.py LOG: tiny authoritative-style DNS responder for the lab. Answers on 10.0.0.53,
+# answers after 100 ms; silently drops everything on 10.0.0.54 (a "dead" resolver). Logs every query it sees.
+import socket, struct, sys, time, threading
+LOG = sys.argv[1]; DELAY = 0.1; t0 = time.monotonic()
+ZONE = {("api.example.com", 1): ["192.0.2.10"], ("api.example.com", 28): ["2001:db8::10"],
+        ("db.corp.example", 1): ["192.0.2.20"], ("db.corp.example", 28): []}
+NAMES = {n for n, _ in ZONE}
+QT = {1: "A", 28: "AAAA"}
+def qname(b, off):
+    labels = []
+    while b[off]:
+        ln = b[off]; labels.append(b[off + 1: off + 1 + ln].decode()); off += 1 + ln
+    return ".".join(labels).lower(), off + 1
+def answer(q):
+    qid, flags = struct.unpack("!HH", q[:4]); name, end = qname(q, 12); qtype = struct.unpack("!H", q[end:end + 2])[0]
+    question = q[12:end + 4]; rd = flags & 0x0100
+    if name.endswith("broken.example"): rcode, rrs = 2, []
+    elif name in NAMES: rcode, rrs = 0, ZONE.get((name, qtype), [])
+    else: rcode, rrs = 3, []
+    out = b""
+    for r in rrs:
+        rdata = socket.inet_pton(socket.AF_INET if qtype == 1 else socket.AF_INET6, r)
+        out += struct.pack("!HHHIH", 0xC00C, qtype, 1, 60, len(rdata)) + rdata
+    hdr = struct.pack("!HHHHHH", qid, 0x8400 | rd | 0x0080 | rcode, 1, len(rrs), 0, 0)
+    return hdr + question + out, name, QT.get(qtype, qtype), {0: "NOERROR", 2: "SERVFAIL", 3: "NXDOMAIN"}[rcode], len(rrs)
+def log(line):
+    with open(LOG, "a") as f: f.write(line + "\n")
+def serve(addr, alive):
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.bind((addr, 53))
+    while True:
+        q, a = s.recvfrom(4096); ms = (time.monotonic() - t0) * 1000
+        if not alive:
+            name, end = qname(q, 12); qtype = struct.unpack("!H", q[end:end + 2])[0]
+            log(f"{ms:9.1f}ms  {addr}  from :{a[1]:<5d} {QT.get(qtype, qtype):4s} {name:34s} DROPPED"); continue
+        r, name, qt, rc, n = answer(q)
+        log(f"{ms:9.1f}ms  {addr}  from :{a[1]:<5d} {qt:4s} {name:34s} {rc} ({n} answers)")
+        threading.Timer(DELAY, s.sendto, (r, a)).start()   # every answer takes DELAY seconds
+threading.Thread(target=serve, args=("10.0.0.54", False), daemon=True).start()
+serve("10.0.0.53", True)
+```
+
+### Client Test Helper: `resolve.py`
+
+```{.python filename="resolve.py"}
+# resolve.py NAME [addrconfig]: one getaddrinfo() call through glibc, timed.
+import socket, sys, time
+flags = socket.AI_ADDRCONFIG if "addrconfig" in sys.argv[2:] else 0
+t = time.monotonic()
+try:
+    res = sorted({ai[4][0] for ai in socket.getaddrinfo(sys.argv[1], 80, 0, socket.SOCK_STREAM, 0, flags)})
+    out = ", ".join(res)
+except socket.gaierror as e:
+    out = f"gaierror: {e.strerror}"
+print(f"   getaddrinfo({sys.argv[1]!r}{', AI_ADDRCONFIG' if flags else ''}) -> {out}   [{(time.monotonic()-t)*1000:.0f} ms]")
+```
+
+## Measured Test Results
+
+The exact console output generated by executing `unshare -urnm sh lab.sh` is presented below:
+
+```text
+== 1. search list and ndots: how many queries does one short-looking name cost?
+   resolv.conf: nameserver 10.0.0.53;search corp.example svc.example;options ndots:5;
+   getaddrinfo('api.example.com') -> 192.0.2.10, 2001:db8::10   [307 ms]
+          400.5ms  10.0.0.53  from :33099 A    api.example.com.corp.example       NXDOMAIN (0 answers)
+          401.0ms  10.0.0.53  from :33099 AAAA api.example.com.corp.example       NXDOMAIN (0 answers)
+          501.6ms  10.0.0.53  from :53856 A    api.example.com.svc.example        NXDOMAIN (0 answers)
+          502.4ms  10.0.0.53  from :53856 AAAA api.example.com.svc.example        NXDOMAIN (0 answers)
+          603.3ms  10.0.0.53  from :51019 A    api.example.com                    NOERROR (1 answers)
+          603.6ms  10.0.0.53  from :51019 AAAA api.example.com                    NOERROR (1 answers)
+      (6 queries)
+   resolv.conf: nameserver 10.0.0.53;search corp.example svc.example;options ndots:1;
+   getaddrinfo('api.example.com') -> 192.0.2.10, 2001:db8::10   [104 ms]
+          728.4ms  10.0.0.53  from :40653 A    api.example.com                    NOERROR (1 answers)
+          729.0ms  10.0.0.53  from :40653 AAAA api.example.com                    NOERROR (1 answers)
+      (2 queries)
+   resolv.conf: nameserver 10.0.0.53;search corp.example svc.example;options ndots:5;
+   getaddrinfo('api.example.com.') -> 192.0.2.10, 2001:db8::10   [104 ms]
+          853.9ms  10.0.0.53  from :41838 A    api.example.com                    NOERROR (1 answers)
+          854.2ms  10.0.0.53  from :41838 AAAA api.example.com                    NOERROR (1 answers)
+      (2 queries)
+   getaddrinfo('db') -> 192.0.2.20   [104 ms]
+          977.5ms  10.0.0.53  from :54389 A    db.corp.example                    NOERROR (1 answers)
+          978.1ms  10.0.0.53  from :54389 AAAA db.corp.example                    NOERROR (0 answers)
+      (2 queries)
+   getaddrinfo('nosuch') -> gaierror: Name or service not known   [306 ms]
+         1102.0ms  10.0.0.53  from :56404 A    nosuch.corp.example                NXDOMAIN (0 answers)
+         1102.4ms  10.0.0.53  from :56404 AAAA nosuch.corp.example                NXDOMAIN (0 answers)
+         1202.8ms  10.0.0.53  from :34930 A    nosuch.svc.example                 NXDOMAIN (0 answers)
+         1203.2ms  10.0.0.53  from :34930 AAAA nosuch.svc.example                 NXDOMAIN (0 answers)
+         1304.0ms  10.0.0.53  from :34864 A    nosuch                             NXDOMAIN (0 answers)
+         1304.7ms  10.0.0.53  from :34864 AAAA nosuch                             NXDOMAIN (0 answers)
+      (6 queries)
+== 2. A and AAAA: parallel on one socket, or one at a time
+   resolv.conf: nameserver 10.0.0.53;
+   getaddrinfo('api.example.com') -> 192.0.2.10, 2001:db8::10   [104 ms]
+         1430.6ms  10.0.0.53  from :57614 A    api.example.com                    NOERROR (1 answers)
+         1431.0ms  10.0.0.53  from :57614 AAAA api.example.com                    NOERROR (1 answers)
+      (2 queries)
+   resolv.conf: nameserver 10.0.0.53;options single-request;
+   getaddrinfo('api.example.com') -> 192.0.2.10, 2001:db8::10   [204 ms]
+         1554.5ms  10.0.0.53  from :53573 A    api.example.com                    NOERROR (1 answers)
+         1655.1ms  10.0.0.53  from :53573 AAAA api.example.com                    NOERROR (1 answers)
+      (2 queries)
+   resolv.conf: nameserver 10.0.0.53;options single-request-reopen;
+   getaddrinfo('api.example.com') -> 192.0.2.10, 2001:db8::10   [204 ms]
+         1778.5ms  10.0.0.53  from :60472 A    api.example.com                    NOERROR (1 answers)
+         1879.2ms  10.0.0.53  from :59554 AAAA api.example.com                    NOERROR (1 answers)
+      (2 queries)
+   AI_ADDRCONFIG; IPv6 addresses on this host: ::1/128(host) 
+   resolv.conf: nameserver 10.0.0.53;
+   getaddrinfo('api.example.com', AI_ADDRCONFIG) -> 192.0.2.10   [103 ms]
+         2003.9ms  10.0.0.53  from :35178 A    api.example.com                    NOERROR (1 answers)
+      (1 queries)
+== 3. a dead first nameserver: timeout, attempts, rotate
+   resolv.conf: nameserver 10.0.0.54;nameserver 10.0.0.53;
+   getaddrinfo('api.example.com') -> 192.0.2.10, 2001:db8::10   [5108 ms]
+         2126.8ms  10.0.0.54  from :50987 A    api.example.com                    DROPPED
+         2127.0ms  10.0.0.54  from :50987 AAAA api.example.com                    DROPPED
+         7131.0ms  10.0.0.53  from :38330 A    api.example.com                    NOERROR (1 answers)
+         7131.5ms  10.0.0.53  from :38330 AAAA api.example.com                    NOERROR (1 answers)
+      (4 queries)
+   resolv.conf: nameserver 10.0.0.54;nameserver 10.0.0.53;options timeout:1 attempts:1;
+   getaddrinfo('api.example.com') -> 192.0.2.10, 2001:db8::10   [1106 ms]
+         7261.6ms  10.0.0.54  from :53401 A    api.example.com                    DROPPED
+         7261.8ms  10.0.0.54  from :53401 AAAA api.example.com                    DROPPED
+         8262.9ms  10.0.0.53  from :37301 A    api.example.com                    NOERROR (1 answers)
+         8263.5ms  10.0.0.53  from :37301 AAAA api.example.com                    NOERROR (1 answers)
+      (4 queries)
+   resolv.conf: nameserver 10.0.0.54;nameserver 10.0.0.53;options timeout:1 attempts:1 rotate;
+   getaddrinfo('api.example.com') -> 192.0.2.10, 2001:db8::10   [1105 ms]
+   getaddrinfo('api.example.com') -> 192.0.2.10, 2001:db8::10   [1105 ms]
+   getaddrinfo('api.example.com') -> 192.0.2.10, 2001:db8::10   [104 ms]
+   getaddrinfo('api.example.com') -> 192.0.2.10, 2001:db8::10   [1105 ms]
+   getaddrinfo('api.example.com') -> 192.0.2.10, 2001:db8::10   [1105 ms]
+   getaddrinfo('api.example.com') -> 192.0.2.10, 2001:db8::10   [1105 ms]
+   getaddrinfo('api.example.com') -> 192.0.2.10, 2001:db8::10   [104 ms]
+   getaddrinfo('api.example.com') -> 192.0.2.10, 2001:db8::10   [104 ms]
+         8388.7ms  10.0.0.54  from :47421 A    api.example.com                    DROPPED
+         8388.8ms  10.0.0.54  from :47421 AAAA api.example.com                    DROPPED
+         9389.5ms  10.0.0.53  from :34196 A    api.example.com                    NOERROR (1 answers)
+         9389.9ms  10.0.0.53  from :34196 AAAA api.example.com                    NOERROR (1 answers)
+         9511.4ms  10.0.0.54  from :39826 A    api.example.com                    DROPPED
+         9511.5ms  10.0.0.54  from :39826 AAAA api.example.com                    DROPPED
+        10512.6ms  10.0.0.53  from :47119 A    api.example.com                    NOERROR (1 answers)
+        10512.9ms  10.0.0.53  from :47119 AAAA api.example.com                    NOERROR (1 answers)
+        10636.1ms  10.0.0.53  from :57494 A    api.example.com                    NOERROR (1 answers)
+        10636.4ms  10.0.0.53  from :57494 AAAA api.example.com                    NOERROR (1 answers)
+        10758.3ms  10.0.0.54  from :50989 A    api.example.com                    DROPPED
+        10758.4ms  10.0.0.54  from :50989 AAAA api.example.com                    DROPPED
+        11759.3ms  10.0.0.53  from :42175 A    api.example.com                    NOERROR (1 answers)
+        11759.9ms  10.0.0.53  from :42175 AAAA api.example.com                    NOERROR (1 answers)
+        11881.7ms  10.0.0.54  from :38149 A    api.example.com                    DROPPED
+        11881.8ms  10.0.0.54  from :38149 AAAA api.example.com                    DROPPED
+        12882.8ms  10.0.0.53  from :56262 A    api.example.com                    NOERROR (1 answers)
+        12883.1ms  10.0.0.53  from :56262 AAAA api.example.com                    NOERROR (1 answers)
+        13005.8ms  10.0.0.54  from :57581 A    api.example.com                    DROPPED
+        13005.9ms  10.0.0.54  from :57581 AAAA api.example.com                    DROPPED
+        14006.9ms  10.0.0.53  from :44112 A    api.example.com                    NOERROR (1 answers)
+        14007.7ms  10.0.0.53  from :44112 AAAA api.example.com                    NOERROR (1 answers)
+        14129.4ms  10.0.0.53  from :33529 A    api.example.com                    NOERROR (1 answers)
+        14129.9ms  10.0.0.53  from :33529 AAAA api.example.com                    NOERROR (1 answers)
+        14250.7ms  10.0.0.53  from :50556 A    api.example.com                    NOERROR (1 answers)
+        14251.0ms  10.0.0.53  from :50556 AAAA api.example.com                    NOERROR (1 answers)
+      (26 queries)
+== 4. SERVFAIL inside the search list
+   resolv.conf: nameserver 10.0.0.53;search broken.example corp.example;options ndots:1;
+   getaddrinfo('db') -> 192.0.2.20   [307 ms]
+        14378.6ms  10.0.0.53  from :38833 A    db.broken.example                  SERVFAIL (0 answers)
+        14379.2ms  10.0.0.53  from :38833 AAAA db.broken.example                  SERVFAIL (0 answers)
+        14479.7ms  10.0.0.53  from :38833 A    db.broken.example                  SERVFAIL (0 answers)
+        14480.1ms  10.0.0.53  from :38833 AAAA db.broken.example                  SERVFAIL (0 answers)
+        14580.9ms  10.0.0.53  from :50660 A    db.corp.example                    NOERROR (1 answers)
+        14581.2ms  10.0.0.53  from :50660 AAAA db.corp.example                    NOERROR (0 answers)
+      (6 queries)
+== 5. nsswitch order and /etc/hosts
+   resolv.conf: nameserver 10.0.0.53;
+   nsswitch: hosts:          files dns
+   getaddrinfo('api.example.com') -> 192.0.2.99   [3 ms]
+      (0 queries)
+   nsswitch: hosts:          dns files
+   getaddrinfo('api.example.com') -> 192.0.2.10, 2001:db8::10   [104 ms]
+        14732.4ms  10.0.0.53  from :39836 A    api.example.com                    NOERROR (1 answers)
+        14732.8ms  10.0.0.53  from :39836 AAAA api.example.com                    NOERROR (1 answers)
+      (2 queries)
+```
+
+## Reading the output
+
+### Section 1: Search Lists, `ndots`, and Query Amplification
+
+The first experiment evaluates how `ndots` interacts with search list directives. Condensed from the log above (the times are the server's receive timestamps):
+
+```text
+api.example.com with ndots:5
+  -> api.example.com.corp.example (A, AAAA) -> NXDOMAIN  [400.5 ms]
+  -> api.example.com.svc.example  (A, AAAA) -> NXDOMAIN  [501.6 ms]
+  -> api.example.com              (A, AAAA) -> NOERROR   [603.3 ms]
+```
+
+- **Query Count**: `api.example.com` contains 2 dots. Because `ndots:5` sets the threshold to 5, glibc treats the requested name as non-absolute. It tests each entry in the search list (`corp.example`, then `svc.example`) before attempting the name itself. This generates 6 queries (3 pairs of `A` and `AAAA` requests).
+- **Latency Impact**: Total latency is 307 ms. Each DNS round-trip takes 100 ms at the responder daemon. The two failed search suffix rounds consume 200 ms before the actual name is queried at timestamp 603.3 ms.
+- **Comparison with `ndots:1`**: Setting `options ndots:1` lowers the dot threshold. Because `api.example.com` has 2 dots (>= 1), glibc queries `api.example.com` directly without traversing the search list. Total queries drop to 2, and total execution time drops to 104 ms.
+- **Trailing Dot Absolute Override**: Querying `api.example.com.` (with a trailing dot) forces glibc to treat the name as absolute. Even with `ndots:5`, it skips the search list entirely, issuing 2 queries and taking 104 ms.
+- **Single-Label Lookups**: Querying `db` (0 dots) with search list `corp.example svc.example` matching `ndots:5` tries `db.corp.example` first. The server responds with `NOERROR` (1 `A` record, 0 `AAAA` records), resolving the lookup in 2 queries and 104 ms.
+- **Nonexistent Names (`nosuch`)**: Looking up `nosuch` evaluates `nosuch.corp.example` (NXDOMAIN), `nosuch.svc.example` (NXDOMAIN), and `nosuch` (NXDOMAIN). All 6 queries execute, taking 306 ms before returning `gaierror: Name or service not known`.
+
+#### Real-World Impact: Kubernetes Default Configurations
+
+In Kubernetes clusters, default pod resolver settings include `options ndots:5` alongside search entries such as `<namespace>.svc.cluster.local`, `svc.cluster.local`, `cluster.local`, and cloud domain suffixes. Every external lookup for domain names containing fewer than 5 dots (such as `api.github.com` or `db.internal.net`) incurs multiple preliminary DNS queries against local cluster search suffixes before hitting the actual fully qualified domain name.
+
+### Section 2: Socket Behavior and Address Resolution Flags
+
+The second experiment measures how glibc structures socket interactions and flags when issuing `A` and `AAAA` queries.
+
+- **Default Behavior**: glibc transmits both `A` and `AAAA` queries concurrently on the same socket source port (`:57614`). The two requests depart at 1430.6 ms and 1431.0 ms. Because the server processes them simultaneously, total lookup time is 104 ms.
+- **`single-request`**: The man page describes it as a workaround for appliance DNS servers that cannot handle two parallel queries from one socket and make the requests time out. Under `single-request`, glibc sends the `A` query on socket `:53573` at 1554.5 ms, waits for the response, and only then transmits the `AAAA` query on the same socket port `:53573` at 1655.1 ms. This adds a full DNS latency delay, resulting in 204 ms total execution time.
+- **`single-request-reopen`**: Documented as closing the socket and opening a new socket for the second request when network equipment misbehaves. In this glibc 2.41 test run, `single-request-reopen` transmitted `A` at 1778.5 ms from port `:60472`, closed the socket, opened a new local source port `:59554`, and transmitted `AAAA` at 1879.2 ms. The lookup completed sequentially in 204 ms.
+- **`AI_ADDRCONFIG`**: When passed to `getaddrinfo()`, glibc inspects local network interface addresses. If no non-loopback IPv6 address is configured on the host (in this lab, only `::1/128` was present), `AI_ADDRCONFIG` suppresses the `AAAA` DNS query completely. The resolver sends a single `A` query from port `:35178` and finishes in 103 ms.
+
+### Section 3: Dead Nameservers, Retries, and Load Balancing
+
+The third experiment tests failover logic when the primary nameserver (`10.0.0.54`) silently drops packets.
+
+- **Default Timeout and Attempt Penalties**: With two servers configured (`nameserver 10.0.0.54` followed by `10.0.0.53`), glibc sends `A` and `AAAA` queries to `10.0.0.54` at 2126.8 ms. The server drops them. After the default socket timeout of 5 seconds expires at 7131.0 ms, glibc falls back to `10.0.0.53`. The lookup succeeds, but total execution time rises to 5108 ms.
+- **Optimized Timeout Settings**: Configuring `options timeout:1 attempts:1` reduces the per-server wait time to 1 second. The dropped packets at `10.0.0.54` (7261.6 ms) time out after 1.0 second, and `10.0.0.53` answers at 8262.9 ms, bringing total lookup latency down to 1106 ms.
+- **The `rotate` Option with Dead Servers**: Across 8 fresh Python processes executing lookups with `rotate` enabled:
+  - Process 1: 1105 ms (started at dead `.54`, timed out, fell back to `.53`)
+  - Process 2: 1105 ms (started at dead `.54`)
+  - Process 3: 104 ms (started directly at alive `.53`)
+  - Process 4: 1105 ms (started at dead `.54`)
+  - Process 5: 1105 ms (started at dead `.54`)
+  - Process 6: 1105 ms (started at dead `.54`)
+  - Process 7: 104 ms (started directly at alive `.53`)
+  - Process 8: 104 ms (started directly at alive `.53`)
+
+Out of 8 lookups, 5 hit the dead server first and suffered a ~1.1 second penalty, while 3 hit the live server directly and finished in 104 ms. 
+
+In this glibc implementation, the starting nameserver selection for fresh process instances varied. Enabling `rotate` distributes queries across nameservers, but it does not remove a dead server from the list. Any process that selects the dead nameserver as its primary target pays the full `timeout` delay.
+
+### Section 4: `SERVFAIL` Handling in Search Lists
+
+The fourth experiment compares how glibc reacts to server errors (`SERVFAIL`) versus missing records (`NXDOMAIN`) while traversing search lists. Condensed from the log above:
+
+```text
+search broken.example corp.example
+Look up "db":
+  -> db.broken.example (A, AAAA) -> SERVFAIL  [attempt 1, 14378.6 ms]
+  -> db.broken.example (A, AAAA) -> SERVFAIL  [attempt 2, 14479.7 ms]
+  -> db.corp.example   (A, AAAA) -> NOERROR   [14580.9 ms]
+```
+
+When `db.broken.example` returns `SERVFAIL`, glibc does not abort the resolution. Because `attempts:2` is active by default, it retries `db.broken.example` a second time on the same socket (14479.7 ms). After receiving a second `SERVFAIL`, glibc advances to the next entry in the search list (`corp.example`). It queries `db.corp.example` at 14580.9 ms, receives a valid `NOERROR` answer, and succeeds. Total latency is 307 ms. 
+
+Unlike `NXDOMAIN` (which causes glibc to advance immediately to the next search domain), `SERVFAIL` triggers retry attempts per domain before advancing.
+
+### Section 5: `nsswitch.conf` Precedence and Bind-Mount Editing
+
+The fifth experiment verifies host lookup ordering between `/etc/hosts` and DNS.
+
+- **Precedence `hosts: files dns`**: The hostname `api.example.com` is present in `/etc/hosts` mapped to `192.0.2.99`. With `files` first, `getaddrinfo()` returns `192.0.2.99` in 3 ms without sending any DNS packets (`0 queries`).
+- **Precedence `hosts: dns files`**: Reversing the order causes glibc to query `10.0.0.53` over the network. The DNS server returns `192.0.2.10` and `2001:db8::10` in 104 ms (`2 queries`), ignoring the entry in `/etc/hosts`.
+
+#### Bind-Mount Modification Mechanics
+
+In `lab.sh`, updating `/etc/nsswitch.conf` required an explicit `cat` copy step:
+
+```sh
+sed 's/^hosts:.*/hosts:          dns files/' $W/nss > $W/nss.new
+cat $W/nss.new > $W/nss   # keep the inode: it is bind-mounted
+```
+
+Using `sed -i` directly would create a new file and swap file inodes. Because `/etc/nsswitch.conf` was mounted into the namespace via `mount --bind`, replacing the underlying file inode leaves the bind-mount attached to the original unedited inode. Writing data in-place via `cat` ensures modifications remain visible through mount boundaries.
+
+## `systemd-resolved` Architecture
+
+*(not run here: written from the docs)*
+
+On distributions that enable systemd-resolved (Ubuntu among them), `/etc/resolv.conf` is frequently replaced with a symlink pointing to `/run/systemd/resolve/stub-resolv.conf`. This directs local lookups to a local stub listener at `127.0.0.53:53`.
+
+```text
+Application -> getaddrinfo() -> nsswitch.conf, e.g. "hosts: mymachines resolve [!UNAVAIL=return] files myhostname dns"
+                                    |
+                          nss-resolve plugin
+                                    |
+                         systemd-resolved.service
+                                    |
+          +-------------------------+-------------------------+
+          |                                                   |
+   Global Configuration                             Per-Interface Configuration
+   (/etc/systemd/resolved.conf)                     (e.g., systemd-networkd)
+   - DNSSEC, DoT settings                           - Link-specific DNS servers
+   - Global fallbacks                               - Routing domains (~corp.example)
+```
+
+When `systemd-resolved` is active:
+
+- **Search Lists and Options**: Search list processing, server selection, and timeout retries move out of glibc and into `systemd-resolved.service(8)`. Parameters set in `/etc/resolv.conf` affect only the loopback communication step between glibc and `127.0.0.53`.
+- **NSS Module (`nss-resolve`)**: The service provides an NSS plugin configured in `nsswitch.conf` as `hosts: ... resolve [!UNAVAIL=return] ...`. With it, glibc asks systemd-resolved directly through its local interface instead of sending DNS packets to 127.0.0.53, bypassing `nss_dns` and the options in `/etc/resolv.conf` entirely. If resolved is not running, the module returns UNAVAIL and the `[!UNAVAIL=return]` action lets the later `files` and `dns` sources take over.
+- **Routing Domains**: `systemd-resolved` supports per-link routing domains prefixed with `~` (e.g., `~corp.example` configured via `resolvectl`). Queries ending in `corp.example` are routed exclusively to the DNS servers attached to that specific network interface (such as a VPN interface), leaving default internet queries directed to primary interfaces.
+- **Control Tools**: Administrative queries and configuration inspections are performed using `resolvectl status` and `resolvectl query <name>`.
+
+## Gotchas
+
+- **High `ndots` values create massive DNS query amplification**: Configuring `options ndots:5` in environments with multiple search domains forces glibc to send failed search queries for almost every external fully qualified domain name. This multiplies lookup latency and degrades upstream DNS infrastructure.
+- **Worst-case failure latency scales multiplicatively**: Total timeout for an unreachable DNS infrastructure equals `timeout` x `attempts` x `nameservers`. With default settings (5 s timeout, 2 attempts, 3 nameservers), an application hangs for 30 seconds before returning a lookup failure.
+- **The `rotate` option does not route around dead nameservers**: `rotate` distributes initial queries across configured nameservers, but it does not perform health checks or remove unresponsive servers. If one server in a set of three is dead, expect on the order of one lookup in three to start at it and pay the full `timeout`; in this lab, with one dead server out of two, 5 of 8 lookups did.
+- **A name without a trailing dot is not absolute**: If it has fewer dots than `ndots`, glibc tries every search domain first. That delays the lookup and sends the name you are looking up (with your search suffixes attached) to whatever servers answer for those domains. Write `api.example.com.` in configuration when you mean exactly that name.
+- **`/etc/hosts` overrides DNS silently when placed first in `nsswitch.conf`**: Default configurations put `files` before `dns`. Stale or testing entries left in `/etc/hosts` prevent applications from making DNS queries entirely, suppressing network traffic without logging warnings.
+- **`sed -i` breaks bind-mounted configuration files in containers**: Running `sed -i` on `/etc/resolv.conf` or `/etc/hosts` inside a container or mount namespace replaces the file inode. The bind mount continues pointing to the original inode, causing configuration edits to be ignored by applications.
+- **`AI_ADDRCONFIG` suppresses IPv6 lookups on dual-stack applications if IPv6 route state is incomplete**: If a host lacks an assigned non-loopback IPv6 address, passing `AI_ADDRCONFIG` causes glibc to drop `AAAA` queries completely, breaking IPv6 resolution even if IPv6 transition mechanisms are available.
+- **Workarounds like `single-request` double baseline DNS latency**: Enforcing `single-request` or `single-request-reopen` to accommodate legacy middleboxes forces glibc to serialize `A` and `AAAA` requests, adding a full DNS round-trip delay to every host resolution.
+
+## Exercises
+
+1. Modify `lab.sh` to configure three nameservers where the first two are dead (`10.0.0.54` and `10.0.0.55`) and the third is alive (`10.0.0.53`). Measure the total lookup time under default settings versus `options timeout:1 attempts:1`.
+2. Edit `dnsd.py` to return `NXDOMAIN` for `db.broken.example`. Run Section 4 of the lab and compare the query sequence and latency against the `SERVFAIL` output.
+3. Write a Python script using `socket.getaddrinfo()` to resolve `api.example.com` 50 times in a single process with `options rotate` enabled in `/etc/resolv.conf`. Observe whether single-process thread state retains nameserver rotation order compared to executing fresh process instances.
+4. In the lab namespace, add a global IPv6 address with `ip addr add 2001:db8::2/64 dev d0 nodad`, then run `resolve.py api.example.com addrconfig` again. Does glibc now send the AAAA query? Remove the address, add one to `lo` instead, and check whether an address on the loopback interface counts.
+5. In a container or mount namespace environment, bind-mount a local file to `/etc/hosts`. Execute `sed -i` to update a record, check `ls -i /etc/hosts`, and explain why `getaddrinfo()` continues reading old entries.
+
+## Verification
+
+The system state and software tool versions utilized to run these measurements were logged during execution:
+
+- **Operating System**: Debian GNU/Linux
+- **C Library**: glibc 2.41
+- **Linux Kernel**: 6.12.94
+- **Iproute2 Suite**: 6.15.0
+- **Python Runtime**: 3.13.5
+- **Execution Context**: Unprivileged namespace (`unshare -urnm`) with bind-mounted `/etc/resolv.conf`, `/etc/hosts`, and `/etc/nsswitch.conf`.
+
+## Sources
+
+- [resolv.conf(5) - Linux Manual Page](https://man7.org/linux/man-pages/man5/resolv.conf.5.html)
+- [nsswitch.conf(5) - Linux Manual Page](https://man7.org/linux/man-pages/man5/nsswitch.conf.5.html)
+- [getaddrinfo(3) - Linux Manual Page](https://man7.org/linux/man-pages/man3/getaddrinfo.3.html)
+- [nss-resolve(8) - systemd Manual](https://www.freedesktop.org/software/systemd/man/latest/nss-resolve.html)
+- [systemd-resolved.service(8) - Systemd Manual](https://www.freedesktop.org/software/systemd/man/latest/systemd-resolved.service.html)
+- [resolved.conf(5) - Systemd Manual](https://www.freedesktop.org/software/systemd/man/latest/resolved.conf.5.html)
+- [Kubernetes DNS for Services and Pods Specification](https://kubernetes.io/docs/concepts/services-networking/dns-pod-service/)
