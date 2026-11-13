@@ -1,0 +1,364 @@
+---
+title: "Precision Time Protocol (PTP): Beyond NTP"
+author:
+  - name: "K19G"
+  - name: "grok-bot"
+---
+
+# Precision Time Protocol (PTP): Beyond NTP
+
+## Learning goals
+
+- Say when NTP's milliseconds are not enough and PTP's microseconds or nanoseconds are required
+- Name the PTP clock roles (grandmaster, ordinary, boundary, transparent) and how the best master clock algorithm picks a grandmaster
+- Compute offset and path delay from the four PTP timestamps, and predict the error caused by path asymmetry and queueing
+- Explain why hardware timestamping and transparent clocks matter more than any software tuning
+- Read a Linux PTP setup: the NIC's PTP hardware clock, `ptp4l`, `phc2sys`, and the TAI-UTC offset trap
+
+## Thesis
+
+NTP gets a well-run Linux host to within about a millisecond of UTC over a WAN, and that is enough for logs and certificates. It is not enough for a mobile fronthaul, a trading venue that must prove its clocks are within 100 µs of UTC, or a studio aligning audio streams. PTP (IEEE 1588) gets to the microsecond or below on a LAN by doing two things NTP usually does not: it timestamps packets **in hardware** as they cross the wire, and it lets switches **measure and report their own queueing delay**. The arithmetic is the same as NTP's. What changes is where the timestamps come from, and that is where all the accuracy lives.
+
+## Mental model
+
+```text
+          Grandmaster (GPS/GNSS-locked)
+                 |
+          +--------------+
+          | Boundary     |   terminates PTP: slave on one port,
+          | clock (BC)   |   master on the others
+          +--------------+
+             |        |
+    +-------------+   +-------------+
+    | Transparent |   | Transparent |   forwards PTP, adds its own
+    | clock (TC)  |   | clock (TC)  |   residence time to correctionField
+    +-------------+   +-------------+
+        |                    |
+   ordinary clock       ordinary clock
+   (server NIC PHC)     (radio unit)
+
+  Inside one Linux server:
+
+    wire --> NIC PHC (/dev/ptp0) <-- ptp4l steers it from PTP messages
+                    |
+                    +--> phc2sys steers CLOCK_REALTIME from the PHC
+```
+
+Two clocks per host, two daemons. `ptp4l` disciplines the clock on the NIC. `phc2sys` copies that clock to the system clock that applications read.
+
+## When you need PTP and when you do not
+
+| Need | Typical target | Protocol |
+|------|----------------|----------|
+| Log correlation, Kerberos, TLS validity | 1 to 100 ms | NTP / chrony |
+| Financial trading (EU MiFID II RTS 25, high-frequency trading) | 100 µs to UTC, traceable | PTP, often with GNSS |
+| Professional audio/video over IP (AES67, SMPTE ST 2110 via ST 2059-2) | ~1 µs between devices | PTP |
+| Mobile fronthaul and 5G TDD (ITU-T G.8275.1 / G.8275.2) | plus or minus 1.5 µs phase to the core, tighter between radios | PTP + SyncE |
+| Industrial / automotive TSN (IEEE 802.1AS gPTP) | sub-µs | gPTP |
+| Particle accelerators, sub-ns science | sub-ns | White Rabbit (PTP extension) |
+
+The chapter on name, time and log hygiene covers NTP and chrony. Stay there unless a row above applies to you.
+
+## Clock roles and the best master clock algorithm
+
+- **Grandmaster (GM)**: the root time source of a PTP domain, usually locked to GNSS.
+- **Ordinary clock (OC)**: one PTP port. A server NIC is an OC in slave state.
+- **Boundary clock (BC)**: several ports. It is a slave on the port toward the GM and a master on the others. It terminates the PTP exchange and regenerates it, so downstream clocks see a short, clean hop.
+- **Transparent clock (TC)**: a switch that forwards PTP messages but measures how long each one spent inside it (the **residence time**) and adds that to the message's `correctionField`. End-to-end TCs correct Sync and Delay_Req; peer-to-peer TCs also measure each link.
+
+Every clock advertises itself in **Announce** messages. The **best master clock algorithm (BMCA)** compares those data sets field by field, lowest wins: `priority1`, `clockClass` (for example 6 = locked to a primary reference such as GNSS, 248 = default free-running), `clockAccuracy`, `offsetScaledLogVariance`, `priority2`, and finally `clockIdentity` as the tie-breaker. Operators steer the election with `priority1`/`priority2`. A forgotten lab box with `priority1 1` will win the election and pull a whole domain away from the GNSS grandmaster, which is why production networks filter Announce messages on access ports or use profiles that lock the master role.
+
+## The exchange and the four timestamps
+
+The default delay request-response mechanism uses four messages. PTP event messages run on UDP port 319, general messages on 320, or directly over Ethernet with EtherType `0x88F7`.
+
+```text
+  Master (GM time)                     Slave (local time)
+       |                                    |
+  t1   |------------- Sync ---------------->|  t2
+       |------- Follow_Up (carries t1) ---->|     (two-step only)
+       |                                    |
+  t4   |<----------- Delay_Req -------------|  t3
+       |------ Delay_Resp (carries t4) ---->|
+```
+
+With `ms = t2 - t1` (master to slave) and `sm = t4 - t3` (slave to master):
+
+```text
+  offset = (ms - sm) / 2
+  delay  = (ms + sm) / 2
+```
+
+The formula assumes the path takes the same time in both directions. Any difference between the forward and reverse delay goes straight into the offset, halved. PTP cannot detect this from the messages alone; it has to be measured and configured (`delayAsymmetry`) or designed out.
+
+A **one-step** clock writes `t1` into the Sync message as it leaves. A **two-step** clock sends Sync, timestamps it, then sends `t1` in a Follow_Up. Two-step is easier for hardware; the accuracy is the same.
+
+The **peer delay** mechanism (Pdelay_Req, Pdelay_Resp, Pdelay_Resp_Follow_Up) measures each link separately instead of the whole path. gPTP (802.1AS) requires it.
+
+## Hardware timestamps and the PHC
+
+Software timestamps are taken when the kernel or the application handles the packet. Interrupt latency, scheduling and queueing add tens of microseconds of noise. Hardware timestamps are taken by the NIC's MAC or PHY as the frame's start crosses the wire, using a clock on the NIC: the **PTP hardware clock (PHC)**, exposed by Linux as `/dev/ptpN`.
+
+(not run here; written from the docs) `ethtool -T eth0` lists a NIC's capabilities. You want `hardware-transmit`, `hardware-receive` and `hardware-raw-clock`, and a `PTP Hardware Clock:` index. With software-only capabilities, `ptp4l` must run with `-S`, and microsecond accuracy is out of reach.
+
+## Linux: ptp4l, phc2sys and pmc
+
+All of the following is from the linuxptp documentation and was not run on the lab host (no linuxptp installed, no root, no PTP network).
+
+(not run here; written from the docs) A minimal slave configuration, `/etc/linuxptp/ptp4l.conf`:
+
+```ini
+[global]
+domainNumber            0
+slaveOnly               1
+time_stamping           hardware
+delay_mechanism         E2E
+network_transport       UDPv4
+logging_level           6
+first_step_threshold    0.00002
+step_threshold          0.0
+
+[eth0]
+```
+
+(not run here; written from the docs) Start the two daemons and query state:
+
+```sh
+# discipline the NIC PHC from the network, log to stdout
+ptp4l -f /etc/linuxptp/ptp4l.conf -m
+
+# copy PHC time to CLOCK_REALTIME; -w waits for ptp4l to lock and
+# takes the TAI-UTC offset from it
+phc2sys -s eth0 -c CLOCK_REALTIME -w -m
+
+# management queries over the local UDS
+pmc -u -b 0 'GET CURRENT_DATA_SET'
+pmc -u -b 0 'GET TIME_STATUS_NP'
+pmc -u -b 0 'GET PARENT_DATA_SET'
+```
+
+What to read:
+
+- `ptp4l` logs `master offset <ns> s2 freq <ppb> path delay <ns>`. State `s0` is unlocked, `s1` is a clock step, `s2` is locked. In steady state on hardware stamping, the offset should sit in tens of nanoseconds.
+- `CURRENT_DATA_SET` shows `offsetFromMaster`, `meanPathDelay` and `stepsRemoved` (how many boundary clocks are between you and the GM).
+- `PARENT_DATA_SET` shows which grandmaster you are following and its `clockClass`. If that is not the GM you expect, look at BMCA before anything else.
+
+`first_step_threshold` (default 20 µs) lets `ptp4l` step the clock once at startup if it is far off; `step_threshold 0.0` forbids steps after that, so applications never see time jump. Section 5 of the lab models exactly that policy.
+
+## TAI, UTC and the 37 seconds
+
+PTP's timescale is **TAI**, which has no leap seconds. UTC is currently 37 seconds behind TAI (since 2017-01-01), and the grandmaster announces that value as `currentUtcOffset`. `phc2sys` must subtract it when copying PHC time to `CLOCK_REALTIME` (which is UTC). With `-w` it reads the offset from `ptp4l`; otherwise you pass it with `-O`.
+
+Linux also keeps a separate `CLOCK_TAI`. It is simply `CLOCK_REALTIME` plus a kernel TAI offset that **something has to set**. chrony sets it when configured with `leapsectz right/UTC`; ntpd does it from a leap-seconds file. If nothing sets it, the offset is zero and `CLOCK_TAI` silently equals UTC. Software that reads `CLOCK_TAI` (some PTP tools, TSN schedulers, `SO_TXTIME` users) is then 37 seconds wrong. The lab host shows exactly this.
+
+## Virtual machines
+
+KVM guests can expose a **virtual PHC** (`ptp_kvm`) that reads the host's clock through the hypervisor. It is not PTP on the wire; it is a way to give chrony a precise local reference.
+
+(not run here; written from the docs) In `chrony.conf`:
+
+```text
+refclock PHC /dev/ptp0 poll 2
+```
+
+The lab host has such a device, as the first lab shows.
+
+## Lab 1: look at the clocks this host has
+
+These commands need no root. Output from the lab host:
+
+```text
+$ for f in clock_name max_adjustment n_external_timestamps n_periodic_outputs n_programmable_pins pps_available; do printf '%-22s %s\n' $f "$(cat /sys/class/ptp/ptp0/$f)"; done
+clock_name             KVM virtual PTP
+max_adjustment         0
+n_external_timestamps  0
+n_periodic_outputs     0
+n_programmable_pins    0
+pps_available          0
+$ ls -l /dev/ptp0
+crw------- 1 root root 253, 0 Oct 17 09:36 /dev/ptp0
+$ python3 -c "import time; r=time.clock_gettime(time.CLOCK_REALTIME); t=time.clock_gettime(time.CLOCK_TAI); print('CLOCK_TAI - CLOCK_REALTIME = %.3f s'%(t-r))"
+CLOCK_TAI - CLOCK_REALTIME = 0.000 s
+$ cat /sys/devices/system/clocksource/clocksource0/current_clocksource
+kvm-clock
+```
+
+What this shows:
+
+- `/dev/ptp0` is the **KVM virtual PTP** clock. It has no pins, no PPS, no external timestamp channels and `max_adjustment 0`: it cannot be steered, only read. A real NIC PHC reports a non-zero `max_adjustment` (in ppb) and often PPS and pins.
+- The device is `root`-only (`crw-------`), so reading it requires privileges this lab does not have. On a real host, `chronyd` or `phc2sys` runs with them.
+- `CLOCK_TAI - CLOCK_REALTIME = 0.000 s`. The kernel TAI offset has not been set on this host. If something here read `CLOCK_TAI` expecting TAI, it would be 37 s off. That is the trap described above, reproduced.
+
+## Lab 2: the arithmetic and its errors
+
+The second lab is a model, not a network capture: it gives the slave a known true offset (1.25 ms ahead) so every estimate can be scored. The script is `ptp_exchange.py`:
+
+```python
+#!/usr/bin/env python3
+"""IEEE 1588 delay request-response arithmetic, with the errors that bite.
+
+Run: python3 ptp_exchange.py
+Models a grandmaster and a client clock whose offset is known (so we can
+score the estimate), then adds path asymmetry, timestamp jitter and a
+transparent-clock correction field.
+"""
+import random, statistics
+
+TRUE_OFFSET_NS = 1_250_000      # client is 1.25 ms ahead of the grandmaster
+random.seed(1588)
+
+
+def exchange(fwd_ns, rev_ns, jitter_ns=0, residence_ns=0, corrected=False):
+    """One Sync/Follow_Up + Delay_Req/Delay_Resp round.
+
+    t1: GM sends Sync (GM clock)     t2: client receives (client clock)
+    t3: client sends Delay_Req       t4: GM receives (GM clock)
+    residence_ns: time spent queued in a switch on the forward path.
+    corrected: a transparent clock adds that residence to correctionField.
+    """
+    j = lambda: random.gauss(0, jitter_ns) if jitter_ns else 0.0
+    t1 = 1_000_000_000.0
+    t2 = t1 + fwd_ns + residence_ns + TRUE_OFFSET_NS + j()
+    t3 = t2 + 50_000
+    t4 = t3 - TRUE_OFFSET_NS + rev_ns + j()
+    corr = residence_ns if corrected else 0.0
+    ms = (t2 - t1) - corr           # master-to-slave
+    sm = (t4 - t3)                  # slave-to-master
+    offset = (ms - sm) / 2
+    delay = (ms + sm) / 2
+    return offset, delay
+
+
+def show(label, offset, delay):
+    err = offset - TRUE_OFFSET_NS
+    print(f"  {label:<44} offset={offset:>12.1f} ns  "
+          f"delay={delay:>9.1f} ns  error={err:>9.1f} ns")
+
+
+def main():
+    print(f"true client offset = {TRUE_OFFSET_NS} ns\n")
+    print("== 1. Symmetric 2 us path, perfect timestamps ==")
+    show("fwd=2000 rev=2000", *exchange(2000, 2000))
+
+    print("\n== 2. Asymmetry: error is exactly half the difference ==")
+    for fwd, rev in [(2000, 2400), (2000, 3000), (2000, 12000)]:
+        show(f"fwd={fwd} rev={rev}", *exchange(fwd, rev))
+
+    print("\n== 3. A queueing switch on the forward path ==")
+    show("10 us residence, no transparent clock",
+         *exchange(2000, 2000, residence_ns=10_000))
+    show("10 us residence, correctionField used",
+         *exchange(2000, 2000, residence_ns=10_000, corrected=True))
+
+    print("\n== 4. Timestamp jitter: software vs hardware stamping ==")
+    for label, jit in [("software stamps (sigma 20 us)", 20_000),
+                       ("hardware stamps (sigma 8 ns)", 8)]:
+        errs = [exchange(2000, 2000, jitter_ns=jit)[0] - TRUE_OFFSET_NS
+                for _ in range(1000)]
+        print(f"  {label:<32} single-shot error sd={statistics.pstdev(errs):>9.1f} ns"
+              f"  worst={max(map(abs, errs)):>9.1f} ns")
+
+    print("\n== 5. A PI servo steering the client clock (16 Sync/s) ==")
+    # client clock also drifts at +12 ppm; servo adjusts frequency
+    kp, ki = 0.7, 0.3
+    offset_ns, freq_ppb, integral = float(TRUE_OFFSET_NS), 12_000.0, 0.0
+    interval = 1 / 16
+    for step in range(1, 161):
+        measured = offset_ns + random.gauss(0, 8)
+        integral += ki * measured
+        adj_ppb = kp * measured + integral   # ns/s correction ~ ppb
+        if step == 1 and abs(measured) > 20_000:
+            offset_ns -= measured           # first sample: step the clock
+            integral = 0.0
+            print(f"  step  1: |offset| > 20 us -> clock stepped by {measured:.0f} ns")
+            continue
+        offset_ns += (freq_ppb - adj_ppb) * interval
+        if step in (2, 4, 8, 16, 32, 64, 160):
+            print(f"  step {step:>3}: offset={offset_ns:>10.1f} ns  "
+                  f"applied freq adj={adj_ppb:>9.1f} ppb")
+
+
+if __name__ == "__main__":
+    main()
+```
+
+Run it with `python3 ptp_exchange.py`:
+
+```text
+true client offset = 1250000 ns
+
+== 1. Symmetric 2 us path, perfect timestamps ==
+  fwd=2000 rev=2000                            offset=   1250000.0 ns  delay=   2000.0 ns  error=      0.0 ns
+
+== 2. Asymmetry: error is exactly half the difference ==
+  fwd=2000 rev=2400                            offset=   1249800.0 ns  delay=   2200.0 ns  error=   -200.0 ns
+  fwd=2000 rev=3000                            offset=   1249500.0 ns  delay=   2500.0 ns  error=   -500.0 ns
+  fwd=2000 rev=12000                           offset=   1245000.0 ns  delay=   7000.0 ns  error=  -5000.0 ns
+
+== 3. A queueing switch on the forward path ==
+  10 us residence, no transparent clock        offset=   1255000.0 ns  delay=   7000.0 ns  error=   5000.0 ns
+  10 us residence, correctionField used        offset=   1250000.0 ns  delay=   2000.0 ns  error=      0.0 ns
+
+== 4. Timestamp jitter: software vs hardware stamping ==
+  software stamps (sigma 20 us)    single-shot error sd=  13896.4 ns  worst=  53042.6 ns
+  hardware stamps (sigma 8 ns)     single-shot error sd=      5.6 ns  worst=     19.8 ns
+
+== 5. A PI servo steering the client clock (16 Sync/s) ==
+  step  1: |offset| > 20 us -> clock stepped by 1250016 ns
+  step   2: offset=     735.5 ns  applied freq adj=    -28.4 ppb
+  step   4: offset=    2087.4 ns  applied freq adj=   1635.1 ppb
+  step   8: offset=    3930.8 ns  applied freq adj=   6616.1 ppb
+  step  16: offset=    3577.6 ns  applied freq adj=  16876.5 ppb
+  step  32: offset=   -2496.9 ns  applied freq adj=  14357.5 ppb
+  step  64: offset=     998.6 ns  applied freq adj=  14314.4 ppb
+  step 160: offset=      43.2 ns  applied freq adj=  12372.6 ppb
+```
+
+### Reading the results
+
+1. **Symmetric path, perfect timestamps.** The estimate is exact: offset 1,250,000 ns, delay 2,000 ns.
+2. **Asymmetry.** A 400 ns longer reverse path gives a 200 ns error; 1 µs gives 500 ns; 10 µs gives 5 µs. The error is always exactly `(fwd - rev) / 2`, and the delay estimate looks perfectly plausible. Nothing in the protocol flags it. Asymmetric fibre lengths, different optics, or a different path through the network in each direction all do this.
+3. **A queueing switch.** A Sync that spends 10 µs in a switch queue looks like a 10 µs longer forward path, so the offset is 5 µs wrong. A transparent clock that writes the 10 µs into `correctionField` removes the error entirely, because the slave subtracts it from `t2 - t1`. This is why PTP networks use TCs or BCs on every hop, or a dedicated timing VLAN with strict priority.
+4. **Timestamp jitter.** With software stamping (20 µs sigma per timestamp) a single exchange is off by about 13.9 µs (standard deviation), with a worst case of 53 µs in 1,000 samples. Hardware stamping (8 ns sigma) gives 5.6 ns standard deviation. A servo can average some software noise away, but it cannot average its way to hardware precision.
+5. **The servo.** The first sample is more than 20 µs off, so the clock is stepped, like `ptp4l`'s `first_step_threshold`. After that only the frequency is adjusted. The client oscillator runs 12 ppm fast; the integral term learns that and settles near a 12,000 ppb correction, at which point the offset is held in the tens of nanoseconds (43.2 ns at step 160). Early on the offset wanders by a few microseconds while the integral term catches up. The gains here are a toy, not linuxptp's tuned PI constants.
+
+## Case
+
+This is an illustrative scenario, not a real named incident.
+
+A broadcaster moves a studio to IP audio. Two racks of devices lock to the same GNSS grandmaster through a pair of core switches, but engineers hear faint phasing when mixing feeds from both racks. `pmc` on a test host in each rack shows both locked (`s2`) with offsets under 100 ns from their parent, so "PTP is fine" is the first conclusion. `PARENT_DATA_SET` tells a different story: rack B follows a different grandmaster, a spare unit someone racked for testing with `priority1 127`, lower than the production GM's 128. It had no GNSS antenna and was free-running. Each rack was perfectly locked, to a different clock. The fix was operational, not technical: set the spare's `priority1` to 255, document the production GM's values, and add Announce filtering on access ports so only the core can offer master.
+
+## Trap
+
+Trusting "locked, offset 20 ns" as proof of correct time. That offset is measured against your parent, over a path PTP assumes is symmetric. It says nothing about which grandmaster you follow, whether that grandmaster is traceable to UTC, or whether 3 µs of asymmetry is hiding in the fibre. Check the parent and the grandmaster's `clockClass`, and compare against an independent reference (a second GNSS receiver, a PPS output) when accuracy matters.
+
+## Boring rule
+
+Hardware timestamping on every PTP NIC, a TC or BC on every switch hop, one documented grandmaster with GNSS and a known backup, `priority1` locked down on everything else, and `phc2sys -w` so the TAI-UTC offset comes from the network. Anything less is NTP with extra steps.
+
+## Try this
+
+1. Change `TRUE_OFFSET_NS` to `0` and rerun section 2. Is the asymmetry error any different? Why does the true offset not matter?
+2. In section 4, average the offsets of 16 consecutive software-stamped exchanges before scoring. How much does the standard deviation drop? Compare with the square-root-of-N rule.
+3. Change the servo so the first step is skipped (remove the `step == 1` branch). How many steps does it take to pull in 1.25 ms by frequency alone, and what frequency adjustment does it need on the way?
+4. Add a second hop to section 3: two switches with 10 µs and 3 µs residence, only the first acting as a transparent clock. Predict the error before running.
+5. On a host where you have root and a PTP-capable NIC, run `ethtool -T`, then read `/sys/class/ptp/ptp0/clock_name` and `max_adjustment`, and compare with the virtual clock in Lab 1.
+
+## Verification
+
+- Both labs ran on Linux 6.12.94+ (a KVM guest) with Python 3.13.5, as an unprivileged user with no sudo and no extra packages, on 2026-11-13. Outputs are pasted unedited.
+- Lab 1 read real sysfs and clock values from the host. Lab 2 is a numeric model with a fixed random seed, so it prints the same numbers on any machine with the same Python.
+- Not run here: `ptp4l`, `phc2sys`, `pmc`, `ethtool -T` and chrony's PHC refclock (linuxptp, ethtool and chrony are not installed; `/dev/ptp0` is root-only). Their configurations and commands are written from the linuxptp and chrony documentation.
+
+## Sources
+
+- IEEE 1588-2019, *Standard for a Precision Clock Synchronization Protocol for Networked Measurement and Control Systems*: <https://standards.ieee.org/ieee/1588/6825/>
+- linuxptp project and man pages `ptp4l(8)`, `phc2sys(8)`, `pmc(8)`: <https://linuxptp.nwtime.org/documentation/>
+- Linux kernel PTP hardware clock infrastructure: <https://docs.kernel.org/driver-api/ptp.html>
+- Linux kernel timestamping (`SO_TIMESTAMPING`, hardware stamps): <https://docs.kernel.org/networking/timestamping.html>
+- `chrony.conf(5)` (`refclock PHC`, `leapsectz`): <https://chrony-project.org/doc/latest/chrony.conf.html>
+- `clock_gettime(2)` (`CLOCK_TAI`): <https://man7.org/linux/man-pages/man2/clock_gettime.2.html>
+- IERS Bulletin C (current TAI-UTC = 37 s): <https://www.iers.org/IERS/EN/Publications/Bulletins/bulletins.html>
+- ITU-T G.8275.1 and G.8275.2 (telecom PTP profiles): <https://www.itu.int/rec/T-REC-G.8275.1> and <https://www.itu.int/rec/T-REC-G.8275.2>
+- Commission Delegated Regulation (EU) 2017/574 (MiFID II RTS 25, clock accuracy): <https://eur-lex.europa.eu/eli/reg_del/2017/574/oj>
+- White Rabbit project (CERN): <https://white-rabbit.web.cern.ch/>
