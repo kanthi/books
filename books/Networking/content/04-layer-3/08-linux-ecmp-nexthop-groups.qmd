@@ -1,0 +1,505 @@
+---
+title: "Linux ECMP: Nexthop Objects, Hash Policies and Resilient Groups"
+author:
+  - name: "K19G"
+  - name: "grok-bot"
+---
+
+# Linux ECMP: Nexthop Objects, Hash Policies and Resilient Groups
+
+Equal-Cost Multipath (ECMP) routing allows a host or router to balance traffic across multiple paths of equal cost to a given destination network. Instead of selecting a single gateway, the routing subsystem selects among several candidates based on a hash of packet fields. In modern networks, ECMP is essential for maximizing fabric throughput, providing redundancy, and supporting scale-out leaf-spine top-of-rack architectures.
+
+Linux has supported ECMP routing in the kernel Forwarding Information Base (FIB) for decades. However, the legacy mechanism for configuring multipath routes scales poorly with large routing tables and exhibits disruption under topology changes. Recent Linux kernel releases introduced dedicated nexthop objects, custom hash policy field masks, and resilient nexthop groups.
+
+This chapter details the internal mechanics of Linux IPv4 ECMP routing, contrasting legacy syntax with nexthop objects, explaining RFC 2992 hash-threshold behavior versus resilient hashing, evaluating kernel hash field policies, and troubleshooting real-world issues like hash polarization and packet reordering.
+
+## Learning goals
+
+- Understand the difference between legacy inline multipath routes and standalone kernel nexthop objects.
+- Evaluate the mathematical and operational differences between hash-threshold algorithms (RFC 2992) and resilient hashing groups.
+- Configure sysctl parameters governing layer 3, layer 4, and custom field-based multipath hash calculations.
+- Measure flow migration and collateral disruption during link failure events.
+- Recognize potential edge cases, including IP fragment handling, hash polarization in multi-tier fabrics, and neighbor cache integration.
+
+## Version note
+
+The command outputs and empirical measurements in this chapter were gathered using Linux kernel version 6.12.94+, iproute2 6.15.0, and Python 3.13.5. The tests ran inside an unprivileged user and network namespace environment initialized via `unshare -rn sh lab.sh` without superuser privileges or external host package dependencies. The host namespace defaults on this test system were `fib_multipath_hash_policy=0`, `fib_multipath_hash_fields=7` (0x0007), and `fib_multipath_use_neigh=0`. Kernel FIB queries were performed using `ip route get ... iif in0 ipproto udp sport X dport Y` against simulated forwarding interfaces without sending live packets.
+
+## Evolution of Linux Multipath Routing
+
+### Legacy Multipath Syntax
+
+Historically, Linux multipath routes were specified inline within the route definition itself. Each route entry carried a set of gateways and interface references.
+
+```sh
+# Legacy multipath route specification (not run here: written from the docs)
+ip route add 198.51.100.0/24 nexthop via 10.0.1.2 dev r1 nexthop via 10.0.2.2 dev r2
+```
+
+While functional for basic multihoming, this inline model creates severe scaling bottlenecks when managing modern dynamic routing tables:
+
+1. **Memory Redundancy**: If a BGP router receives 1,000,000 IPv4 prefixes pointing to the exact same pair of next hops, the kernel allocates and builds 1,000,000 separate route structures, each duplicating the gateway and interface pointers internally.
+2. **Slow Convergence**: When an upstream link flaps, a control plane daemon such as FRR zebra must issue 1,000,000 individual Netlink route updates to remove or replace the affected path. This introduces noticeable convergence lag and heavy CPU utilization.
+3. **Non-atomic Updates**: Modifying a path set requires deleting and re-adding or replacing whole routes, opening transient windows where packets may drop or misroute.
+
+### Modern Nexthop Objects
+
+Linux kernel 5.3 introduced explicit **nexthop objects** managed via the `ip nexthop` command family. Next hops are decoupled from routing table prefixes. A nexthop object can represent a single gateway (`via`), a blackhole, or a multipath group referencing other nexthop IDs.
+
+```sh
+# The same commands the lab below runs (shortened to two next hops)
+ip nexthop add id 1 via 10.0.1.2 dev r1
+ip nexthop add id 2 via 10.0.2.2 dev r2
+ip nexthop add id 100 group 1/2
+ip route add 198.51.100.0/24 nhid 100
+```
+
+This architecture provides significant advantages:
+
+- **Deduplication**: Millions of routes can reference a single group ID (`nhid 100`).
+- **Atomic Operations**: When link `r1` fails, deleting nexthop ID 1 or updating group 100 updates forwarding for every prefix that uses it with one netlink message, instead of one message per route.
+- **Control plane decoupling**: a routing daemon can track next-hop reachability (link state, BFD) separately from prefix churn, and change one group when a path fails while the prefixes stay untouched.
+
+When querying routes using `ip route show`, the kernel expands the referenced nexthop group ID for display.
+
+---
+
+## Hash Algorithms and Group Types
+
+When forwarding an IP packet toward a prefix backed by a nexthop group, the kernel computes a hash over key fields in the packet header. The calculated hash integer maps to one of the nexthop choices in the group.
+
+Linux supports two distinct group types: **multipath (`mpath`)** and **resilient (`resilient`)**.
+
+### Multipath Groups (Hash-Threshold / RFC 2992)
+
+The default group type in Linux is `mpath`, which implements the hash-threshold algorithm defined in RFC 2992.
+
+Under hash-threshold, the total hash key space $[0, 2^{32}-1]$ is partitioned into contiguous regions proportional to the weight assigned to each nexthop member. 
+
+For example, with three equal-weight next hops ($A, B, C$), the hash range is partitioned into three equal segments:
+- $[0, \frac{1}{3} \times 2^{32}-1] \rightarrow A$
+- $[\frac{1}{3} \times 2^{32}, \frac{2}{3} \times 2^{32}-1] \rightarrow B$
+- $[\frac{2}{3} \times 2^{32}, 2^{32}-1] \rightarrow C$
+
+```
+Hash Space Partitioning (RFC 2992):
++-----------------------+-----------------------+-----------------------+
+|     Nexthop A (33%)   |     Nexthop B (33%)   |     Nexthop C (33%)   |
++-----------------------+-----------------------+-----------------------+
+0                                                                    2^32-1
+```
+
+If Nexthop $C$ is removed, the remaining hash space must be re-divided into two equal regions between $A$ and $B$:
+- $[0, \frac{1}{2} \times 2^{32}-1] \rightarrow A$
+- $[\frac{1}{2} \times 2^{32}, 2^{32}-1] \rightarrow B$
+
+```
+Hash Space Partitioning after removing C:
++-----------------------------------+-----------------------------------+
+|          Nexthop A (50%)          |          Nexthop B (50%)          |
++-----------------------------------+-----------------------------------+
+0                                                                    2^32-1
+```
+
+Because the boundary dividing $A$ and $B$ shifted from $33\%$ to $50\%$, flows hashing into the region $[33\%, 50\%]$ that originally mapped to $B$ now map to $A$. 
+
+This shifting phenomenon is known as **collateral disruption** or **flow churn**. Mathematically, removing one member out of $N$ equal-weight paths under hash-threshold causes more than just the $1/N$ flows bound to the failed path to move; it shifts a substantial portion of healthy flows operating on surviving paths. In stateful network environments, this causes TCP resets or out-of-order packet delivery across unaffected uplinks.
+
+#### Weights in Hash-Threshold Groups
+
+Weights control relative region sizing. A nexthop group syntax like `group 1/2/3,2` specifies that nexthop ID 3 receives weight 2, while IDs 1 and 2 receive weight 1. The total weight is 4 ($1+1+2$), allocating $25\%$ of the hash space to ID 1, $25\%$ to ID 2, and $50\%$ to ID 3.
+
+### Resilient Nexthop Groups
+
+Introduced in Linux kernel 5.13, **resilient groups** eliminate collateral disruption by replacing contiguous range partitioning with a fixed lookup table of discrete **buckets**.
+
+When defining a resilient group (`type resilient buckets N`), the kernel creates $N$ buckets and gives each next hop a share of them proportional to its weight. Buckets are not re-cut when membership changes: only the buckets that must change owner do.
+
+```sh
+# As run in section 3 of the lab
+ip nexthop add id 200 group 1/2/3/4 type resilient buckets 64 idle_timer 0
+```
+
+When a packet arrives:
+1. The kernel computes the flow hash value.
+2. The hash value modulo the total number of buckets selects a specific bucket ($B = \text{hash} \pmod N$).
+3. The packet is routed through the nexthop owning bucket $B$.
+
+```
+Resilient Bucket Table (e.g., 64 buckets):
+Bucket:  [ 0 ][ 1 ][ 2 ][ 3 ] ... [ 63 ]
+Owner:   [NH1][NH2][NH3][NH4] ... [NH3]
+```
+
+When a nexthop member is deleted from a resilient group, **only the buckets owned by the deleted nexthop are reassigned** to the remaining healthy nexthops. The ownership of all other buckets remains unchanged.
+
+```
+Bucket Reassignment after deleting NH4:
+Bucket:  [ 0 ][ 1 ][ 2 ][ 3 ] ... [ 63 ]
+Owner:   [NH1][NH2][NH3][NH1] ... [NH3]  <-- Bucket 3 reassigned from NH4 to NH1
+```
+
+Consequently, zero flows on surviving nexthops suffer collateral remapping.
+
+#### Resilient Timers and Buckets
+
+Resilient groups accept specific tuning parameters:
+
+- `buckets N`: Total bucket count. The bucket count should be significantly larger than the number of next hops to ensure balanced distribution. For instance, allocating 64 buckets across 3 next hops results in an integer allocation of 21, 22, and 21 buckets per next hop, yielding a near-perfect $33.3\%$ traffic split.
+- `idle_timer S`: Time in seconds a bucket must remain idle before it can be migrated to another next hop during rebalancing (such as when adding a new nexthop back into the group). Setting `idle_timer 0` allows instant bucket migration.
+- `unbalanced_timer S`: how long the group may stay unbalanced before buckets are migrated even if they are not idle. `0` (the default) means never force it: only idle buckets move.
+
+---
+
+## Multipath Hash Policies and Field Masks
+
+The packet header fields included in the ECMP hash calculation are controlled by the sysctl parameter `net.ipv4.fib_multipath_hash_policy`. (IPv6 offers an equivalent configuration knob in `net.ipv6.fib_multipath_hash_policy`).
+
+| Value | Policy Mode | Description |
+|---|---|---|
+| `0` | Layer 3 (L3) | Hashes Source IP and Destination IP. For IPv6, includes Flow Label and Next Header. |
+| `1` | Layer 4 (L4) | Hashes 5-tuple: Source IP, Destination IP, L4 Protocol, Source Port, Destination Port. |
+| `2` | Inner Layer 3 | Hashes Layer 3 headers, looking inside encapsulation headers (e.g., VXLAN/GRE inner IPs) if present. |
+| `3` | Custom Bitmask | Uses explicit field bitmask defined in `net.ipv4.fib_multipath_hash_fields`. |
+
+### Custom Hash Fields Bitmask (`fib_multipath_hash_fields`)
+
+When `fib_multipath_hash_policy` is set to `3`, the kernel evaluates `fib_multipath_hash_fields` as a bitmask to select exact packet header fields for hashing.
+
+The bit flags are defined as follows:
+
+| Bit Flag (Hex) | Decimal Value | Selected Header Field |
+|---|---|---|
+| `0x0001` | 1 | Source IP Address |
+| `0x0002` | 2 | Destination IP Address |
+| `0x0004` | 4 | IP Protocol |
+| `0x0008` | 8 | IPv6 Flow Label |
+| `0x0010` | 16 | Layer 4 Source Port |
+| `0x0020` | 32 | Layer 4 Destination Port |
+| `0x0040` | 64 | Inner Source IP Address |
+| `0x0080` | 128 | Inner Destination IP Address |
+| `0x0100` | 256 | Inner IP Protocol |
+| `0x0200` | 512 | Inner IPv6 Flow Label |
+| `0x0400` | 1024 | Inner Layer 4 Source Port |
+| `0x0800` | 2048 | Inner Layer 4 Destination Port |
+
+The default value of `fib_multipath_hash_fields` is `7` (`0x0007`), representing Source IP (`0x01`) + Destination IP (`0x02`) + IP Protocol (`0x04`).
+
+*Note:* Reading `/proc/sys/net/ipv4/fib_multipath_hash_fields` in sysctl scripts returns values in decimal format. For example, a bitmask of `0x0021` (Source IP + Destination Port) prints as `33`.
+
+---
+
+## Operational Mechanics and Edge Cases
+
+### Neighbor Cache Integration (`fib_multipath_use_neigh`)
+
+By default, the Linux FIB selects next hops strictly based on hash values, regardless of whether the target gateway's ARP or Neighbor Discovery (ND) state is valid. 
+
+Setting `net.ipv4.fib_multipath_use_neigh=1` instructs the kernel FIB to consult the neighbor table before selecting a nexthop. If a candidate nexthop gateway enters a failed state (`NUD_FAILED`), the kernel skips that path during hash selection and routes traffic via remaining healthy gateways.
+
+### IP Fragment Handling
+
+Layer 4 hashing policies reliance on transport-layer ports introduces challenges with IP fragmentation. 
+
+Only the initial fragment (fragment offset 0) contains transport protocol header fields like TCP/UDP source and destination ports. Subsequent fragments carry only IP headers and fragment offsets. 
+
+When L4 multipath hashing (`policy 1`) is enabled:
+- Fragment 0 hashes using the full 5-tuple.
+- Fragments 1..N lack port fields, forcing the kernel to fall back to L3 header fields (Source IP, Destination IP, Protocol).
+
+Because the computed hash value for fragment 0 differs from subsequent fragments, initial and trailing fragments of the same IP datagram can be routed across different physical uplinks. If one path experiences higher latency or drops packets, receiver reassembly buffers fail, causing degraded application performance.
+
+### Hash Polarization
+
+**Hash polarization** occurs in multi-tier leaf-spine network fabrics when every router in the path uses the identical hashing algorithm and identical header input fields.
+
+```text
+            flows
+              |
+         [ leaf L1 ]   hash H(5-tuple) mod 2 -> keeps only flows with H even for S1
+          /       \
+     [ S1 ]       [ S2 ]
+     /    \
+ [L2a]   [L2b]    S1 hashes the same fields with the same function: every flow it
+                  received has H even, so H mod 2 sends them all to L2a
+```
+
+If Leaf L1 splits incoming traffic across two spines using a 5-tuple hash, Spine S1 receives a pre-filtered subset of total flows. If Spine S1 uses the exact same hashing function and input fields to route traffic toward downstream Leaf L2, the hash calculation yields identical relative buckets. As a result, traffic concentrates heavily on a subset of links while adjacent uplinks sit completely idle.
+
+To mitigate hash polarization:
+1. Vary hash field bitmasks (`fib_multipath_hash_fields`) across different network tiers.
+2. Give each router its own hash seed (`net.ipv4.fib_multipath_hash_seed`, added in Linux 6.11 and present on this box's 6.12 kernel). By default the seed is random per boot, so polarization between Linux boxes mostly comes from a seed that has been pinned to the same value everywhere (done so that a group of routers hash consistently), or from hardware switches whose hash function and inputs really are identical.
+
+### Routing Daemon Integration
+
+FRRouting's zebra can install its next-hop groups as kernel nexthop objects on kernels that support them, so routes arrive as `nhid N` references rather than inline multipath routes; check `ip nexthop show` on an FRR box to see which objects it owns (not run here: no FRR on this box; see the FRR zebra documentation).
+
+---
+
+## Hands-on Lab
+
+The following lab script creates a network namespace topology containing four uplink interfaces and tests hash-threshold groups, resilient groups, nexthop deletion, group weighting, and custom field hash policies.
+
+### Lab Script (`lab.sh`)
+
+```{.sh filename="lab.sh"}
+#!/bin/sh
+# Run as: unshare -rn sh lab.sh   (unprivileged user + network namespace, no sudo)
+set -e
+H=$(pwd); N=4000
+ip link set lo up
+ip link add in0 type veth peer name in1          # ingress: flows "arrive" here
+ip addr add 203.0.113.254/24 dev in0; ip link set in0 up; ip link set in1 up
+for i in 1 2 3 4; do                              # four uplinks, gateway .2 on each
+  ip link add r$i type veth peer name p$i
+  ip addr add 10.0.$i.1/24 dev r$i; ip link set r$i up; ip link set p$i up
+  ip nexthop add id $i via 10.0.$i.2 dev r$i
+done
+echo 1 > /proc/sys/net/ipv4/ip_forward
+echo 1 > /proc/sys/net/ipv4/fib_multipath_hash_policy    # L4: 5-tuple
+
+echo "== 1. hash-threshold group of four, $N flows"
+ip nexthop add id 100 group 1/2/3/4
+ip route add 198.51.100.0/24 nhid 100
+ip nexthop show id 100
+python3 $H/flows.py $N ht-4.txt
+echo "== 2. delete nexthop 4 (link down, BFD, withdrawn route...)"
+ip nexthop del id 4
+ip nexthop show id 100
+python3 $H/flows.py $N ht-3.txt
+python3 $H/compare.py ht-4.txt ht-3.txt 10.0.4.2
+
+echo "== 3. same story with a resilient group (64 buckets)"
+ip route del 198.51.100.0/24; ip nexthop del id 100
+ip nexthop add id 4 via 10.0.4.2 dev r4
+ip nexthop add id 200 group 1/2/3/4 type resilient buckets 64 idle_timer 0
+ip route add 198.51.100.0/24 nhid 200
+ip nexthop show id 200
+python3 $H/flows.py $N rs-4.txt
+ip nexthop del id 4
+python3 $H/flows.py $N rs-3.txt
+python3 $H/compare.py rs-4.txt rs-3.txt 10.0.4.2
+echo "   bucket owners after the delete:"
+ip nexthop bucket show id 200 | awk '{print $NF}' | sort | uniq -c | sed 's/^/     /'
+
+echo "== 4. weights: 1:1:2 (hash-threshold)"
+ip route del 198.51.100.0/24; ip nexthop del id 200
+ip nexthop add id 300 group 1/2/3,2
+ip route add 198.51.100.0/24 nhid 300
+ip nexthop show id 300
+python3 $H/flows.py $N w.txt
+python3 $H/compare.py w.txt
+
+echo "== 5. policy 3: hash only on what you choose"
+echo 3 > /proc/sys/net/ipv4/fib_multipath_hash_policy
+echo 0x0021 > /proc/sys/net/ipv4/fib_multipath_hash_fields   # 0x0001 src IP | 0x0020 dst port
+printf "   fields = %s\n" "$(cat /proc/sys/net/ipv4/fib_multipath_hash_fields)"
+for src in 10 11 12 13; do for sp in 1111 2222; do
+  printf "   src 203.0.113.%s sport %s dport 53 -> " $src $sp
+  ip route get 198.51.100.7 from 203.0.113.$src iif in0 ipproto udp sport $sp dport 53 | grep -o 'via [0-9.]*'
+done; done
+```
+
+### Flow Query Script (`flows.py`)
+
+```{.python filename="flows.py"}
+#!/usr/bin/env python3
+# flows.py N OUT: ask the kernel FIB which next hop each of N synthetic UDP flows gets.
+# Uses one `ip -batch` run of `route get` and prints flow-key -> gateway lines to OUT.
+import subprocess, sys, random
+n, out = int(sys.argv[1]), sys.argv[2]
+rnd = random.Random(7)          # fixed seed: the same N flows every time
+lines, keys = [], []
+for _ in range(n):
+    src = f"203.0.113.{rnd.randrange(1, 254)}"   # .254 is our own in0
+    dst = f"198.51.100.{rnd.randrange(1, 255)}"
+    sp, dp = rnd.randrange(1024, 65535), rnd.choice([53, 443, 4789])
+    keys.append(f"{src}:{sp}->{dst}:{dp}")
+    lines.append(f"route get {dst} from {src} iif in0 ipproto udp sport {sp} dport {dp}")
+r = subprocess.run(["ip", "-batch", "-"], input="\n".join(lines) + "\n",
+                   capture_output=True, text=True, check=True)
+gws = [l.split(" via ")[1].split()[0] for l in r.stdout.splitlines() if " via " in l]
+assert len(gws) == n, (len(gws), r.stderr[:200])
+with open(out, "w") as f:
+    for k, g in zip(keys, gws):
+        f.write(f"{k} {g}\n")
+```
+
+### Results Comparison Script (`compare.py`)
+
+```{.python filename="compare.py"}
+#!/usr/bin/env python3
+# compare.py BEFORE AFTER [REMOVED_GW]: spread per gateway, and how many flows moved.
+import sys, collections
+def load(p): return dict(l.split() for l in open(p))
+a = load(sys.argv[1]); b = load(sys.argv[2]) if len(sys.argv) > 2 else None
+gone = sys.argv[3] if len(sys.argv) > 3 else None
+def spread(m):
+    c = collections.Counter(m.values())
+    return "  ".join(f"{g}={c[g]}" for g in sorted(c))
+print("   before:", spread(a))
+if b:
+    print("   after: ", spread(b))
+    moved = [k for k in a if a[k] != b[k]]
+    innocent = [k for k in moved if a[k] != gone]
+    print(f"   moved {len(moved)} of {len(a)} flows;"
+          f" flows that were NOT on {gone} but moved anyway: {len(innocent)}")
+```
+
+### Lab Execution Output
+
+```text
+== 1. hash-threshold group of four, 4000 flows
+id 100 group 1/2/3/4 
+== 2. delete nexthop 4 (link down, BFD, withdrawn route...)
+id 100 group 1/2/3 
+   before: 10.0.1.2=964  10.0.2.2=997  10.0.3.2=999  10.0.4.2=1040
+   after:  10.0.1.2=1298  10.0.2.2=1330  10.0.3.2=1372
+   moved 2041 of 4000 flows; flows that were NOT on 10.0.4.2 but moved anyway: 1001
+== 3. same story with a resilient group (64 buckets)
+id 200 group 1/2/3/4 type resilient buckets 64 idle_timer 0 unbalanced_timer 0 unbalanced_time 0 
+   before: 10.0.1.2=1024  10.0.2.2=1001  10.0.3.2=1042  10.0.4.2=933
+   after:  10.0.1.2=1312  10.0.2.2=1365  10.0.3.2=1323
+   moved 933 of 4000 flows; flows that were NOT on 10.0.4.2 but moved anyway: 0
+   bucket owners after the delete:
+          21 1
+          22 2
+          21 3
+== 4. weights: 1:1:2 (hash-threshold)
+id 300 group 1/2/3,2 
+   before: 10.0.1.2=964  10.0.2.2=997  10.0.3.2=2039
+== 5. policy 3: hash only on what you choose
+   fields = 33
+   src 203.0.113.10 sport 1111 dport 53 -> via 10.0.1.2
+   src 203.0.113.10 sport 2222 dport 53 -> via 10.0.1.2
+   src 203.0.113.11 sport 1111 dport 53 -> via 10.0.3.2
+   src 203.0.113.11 sport 2222 dport 53 -> via 10.0.3.2
+   src 203.0.113.12 sport 1111 dport 53 -> via 10.0.2.2
+   src 203.0.113.12 sport 2222 dport 53 -> via 10.0.2.2
+   src 203.0.113.13 sport 1111 dport 53 -> via 10.0.3.2
+   src 203.0.113.13 sport 2222 dport 53 -> via 10.0.3.2
+```
+
+---
+
+## Reading the output
+
+### Step 1 & 2: Hash-Threshold Disruption
+
+In Step 1, a hash-threshold group (ID 100) containing 4 equal next hops is evaluated across 4,000 synthetic UDP flows. The initial flow distribution across gateways is roughly equal:
+- `10.0.1.2`: 964 flows
+- `10.0.2.2`: 997 flows
+- `10.0.3.2`: 999 flows
+- `10.0.4.2`: 1040 flows
+
+In Step 2, nexthop ID 4 (`10.0.4.2`) is removed from group 100. Comparing the flow mapping before and after deletion reveals massive collateral churn:
+- **Total moved flows**: 2,041 of 4,000 flows ($51.0\%$).
+- **Innocent moved flows**: 1,001 flows that were bound to healthy gateways (`10.0.1.2`, `10.0.2.2`, `10.0.3.2`) were forcibly remapped to different surviving gateways.
+
+This occurs because removing nexthop 4 shifted the RFC 2992 hash range boundaries across all remaining gateways. Approximately $25\%$ of all active network flows suffered collateral disruption despite operating on unaffected physical interfaces.
+
+### Step 3: Resilient Group Stabilization
+
+In Step 3, group ID 200 is configured as a `resilient` group with 64 buckets. The initial distribution across 4,000 flows yields:
+- `10.0.1.2`: 1024 flows
+- `10.0.2.2`: 1001 flows
+- `10.0.3.2`: 1042 flows
+- `10.0.4.2`: 933 flows
+
+*Note:* The initial flow counts differ slightly from Section 2 because consistent bucket hash indexing maps flow keys differently than hash-threshold range boundaries.
+
+When nexthop ID 4 is deleted:
+- **Total moved flows**: 933 of 4,000 flows ($23.3\%$).
+- **Innocent moved flows**: **0**.
+
+Every single flow that was originally routed to surviving gateways (`10.0.1.2`, `10.0.2.2`, `10.0.3.2`) remained on its exact initial path. Only the 933 flows associated with the failed gateway (`10.0.4.2`) were reassigned to remaining healthy gateways.
+
+The bucket inspection query displays the updated owner counts across the 64 buckets:
+- Gateway `10.0.1.2` (Nexthop 1): 21 buckets
+- Gateway `10.0.2.2` (Nexthop 2): 22 buckets
+- Gateway `10.0.3.2` (Nexthop 3): 21 buckets
+
+The deleted nexthop's buckets were evenly split across the surviving next hops, maintaining balance without disturbing unaffected flows.
+
+### Step 4: Weighted Hash-Threshold Distribution
+
+In Step 4, group ID 300 is initialized with weights `1/2/3,2` (Nexthop 1 weight 1, Nexthop 2 weight 1, Nexthop 3 weight 2). 
+
+The 4,000 flows distribute as follows:
+- `10.0.1.2`: 964 flows ($24.1\%$)
+- `10.0.2.2`: 997 flows ($24.9\%$)
+- `10.0.3.2`: 2039 flows ($51.0\%$)
+
+This matches the expected proportional weights of $1:1:2$ ($25\% / 25\% / 50\%$).
+
+### Step 5: Custom Field Hash Policy Enforcement
+
+In Step 5, the multipath policy is switched to mode 3 (`custom`), and `fib_multipath_hash_fields` is set to `0x0021` (decimal `33`). This bitmask enables hashing on Source IP (`0x0001`) and Destination Port (`0x0020`), explicitly excluding Source Port (`0x0010`).
+
+The output demonstrates that changing the source port (`sport 1111` vs `sport 2222`) has **zero effect** on route selection:
+- `203.0.113.10` port 1111 and port 2222 both map to `via 10.0.1.2`.
+- `203.0.113.11` port 1111 and port 2222 both map to `via 10.0.3.2`.
+- `203.0.113.12` port 1111 and port 2222 both map to `via 10.0.2.2`.
+- `203.0.113.13` port 1111 and port 2222 both map to `via 10.0.3.2`.
+
+Varying the source IP shifts the hash result to different next hops (`10.0.1.2`, `10.0.3.2`, `10.0.2.2`), but for any single source IP, all source ports land on the identical nexthop gateway.
+
+---
+
+## Gotchas
+
+- **Belief: Deleting a single link from an ECMP group only affects flows on that specific link.**
+  *Why it is wrong:* Under default hash-threshold (`mpath`) groups, removing one gateway shifts the boundaries of all adjacent hash regions. As shown in the lab, deleting 1 of 4 gateways caused $51\%$ of all flows to shift paths, including over 1,000 flows operating on healthy uplinks. Use resilient groups (`type resilient`) when minimal flow disruption is required.
+
+- **Belief: Setting `fib_multipath_hash_policy=1` guarantees equal distribution for fragmented IP traffic.**
+  *Why it is wrong:* Non-initial IP fragments lack UDP/TCP port headers. The kernel falls back to L3 headers when hashing non-initial fragments, causing trailing fragments to select different next hops than the initial fragment.
+
+- **Belief: `idle_timer 0` is the safe setting.**
+  *Why it is wrong:* it is the aggressive one. With `idle_timer 0` a bucket can be handed to another next hop the moment the group is rebalanced (for example when a repaired next hop is added back), so live flows in that bucket change path. Through stateful firewalls, NAT or load balancers that is the same reset you were trying to avoid. A nonzero idle timer (the default is 120 seconds) waits for a bucket to go quiet first. The lab uses 0 only because it measures decisions, not live flows.
+
+- **Belief: Modifying sysctl `fib_multipath_hash_fields` takes effect immediately while `fib_multipath_hash_policy=1`.**
+  *Why it is wrong:* The `fib_multipath_hash_fields` bitmask is strictly ignored by the kernel unless `fib_multipath_hash_policy` is explicitly set to `3`.
+
+- **Belief: a few buckets are enough, as long as there is one per next hop.**
+  *Why it is wrong:* bucket shares are integers. With 4 next hops and 4 buckets, losing one leaves 3 buckets for 3 next hops, fine, but weights cannot be expressed and a 5th next hop cannot get any share without stealing a whole bucket. Use many more buckets than next hops (64 gave 21/22/21 here; production setups use hundreds or thousands).
+
+- **Belief: The kernel ARP/Neighbor table automatically withdraws failed ECMP gateways from routing decisions.**
+  *Why it is wrong:* By default (`fib_multipath_use_neigh=0`), the kernel forwards packets according to hash calculations even if the gateway's ARP state is `NUD_FAILED`. To bypass dead neighbor entries, `net.ipv4.fib_multipath_use_neigh` must be explicitly set to `1`.
+
+- **Belief: Custom hash field values set via sysctl are entered in hexadecimal when using echo.**
+  *Why it is wrong:* While `echo 0x0021 > /proc/sys/...` accepts hex strings, reading back the sysctl parameter returns decimal values (e.g., `33`). Automation scripts verifying configuration state must account for decimal conversion.
+
+---
+
+## Exercises
+
+1. **Resilient Idle Timers**: Modify `lab.sh` to construct a resilient group with `idle_timer 10`. Delete nexthop 4, re-add nexthop 4 immediately, and measure flow migration before and after the 10-second idle window expires.
+2. **IPv6 Flow Label Hashing**: Create an IPv6 variant of the lab using `net.ipv6.fib_multipath_hash_policy=3` and configure `fib_multipath_hash_fields` to hash strictly on IPv6 Destination IP and Flow Label (`0x000a`). Verify that varying the IPv6 Flow Label spreads flows without altering port numbers.
+3. **Single Source ECMP Spread under L3 Policy**: Set `fib_multipath_hash_policy=0` (L3 mode). Write a script sending 4,000 flows originating from a single source IP address (`203.0.113.10`) toward random destination IPs in `198.51.100.0/24`. Measure the resulting gateway distribution.
+4. **8-Way Hash-Threshold Disruption**: Extend the hash-threshold lab to 8 equal-cost next hops. Remove 1 next hop and compute the percentage of innocent flows disrupted. Compare the result against theoretical predictions.
+5. **Resilient Group Weighting**: Configure a resilient group with 64 buckets and weights `1/2/3,2`. Query `ip nexthop bucket show` to verify the exact bucket count assigned to each nexthop ID.
+
+---
+
+## Verification
+
+The tests and outputs in this chapter were executed and verified in the following environment:
+
+- **Operating System / Kernel**: Linux 6.12.94+
+- **Routing Tools**: iproute2 6.15.0
+- **Runtime Environment**: Python 3.13.5
+- **Execution Context**: Unprivileged user and network namespace sandbox (`unshare -rn sh lab.sh`)
+- **Default Namespace Sysctl Parameters**:
+  - `net.ipv4.fib_multipath_hash_policy = 0`
+  - `net.ipv4.fib_multipath_hash_fields = 7` (0x0007)
+  - `net.ipv4.fib_multipath_use_neigh = 0`
+
+---
+
+## Sources
+
+- [ip-nexthop(8): Linux manual page](https://man7.org/linux/man-pages/man8/ip-nexthop.8.html)
+- [ip-route(8): Linux manual page](https://man7.org/linux/man-pages/man8/ip-route.8.html)
+- [IP Sysctl Documentation: Linux kernel documentation](https://www.kernel.org/doc/html/latest/networking/ip-sysctl.html)
+- [Resilient Nexthop Groups: Linux kernel documentation](https://www.kernel.org/doc/html/latest/networking/nexthop-group-resilient.html)
+- [RFC 2992: Analysis of an Equal-Cost Multi-Path Algorithm](https://datatracker.ietf.org/doc/html/rfc2992)
