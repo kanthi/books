@@ -1,0 +1,321 @@
+---
+title: "Merkle Tree Certificates: Keeping Post-Quantum TLS Handshakes Small"
+author:
+  - name: "K19G"
+  - name: "grok-bot"
+---
+
+# Merkle Tree Certificates: Keeping Post-Quantum TLS Handshakes Small
+
+## Learning goals
+
+- Count the signatures a TLS server sends today to prove its identity, and work out why post-quantum signature sizes make that number a problem
+- Explain the core inversion in Merkle Tree Certificates (MTCs): the CA does not sign a certificate and then log it; it *logs* the certificate and signs the log
+- Describe issuance logs, checkpoints, subtrees, inclusion proofs, cosigners and landmarks well enough to read the IETF draft
+- Implement the draft's subtree and inclusion-proof algorithms, check them against the draft's own test vectors, and run a toy CA that issues and verifies certificates
+- Compare the authentication bytes in a handshake for classical, post-quantum X.509 and both MTC forms
+- Know what is deployable now (nothing in production yet), what is planned, and what to watch as an operator
+
+## Thesis
+
+A TLS 1.3 server authenticates with a chain of signatures. The server's own `CertificateVerify` signature proves it holds the key. The CA's signature on the leaf proves the CA vouched for the name. And because browsers require Certificate Transparency, each certificate carries two or more Signed Certificate Timestamps (SCTs), each another signature. With Ed25519 or ECDSA each of those signatures is 64 bytes, so nobody counts them. With ML-DSA-44, the smallest standard lattice signature in FIPS 204, each one is **2,420 bytes** and each public key is **1,312 bytes**. The draft computes that two SCTs plus a leaf signature alone add 7,260 bytes to every handshake. That pushes the server's first flight past the TCP initial congestion window and the QUIC anti-amplification limit, so the handshake costs an extra round trip.
+
+Merkle Tree Certificates, being standardized in the IETF PLANTS working group (`draft-ietf-plants-merkle-tree-certs`, revision -08 of 2 November 2026), take most of those signatures out of the handshake. The CA appends what it certifies to an append-only Merkle tree, the *issuance log*. It signs the tree, not each certificate, and other parties cosign the same tree. A certificate then carries a short inclusion proof, a few hundred bytes of hashes, instead of signatures. For clients that already received the tree heads in advance, no CA or log signature crosses the wire at all. Transparency stops being an extra system bolted onto issuance. In Cloudflare's words: "don't log what you issue, issue by logging."
+
+## Mental model
+
+```text
+  Today (X.509 + CT)                          Merkle Tree Certificates
+  ------------------                          ------------------------
+  CA signs leaf        ── sig #1              CA appends entry to its issuance log
+  log A returns SCT    ── sig #2              CA signs a checkpoint / subtree   ┐ once per
+  log B returns SCT    ── sig #3              cosigners (mirrors) cosign it     ┘ batch, not
+  server signs handshake ── sig #4 (always)   per certificate
+                                              certificate = entry + inclusion proof
+  handshake carries: sig #1..#4                 + (standalone) subtree cosignatures
+                                                + (landmark-relative) nothing more
+                                              server signs handshake ── still 1 sig
+
+            ┌──────────── subtree [8,13) ─────────────┐
+            │      ┌─── [8,12) ───┐                    │   inclusion proof for entry 10:
+            │   [8,10)       [10,12)                   │     d[11], [8,10), d[12]
+            │   8    9     (10)   11          12       │   = 3 hashes = 96 bytes
+            └──────────────────────────────────────────┘
+```
+
+## How the system fits together
+
+The draft defines five roles. Most of them map onto parts of today's Web PKI:
+
+| Role | Job | Today's analogue |
+|------|-----|------------------|
+| **Certification authority** | Validates requests (for example over ACME), appends a `TBSCertificateLogEntry` to its *issuance log*, signs checkpoints and subtrees with its *CA cosigner* key | CA |
+| **Issuance log** | Append-only Merkle tree (RFC 9162 hashing) of everything the CA certified. Up to 2^48−1 entries per log. Only the CA adds entries; there is no public submission | CT log, but operated by the CA and holding only its own entries |
+| **Cosigner** | Follows the log, checks it is append-only, signs subtrees. A *mirror* cosigner also keeps a full copy | CT log operators, witnesses |
+| **Monitor** | Watches logs for certificates of interest | CT monitors |
+| **Relying party** | Trusts a set of cosigners and, optionally, receives *landmark* subtrees ahead of time | Browser root store + CT policy |
+
+Three details are worth knowing because they change how certificates look:
+
+- **The log entry does not contain the public key.** `TBSCertificateLogEntry` holds `subjectPublicKeyInfoHash`, a hash of the key, and no signature. Post-quantum key and signature sizes therefore do not grow the log.
+- **The serial number is the log position.** `serialNumber = (log_number << 48) | index`. Revocation can then be done by *ranges* of serial numbers (section 7.5): "everything before index N" retires expired history in bulk, and "everything after index N" distrusts a CA from a point onward without breaking existing certificates.
+- **The signature algorithm is a proof.** An MTC is still an X.509 certificate. Its `signatureAlgorithm` is `id-alg-mtcProof`, and the `signatureValue` holds an `MTCProof`: the subtree `[start, end)`, the inclusion proof, and zero or more cosignatures.
+
+### Subtrees and the two-subtree cover
+
+The CA issues continuously. Every so often (the draft's size estimate assumes every 2 seconds) it takes a checkpoint and must sign "everything since the previous checkpoint", an arbitrary interval `[prev, size)`. An arbitrary interval is not a node of the Merkle tree, and building a separate tree over it would not be provably consistent with the main log. The draft therefore defines a **subtree** as an interval `[start, end)` where `start` is a multiple of `BIT_CEIL(end − start)`. That alignment guarantees a consistency proof against the full tree exists. It then shows (section 4.5.1) that **any interval can be covered by two subtrees**, each at most `BIT_CEIL(end − start)` in size. The CA signs those two subtrees. Each new certificate gets an inclusion proof into whichever of the two contains it.
+
+### Standalone vs landmark-relative
+
+- A **standalone certificate** carries the inclusion proof *and* the cosignatures on the subtree: the CA's own, plus as many external cosigners as relying-party policy demands. It is usable immediately after issuance, by any client that trusts those cosigners.
+- A **landmark-relative certificate** carries only the inclusion proof. Periodically, for example hourly, the CA designates the current tree size as a *landmark*, and the subtrees between consecutive landmarks are distributed to relying parties out of band (a browser update channel). A client that already holds that landmark subtree needs no signature at all. The server learns whether the client is up to date through the TLS Trust Anchor IDs mechanism (`draft-ietf-tls-trust-anchor-ids`). If the client is not, the server falls back to the standalone certificate.
+
+The draft's example sizing: with a 7-day maximum certificate lifetime and a landmark every hour, a relying party holds at most 169 active landmarks (338 subtree hashes), about 10.8 KB per CA.
+
+## Lab: the draft's tree algorithms, checked against its test vectors
+
+Everything here uses the Python 3 standard library only. Nothing touches the network.
+
+### The primitives
+
+`mtc.py` implements, in order: the RFC 9162 Merkle Tree Hash, the subtree validity rule (draft section 4.1), subtree inclusion proofs (4.3), the relying party's proof evaluation step by step as written in 4.3.2, and the two-subtree cover from 4.5.1.
+
+```python
+#!/usr/bin/env python3
+"""Merkle Tree Certificate building blocks from draft-ietf-plants-merkle-tree-certs-08:
+RFC 9162 Merkle Tree Hash, subtree validity (4.1), subtree inclusion proofs (4.3),
+proof evaluation (4.3.2) and the two-subtree cover (4.5.1).  Standard library only."""
+import hashlib
+
+def H(b: bytes) -> bytes:
+    return hashlib.sha256(b).digest()
+
+def mth(d: list[bytes]) -> bytes:                       # RFC 9162 2.1.1
+    n = len(d)
+    if n == 0:
+        return H(b"")
+    if n == 1:
+        return H(b"\x00" + d[0])
+    k = 1 << ((n - 1).bit_length() - 1)                 # largest power of 2 < n
+    return H(b"\x01" + mth(d[:k]) + mth(d[k:]))
+
+def bit_ceil(n: int) -> int:
+    return 1 if n <= 1 else 1 << (n - 1).bit_length()
+
+def valid_subtree(start: int, end: int) -> bool:        # draft 4.1
+    return start <= end and start % bit_ceil(end - start) == 0
+
+def path(m: int, d: list[bytes]) -> list[bytes]:        # RFC 9162 2.1.3.1 PATH(m, D_n)
+    n = len(d)
+    if n <= 1:
+        return []
+    k = 1 << ((n - 1).bit_length() - 1)
+    if m < k:
+        return path(m, d[:k]) + [mth(d[k:])]
+    return path(m - k, d[k:]) + [mth(d[:k])]
+
+def inclusion_proof(d, start, end, index):              # draft 4.3
+    return path(index - start, d[start:end])
+
+def evaluate(proof, start, end, index, entry_hash):     # draft 4.3.2, step by step
+    if not (valid_subtree(start, end) and start <= index < end):
+        raise ValueError("bad subtree or index")
+    fn, sn, r = index - start, end - start - 1, entry_hash
+    for p in proof:
+        if sn == 0:
+            raise ValueError("proof too long")
+        if fn & 1 or fn == sn:
+            r = H(b"\x01" + p + r)
+            while not fn & 1:
+                fn >>= 1; sn >>= 1
+        else:
+            r = H(b"\x01" + r + p)
+        fn >>= 1; sn >>= 1
+    if sn != 0:
+        raise ValueError("proof too short")
+    return r
+
+def find_subtrees(start, end):                          # draft 4.5.1, verbatim logic
+    if end - start <= 1:
+        return (start, end), (end, end)
+    last = end - 1
+    split = (start ^ last).bit_length() - 1
+    mask = (1 << split) - 1
+    mid = last & ~mask
+    left_split = (~start & mask).bit_length()
+    left_start = start & ~((1 << left_split) - 1)
+    return (left_start, mid), (mid, end)
+```
+
+### Checking against Appendix C
+
+The draft ships "accumulated" test vectors. You hash every valid subtree of trees up to size 130, and every inclusion proof in them, into one rolling SHA-256, and compare with a published value. `vectors.py` does both and also runs every proof through the relying-party `evaluate()` function:
+
+```python
+#!/usr/bin/env python3
+"""Check mtc.py against the accumulated test vectors in Appendix C.1.1 and C.1.2
+of draft-ietf-plants-merkle-tree-certs-08, then evaluate every proof (relying-party side)."""
+import hashlib
+from mtc import H, mth, valid_subtree, inclusion_proof, evaluate
+
+D = [bytes([i]) for i in range(130)]
+h1, h2, checked = hashlib.sha256(), hashlib.sha256(), 0
+for end in range(0, 131):
+    for start in range(end + 1):
+        if not valid_subtree(start, end):
+            continue
+        st = mth(D[start:end])
+        h1.update(f"[{start}, {end}) {st.hex()}\n".encode())
+        for index in range(start, end):
+            proof = inclusion_proof(D, start, end, index)
+            h2.update((f"{index} [{start}, {end})" + "".join(" " + p.hex() for p in proof) + "\n").encode())
+            assert evaluate(proof, start, end, index, H(b"\x00" + D[index])) == st
+            checked += 1
+print("C.1.1 subtree hashes   ", h1.hexdigest() == "b82806ad4265bb151c1119c0f4db437bb4d1a1f887b3a7fba1cd4ebf552e3e81")
+print("C.1.2 inclusion proofs ", h2.hexdigest() == "ac2a8f989e44d99e399db448050ff5f19757df53cfb716aa81015d3955d8163f")
+print("proofs evaluated by the relying-party code:", checked)
+```
+
+```text
+C.1.1 subtree hashes    True
+C.1.2 inclusion proofs  True
+proofs evaluated by the relying-party code: 12807
+```
+
+Both published digests match. That is strong evidence the implementation follows the draft exactly: a single wrong bit in any of 12,807 proofs would change the digest.
+
+### A toy CA
+
+`toyca.py` issues four batches of a few hundred entries, cuts a checkpoint after each, covers each new interval with two subtrees, and gives every entry a certificate (subtree, inclusion proof, signed subtree hash). A relying party then checks one honest certificate, one where the entry was swapped, and one with a truncated proof. Finally it prints the authentication-byte budget.
+
+```python
+#!/usr/bin/env python3
+"""A toy Merkle Tree CA: append entries, cut a checkpoint every BATCH entries,
+cover each new interval with two subtrees (4.5.1), hand out proofs, and let a
+relying party check them.  Then print the authentication-byte budget."""
+import random
+from mtc import H, mth, find_subtrees, inclusion_proof, evaluate
+
+random.seed(7)
+log, checkpoints, certs = [], [0], {}
+for batch in range(4):
+    for _ in range(random.randint(250, 400)):           # one checkpoint's worth of issuance
+        log.append(b"tbs-entry:%d:example-%d.test" % (len(log), random.randrange(10**6)))
+    prev, size = checkpoints[-1], len(log)
+    left, right = find_subtrees(prev, size)
+    print(f"checkpoint {batch + 1}: entries [{prev}, {size}) covered by subtrees {left} and {right}")
+    for idx in range(prev, size):                       # "sign" each subtree once, issue many certs
+        st = left if idx < left[1] else right
+        certs[idx] = (st, inclusion_proof(log, st[0], st[1], idx), mth(log[st[0]:st[1]]))
+    checkpoints.append(size)
+
+idx = 1000
+(start, end), proof, signed_hash = certs[idx]
+leaf = H(b"\x00" + log[idx])
+print(f"\ncert for entry {idx}: subtree [{start}, {end}), proof = {len(proof)} hashes = {32 * len(proof)} bytes")
+print("relying party, honest entry  :", evaluate(proof, start, end, idx, leaf) == signed_hash)
+forged = H(b"\x00" + log[idx].replace(b"example", b"evil---"))
+print("relying party, swapped entry :", evaluate(proof, start, end, idx, forged) == signed_hash)
+try:
+    evaluate(proof[:-1], start, end, idx, leaf)
+except ValueError as e:
+    print("relying party, truncated proof:", "rejected:", e)
+
+print("\nauthentication bytes a TLS server sends besides its own key and CertificateVerify")
+MLDSA44, ED = 2420, 64
+def proof_bytes(span): return 32 * (span - 1).bit_length()
+rows = [
+    ("classic X.509, Ed25519/ECDSA, 2 SCTs", 3 * ED),
+    ("classic X.509, ML-DSA-44, 2 SCTs", 3 * MLDSA44),
+    ("MTC standalone, ~3,000-cert subtree, CA + 1 cosigner", proof_bytes(3000) + 2 * MLDSA44),
+    ("MTC landmark-relative, ~5.4M-cert subtree", proof_bytes(5_400_000)),
+    ("MTC landmark-relative, 2^32-cert subtree", proof_bytes(2**32)),
+]
+for name, b in rows:
+    print(f"  {name:<55}{b:>7,} bytes")
+```
+
+```text
+checkpoint 1: entries [0, 332) covered by subtrees (0, 256) and (256, 332)
+checkpoint 2: entries [332, 631) covered by subtrees (256, 512) and (512, 631)
+checkpoint 3: entries [631, 950) covered by subtrees (512, 768) and (768, 950)
+checkpoint 4: entries [950, 1277) covered by subtrees (896, 1024) and (1024, 1277)
+
+cert for entry 1000: subtree [896, 1024), proof = 7 hashes = 224 bytes
+relying party, honest entry  : True
+relying party, swapped entry : False
+relying party, truncated proof: rejected: proof too short
+
+authentication bytes a TLS server sends besides its own key and CertificateVerify
+  classic X.509, Ed25519/ECDSA, 2 SCTs                       192 bytes
+  classic X.509, ML-DSA-44, 2 SCTs                         7,260 bytes
+  MTC standalone, ~3,000-cert subtree, CA + 1 cosigner     5,224 bytes
+  MTC landmark-relative, ~5.4M-cert subtree                  736 bytes
+  MTC landmark-relative, 2^32-cert subtree                 1,024 bytes
+```
+
+### Reading the output
+
+- **The two-subtree cover.** Checkpoint 2 had to sign entries `[332, 631)`. The cover is `[256, 512)` and `[512, 631)`. The left subtree reaches back to 256, before the interval starts, because `[332, 512)` is not aligned. The draft allows that: the left subtree may contain extra, already-certified entries, and the right one ends exactly at the checkpoint. Each subtree is at most `BIT_CEIL(299) = 512` entries.
+- **Proof size is logarithmic.** Entry 1000 sits in subtree `[896, 1024)`, 128 entries, so its proof is `log2(128) = 7` hashes, or 224 bytes.
+- **Tampering fails closed.** Changing one name in the entry gives a different leaf hash, the recomputed root no longer matches the signed subtree hash, and the relying party rejects it. A shortened proof is rejected before any comparison, because the bit-walk in 4.3.2 ends with `sn != 0`.
+- **The budget.** These are the bytes beyond the server's own public key and `CertificateVerify` signature, which every scheme still sends:
+
+| Scheme | Extra bytes | Where the number comes from |
+|--------|------------:|-----------------------------|
+| Classical X.509, Ed25519/ECDSA, 2 SCTs | 192 | 3 × 64 |
+| X.509 with ML-DSA-44, 2 SCTs | 7,260 | 3 × 2,420 (matches the draft's own figure) |
+| MTC standalone, ~3,000-entry subtree, CA + 1 cosigner | 5,224 | 12 hashes + 2 × 2,420 (toy assumption: two ML-DSA-44 cosignatures, ignoring IDs) |
+| MTC landmark-relative, ~5.4 M-entry subtree | 736 | 23 hashes (matches the draft's section 6.5 estimate) |
+| MTC landmark-relative, 2^32-entry subtree | 1,024 | 32 hashes, the upper bound the draft gives |
+
+The standalone form saves a little; the landmark-relative form is where the win is. That is why the design depends on clients receiving landmarks in the background and on servers holding both certificates.
+
+## What this means for people who run networks
+
+- **Nothing to deploy yet, but the timeline is short.** The draft is a working-group document, not an RFC. Cloudflare announced on 29 September 2026 that it is becoming a public CA, with production MTC issuance planned for the first quarter of 2027 and inclusion targeted in Chrome's new quantum-resistant root store, after an experimental deployment with Chrome. Plan for MTCs arriving over ACME for sites behind large CDNs first.
+- **Servers will hold more than one certificate per name.** A classical chain for old clients, a standalone MTC, and one or more landmark-relative MTCs, chosen per handshake from the client's `trust_anchors` extension. Tooling that assumes "one cert file per vhost" (config management, expiry monitors, certificate inventories) needs to cope with that.
+- **Middleboxes that parse certificates will see an unknown signature algorithm** (`id-alg-mtcProof`). TLS inspection boxes and any "validate the chain on the wire" IDS rule must either learn MTCs or stop inspecting. The same class of devices already broke on large post-quantum key shares in the `ClientHello`.
+- **Monitoring moves to issuance logs.** If you watch CT for your domains today, you will eventually watch CA issuance logs too. They contain hashes of public keys, not the keys, so match on names and the key hashes you expect.
+- **Handshake size is a network property.** Whatever certificate form wins, measure the server's first flight in bytes and compare it with the initial congestion window (commonly 10 segments, about 14 KB) and QUIC's 3× anti-amplification limit. Crossing either one costs a round trip on every new connection.
+
+## Case
+
+A platform team running TLS termination for a few hundred internal services tested an ML-DSA-44 chain from a private PKI with one intermediate and two SCT-like signed timestamps from an internal log. The server's first flight grew from about 4 KB to about 17 KB. QUIC handshakes from mobile clients gained a full round trip because the server hit the anti-amplification limit before the client's second flight arrived. Moving the intermediate into the clients' trust store as a directly trusted anchor removed one signature and one public key but not the round trip. The team concluded that for an internal PKI the useful parts of MTCs are the issuance-log design (one log, one CA cosigner, internal mirrors) and landmark-relative certificates pushed with their existing client configuration channel. They are tracking the draft rather than inventing their own.
+
+## Trap
+
+**"MTCs remove signatures from TLS."** They remove the *CA and transparency* signatures. The server still proves possession of its key with a `CertificateVerify` signature, and with a post-quantum key that is still about 2.4 KB plus a 1.3 KB public key.
+
+**"An inclusion proof is a signature."** It proves only that an entry is in *a* tree with a given root. Trust comes from the cosignatures on that root, or from the relying party already holding it as a landmark. An inclusion proof into an unsigned, unknown subtree proves nothing.
+
+**"Any interval can be a subtree."** Only aligned intervals can. If you write your own log tooling and sign `[332, 631)` directly, you produce a tree that cannot be proven consistent with the log. Use the two-subtree cover.
+
+**"Landmark-relative is always used."** Only when the client signals it holds the landmark. Servers must keep a standalone certificate (or a classical chain) for everyone else, and the fallback path needs testing as much as the fast path.
+
+## Boring rule
+
+Count the signatures and bytes in your handshake before and after any certificate change. Treat the issuance log as the source of truth and the certificate as a pointer into it.
+
+## Try this
+
+1. Change `toyca.py` to cut a checkpoint every 3,000 entries and confirm that no standalone proof is longer than 12 hashes, as the draft's section 6.5 estimates.
+2. Implement subtree *consistency* proof verification (draft section 4.4.3) and check it against the Appendix C.1.3 accumulated vector.
+3. Add `serial = (1 << 48) | index` to each toy certificate and write a relying-party check that rejects any serial below a `minSerial` you choose. That is the bulk revocation of section 7.5.
+4. Using the landmark rule in section 6.4.2, compute the relying-party state for a 47-day certificate lifetime with landmarks every hour, and every six hours.
+
+## Verification
+
+- `vectors.py` and `toyca.py` were run on this box with Python 3.13.5 (standard library only). Output is pasted verbatim. Both Appendix C.1.1 and C.1.2 accumulated digests from draft-08 matched.
+- The byte budget uses ML-DSA-44 sizes (1,312-byte public key, 2,420-byte signature) as quoted in the draft from FIPS 204. The standalone row is a stated toy assumption, not a measurement of a real deployment.
+- Not run: real MTC issuance, ACME, TLS trust-anchor negotiation and any browser. No public implementation was used. Deployment status comes from the Cloudflare announcements cited below and may change.
+
+## Sources
+
+- IETF, *Merkle Tree Certificates*, draft-ietf-plants-merkle-tree-certs-08 (2 November 2026): <https://datatracker.ietf.org/doc/draft-ietf-plants-merkle-tree-certs/>
+- RFC 9162, *Certificate Transparency Version 2.0* (Merkle Tree Hash, inclusion proofs): <https://www.rfc-editor.org/rfc/rfc9162>
+- RFC 6962, *Certificate Transparency*: <https://www.rfc-editor.org/rfc/rfc6962>
+- IETF, *TLS Trust Anchor Identifiers*, draft-ietf-tls-trust-anchor-ids: <https://datatracker.ietf.org/doc/draft-ietf-tls-trust-anchor-ids/>
+- NIST FIPS 204, *Module-Lattice-Based Digital Signature Standard* (ML-DSA): <https://csrc.nist.gov/pubs/fips/204/final>
+- Cloudflare, *Building a post-quantum certificate authority with Merkle Tree Certificates* (29 September 2026): <https://blog.cloudflare.com/pq-ca-with-mtcs/>
+- Cloudflare, *Building a certificate authority for the whole Internet*: <https://blog.cloudflare.com/cloudflare-certificate-authority/>
