@@ -1,0 +1,524 @@
+---
+title: "Where Did the Packet Die? Linux Drop Counters from nstat to Drop Reasons"
+author:
+  - name: "K19G"
+  - name: "grok-bot"
+---
+
+# Where Did the Packet Die? Linux Drop Counters from nstat to Drop Reasons
+
+A packet that leaves a client and never reaches the application on the other side died somewhere. `tcpdump` can show you where it was last seen, but it cannot tell you *why* the kernel threw it away, and it shows nothing at all for packets that never made it to the capture point. The kernel, on the other hand, keeps score: almost every drop path in Linux increments a counter, and since Linux 5.17 most of them also attach a *drop reason* to the freed packet. The trouble is that the counters are spread across half a dozen files, some are per network namespace and some are kernel-wide, and a few drop paths count nothing at all.
+
+This chapter builds a map. You will reproduce nine distinct ways to lose a packet on a three-namespace Linux path, watch exactly which counter moves for each, and end up with a small tool, `netdelta.py`, that snapshots every relevant counter around a command and prints only what changed. The last part shows where the counters stop and drop reasons take over.
+
+## Learning goals
+
+- Know which file or command holds each class of Linux drop counter: SNMP and netstat MIBs (`nstat`), per-device statistics (`ip -s link`), per-CPU backlog statistics (`/proc/net/softnet_stat`), routing-cache statistics and neighbour-table statistics.
+- Tell per-namespace counters from kernel-wide ones, and know which ones silently include other traffic on the host.
+- Reproduce and recognise the counter signature of the common drops: closed UDP port, full socket buffer, full accept queue, TTL expiry, missing route, disabled forwarding, reverse-path filtering, failed neighbour resolution, blackhole and prohibit routes.
+- Explain why some ICMP errors never get sent even though the drop was counted, and which two rate limiters are responsible.
+- Map each drop to its kernel drop reason (`enum skb_drop_reason`) and know how to read drop reasons with `perf`, `bpftrace` or `dropwatch` on a host where you have root.
+- Use a before/after counter diff as the first step of any "packets are disappearing" investigation.
+
+## Version note
+
+Every listing in the lab ran on this box as an unprivileged user: Linux **6.12.94**, iproute2 **6.15.0** (`ip`, `nstat`), Python **3.13.5** standard library only. The topology lives inside `unshare -urnm` (new user, network and mount namespaces) with three named network namespaces joined by veth pairs, so no sudo and no installs were needed and the host's own networking was never touched. All outputs are pasted unedited from those runs.
+
+Kernel behaviour quoted in this chapter was checked against the Linux **v6.12** source: `net/ipv4/route.c` (`ip_error()`), `net/ipv4/ip_forward.c`, `net/ipv4/ip_input.c`, `net/ipv4/udp.c`, `net/core/neighbour.c`, `net/core/net-procfs.c` and `include/net/dropreason-core.h`.
+
+Not run here: anything that reads drop reasons (`perf`, `bpftrace`, `dropwatch`, `pwru`), because attaching to the `skb:kfree_skb` tracepoint needs root or `CAP_SYS_ADMIN`/`CAP_BPF`, and `ethtool -S`, because veth devices expose few driver statistics and `ethtool` is not installed. Those commands are shown from their documentation and marked.
+
+## The five places Linux keeps score
+
+Before reproducing anything, it helps to know where to look. Linux exposes drop accounting in five layers, and each answers a different question.
+
+| Source | Scope | Answers | Read with |
+|---|---|---|---|
+| SNMP MIBs: `/proc/net/snmp`, `/proc/net/snmp6` | per network namespace | IP/ICMP/UDP/TCP drops defined by the IETF MIBs (`IpInHdrErrors`, `UdpNoPorts`, ...) | `nstat`, `netstat -s` |
+| Linux MIBs: `/proc/net/netstat` (`TcpExt`, `IpExt`) | per network namespace | Linux-specific events: listen overflows, reverse-path filter, no-route on input | `nstat` |
+| Device statistics | per device | drops and errors at the interface: queue full, peer down, driver errors | `ip -s -s link`, `ethtool -S` |
+| `/proc/net/softnet_stat` | per CPU, kernel-wide | the per-CPU input backlog: overflow drops, NAPI budget exhaustion | `cat`, a small decoder |
+| `/proc/net/stat/rt_cache`, neighbour-table stats | kernel-wide | input packets with no route, martian sources and destinations, ARP failures | `cat`, `ip -s ntable` |
+
+`nstat` deserves a word because it is the one you will use most. It reads the three MIB files and keeps a history file so that, by default, each invocation prints the *change* since the last one. For scripting you usually want the opposite: `-a` (absolute values), `-z` (include zero counters), and `-s` (do not update the history file, so you do not disturb anyone else's deltas). `nstat -saz --json` gives you every counter in the current network namespace as JSON. Counter names are the MIB table name glued to the field name, which is why the reverse-path filter counter is called `TcpExtIPReversePathFilter` even though it has nothing to do with TCP: it lives in the `TcpExt` table of `/proc/net/netstat`.
+
+The scope column is the trap. MIB counters are per network namespace, so in a container or a lab namespace they describe only that namespace's traffic. Softnet, routing-cache and neighbour-table statistics are kernel-wide: read from inside any namespace, they include every packet on the machine. On a busy host a kernel-wide counter moving by three tells you nothing unless you control the traffic.
+
+## The tool: snapshot, run, diff
+
+Counters are cumulative since boot (or since namespace creation), so their absolute values mean little. What you want is the delta across an event. `netdelta.py` takes one or more namespace names and a command, snapshots every counter in those namespaces and the kernel-wide tables, runs the command, snapshots again and prints the counters that moved. By default it prints only counters whose names look like drops, errors or rate limiting; `--all` prints everything.
+
+```{.python filename="netdelta.py"}
+#!/usr/bin/env python3
+"""netdelta.py: snapshot the kernel's drop-related counters, run a command, print what moved.
+
+Usage: netdelta.py [--all] [--ns NAME]... -- command args...
+Only counters whose names look like drops or errors are printed, unless --all.
+Sources: nstat -saz (SNMP + netstat MIBs, per namespace), ip -s -j link (per device),
+and three kernel-wide tables: /proc/net/softnet_stat, /proc/net/stat/rt_cache, /proc/net/stat/arp_cache.
+"""
+import json, re, subprocess, sys
+
+DROPPY = re.compile(r"Drop|Discard|Err|NoRoute|NoPort|Overflow|Fail|Filter|TimeExcd|DestUnreach|Prune|Collapse|dropped|errors|squeeze|InAddr|Csum|RateLimit")
+
+def sh(ns, *argv):
+    pre = ["ip", "netns", "exec", ns] if ns else []
+    return subprocess.run(pre + list(argv), capture_output=True, text=True).stdout
+
+def snapshot(ns):
+    snap = {}
+    data = json.loads(sh(ns, "nstat", "-saz", "--json") or "{}")
+    for table in data.values():
+        for k, v in table.items():
+            snap[k] = v
+    for dev in json.loads(sh(ns, "ip", "-s", "-j", "link") or "[]"):
+        st = dev.get("stats64", {})
+        for d in ("rx", "tx"):
+            for k in ("dropped", "errors"):
+                snap[f"{dev['ifname']}.{d}_{k}"] = st.get(d, {}).get(k, 0)
+    return snap
+
+def global_snapshot():
+    """Kernel-wide counters: NOT per network namespace, so other traffic on the host shows up too."""
+    snap = {}
+    for cpu, row in enumerate(open("/proc/net/softnet_stat")):
+        f = [int(x, 16) for x in row.split()]
+        snap[f"softnet.cpu{cpu}.dropped"] = f[1]
+        snap[f"softnet.cpu{cpu}.time_squeeze"] = f[2]
+    rows = open("/proc/net/stat/rt_cache").read().split("\n")
+    names = rows[0].split()
+    for name in ("in_no_route", "in_martian_dst", "in_martian_src"):
+        i = names.index(name)
+        snap[f"rt_cache.{name}"] = sum(int(r.split()[i], 16) for r in rows[1:] if r.strip())
+    # /proc/net/stat/arp_cache only exists in the initial namespace; ip ntable works everywhere
+    out = subprocess.run(["ip", "-s", "ntable", "show", "name", "arp_cache"],
+                         capture_output=True, text=True).stdout
+    for name in ("res_failed", "unresolved_discards", "table_fulls"):
+        m = re.search(rf"\b{name} (\d+)", out)
+        if m:
+            snap[f"arp_cache.{name}"] = int(m.group(1))
+    return snap
+
+def main():
+    args = sys.argv[1:]
+    nss, show_all = [], False
+    if args and args[0] == "--all":
+        show_all, args = True, args[1:]
+    while args and args[0] == "--ns":
+        nss.append(args[1]); args = args[2:]
+    if args and args[0] == "--":
+        args = args[1:]
+    nss = nss or [None]
+    before = {ns: snapshot(ns) for ns in nss}
+    gbefore = global_snapshot()
+    rc = subprocess.run(args).returncode
+    gafter = global_snapshot()
+    for ns in nss:
+        after = snapshot(ns)
+        moved = {k: after[k] - before[ns].get(k, 0) for k in after
+                 if after[k] != before[ns].get(k, 0) and (show_all or DROPPY.search(k))}
+        for k in sorted(moved):
+            print(f"   [{ns or 'host'}] {k:<34} +{moved[k]}")
+    for k in sorted(gafter):
+        if gafter[k] != gbefore[k] and (show_all or DROPPY.search(k) or k.startswith(("rt_cache", "arp_cache"))):
+            print(f"   [kernel-wide] {k:<28} +{gafter[k] - gbefore[k]}")
+    return rc
+
+if __name__ == "__main__":
+    sys.exit(main())
+```
+
+Three implementation details are worth knowing because they reflect real kernel quirks:
+
+- `/proc/net/stat/arp_cache` exists only in the initial network namespace. Inside any other namespace the file is simply missing (the first version of this tool crashed on it). `ip -s ntable show name arp_cache` returns the same neighbour-table statistics from anywhere, so the tool parses that instead.
+- `/proc/net/stat/rt_cache` is visible inside every namespace but its counters are global per-CPU counters, summed here across CPUs.
+- The `DROPPY` filter is a heuristic. It deliberately includes `RateLimit` and `DestUnreach` because "the router counted the drop but never told the sender" is half of what you are looking for.
+
+## The lab
+
+The topology is a client `c`, a router `r` and a server `s` on two point-to-point veth links:
+
+```text
+   c (10.0.1.2) ---- c0 | ra (10.0.1.1)  r  (10.0.2.1) rb | s0 ---- (10.0.2.2) s
+                         ip_forward=1, default routes on c and s point at r
+```
+
+Four tiny helpers generate traffic. `udpsend.py` fires datagrams and never reads; `slowsink.py` binds a UDP socket with a 2 KiB receive buffer and never reads it; `fulllisten.py` listens with a backlog of 1 and never accepts; `connectmany.py` opens several non-blocking connects at once.
+
+```{.python filename="udpsend.py"}
+# udpsend.py HOST PORT COUNT [TTL]: fire COUNT small UDP datagrams, never read anything back
+import socket, sys
+host, port, n = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+if len(sys.argv) > 4:
+    s.setsockopt(socket.IPPROTO_IP, socket.IP_TTL, int(sys.argv[4]))
+for i in range(n):
+    try:
+        s.sendto(b"x" * 64, (host, port))
+    except OSError as e:
+        print(f"   sendto #{i}: {e.strerror}")
+        break
+```
+
+```{.python filename="slowsink.py"}
+# slowsink.py HOST PORT: bind a UDP socket with a tiny receive buffer and never read it
+import socket, sys, time
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 2048)
+s.bind((sys.argv[1], int(sys.argv[2])))
+time.sleep(30)
+```
+
+```{.python filename="fulllisten.py"}
+# fulllisten.py HOST PORT: listen with backlog 1 and never call accept()
+import socket, sys, time
+s = socket.socket()
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind((sys.argv[1], int(sys.argv[2])))
+s.listen(1)
+time.sleep(30)
+```
+
+```{.python filename="connectmany.py"}
+# connectmany.py HOST PORT N: open N non-blocking connects and wait 3 s
+import socket, sys, time
+socks = []
+for _ in range(int(sys.argv[3])):
+    c = socket.socket(); c.setblocking(False)
+    c.connect_ex((sys.argv[1], int(sys.argv[2]))); socks.append(c)
+time.sleep(3)
+```
+
+The driver script builds the namespaces and runs nine scenarios, each wrapped in `netdelta.py` with the namespaces that matter for it:
+
+```{.bash filename="lab.sh"}
+#!/bin/sh
+# Run as: unshare -urnm sh lab.sh   (user + net + mount namespaces, no sudo)
+H=$(pwd); D="python3 $H/netdelta.py"
+mount -t tmpfs tmpfs /run; mkdir -p /run/netns
+for ns in c r s; do ip netns add $ns; ip -n $ns link set lo up; done
+ip link add c0 type veth peer name ra; ip link set c0 netns c; ip link set ra netns r
+ip link add rb type veth peer name s0; ip link set rb netns r; ip link set s0 netns s
+ip -n c addr add 10.0.1.2/24 dev c0; ip -n r addr add 10.0.1.1/24 dev ra
+ip -n r addr add 10.0.2.1/24 dev rb; ip -n s addr add 10.0.2.2/24 dev s0
+for d in c:c0 r:ra r:rb s:s0; do ip -n ${d%:*} link set ${d#*:} up; done
+ip netns exec r sh -c 'echo 1 > /proc/sys/net/ipv4/ip_forward'
+ip -n c route add default via 10.0.1.1; ip -n s route add default via 10.0.2.1
+ping() { ip netns exec c python3 $H/udpsend.py "$@"; }
+sleep 1
+
+echo "== 1. UDP to a port nobody listens on (c -> s:9999)"
+$D --ns c --ns s -- ip netns exec c python3 $H/udpsend.py 10.0.2.2 9999 5
+
+echo "== 2. UDP to a socket that never reads (SO_RCVBUF 2048)"
+ip netns exec s python3 $H/slowsink.py 10.0.2.2 9000 & P=$!; sleep 0.5
+$D --ns s -- ip netns exec c python3 $H/udpsend.py 10.0.2.2 9000 200
+kill $P
+
+echo "== 3. TCP listener with backlog 1 that never accepts"
+ip netns exec s python3 $H/fulllisten.py 10.0.2.2 8000 & P=$!; sleep 0.5
+$D --ns s -- ip netns exec c python3 $H/connectmany.py 10.0.2.2 8000 8
+kill $P
+
+echo "== 4. TTL runs out on the router (IP TTL 1)"
+$D --ns r --ns c -- ip netns exec c python3 $H/udpsend.py 10.0.2.2 9999 3 1
+
+echo "== 5. router has no route for the destination"
+$D --ns r -- ip netns exec c python3 $H/udpsend.py 172.16.9.9 9999 3
+
+echo "   same three packets after a 6 s pause (route error tokens refilled):"
+sleep 6
+$D --ns r -- ip netns exec c python3 $H/udpsend.py 172.16.9.9 9999 3
+
+echo "== 6. forwarding switched off on the router"
+ip netns exec r sh -c 'echo 0 > /proc/sys/net/ipv4/conf/all/forwarding'
+$D --ns r -- ip netns exec c python3 $H/udpsend.py 10.0.2.2 9999 3
+ip netns exec r sh -c 'echo 1 > /proc/sys/net/ipv4/conf/all/forwarding'
+
+echo "== 7. strict rp_filter on r: a source r would not route back out of ra"
+ip netns exec r sh -c 'echo 1 > /proc/sys/net/ipv4/conf/all/rp_filter; echo 1 > /proc/sys/net/ipv4/conf/ra/rp_filter'
+ip -n c addr add 10.0.2.77/32 dev c0
+$D --ns r -- ip netns exec c sh -c "python3 -c \"
+import socket; s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.bind(('10.0.2.77',0))
+[s.sendto(b'x'*64,('10.0.2.2',9999)) for _ in range(4)]\""
+echo "   same packets with rp_filter=2 (loose) on ra:"
+ip netns exec r sh -c 'echo 2 > /proc/sys/net/ipv4/conf/all/rp_filter; echo 2 > /proc/sys/net/ipv4/conf/ra/rp_filter'
+$D --ns r --ns s -- ip netns exec c sh -c "python3 -c \"
+import socket; s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.bind(('10.0.2.77',0))
+[s.sendto(b'x'*64,('10.0.2.2',9999)) for _ in range(4)]\""
+ip -n c addr del 10.0.2.77/32 dev c0
+
+echo "== 8. the far end of a veth is down"
+ip -n s link set s0 down
+$D --ns r -- ip netns exec c sh -c "python3 $H/udpsend.py 10.0.2.2 9999 3; sleep 4"
+ip -n s link set s0 up
+
+echo "== 9. blackhole and prohibit routes on r"
+sleep 6
+ip -n r route add blackhole 10.0.2.0/25
+$D --ns r --ns c -- ip netns exec c python3 $H/udpsend.py 10.0.2.2 9999 3
+ip -n r route del blackhole 10.0.2.0/25
+ip -n r route add prohibit 10.0.2.0/25; sleep 6
+$D --ns r --ns c -- ip netns exec c python3 $H/udpsend.py 10.0.2.2 9999 3
+ip -n r route del prohibit 10.0.2.0/25
+```
+
+Run it from the directory holding the files:
+
+```bash
+unshare -urnm sh lab.sh
+```
+
+The output follows, scenario by scenario.
+
+### 1. Nobody is listening
+
+```text
+== 1. UDP to a port nobody listens on (c -> s:9999)
+   [c] IcmpInDestUnreachs                 +5
+   [s] IcmpOutDestUnreachs                +5
+   [s] UdpNoPorts                         +5
+```
+
+The simplest drop has a complete paper trail on both ends. The server counted `UdpNoPorts` (the IETF name for "datagram arrived for a port with no socket") and sent an ICMP port unreachable for each, `IcmpOutDestUnreachs +5`; the client counted the five ICMP errors arriving. In the kernel this is `__udp4_lib_rcv()` setting drop reason `SKB_DROP_REASON_NO_SOCKET`. If you see `UdpNoPorts` climbing on a DNS server, something is querying a port your daemon is not bound to, often after a restart or an address change.
+
+### 2. A socket that does not keep up
+
+```text
+== 2. UDP to a socket that never reads (SO_RCVBUF 2048)
+   [s] UdpInErrors                        +195
+   [s] UdpRcvbufErrors                    +195
+```
+
+This time the port is open but the application never reads, and its receive buffer was set to 2048 bytes (the kernel doubles `SO_RCVBUF` for bookkeeping and accounts the full skb truesize, so only a handful of small datagrams fit). Of 200 datagrams, 195 were dropped and counted twice: `UdpRcvbufErrors` (the specific reason) and `UdpInErrors` (the MIB total that includes it). No ICMP is sent, because from the network's point of view the datagram was delivered. Drop reason: `SKB_DROP_REASON_SOCKET_RCVBUFF`. On a real server this is the signature of a slow consumer or a receive buffer left at the default for a bursty protocol (syslog, DNS, telemetry).
+
+### 3. A full accept queue
+
+```text
+== 3. TCP listener with backlog 1 that never accepts
+   [s] TcpExtListenDrops                  +18
+   [s] TcpExtListenOverflows              +18
+```
+
+The listener has a backlog of 1 and never calls `accept()`, so after the first completed connection or two the accept queue is full and further handshakes are dropped. `TcpExtListenOverflows` counts "the accept queue was full"; `TcpExtListenDrops` counts all drops at the listen stage and is always at least as large. Eight connects produced 18 drops because TCP clients retransmit their SYN (and the server may retransmit SYN-ACKs) while the queue stays full. Every retransmission is another drop. In production, both counters rising together is the classic sign of an application that cannot accept fast enough, or a backlog capped by `net.core.somaxconn`.
+
+### 4. TTL runs out on the router
+
+```text
+== 4. TTL runs out on the router (IP TTL 1)
+   [r] IcmpOutTimeExcds                   +3
+   [r] IpInHdrErrors                      +3
+   [c] IcmpInTimeExcds                    +3
+```
+
+With IP TTL 1 the router must discard the packet instead of forwarding it. `ip_forward()` increments `IpInHdrErrors` (TTL expiry is classed as a header error by the MIB), sends ICMP time exceeded (`IcmpOutTimeExcds`), and frees the packet with reason `SKB_DROP_REASON_IP_INHDR`. This is exactly the mechanism traceroute uses. Seeing it unexpectedly in production usually means a routing loop: packets bounce until their TTL is gone, and every router in the loop counts `IpInHdrErrors`.
+
+### 5. No route on the router, and the two ICMP rate limiters
+
+```text
+== 5. router has no route for the destination
+   [r] IcmpOutDestUnreachs                +1
+   [r] IcmpOutRateLimitHost               +1
+   [r] IpExtInNoRoutes                    +3
+   [kernel-wide] rt_cache.in_no_route         +3
+   same three packets after a 6 s pause (route error tokens refilled):
+   [r] IcmpOutDestUnreachs                +2
+   [r] IcmpOutRateLimitHost               +1
+   [r] IpExtInNoRoutes                    +3
+   [kernel-wide] rt_cache.in_no_route         +3
+```
+
+The client's default route takes packets for 172.16.9.9 to `r`, which has no route for them. Three counters agree that three packets died: `IpExtInNoRoutes +3` in the router's namespace and the kernel-wide `rt_cache.in_no_route +3`. But only **one** ICMP net unreachable left the router, with one more counted as suppressed in `IcmpOutRateLimitHost`. The third packet produced no ICMP and no counter at all.
+
+Two independent limiters are at work:
+
+- `ip_error()` in `net/ipv4/route.c`, which handles every packet that hit an unreachable route, keeps a token bucket per source host. Its parameters are `net.ipv4.route.error_cost` (one second's worth of tokens per ICMP) and `net.ipv4.route.error_burst` (five seconds' worth). These two sysctls exist only in the initial network namespace, and a suppression here increments nothing.
+- The general ICMP limiter, `net.ipv4.icmp_ratelimit` (1000 ms by default, per namespace) applied to the message types in `net.ipv4.icmp_ratemask` (6168, which includes destination unreachable and time exceeded). Suppressions here are counted in `IcmpOutRateLimitHost` (and `IcmpOutRateLimitGlobal` for the global `icmp_msgs_per_sec` limit).
+
+The second burst, sent after a six-second pause that refilled the route-error bucket, sent two ICMP errors and rate-limited one, and all three packets are now accounted for. The lesson: a missing ICMP error is not evidence that a router did not drop your packet, and "ping works but my burst of probes gets only one unreachable back" is normal behaviour.
+
+### 6. Forwarding switched off
+
+```text
+== 6. forwarding switched off on the router
+   [r] IpInAddrErrors                     +3
+   [kernel-wide] rt_cache.in_no_route         +3
+```
+
+Turn off forwarding on `r` and packets for a non-local destination are dropped with `IpInAddrErrors` ("address errors": the packet was not for us and we do not forward). No ICMP is sent at all. In `ip_error()` the forwarding check comes first: with forwarding off, an `EHOSTUNREACH` result is counted as `IPSTATS_MIB_INADDRERRORS` with reason `SKB_DROP_REASON_IP_INADDRERRORS`, and the function returns without touching ICMP. The kernel-wide `in_no_route` moves too, because the input route lookup failed. On a Linux router that "suddenly stopped routing" after a configuration management run or a container runtime upgrade, `IpInAddrErrors` climbing is the quickest confirmation that `ip_forward` was reset.
+
+### 7. Reverse-path filtering, strict versus loose
+
+```text
+== 7. strict rp_filter on r: a source r would not route back out of ra
+   [r] TcpExtIPReversePathFilter          +4
+   [kernel-wide] rt_cache.in_martian_src      +4
+   same packets with rp_filter=2 (loose) on ra:
+   [s] IcmpOutDestUnreachs                +4
+   [s] UdpNoPorts                         +4
+```
+
+The client sends from 10.0.2.77, an address that `r` would route out of `rb`, not back out of `ra` where the packet arrived. With strict reverse-path filtering (`rp_filter=1`) the router asks "would I send a reply to this source out of the interface it came in on?", gets "no", and drops the packet. The counter is `TcpExtIPReversePathFilter` (`LINUX_MIB_IPRPFILTER`, set in `ip_input.c` when route validation returns `-EXDEV`), the drop reason is `SKB_DROP_REASON_IP_RPFILTER`, and the kernel-wide `in_martian_src` moves as well. No ICMP is sent.
+
+With loose mode (`rp_filter=2`) the question becomes "is this source reachable via *any* interface?", the answer is yes, and the packets are forwarded: the server's `UdpNoPorts +4` shows they arrived. Two operational notes. First, the effective value on an interface is the *maximum* of `net.ipv4.conf.all.rp_filter` and the interface's own value, which is why the lab sets both. Second, strict mode breaks legitimate asymmetric routing (multihomed hosts, ECMP with different return paths, policy routing), and the only symptom is this counter. If an asymmetric flow dies silently on a Linux box, read `TcpExtIPReversePathFilter` first.
+
+### 8. The next hop is gone
+
+```text
+== 8. the far end of a veth is down
+   [r] IcmpOutDestUnreachs                +3
+   [r] rb.tx_dropped                      +4
+   [kernel-wide] arp_cache.res_failed         +1
+```
+
+Here the far end of `rb` is administratively down and the router has no neighbour entry for 10.0.2.2. The forwarded packets wait in the neighbour entry's queue while ARP solicitations are attempted; the solicitations go nowhere (`rb.tx_dropped +4` on the device with a dead peer), resolution fails (`arp_cache.res_failed +1`, reason `SKB_DROP_REASON_NEIGH_FAILED` for the queued packets), and the router sends ICMP host unreachable back to the client, `IcmpOutDestUnreachs +3`.
+
+Notice what is *not* in the filtered output. A separate `--all` run of the same scenario showed `IpForwDatagrams +3`: the MIB counted all three packets as forwarded, because the counter is incremented when a packet is handed to the output path, before neighbour resolution. "Forwarded" in `IpForwDatagrams` means "routed", not "transmitted". The scenario also needed `sleep 4` inside the measured command, because ARP gives up only after `mcast_solicit` probes spaced `retrans_time` (one second by default) apart; a snapshot taken immediately after sending would miss the failure entirely.
+
+### 9. Blackhole and prohibit routes
+
+```text
+== 9. blackhole and prohibit routes on r
+   [kernel-wide] rt_cache.in_no_route         +3
+   [r] IcmpOutDestUnreachs                +2
+   [r] IcmpOutRateLimitHost               +1
+   [c] IcmpInDestUnreachs                 +2
+   [kernel-wide] rt_cache.in_no_route         +3
+```
+
+This is the scenario that justifies the kernel-wide columns in the tool. A `blackhole` route drops matching packets without an ICMP error, which is the point of it, but it also drops them without any per-namespace counter. The only trace is `rt_cache.in_no_route +3`, and that is a kernel-wide counter which on a real router moves for every unroutable packet from every source. In `ip_error()` the blackhole case is the `EINVAL` branch: `goto out`, free the packet with reason `NOT_SPECIFIED`, count nothing.
+
+A `prohibit` route is the polite version. It sends ICMP destination unreachable with code 13 (communication administratively prohibited), so the client saw `IcmpInDestUnreachs +2`, but again there is no SNMP drop counter for the packets themselves, only the ICMP that announced them, with one ICMP suppressed by the host rate limiter. An `unreachable` route behaves the same way with code 1 (host unreachable). If you use blackhole routes for DDoS mitigation or null-routing, count the drops somewhere else: an nftables counter on a matching rule, the drop-reason tracepoint, or flow export.
+
+## Reading the per-CPU backlog: softnet_stat
+
+The last kernel-wide source sits below IP. When a NIC driver receives packets it either processes them in NAPI context or, for RPS, loopback and veth traffic, queues them on a per-CPU input backlog. `/proc/net/softnet_stat` has one line per online CPU, all hexadecimal. In Linux 6.12 (`softnet_seq_show()` in `net/core/net-procfs.c`) the columns are: packets processed, packets dropped, time squeeze, five zero columns (formerly fastroute), a zero column (formerly cpu_collision), packets received via RPS, flow-limit count, current backlog length, the CPU index, and the input and process queue lengths separately. The column count changed over the years, so decode it from the source of the kernel you run rather than from a blog post.
+
+```{.python filename="softnet.py"}
+# softnet.py: decode /proc/net/softnet_stat (column layout from net/core/net-procfs.c, Linux 6.12)
+cols = {0: "processed", 1: "dropped", 2: "time_squeeze", 9: "received_rps",
+        10: "flow_limit", 11: "backlog", 12: "cpu"}
+print(f"{'cpu':>4} {'processed':>10} {'dropped':>8} {'squeeze':>8} {'rps':>5} {'flow_lim':>8} {'backlog':>8}")
+for row in open("/proc/net/softnet_stat"):
+    f = [int(x, 16) for x in row.split()]
+    print(f"{f[12]:>4} {f[0]:>10} {f[1]:>8} {f[2]:>8} {f[9]:>5} {f[10]:>8} {f[11]:>8}")
+print("netdev_max_backlog =", open("/proc/sys/net/core/netdev_max_backlog").read().strip(),
+      "| netdev_budget =", open("/proc/sys/net/core/netdev_budget").read().strip(),
+      "| netdev_budget_usecs =", open("/proc/sys/net/core/netdev_budget_usecs").read().strip())
+```
+
+```text
+ cpu  processed  dropped  squeeze   rps flow_lim  backlog
+   0    3967934        0       22     0        0        0
+   1    4202784        0       21     0        0        0
+   2    4085750        0       22     0        0        0
+   3    4096244        0       22     0        0        0
+   4   21389927        0     1429     0        0        0
+   5    4088564        0      157     0        0        0
+   6    4196121        0       34     0        0        0
+   7    4177096        0       22     0        0        0
+netdev_max_backlog = 1000 | netdev_budget = 300 | netdev_budget_usecs = 8000
+```
+
+How to read it:
+
+- **dropped** counts packets thrown away because the per-CPU backlog already held `net.core.netdev_max_backlog` packets (1000 here). Non-zero and growing means one CPU is receiving faster than it can process, typically because all flows hash to one receive queue. Fixes are RSS or RPS spreading, or a larger backlog as a stop-gap. This idle box shows zero everywhere.
+- **time_squeeze** counts how often the receive softirq ran out of budget (`net.core.netdev_budget` packets or `netdev_budget_usecs` microseconds, 300 and 8000 here) with work still pending. A few, as here, are normal. CPU 4 processed about five times more packets than any other and has by far the most squeezes (1429), which tells you the box's receive load lands mostly on one CPU. A squeeze is not a drop, but a steadily rising rate means packets wait longer in ring buffers, and if the NIC ring fills, the drops happen in hardware and show up only in `ethtool -S` as something like `rx_missed_errors` or `rx_fifo_errors`.
+- **received_rps** and **flow_limit** stay at zero unless RPS or the flow limiter (`net.core.flow_limit_cpu_bitmap`) are configured.
+
+## The map
+
+Putting the lab together:
+
+| Symptom | Counter that moves | Scope | Drop reason (v6.12) | ICMP to sender | First fix to consider |
+|---|---|---|---|---|---|
+| UDP to a closed port | `UdpNoPorts` | netns | `NO_SOCKET` | port unreachable | is the service bound to that address/port? |
+| UDP faster than the app reads | `UdpRcvbufErrors`, `UdpInErrors` | netns | `SOCKET_RCVBUFF` | none | bigger `SO_RCVBUF`, faster consumer |
+| Accept queue full | `TcpExtListenOverflows`, `TcpExtListenDrops` | netns | (TCP listen path) | none | backlog/`somaxconn`, accept loop |
+| TTL expired while forwarding | `IpInHdrErrors`, `IcmpOutTimeExcds` | netns | `IP_INHDR` | time exceeded | look for a routing loop |
+| No route on a router | `IpExtInNoRoutes`, `rt_cache.in_no_route` | netns + kernel | `IP_INNOROUTES` | net unreachable, rate limited | missing route or default |
+| Forwarding disabled | `IpInAddrErrors` | netns | `IP_INADDRERRORS` | none | `net.ipv4.ip_forward` / `conf.*.forwarding` |
+| Reverse-path check failed | `TcpExtIPReversePathFilter`, `rt_cache.in_martian_src` | netns + kernel | `IP_RPFILTER` | none | asymmetric path: use `rp_filter=2` or fix routing |
+| Neighbour resolution failed | `arp_cache.res_failed`, device `tx_dropped` | kernel + device | `NEIGH_FAILED` | host unreachable | next hop down, wrong subnet, VLAN mismatch |
+| Blackhole route | only `rt_cache.in_no_route` | kernel | `NOT_SPECIFIED` | none | intentional? count with a firewall rule |
+| Prohibit route | only ICMP out counters | netns | (ICMP sent) | admin prohibited | intentional? |
+| Per-CPU backlog full | `softnet_stat` dropped | kernel, per CPU | `CPU_BACKLOG` | none | RSS/RPS spread, `netdev_max_backlog` |
+
+The drop reasons listed are the ones set by the code paths quoted above in the v6.12 source. Others exist for paths the lab did not exercise: `NETFILTER_DROP` for firewall drops, `QDISC_DROP` for a full queueing discipline, `TCP_CSUM`/`UDP_CSUM` for checksum failures, `PKT_TOO_BIG`, `FULL_RING`, `XDP` and many TCP-specific reasons. `include/net/dropreason-core.h` is the authoritative list, and it grows with almost every release.
+
+## When counters are not enough: drop reasons
+
+The table shows the limit of counters: some drops count nothing, some count only kernel-wide, and none tell you *which* packet died. Since Linux 5.17 most `kfree_skb()` calls in the stack have become `kfree_skb_reason()`, and the `skb:kfree_skb` tracepoint carries the reason, the protocol and the code location. On a host where you have root, these are the usual ways to read it (not run here: tracepoints need root or `CAP_SYS_ADMIN`/`CAP_BPF`):
+
+```bash
+# not run here: count drops by reason for 10 seconds (bpftrace)
+sudo bpftrace -e 'tracepoint:skb:kfree_skb { @[args->reason] = count(); }
+                  interval:s:10 { exit(); }'
+
+# not run here: record drops with call stacks, then summarise (perf)
+sudo perf record -e skb:kfree_skb -a -g -- sleep 10
+sudo perf script | head
+
+# not run here: dropwatch prints drop locations live
+sudo dropwatch -l kas
+```
+
+`bpftrace` prints numeric reasons; map them through the enum in `dropreason-core.h` for your kernel. `perf script` prints symbolic names, because the tracepoint's own format string (`include/trace/events/skb.h`) decodes the reason with `__print_symbolic`. `pwru` (packet, where are you?) goes further and traces one packet through every kernel function with a filter expression, at the cost of an eBPF-capable host. Treat these as the second step: run `netdelta.py` (or plain `nstat`) first to learn *which class* of drop you have, then trace with a filter for that class rather than tracing every freed skb on a busy host. A note on volume: `kfree_skb` also fires for packets freed for normal reasons on some paths in older kernels, and `consume_skb` is the "not a drop" counterpart; filter on a non-`NOT_SPECIFIED` reason to keep the signal.
+
+## Production checklist
+
+None of this needs a lab. On a real host, the same investigation looks like this (not run here; these are standard iproute2 and procfs reads):
+
+```bash
+# not run here: baseline, reproduce, compare (per namespace)
+nstat -n                     # reset history so the next call shows deltas
+# ... reproduce the problem ...
+nstat | grep -Ei 'drop|err|overflow|noroute|noport|filter|ratelimit'
+
+ip -s -s link show dev eth0  # device rx/tx dropped, errors, missed, fifo
+ethtool -S eth0 | grep -Ei 'drop|miss|fifo|err'   # driver/NIC counters
+cat /proc/net/softnet_stat   # per-CPU backlog drops and squeezes
+ip -s ntable show name arp_cache   # res_failed, unresolved_discards, table_fulls
+sysctl net.ipv4.conf.all.rp_filter net.ipv4.ip_forward
+```
+
+In a container, run the same commands inside the container's network namespace (`nsenter -t <pid> -n`), and remember which counters are kernel-wide. For monitoring, the Prometheus node exporter's `netstat` and `softnet` collectors export exactly these counters; alert on rates of `UdpRcvbufErrors`, `TcpExtListenOverflows`, `TcpExtIPReversePathFilter` and softnet `dropped`, not on absolute values.
+
+## Gotchas
+
+1. **Kernel-wide counters lie in shared environments.** `softnet_stat`, `rt_cache` and the neighbour-table statistics include every namespace on the host. In a container, a moving `in_no_route` may be your neighbour's traffic.
+2. **Blackhole drops are invisible to SNMP.** The only per-packet evidence of a blackhole route doing its job is the kernel-wide `in_no_route` counter or the drop-reason tracepoint. Add a counting firewall rule if you need numbers.
+3. **Missing ICMP does not mean no drop.** `ip_error()` has its own uncounted per-source token bucket (`route.error_cost`/`error_burst`, initial namespace only), and `icmp_ratelimit` adds a second, counted one. Bursts of probes get one or two errors back.
+4. **`IpForwDatagrams` counts routed, not transmitted.** Packets that later die in neighbour resolution or a full qdisc are already counted as forwarded.
+5. **The counter name lies about the protocol.** `TcpExtIPReversePathFilter` is an IP counter stored in the `TcpExt` table. Search by meaning, not by prefix.
+6. **`rp_filter` is the maximum of `all` and the interface.** Setting `conf/eth0/rp_filter=0` does nothing while `conf/all/rp_filter=1`.
+7. **Snapshots need to wait for slow drops.** Neighbour resolution fails seconds after the packet was sent; TCP retransmits SYNs for over a minute. Measure across the whole failure, not just the send.
+8. **`/proc/net/stat/arp_cache` is missing outside the initial namespace.** Scripts that read it break inside containers; use `ip -s ntable`.
+9. **The `softnet_stat` layout changes between kernels.** Columns were added (backlog length, CPU index, queue lengths) and retired columns are kept as zeros. Decode with the source of your running kernel.
+
+## Exercises
+
+1. **Strict rp_filter on the server side.** Leave `rp_filter=1` on `r` and instead give the server a second address in a subnet routed via a different interface. Predict which counter moves on which namespace before you run `netdelta.py --ns r --ns s`.
+2. **Find the receive-buffer knee.** Rerun scenario 2 with `SO_RCVBUF` values of 2048, 8192, 65536 and 212992. Record how many of 200 datagrams survive each time and explain why the numbers are not proportional to the buffer size (hint: `skb->truesize`).
+3. **Make the router talk.** In scenario 5, send 10 packets one per 1.1 seconds instead of a burst. How many ICMP errors come back? Then set `net.ipv4.icmp_ratelimit=0` inside `r` and repeat the burst. Which limiter is left, and how can you tell?
+4. **Count a blackhole properly.** Pick a method that counts blackholed packets per prefix without root on the router (for example, a UDP receiver on the far side and a sender that numbers its datagrams), and compare its count with `rt_cache.in_no_route` while another process generates unrelated unroutable traffic.
+5. **Watch the accept queue.** During scenario 3, run `ip netns exec s ss -ltn` in another shell. Compare `Recv-Q` and `Send-Q` on the listening socket with the backlog of 1, and relate them to `TcpExtListenOverflows`.
+6. **Read drop reasons for real.** On a machine where you have root, run the `bpftrace` one-liner while repeating scenarios 1, 2, 7 and 9. Confirm the reasons in the map table, and note what `blackhole` reports.
+
+## Verification
+
+- Ran on this box, unprivileged, inside `unshare -urnm`: `lab.sh` with `netdelta.py`, `udpsend.py`, `slowsink.py`, `fulllisten.py` and `connectmany.py` (all nine scenarios), and `softnet.py` on the host. Outputs are pasted verbatim. Exact counts for scenarios 2 and 3 depend on timing and buffer accounting and vary slightly between runs.
+- The `IpForwDatagrams +3` observation in scenario 8 comes from a separate `netdelta.py --all` run of the same scenario during development.
+- Kernel code paths and drop-reason names were checked against the Linux v6.12 sources named in the version note.
+- Not run here: `perf`, `bpftrace`, `dropwatch`, `pwru`, `ethtool -S`, and the production checklist commands (no root, tools not installed).
+
+## Sources
+
+- Linux kernel source v6.12: `net/ipv4/route.c`, `net/ipv4/ip_forward.c`, `net/ipv4/ip_input.c`, `net/ipv4/udp.c`, `net/core/neighbour.c`, `net/core/net-procfs.c`, `include/net/dropreason-core.h`, `include/trace/events/skb.h`, `net/core/dev.c`. <https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/?h=v6.12>
+- Linux kernel documentation, IP sysctl (`rp_filter`, `icmp_ratelimit`, `icmp_ratemask`, `route/error_cost`, `route/error_burst`). <https://docs.kernel.org/networking/ip-sysctl.html>
+- Linux kernel documentation, Scaling in the Linux networking stack (RSS, RPS, RFS, flow limit). <https://docs.kernel.org/networking/scaling.html>
+- Linux kernel documentation, SNMP counters. <https://docs.kernel.org/networking/snmp_counter.html>
+- `nstat(8)`, `ip-link(8)`, `ip-ntable(8)` from iproute2. <https://man7.org/linux/man-pages/man8/nstat.8.html>
+- RFC 1213, Management Information Base for Network Management of TCP/IP-based internets: MIB-II (the `Ip*`, `Icmp*`, `Udp*` counters). <https://www.rfc-editor.org/rfc/rfc1213>
+- RFC 3704, Ingress Filtering for Multihomed Networks (strict and loose reverse-path forwarding). <https://www.rfc-editor.org/rfc/rfc3704>
+- bpftrace reference guide (tracepoint probes). <https://github.com/bpftrace/bpftrace>
