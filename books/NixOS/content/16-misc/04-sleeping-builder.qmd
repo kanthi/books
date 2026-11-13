@@ -1,0 +1,217 @@
+---
+title: "A Builder That Sleeps"
+---
+
+# A Builder That Sleeps
+
+**Goal:** Keep a spare NixOS box asleep, wake it from the desk when a build needs it, and let it suspend again after the SSH session is gone.
+
+The remote-builders chapter is the case where the builder stays up and `nix.buildMachines` copies results back. This chapter is the other case: a physical machine on the same LAN, used for untrusted nixpkgs checkouts, whose store is the one that fills up. The desk evaluates. The spare box builds. The desk's store does not receive the outputs.
+
+A VM on the lab host is a poor fit. Wake-on-LAN is a frame on the local Ethernet segment. The hypervisor does not deliver it into a guest the way a real NIC does. Use a second computer, or leave the VM running.
+
+## What each machine does
+
+```text
+desk (lab)                         build-01 (spare box, asleep)
+  nix eval locally
+  ssh-ng opens SSH  ---------------- magic packet, if :22 is closed
+        |                                      |
+        +-------- derivations ---------------> daemon builds
+        |                                      |
+        outputs stay on build-01               SSH idle 5 min
+                                               autosuspend -> S3
+```
+
+| Piece | Where it lives |
+|-------|----------------|
+| Wake-on-LAN in firmware and on the NIC | `build-01` |
+| `services.autosuspend`, watching the SSH port | `build-01` |
+| `wake-host` and an SSH `Match` | the desk |
+| `rbuild`, eval local, store remote | the desk, run from a nixpkgs checkout |
+
+Names for this lab: builder hostname `build-01`, address `192.168.122.40` on the lab LAN, SSH user `alice`, SSH port taken from `services.openssh.ports`. Replace the address. Read the MAC from the builder. Do not reuse a MAC from a write-up.
+
+## Wake-on-LAN that still works after a suspend
+
+In the builder's firmware, enable wake-on-LAN for the Ethernet port you will use. Wi-Fi almost never wakes a machine. After NixOS is installed, find the interface:
+
+```bash
+ip -br link
+```
+
+`build-01`'s link module, with the name you just read:
+
+```nix
+{ ... }:
+{
+  networking.hostName = "build-01";
+
+  networking.interfaces.enp1s0.wakeOnLan.enable = true;
+
+  services.openssh.enable = true;
+
+  users.users.alice.extraGroups = [ "wheel" ];
+
+  nix.settings.trusted-users = [ "root" "alice" ];
+}
+```
+
+`wakeOnLan.enable` asks the interface for magic-packet wake (`g`) and restores that flag on boot. `alice` is trusted because the remote store operations in this chapter are trusted-user operations. This box holds build outputs, not secrets. Do not reuse that trust decision on a machine that has home directories or keys you care about.
+
+Confirm before you rely on suspend:
+
+```bash
+ethtool enp1s0 | sed -n '/Wake-on/p'
+```
+
+`Wake-on: g` is the line you want. Then suspend once by hand (`systemctl suspend`) and wake it with the script below. A box that will not wake from a manual suspend will not wake from a build either.
+
+## Suspend when nobody is connected
+
+`autosuspend` is in NixOS 26.05. It runs checks on an interval. When every check has been idle for `idle_time` seconds, it runs `suspend_cmd`, which defaults to `systemctl suspend`.
+
+```nix
+{ config, lib, ... }:
+{
+  services.autosuspend = {
+    enable = true;
+    settings = {
+      interval = 30;
+      idle_time = 300;
+    };
+    checks.ActiveConnection.ports = lib.concatMapStringsSep "," toString config.services.openssh.ports;
+    checks.LocalUsers = {
+      class = "Users";
+      name = ".*";
+      terminal = ".*";
+      host = "localhost";
+    };
+  };
+
+  nix.gc = {
+    automatic = true;
+    dates = "weekly";
+    options = "--delete-older-than 14d";
+  };
+}
+```
+
+`checks.ActiveConnection` uses the check class of the same name. `ports` is filled from the SSH module, so a port change in one place is the port the idle check watches. An open connection to that port counts as activity. Five minutes after the last one closes, the machine suspends. The check runs every 30 seconds, so the real delay is a little over five minutes.
+
+`LocalUsers` is the console. The connection check does not see a person sitting at `build-01`. Without it, a local login would be suspended out from under you.
+
+Weekly GC is what keeps the "outputs stay here" decision from filling the disk. It does not delete paths that are still rooted.
+
+`services.autosuspend.checks` must contain at least one check. The module refuses to enable with an empty set.
+
+## The desk wakes the builder by opening SSH
+
+`wake-host` probes a TCP port. If the probe succeeds, the builder is already up. If it fails, the script sends one magic packet and probes once a second for a minute.
+
+On the desk, in the same flake:
+
+```nix
+{ pkgs, ... }:
+{
+  environment.systemPackages = [
+    (pkgs.writeShellApplication {
+      name = "wake-host";
+      runtimeInputs = with pkgs; [ netcat wakeonlan ];
+      text = ''
+        host=$1
+        port=$2
+        mac=$3
+        nc -z -w 1 "$host" "$port" && exit 0
+        wakeonlan "$mac"
+        for _ in {1..60}; do
+          nc -z -w 1 "$host" "$port" && exit 0
+          sleep 1
+        done
+        exit 1
+      '';
+    })
+  ];
+}
+```
+
+`netcat` here is OpenBSD netcat, which implements `nc -z`. The MAC is an argument so the script is not tied to one board.
+
+`~/.ssh/config` on the desk:
+
+```text
+Host build-01
+  HostName 192.168.122.40
+  User alice
+  Port 22
+
+Match originalhost build-01 exec "wake-host %h %p aa:bb:cc:dd:ee:01"
+```
+
+Put the builder's real MAC in that `exec` line. `originalhost` is the name you typed (`build-01`), before `HostName` rewrites it. SSH runs `wake-host` to decide the `Match`. The command's job is the side effect: the packet goes out whether or not later lines exist in the block. `%h` is the host SSH is about to dial and `%p` is the port. Check both before you depend on them:
+
+```bash
+ssh -G build-01 | awk '$1 == "hostname" || $1 == "port" { print }'
+wake-host 192.168.122.40 22 aa:bb:cc:dd:ee:01; echo $?
+```
+
+`0` means the port opened, either because the machine was already awake or because it woke. `1` means a minute passed with the port still closed: firmware, the NIC flag, the broadcast domain, or the MAC.
+
+If the desk and the builder are on the same subnet but `wakeonlan` still does nothing, the default broadcast is the wrong one. The script can take `wakeonlan -i 192.168.122.255`. That address is the lab subnet in Lab 0. Use the broadcast of the subnet the builder's NIC is on.
+
+## Build on the remote store
+
+From a nixpkgs checkout on the desk:
+
+```bash
+rbuild() {
+  nix build \
+    --option restrict-eval true \
+    --option allow-import-from-derivation false \
+    -I "$(pwd -P)" \
+    --eval-store auto \
+    --store ssh-ng://build-01 \
+    -f . "$1"
+}
+```
+
+```bash
+cd ~/src/nixpkgs
+rbuild hello
+rbuild nixosTests.openssh
+```
+
+| Flag | Effect |
+|------|--------|
+| `--eval-store auto` | Evaluate and instantiate on the desk |
+| `--store ssh-ng://build-01` | Realise on the builder's store. Opening that URL is what runs `wake-host` |
+| `-I "$(pwd -P)"` | The checkout is the only tree evaluation may read |
+| `restrict-eval` | Evaluation cannot wander into the rest of the desk or out to the network |
+| `allow-import-from-derivation false` | Evaluation cannot start a build in order to finish evaluating |
+| `-f .` | `default.nix` in the checkout, then the attribute you named |
+
+`restrict-eval` is the point of doing this on a spare box. A checkout you have not reviewed yet should not be able to read `~/.ssh` during eval. Fetches of source tarballs happen later, on the builder, as fixed-output derivations. That is the builder's job.
+
+The outputs are not copied back. `nix path-info` on the desk will not show them. On `build-01`:
+
+```bash
+nix path-info -Sh /nix/store/*-hello-* | head
+```
+
+That split is deliberate. A `nix.buildMachines` builder is how you want a result on the machine you are sitting at. `rbuild` is how you want a dirty nixpkgs attribute tested without paying for it in the desk store.
+
+## What this does not survive
+
+Closing the laptop lid, or anything else that drops the SSH session, cancels the remote build. The builder has no queue of its own. The next `rbuild` starts again, after another wake if the five minutes have already elapsed.
+
+Suspend also loses anything that lived only in RAM. A build that was cancelled is gone. Paths that were already written to the store remain, until GC.
+
+This is a desk hack for one spare computer. A fleet that must keep building while you sleep belongs on the remote-builders setup, with the machine left powered and the results pushed to a cache you signed.
+
+## The boring rule
+
+- WoL is for a physical NIC on the same L2 segment. Enable it in firmware and with `wakeOnLan.enable`.
+- Suspend on an idle SSH port. Stay awake for a local login.
+- Wake as a side effect of the SSH config, then build with `--store ssh-ng://build-01`.
+- Evaluate under `restrict-eval`. Leave the outputs on the builder. GC them there.
+- A dropped SSH session cancels the build.

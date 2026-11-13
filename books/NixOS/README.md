@@ -2,7 +2,7 @@
 
 Personal **journey notes** on Nix & NixOS as a **topic-oriented book** (parts and chapters), not a day calendar or certification track.
 
-**Baseline:** NixOS **26.05 “Yarara”** (as of mid-2026).
+**Baseline:** Nix **2.35** (upstream **2.35.6**; 26.05 packages **2.35.3**), NixOS **26.05 “Yarara”** (checked 13 November 2026). 26.11 “Zokor” is scheduled, not the pin.
 
 Parts are numbered uniquely (`01-concepts`, `02-nix-on-linux`, `03-nixos-host`, … `09-capstone`, `99-projects`). Fedora dual-stack learners start with Concepts → Nix on Linux.
 

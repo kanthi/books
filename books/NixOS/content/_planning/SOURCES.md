@@ -26,6 +26,10 @@ It is an **expert learning path** for Nix + NixOS (baseline 26.05), using those 
 | Capstone | devops-lab style | Synthesis day | Immutable multi-node | **A required; B stretch** |
 | Go parallel track | Same 90-day file | Same | N/A | **Out of this book**; see syllabus note on dual-track study |
 
+## Misc part (2026-11-13)
+
+`content/16-misc/` is original lab prose. The version chapter and the release-pipeline chapter were written from the NixOS 26.05 announcement, the Nix 2.35 manual, status.nixos.org, the 26.11 release schedule and draft notes, and the Foundation's September 2026 cache write-up. The minimal-ISO chapter uses this book's names (`lab`, `alice`, `~/nixos-config`) and a 1 GB ESP. The sleeping-builder chapter uses `build-01`, `alice`, and `192.168.122.40`. Do not put outside article titles, author names, or links back into these chapters.
+
 ## Archive
 
 `_archive-pre-scratch/` = pre-scratch multi-syllabus exploration — not the contract for chapters.
