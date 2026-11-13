@@ -1,0 +1,773 @@
+---
+title: "TURN Relays: Credentials, Permissions and Peer Policy"
+author:
+  - name: "K19G"
+  - name: "grok-bot"
+---
+
+# TURN Relays: Credentials, Permissions and Peer Policy
+
+The NAT traversal chapter ended with the cases hole punching cannot fix, where traffic has to go through a relay. TURN (Traversal Using Relays around NAT, RFC 8656) is the standard relay, and nearly every WebRTC deployment runs one. This chapter is about running one safely. A TURN server is, by design, a UDP proxy that sends traffic wherever its authenticated clients ask. Pointed at the public Internet, that is the service you meant to provide. Pointed at `127.0.0.1`, at the private network behind it, or at `169.254.169.254`, it is a way into places the Internet was never meant to reach.
+
+The lab builds a small TURN server and client from the standard library, checks the codec against the RFC 5769 test vectors, and then runs the same client against an open relay, a naively filtered relay and a hardened one. It ends with ephemeral credentials and with what an egress filter can and cannot see of TURN traffic.
+
+## Learning goals
+
+- Describe the TURN objects: allocation, relayed transport address, permission, Send and Data indications, channels.
+- Explain the STUN long-term credential mechanism and compute a MESSAGE-INTEGRITY by hand.
+- Show why an unrestricted TURN server reaches loopback, private and link-local services, the server's own addresses, and `0.0.0.0`.
+- Write a peer policy that blocks those destinations, and say why "allowed wins over denied" matters.
+- Issue short-lived TURN credentials from an application backend instead of a static shared password.
+- Decide what an egress firewall can enforce about TURN, and what it cannot see.
+
+## Version note
+
+The lab ran on the book's build box: Linux 6.12.94, iproute2 6.15.0, Python 3.13.5 (standard library only), as an unprivileged user inside `unshare -urn`, which gives the lab its own network namespace where it may add addresses to `lo`. No packages were installed and nothing left the box. The coturn configuration in the production section is written from coturn's example `turnserver.conf` and ChangeLog and is **not run here**.
+
+## What a TURN server does
+
+A client behind a NAT sends an **Allocate** request to the server, normally on UDP or TCP port 3478 (or TLS on 5349 or 443). After authentication the server reserves a **relayed transport address**, an IP and port on the server itself, for that client's 5-tuple. The **allocation** lives for a lifetime (600 s by default) and the client keeps it alive with **Refresh**.
+
+```text
+  client (behind NAT)        TURN server                       peer
+  10.1.1.5:50000 --NAT--> 203.0.113.9:3478
+                            relayed 203.0.113.9:49152 <-------> 198.51.100.7:40000
+     Send indication(peer=198.51.100.7:40000, data) -->  UDP from :49152 -->
+     <-- Data indication(peer=198.51.100.7:40000, data)  <-- UDP to :49152
+```
+
+Two things control which peers the relay talks to:
+
+- **Permissions.** The client must install a permission for a peer IP with **CreatePermission** (or implicitly with **ChannelBind**). Permissions are per IP address, the port is ignored, and they last 300 seconds unless refreshed. The server silently drops Send indications to peers without a permission, and silently drops packets arriving at the relayed address from peers without a permission. That gives the relay the same address-dependent filtering a NAT has (RFC 8656 sections 9 and 21.2).
+- **Peer policy.** RFC 8656 allows the server to refuse some peer addresses: "The server MAY impose restrictions on the IP address allowed in the XOR-PEER-ADDRESS attribute; if a value is not allowed, the server rejects the request with a 403 (Forbidden) error" (section 10.2, repeated for ChannelBind in 12.2). The RFC says MAY. Operators should read it as MUST.
+
+**Channels** (ChannelBind, then ChannelData) are an optimisation: a 4-byte header with a channel number in 0x4000 to 0x4FFF instead of a 36-byte or larger Send indication. They follow the same permission rules.
+
+### Authentication
+
+Every request that creates state, Allocate, Refresh, CreatePermission and ChannelBind, uses STUN's **long-term credential mechanism** (RFC 8489 section 9.2). The first request goes without credentials. The server answers **401 Unauthorized** with a REALM and a NONCE. The client repeats the request with USERNAME, REALM, NONCE and a **MESSAGE-INTEGRITY** attribute: an HMAC-SHA1 over the message, keyed with
+
+```text
+key = MD5(username ":" realm ":" SASLprep(password))
+```
+
+RFC 8489 also defines a SHA-256 variant (MESSAGE-INTEGRITY-SHA256, negotiated with PASSWORD-ALGORITHMS); MD5 remains the default that every server supports. A server answers **438 Stale Nonce** when its nonce has rotated, and **437 Allocation Mismatch** when the 5-tuple already has an allocation. Send and Data indications are *not* authenticated; they ride on the allocation that was.
+
+Authentication protects the operator from strangers. It does not protect anything from the authenticated users, and in a WebRTC service every visitor of the web page is an authenticated user, because the page hands them TURN credentials. That is why the peer policy is the real security boundary.
+
+## The lab
+
+Six files: a codec, the RFC 5769 check, a toy server, a client, the scenarios, and the namespace wrapper.
+
+`stun.py` encodes and decodes STUN messages, XOR-encoded addresses, MESSAGE-INTEGRITY and FINGERPRINT.
+
+```{.python filename="stun.py"}
+"""Minimal STUN/TURN message codec (RFC 8489, RFC 8656). Standard library only."""
+import hashlib, hmac, ipaddress, os, struct, zlib
+
+MAGIC = 0x2112A442
+# method | class bits; only what the lab needs
+BINDING, ALLOCATE, REFRESH, SEND, DATA, CREATE_PERMISSION = 0x001, 0x003, 0x004, 0x006, 0x007, 0x008
+REQUEST, INDICATION, SUCCESS, ERROR = 0x000, 0x010, 0x100, 0x110
+A = dict(USERNAME=0x0006, MESSAGE_INTEGRITY=0x0008, ERROR_CODE=0x0009, LIFETIME=0x000D,
+         XOR_PEER_ADDRESS=0x0012, DATA=0x0013, REALM=0x0014, NONCE=0x0015,
+         XOR_RELAYED_ADDRESS=0x0016, REQUESTED_TRANSPORT=0x0019, XOR_MAPPED_ADDRESS=0x0020,
+         SOFTWARE=0x8022, FINGERPRINT=0x8028)
+NAMES = {v: k for k, v in A.items()}
+
+def msg_type(method, cls):
+    # RFC 8489 section 5: class bits C1 C0 sit at bits 8 and 4 of the type field
+    return ((method & 0xF80) << 2) | ((method & 0x070) << 1) | (method & 0x00F) | cls
+
+def split_type(t):
+    cls = t & 0x110
+    method = (t & 0x000F) | ((t & 0x00E0) >> 1) | ((t & 0x3E00) >> 2)
+    return method, cls
+
+def pad(b, fill=b"\0"):
+    return b + fill * (-len(b) % 4)
+
+def xor_addr(ip, port, tid):
+    ip = ipaddress.ip_address(ip)
+    xport = port ^ (MAGIC >> 16)
+    if ip.version == 4:
+        return struct.pack("!BBHI", 0, 1, xport, int(ip) ^ MAGIC)
+    key = int.from_bytes(struct.pack("!I", MAGIC) + tid, "big")
+    return struct.pack("!BBH", 0, 2, xport) + (int(ip) ^ key).to_bytes(16, "big")
+
+def unxor_addr(v, tid):
+    fam, xport = v[1], struct.unpack("!H", v[2:4])[0]
+    port = xport ^ (MAGIC >> 16)
+    if fam == 1:
+        return str(ipaddress.IPv4Address(struct.unpack("!I", v[4:8])[0] ^ MAGIC)), port
+    key = int.from_bytes(struct.pack("!I", MAGIC) + tid, "big")
+    return str(ipaddress.IPv6Address(int.from_bytes(v[4:20], "big") ^ key)), port
+
+def long_term_key(username, realm, password):
+    # RFC 8489 section 9.2.2 (MD5 algorithm, the default and the one coturn uses)
+    return hashlib.md5(f"{username}:{realm}:{password}".encode()).digest()
+
+def encode(method, cls, attrs, tid=None, key=None, fingerprint=False, fill=b"\0"):
+    tid = tid or os.urandom(12)
+    body = b"".join(struct.pack("!HH", t, len(v)) + pad(v, fill) for t, v in attrs)
+    t = msg_type(method, cls)
+    if key is not None:
+        hdr = struct.pack("!HHI", t, len(body) + 24, MAGIC) + tid
+        mac = hmac.new(key, hdr + body, hashlib.sha1).digest()
+        body += struct.pack("!HH", A["MESSAGE_INTEGRITY"], 20) + mac
+    if fingerprint:
+        hdr = struct.pack("!HHI", t, len(body) + 8, MAGIC) + tid
+        crc = (zlib.crc32(hdr + body) ^ 0x5354554E) & 0xFFFFFFFF
+        body += struct.pack("!HHI", A["FINGERPRINT"], 4, crc)
+    return struct.pack("!HHI", t, len(body), MAGIC) + tid + body
+
+def decode(buf):
+    """Return dict or None. Keeps attribute offsets so integrity can be checked."""
+    if len(buf) < 20 or buf[0] & 0xC0:
+        return None
+    t, length, cookie = struct.unpack("!HHI", buf[:8])
+    if cookie != MAGIC or length + 20 != len(buf) or length % 4:
+        return None
+    method, cls = split_type(t)
+    m = dict(type=t, method=method, cls=cls, tid=buf[8:20], attrs={}, offsets={}, raw=buf)
+    off = 20
+    while off < len(buf):
+        at, alen = struct.unpack("!HH", buf[off:off + 4])
+        m["attrs"].setdefault(at, buf[off + 4:off + 4 + alen])
+        m["offsets"].setdefault(at, off)
+        off += 4 + alen + (-alen % 4)
+    return m
+
+def check_integrity(m, key):
+    off = m["offsets"].get(A["MESSAGE_INTEGRITY"])
+    if off is None:
+        return False
+    buf = m["raw"]
+    hdr = buf[:2] + struct.pack("!H", off - 20 + 24) + buf[4:20]
+    mac = hmac.new(key, hdr + buf[20:off], hashlib.sha1).digest()
+    return hmac.compare_digest(mac, buf[off + 4:off + 24])
+
+def check_fingerprint(m):
+    off = m["offsets"].get(A["FINGERPRINT"])
+    if off is None:
+        return False
+    crc = (zlib.crc32(m["raw"][:off]) ^ 0x5354554E) & 0xFFFFFFFF
+    return crc == struct.unpack("!I", m["raw"][off + 4:off + 8])[0]
+
+def error_code(m):
+    v = m["attrs"].get(A["ERROR_CODE"])
+    return None if v is None else v[2] * 100 + v[3]
+```
+
+`vectors.py` checks the codec against RFC 5769, the STUN test vectors: a short-term-credential request, an IPv4 response, and a long-term-credential request with a non-ASCII username and a password that needs SASLprep.
+
+```{.python filename="vectors.py"}
+"""Check stun.py against the RFC 5769 test vectors (sections 2.1, 2.2, 2.4)."""
+import stun
+
+def h(s):
+    return bytes.fromhex("".join(s.split()))
+
+REQ = h("""00 01 00 58 21 12 a4 42 b7 e7 a7 01 bc 34 d6 86 fa 87 df ae
+80 22 00 10 53 54 55 4e 20 74 65 73 74 20 63 6c 69 65 6e 74
+00 24 00 04 6e 00 01 ff 80 29 00 08 93 2f f9 b1 51 26 3b 36
+00 06 00 09 65 76 74 6a 3a 68 36 76 59 20 20 20
+00 08 00 14 9a ea a7 0c bf d8 cb 56 78 1e f2 b5 b2 d3 f2 49 c1 b5 71 a2
+80 28 00 04 e5 7a 3b cf""")
+RESP4 = h("""01 01 00 3c 21 12 a4 42 b7 e7 a7 01 bc 34 d6 86 fa 87 df ae
+80 22 00 0b 74 65 73 74 20 76 65 63 74 6f 72 20
+00 20 00 08 00 01 a1 47 e1 12 a6 43
+00 08 00 14 2b 91 f5 99 fd 9e 90 c3 8c 74 89 f9 2a f9 ba 53 f0 6b e7 d7
+80 28 00 04 c0 7d 4c 96""")
+LTREQ = h("""00 01 00 60 21 12 a4 42 78 ad 34 33 c6 ad 72 c0 29 da 41 2e
+00 06 00 12 e3 83 9e e3 83 88 e3 83 aa e3 83 83 e3 82 af e3 82 b9 00 00
+00 15 00 1c 66 2f 2f 34 39 39 6b 39 35 34 64 36 4f 4c 33 34 6f 4c 39 46 53 54 76 79 36 34 73 41
+00 14 00 0b 65 78 61 6d 70 6c 65 2e 6f 72 67 00
+00 08 00 14 f6 70 24 65 6d d6 4a 3e 02 b8 e0 71 2e 85 c9 a2 8c a8 96 66""")
+
+short = b"VOkJxbRl1RmTxUk/WvJxBt"   # short-term credential: the key is the password itself
+m = stun.decode(REQ)
+print("2.1 request  type=0x%04x method=%d class=0x%03x" % (m["type"], m["method"], m["cls"]),
+      "MI ok:", stun.check_integrity(m, short), "FP ok:", stun.check_fingerprint(m))
+m = stun.decode(RESP4)
+print("2.2 response mapped=%s:%d" % stun.unxor_addr(m["attrs"][stun.A["XOR_MAPPED_ADDRESS"]], m["tid"]),
+      "MI ok:", stun.check_integrity(m, short), "FP ok:", stun.check_fingerprint(m))
+m = stun.decode(LTREQ)
+user = m["attrs"][stun.A["USERNAME"]].decode()
+realm = m["attrs"][stun.A["REALM"]].decode()
+key = stun.long_term_key(user, realm, "TheMatrIX")   # password after SASLprep
+print("2.4 long-term user=%s realm=%s key=%s" % (user, realm, key.hex()),
+      "MI ok:", stun.check_integrity(m, key))
+print("    same check with the un-SASLprepped password:",
+      stun.check_integrity(m, stun.long_term_key(user, realm, "The\u00adM\u00aatr\u2168")))
+# Re-encode 2.2 from scratch and compare byte for byte
+again = stun.encode(stun.BINDING, stun.SUCCESS,
+                    [(stun.A["SOFTWARE"], b"test vector"),
+                     (stun.A["XOR_MAPPED_ADDRESS"], stun.xor_addr("192.0.2.1", 32853, RESP4[8:20]))],
+                    tid=RESP4[8:20], key=short, fingerprint=True, fill=b" ")
+print("2.2 re-encoded byte-identical (space padding as in the RFC):", again == RESP4)
+nul = stun.encode(stun.BINDING, stun.SUCCESS,
+                  [(stun.A["SOFTWARE"], b"test vector"),
+                   (stun.A["XOR_MAPPED_ADDRESS"], stun.xor_addr("192.0.2.1", 32853, RESP4[8:20]))],
+                  tid=RESP4[8:20], key=short, fingerprint=True)
+print("2.2 re-encoded with NUL padding: identical:", nul == RESP4,
+      "| MI tail", nul[-28:-24].hex(), "vs", RESP4[-28:-24].hex())
+```
+
+```text
+2.1 request  type=0x0001 method=1 class=0x000 MI ok: True FP ok: True
+2.2 response mapped=192.0.2.1:32853 MI ok: True FP ok: True
+2.4 long-term user=マトリックス realm=example.org key=e8ca7ad59d5eb0518e312911d2dab2a9 MI ok: True
+    same check with the un-SASLprepped password: False
+2.2 re-encoded byte-identical (space padding as in the RFC): True
+2.2 re-encoded with NUL padding: identical: False | MI tail 5d6b58be vs 2b91f599
+```
+
+All three integrity checks and both fingerprints pass. Two details in that output are worth knowing before you debug a real implementation:
+
+- The long-term check passes only with the password *after* SASLprep (`TheMatrIX`). The raw password contains a soft hyphen and a Roman numeral nine; SASLprep removes the first and maps the second to `IX`. An implementation that skips SASLprep fails for exactly these users.
+- Re-encoding the IPv4 response reproduces the RFC bytes only when the padding bytes are spaces, as in the RFC. With NUL padding the HMAC differs (`5d6b58be...` instead of `2b91f599...`). Padding may hold any value, but the HMAC covers it, so a middlebox or proxy that "normalises" padding breaks integrity.
+
+`turnd.py` is the server. It handles Allocate, Refresh, CreatePermission, Send and Data, with long-term credentials or TURN REST API credentials, and checks every CreatePermission against a `Policy`. `DEFAULT_DENY` lists the ranges a hardened server refuses; `canonical()` turns IPv4-mapped IPv6 addresses back into IPv4 before the check.
+
+```{.python filename="turnd.py"}
+"""A toy TURN server (RFC 8656 subset: UDP, Allocate/Refresh/CreatePermission/Send/Data).
+Enough to show what a relay does for a client, and what a peer policy must stop."""
+import base64, hashlib, hmac, ipaddress, os, select, socket, struct, threading, time
+import stun
+from stun import A
+
+# What coturn-style hardening denies. Note 0.0.0.0/8: on Linux, sending to 0.0.0.0 reaches the host itself.
+DEFAULT_DENY = ["0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8", "169.254.0.0/16",
+                "172.16.0.0/12", "192.168.0.0/16", "224.0.0.0/4", "240.0.0.0/4",
+                "::/128", "::1/128", "fc00::/7", "fe80::/10", "ff00::/8"]
+
+def canonical(ip):
+    ip = ipaddress.ip_address(ip)
+    if ip.version == 6 and ip.ipv4_mapped:      # ::ffff:127.0.0.1 is 127.0.0.1
+        return ip.ipv4_mapped
+    return ip
+
+class Policy:
+    def __init__(self, deny=(), allow=()):
+        self.deny = [ipaddress.ip_network(n) for n in deny]
+        self.allow = [ipaddress.ip_network(n) for n in allow]
+    def permits(self, ip):
+        ip = canonical(ip)
+        if any(ip in n for n in self.allow if n.version == ip.version):
+            return True                          # coturn: allowed-peer-ip wins over denied-peer-ip
+        return not any(ip in n for n in self.deny if n.version == ip.version)
+
+class TurnServer:
+    def __init__(self, listen, relay_ip, realm, users=None, rest_secret=None, policy=None,
+                 lifetime=600, perm_lifetime=300):
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sock.bind(listen)
+        self.addr = self.sock.getsockname()
+        self.relay_ip, self.realm = relay_ip, realm
+        self.users, self.rest_secret = users or {}, rest_secret
+        self.policy = policy or Policy()
+        self.lifetime, self.perm_lifetime = lifetime, perm_lifetime
+        self.allocs = {}          # client 5-tuple -> dict(relay sock, perms, expires, user)
+        self.by_relay = {}        # relay sock fileno -> client addr
+        self.nonce = base64.b64encode(os.urandom(12)).decode()
+        self.log, self.stats = [], dict(relayed_out=0, relayed_in=0, dropped_no_perm=0, forbidden=0)
+        self.stop = threading.Event()
+
+    def password_for(self, user):
+        if self.rest_secret is not None:
+            # TURN REST API (draft-uberti-behave-turn-rest, coturn use-auth-secret):
+            # username = "<expiry-unix-time>:<id>", password = base64(HMAC-SHA1(secret, username))
+            expiry = int(user.split(":", 1)[0]) if ":" in user else 0
+            if expiry < time.time():
+                return None
+            return base64.b64encode(hmac.new(self.rest_secret, user.encode(), hashlib.sha1).digest()).decode()
+        return self.users.get(user)
+
+    def reply(self, m, cls, attrs, peer, key=None):
+        self.sock.sendto(stun.encode(m["method"], cls, attrs, tid=m["tid"], key=key, fingerprint=True), peer)
+
+    def err(self, m, code, reason, peer, key=None, challenge=False):
+        attrs = [(A["ERROR_CODE"], struct.pack("!HBB", 0, code // 100, code % 100) + reason.encode())]
+        if challenge:
+            attrs += [(A["REALM"], self.realm.encode()), (A["NONCE"], self.nonce.encode())]
+        self.reply(m, stun.ERROR, attrs, peer, key)
+
+    def authenticate(self, m, peer):
+        a = m["attrs"]
+        if A["MESSAGE_INTEGRITY"] not in a or A["USERNAME"] not in a:
+            self.err(m, 401, "Unauthorized", peer, challenge=True)
+            return None
+        user = a[A["USERNAME"]].decode()
+        pw = self.password_for(user)
+        key = stun.long_term_key(user, self.realm, pw) if pw else None
+        if a.get(A["NONCE"], b"").decode() != self.nonce:
+            self.err(m, 438, "Stale Nonce", peer, challenge=True)
+            return None
+        if key is None or not stun.check_integrity(m, key):
+            self.err(m, 401, "Unauthorized", peer, challenge=True)
+            return None
+        return user, key
+
+    def handle_client(self, data, peer):
+        m = stun.decode(data)
+        if m is None:
+            return
+        if m["method"] == stun.SEND and m["cls"] == stun.INDICATION:
+            al = self.allocs.get(peer)
+            if not al:
+                return
+            ip, port = stun.unxor_addr(m["attrs"][A["XOR_PEER_ADDRESS"]], m["tid"])
+            if str(canonical(ip)) not in al["perms"]:
+                return                                   # no permission: silently discarded (RFC 8656 s11.2)
+            al["sock"].sendto(m["attrs"][A["DATA"]], (ip, port))
+            self.stats["relayed_out"] += 1
+            return
+        if m["cls"] != stun.REQUEST:
+            return
+        auth = self.authenticate(m, peer)
+        if auth is None:
+            return
+        user, key = auth
+        if m["method"] == stun.ALLOCATE:
+            if peer in self.allocs:
+                return self.err(m, 437, "Allocation Mismatch", peer, key)
+            rs = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            rs.bind((self.relay_ip, 0))
+            self.allocs[peer] = dict(sock=rs, perms={}, user=user)
+            self.by_relay[rs.fileno()] = peer
+            self.log.append(f"allocate user={user} client={peer[0]}:{peer[1]} relay={rs.getsockname()[0]}:{rs.getsockname()[1]}")
+            self.reply(m, stun.SUCCESS, [
+                (A["XOR_RELAYED_ADDRESS"], stun.xor_addr(*rs.getsockname(), m["tid"])),
+                (A["XOR_MAPPED_ADDRESS"], stun.xor_addr(*peer, m["tid"])),
+                (A["LIFETIME"], struct.pack("!I", self.lifetime))], peer, key)
+        elif m["method"] == stun.CREATE_PERMISSION:
+            al = self.allocs.get(peer)
+            if not al:
+                return self.err(m, 437, "Allocation Mismatch", peer, key)
+            ip, _ = stun.unxor_addr(m["attrs"][A["XOR_PEER_ADDRESS"]], m["tid"])
+            if not self.policy.permits(ip):
+                self.stats["forbidden"] += 1
+                self.log.append(f"403 user={user} peer={ip}")
+                return self.err(m, 403, "Forbidden", peer, key)
+            al["perms"][str(canonical(ip))] = time.time() + self.perm_lifetime
+            self.log.append(f"permit user={user} peer={ip}")
+            self.reply(m, stun.SUCCESS, [], peer, key)
+        elif m["method"] == stun.REFRESH:
+            al = self.allocs.pop(peer, None)
+            if al:
+                self.by_relay.pop(al["sock"].fileno(), None)
+                al["sock"].close()
+            self.reply(m, stun.SUCCESS, [(A["LIFETIME"], struct.pack("!I", 0))], peer, key)
+
+    def handle_relay(self, rs):
+        data, src = rs.recvfrom(65535)
+        client = self.by_relay.get(rs.fileno())
+        al = self.allocs.get(client)
+        if al is None or src[0] not in al["perms"]:
+            self.stats["dropped_no_perm"] += 1         # address-dependent filtering
+            return
+        self.stats["relayed_in"] += 1
+        tid = os.urandom(12)
+        self.sock.sendto(stun.encode(stun.DATA, stun.INDICATION, [
+            (A["XOR_PEER_ADDRESS"], stun.xor_addr(*src, tid)), (A["DATA"], data)], tid=tid), client)
+
+    def serve(self):
+        while not self.stop.is_set():
+            socks = [self.sock] + [a["sock"] for a in self.allocs.values()]
+            r, _, _ = select.select(socks, [], [], 0.05)
+            for s in r:
+                if s is self.sock:
+                    self.handle_client(*s.recvfrom(65535))
+                else:
+                    self.handle_relay(s)
+
+    def start(self):
+        threading.Thread(target=self.serve, daemon=True).start()
+        return self
+```
+
+`turnc.py` is the client. It answers the 401 challenge, allocates, installs permissions and exchanges data. It also records every datagram it sends, for the egress test at the end.
+
+```{.python filename="turnc.py"}
+"""A small TURN client: authenticate, allocate, permit, send, receive."""
+import os, socket, struct
+import stun
+from stun import A
+
+class TurnClient:
+    def __init__(self, server, user, password):
+        self.server, self.user, self.password = server, user, password
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sock.settimeout(1.0)
+        self.realm = self.nonce = self.key = None
+        self.sent = []                                   # every datagram we put on the wire
+
+    def _tx(self, b):
+        self.sent.append(b)
+        self.sock.sendto(b, self.server)
+
+    def request(self, method, attrs):
+        """Send a request; on a 401/438 challenge, retry once with long-term credentials."""
+        for _ in range(2):
+            tid = os.urandom(12)
+            extra = []
+            if self.realm:
+                extra = [(A["USERNAME"], self.user.encode()), (A["REALM"], self.realm.encode()),
+                         (A["NONCE"], self.nonce.encode())]
+            built = [(t, v(tid) if callable(v) else v) for t, v in attrs]
+            self._tx(stun.encode(method, stun.REQUEST, built + extra, tid=tid, key=self.key))
+            while True:
+                m = stun.decode(self.sock.recvfrom(65535)[0])
+                if m and m["tid"] == tid:
+                    break
+            code = stun.error_code(m)
+            if code in (401, 438) and self.key is None or code == 438:
+                self.realm = m["attrs"][A["REALM"]].decode()
+                self.nonce = m["attrs"][A["NONCE"]].decode()
+                self.key = stun.long_term_key(self.user, self.realm, self.password)
+                continue
+            return m
+        return m
+
+    def allocate(self):
+        m = self.request(stun.ALLOCATE, [(A["REQUESTED_TRANSPORT"], struct.pack("!B3x", 17))])
+        if stun.error_code(m):
+            return stun.error_code(m), None
+        relay = stun.unxor_addr(m["attrs"][A["XOR_RELAYED_ADDRESS"]], m["tid"])
+        mapped = stun.unxor_addr(m["attrs"][A["XOR_MAPPED_ADDRESS"]], m["tid"])
+        life = struct.unpack("!I", m["attrs"][A["LIFETIME"]])[0]
+        return 200, (relay, mapped, life, stun.check_integrity(m, self.key))
+
+    def permit(self, ip):
+        m = self.request(stun.CREATE_PERMISSION, [(A["XOR_PEER_ADDRESS"], lambda tid: stun.xor_addr(ip, 0, tid))])
+        return stun.error_code(m) or 200
+
+    def send(self, ip, port, data):
+        tid = os.urandom(12)
+        self._tx(stun.encode(stun.SEND, stun.INDICATION,
+                             [(A["XOR_PEER_ADDRESS"], stun.xor_addr(ip, port, tid)), (A["DATA"], data)], tid=tid))
+
+    def recv(self, timeout=0.5):
+        self.sock.settimeout(timeout)
+        try:
+            m = stun.decode(self.sock.recvfrom(65535)[0])
+        except socket.timeout:
+            return None
+        finally:
+            self.sock.settimeout(1.0)
+        if m and m["method"] == stun.DATA:
+            return stun.unxor_addr(m["attrs"][A["XOR_PEER_ADDRESS"]], m["tid"]), m["attrs"][A["DATA"]]
+        return None
+
+    def close(self):
+        self.request(stun.REFRESH, [(A["LIFETIME"], struct.pack("!I", 0))])
+```
+
+`lab.py` runs five small UDP services that stand for things a TURN server can typically reach: a public peer on `192.0.2.10`, an internal resolver on `10.0.0.5:53`, a link-local "metadata" responder on `169.254.169.254:80`, a loopback-only cache on `127.0.0.1:11211`, and an admin service bound to `0.0.0.0:8081`. The TURN server and its relay listen on `192.0.2.1`, standing in for the server's public address.
+
+```{.python filename="lab.py"}
+"""TURN relay lab: what an open relay reaches, and what a peer policy stops.
+Run inside `unshare -urn` after adding the lab addresses to lo (see lab.sh)."""
+import base64, hashlib, hmac, socket, struct, threading, time
+import stun
+from turnd import TurnServer, Policy, DEFAULT_DENY
+from turnc import TurnClient
+
+SERVER, RELAY_IP = ("192.0.2.1", 3478), "192.0.2.1"
+
+hits = {}
+def service(name, addr, answer):
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.bind(addr)
+    def loop():
+        while True:
+            data, src = s.recvfrom(2048)
+            hits[name] = hits.get(name, 0) + 1
+            s.sendto(answer, src)
+    threading.Thread(target=loop, daemon=True).start()
+
+service("public-peer", ("192.0.2.10", 9000), b"pong from a public peer")
+service("internal-dns", ("10.0.0.5", 53), b"internal resolver: corp.example zone answers")
+service("metadata", ("169.254.169.254", 80), b"metadata: role=prod-admin token=...")
+service("loopback-cache", ("127.0.0.1", 11211), b"STAT pid 4242 (loopback-only cache)")
+service("wildcard-admin", ("0.0.0.0", 8081), b"admin: reload ok (bound to 0.0.0.0)")
+
+TARGETS = [("192.0.2.10", 9000), ("10.0.0.5", 53), ("169.254.169.254", 80), ("127.0.0.1", 11211),
+           ("0.0.0.0", 8081), ("192.0.2.1", 8081)]
+
+def probe(client, ip, port):
+    before = sum(hits.values())
+    code = client.permit(ip)
+    if code != 200:
+        return f"CreatePermission -> {code}"
+    client.send(ip, port, b"hello")
+    got = client.recv()
+    time.sleep(0.05)
+    delivered = sum(hits.values()) - before
+    if got:
+        return f"relayed, reply from {got[0][0]}:{got[0][1]}: {got[1].decode()!r}"
+    return f"permitted; delivered to service: {delivered}; no reply reached the client"
+
+def run_policy(title, policy):
+    print(f"\n== {title}")
+    srv = TurnServer(("192.0.2.1", 0), RELAY_IP, "lab.example", users={"alice": "s3cret"}, policy=policy).start()
+    c = TurnClient(srv.addr, "alice", "s3cret")
+    code, info = c.allocate()
+    for ip, port in TARGETS:
+        print(f"  {ip + ':' + str(port):22} {probe(c, ip, port)}")
+    c.close()
+    srv.stop.set()
+    print("  server stats:", srv.stats)
+
+print("== 1. Authentication (long-term credentials, RFC 8489 s9.2)")
+srv = TurnServer(SERVER, RELAY_IP, "lab.example", users={"alice": "s3cret"}).start()
+bad = TurnClient(SERVER, "alice", "guess")
+print("  wrong password  -> Allocate", bad.allocate()[0])
+good = TurnClient(SERVER, "alice", "s3cret")
+code, (relay, mapped, life, mi) = good.allocate()
+print(f"  right password  -> Allocate {code}: relayed={relay[0]}:{relay[1]} mapped={mapped[0]}:{mapped[1]} lifetime={life}s response-MI-valid={mi}")
+print("  second Allocate on the same 5-tuple ->", good.allocate()[0])
+
+print("\n== 2. Permissions are address-dependent filters (RFC 8656 s9)")
+p = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+p.bind(("192.0.2.10", 0))
+p.sendto(b"unsolicited", relay)
+time.sleep(0.1)
+print("  peer -> relay before any permission: client got", good.recv(0.3), "| dropped_no_perm =", srv.stats["dropped_no_perm"])
+print("  CreatePermission 192.0.2.10 ->", good.permit("192.0.2.10"))
+p.sendto(b"now allowed", relay)
+got = good.recv()
+print(f"  peer -> relay after permission: client got Data indication from {got[0][0]}:{got[0][1]} {got[1]!r}")
+good.close()
+srv.stop.set()
+time.sleep(0.1)
+
+run_policy("3. Open relay: no peer policy (what an unconfigured toy or a misconfigured server does)", Policy())
+run_policy("4. Naive policy: deny 127/8, 10/8, 169.254/16 only",
+           Policy(deny=["127.0.0.0/8", "10.0.0.0/8", "169.254.0.0/16"]))
+run_policy("5. Hardened policy: DEFAULT_DENY plus the relay's own address",
+           Policy(deny=DEFAULT_DENY + ["192.0.2.1/32"]))
+
+print("\n== 6. Ephemeral credentials (TURN REST API / coturn use-auth-secret)")
+secret = b"shared-with-the-app-backend"
+srv = TurnServer(("192.0.2.1", 0), RELAY_IP, "lab.example", rest_secret=secret).start()
+def creds(expiry):
+    user = f"{expiry}:alice"
+    return user, base64.b64encode(hmac.new(secret, user.encode(), hashlib.sha1).digest()).decode()
+now = int(time.time())
+for label, exp in (("valid for 1h ", now + 3600), ("expired 60s ago", now - 60)):
+    user, pw = creds(exp)
+    print(f"  {label}: username={user.split(':')[0][:4]}...:alice password={pw[:8]}... -> Allocate",
+          TurnClient(srv.addr, user, pw).allocate()[0])
+user, pw = creds(now + 3600)
+print("  forged expiry (same password, username edited to +1 day) -> Allocate",
+      TurnClient(srv.addr, f"{now + 86400}:alice", pw).allocate()[0])
+srv.stop.set()
+
+print("\n== 7. What an egress filter can see in the client's datagrams")
+def classify(b):
+    if len(b) >= 20 and b[0] & 0xC0 == 0 and struct.unpack("!I", b[4:8])[0] == stun.MAGIC:
+        method, cls = stun.split_type(struct.unpack("!H", b[:2])[0])
+        names = {1: "Binding", 3: "Allocate", 4: "Refresh", 6: "Send", 7: "Data", 8: "CreatePermission", 9: "ChannelBind"}
+        return f"STUN/TURN {names.get(method, method)}"
+    if len(b) >= 4 and 0x4000 <= struct.unpack("!H", b[:2])[0] <= 0x4FFF:
+        return "TURN ChannelData"
+    return "other"
+counts = {}
+for b in good.sent + bad.sent:
+    k = classify(b)
+    counts[k] = counts.get(k, 0) + 1
+for k, v in sorted(counts.items()):
+    print(f"  {v:3d}  {k}")
+print("  ChannelData sample 0x4001 ->", classify(struct.pack("!HH", 0x4001, 5) + b"hello"))
+print("  TLS record sample         ->", classify(bytes.fromhex("160301020001")))
+```
+
+`lab.sh` creates the namespace, adds the four addresses to `lo`, and runs both scripts.
+
+```{.bash filename="lab.sh"}
+#!/bin/sh
+# Rootless: a private network namespace where we are "root" only inside it.
+exec unshare -urn sh -c '
+  ip link set lo up
+  for a in 192.0.2.1 192.0.2.10 10.0.0.5 169.254.169.254; do ip addr add $a/32 dev lo; done
+  python3 vectors.py
+  python3 lab.py
+'
+```
+
+The `lab.py` part of the output (the RFC 5769 part is shown above):
+
+```text
+== 1. Authentication (long-term credentials, RFC 8489 s9.2)
+  wrong password  -> Allocate 401
+  right password  -> Allocate 200: relayed=192.0.2.1:57922 mapped=192.0.2.1:60164 lifetime=600s response-MI-valid=True
+  second Allocate on the same 5-tuple -> 437
+
+== 2. Permissions are address-dependent filters (RFC 8656 s9)
+  peer -> relay before any permission: client got None | dropped_no_perm = 1
+  CreatePermission 192.0.2.10 -> 200
+  peer -> relay after permission: client got Data indication from 192.0.2.10:60133 b'now allowed'
+
+== 3. Open relay: no peer policy (what an unconfigured toy or a misconfigured server does)
+  192.0.2.10:9000        relayed, reply from 192.0.2.10:9000: 'pong from a public peer'
+  10.0.0.5:53            relayed, reply from 10.0.0.5:53: 'internal resolver: corp.example zone answers'
+  169.254.169.254:80     relayed, reply from 169.254.169.254:80: 'metadata: role=prod-admin token=...'
+  127.0.0.1:11211        relayed, reply from 127.0.0.1:11211: 'STAT pid 4242 (loopback-only cache)'
+  0.0.0.0:8081           permitted; delivered to service: 1; no reply reached the client
+  192.0.2.1:8081         relayed, reply from 192.0.2.1:8081: 'admin: reload ok (bound to 0.0.0.0)'
+  server stats: {'relayed_out': 6, 'relayed_in': 5, 'dropped_no_perm': 1, 'forbidden': 0}
+
+== 4. Naive policy: deny 127/8, 10/8, 169.254/16 only
+  192.0.2.10:9000        relayed, reply from 192.0.2.10:9000: 'pong from a public peer'
+  10.0.0.5:53            CreatePermission -> 403
+  169.254.169.254:80     CreatePermission -> 403
+  127.0.0.1:11211        CreatePermission -> 403
+  0.0.0.0:8081           permitted; delivered to service: 1; no reply reached the client
+  192.0.2.1:8081         relayed, reply from 192.0.2.1:8081: 'admin: reload ok (bound to 0.0.0.0)'
+  server stats: {'relayed_out': 3, 'relayed_in': 2, 'dropped_no_perm': 1, 'forbidden': 3}
+
+== 5. Hardened policy: DEFAULT_DENY plus the relay's own address
+  192.0.2.10:9000        relayed, reply from 192.0.2.10:9000: 'pong from a public peer'
+  10.0.0.5:53            CreatePermission -> 403
+  169.254.169.254:80     CreatePermission -> 403
+  127.0.0.1:11211        CreatePermission -> 403
+  0.0.0.0:8081           CreatePermission -> 403
+  192.0.2.1:8081         CreatePermission -> 403
+  server stats: {'relayed_out': 1, 'relayed_in': 1, 'dropped_no_perm': 0, 'forbidden': 5}
+
+== 6. Ephemeral credentials (TURN REST API / coturn use-auth-secret)
+  valid for 1h : username=1794...:alice password=XqIoLjEm... -> Allocate 200
+  expired 60s ago: username=1794...:alice password=fhTvPYXK... -> Allocate 401
+  forged expiry (same password, username edited to +1 day) -> Allocate 401
+
+== 7. What an egress filter can see in the client's datagrams
+    5  STUN/TURN Allocate
+    1  STUN/TURN CreatePermission
+    1  STUN/TURN Refresh
+  ChannelData sample 0x4001 -> TURN ChannelData
+  TLS record sample         -> other
+```
+
+## Reading the results
+
+**1. Authentication.** The wrong password gets 401 twice (the challenge, then the failed retry), and the client gives up. The right password gets an allocation with a relayed address on `192.0.2.1`, a mapped address (what the server saw as the client's source) and a 600 s lifetime, and the client verifies the MESSAGE-INTEGRITY on the response. A second Allocate from the same 5-tuple gets 437, as RFC 8656 requires.
+
+**2. Permissions.** A packet from the peer to the relayed address before any permission exists is dropped (`dropped_no_perm = 1`); the client receives nothing. After CreatePermission for `192.0.2.10`, the same peer's packet arrives as a Data indication. This is the relay's NAT-like filter. It protects the *client* from unsolicited traffic. It does nothing for the networks behind the *server*, because the client chooses which permissions to install.
+
+**3. Open relay.** With no peer policy, every target answers. The client, which in a real deployment could be any visitor to a web page, talks to the internal resolver, the link-local responder, the loopback-only cache, and the wildcard-bound admin service through the server's own public address `192.0.2.1`. These are services that are not reachable from the Internet but are reachable from the TURN server. The `0.0.0.0` line needs a closer look: the request *was* delivered (`delivered to service: 1`), but no reply reached the client. Linux routes a packet sent to `0.0.0.0` to the local host, so the admin service received it. Its reply came from `192.0.2.1`, which does not match the permission for `0.0.0.0`, so the relay dropped it (the second `dropped_no_perm`). For an attacker, one-way delivery is often enough: a UDP "reload" or "flush" command does not need a reply.
+
+The `169.254.169.254` responder here is a UDP stand-in. Real cloud metadata services speak HTTP over TCP, which a UDP allocation cannot carry. TURN TCP allocations (RFC 6062) can, which is one reason to disable TCP relaying unless you need it.
+
+**4. Naive policy.** Denying `127.0.0.0/8`, `10.0.0.0/8` and `169.254.0.0/16` returns 403 for the three obvious targets, and the server counts `forbidden: 3`. Two paths remain: `0.0.0.0` still delivers one-way to the host, and the server's own public address still reaches the wildcard-bound admin service with replies. Neither is in a "private" range, so a list built from RFC 1918 alone misses both. This is the class of bug behind coturn's CVE-2020-26262, fixed in 4.5.2: the loopback check could be bypassed with `0.0.0.0/8` and the IPv6 `::1` and `::` forms.
+
+**5. Hardened policy.** `DEFAULT_DENY` plus the relay's own `/32` refuses all five internal targets and still relays to the public peer. That is the whole goal: the relay serves the Internet and nothing else.
+
+**6. Ephemeral credentials.** With a shared secret between the application backend and the TURN server, the backend issues `username = "<expiry>:<id>"` and `password = base64(HMAC-SHA1(secret, username))`. The server recomputes the password from the username, so it needs no user database. A credential valid for an hour works; one that expired a minute ago gets 401; and editing the expiry in the username to extend it also gets 401, because the password no longer matches. This is the scheme coturn calls `use-auth-secret` (from the TURN REST API draft), and it means a leaked credential is useful for hours, not forever.
+
+**7. Egress view.** Every datagram the clients sent is recognisable: STUN and TURN messages start with two zero bits and carry the magic cookie `0x2112A442` at bytes 4 to 7, and ChannelData starts with a channel number between `0x4000` and `0x4FFF`. An egress filter or IDS that sees UDP/3478 can therefore identify, count and block TURN reliably. A TLS record (the last line) shows nothing: TURN over TLS on port 443 looks like any other TLS session unless you intercept TLS or rely on the server name.
+
+## Running a relay in production (not run here)
+
+Not run here: written from coturn's `examples/etc/turnserver.conf` and ChangeLog. Option names are coturn's; other servers (for example eturnal or Pion-based relays) have equivalents.
+
+```text
+# /etc/turnserver.conf (not run here)
+listening-port=3478
+tls-listening-port=5349
+realm=turn.example.net
+fingerprint
+
+# Credentials: short-lived, issued by the application backend
+use-auth-secret
+static-auth-secret=<long random secret shared with the backend>
+
+# Peer policy: the relay may talk to the Internet and nothing else.
+# Ranges are "first-last". Add every private range of the VPC/LAN the server sits in,
+# and the server's own public and private addresses.
+denied-peer-ip=0.0.0.0-0.255.255.255
+denied-peer-ip=10.0.0.0-10.255.255.255
+denied-peer-ip=100.64.0.0-100.127.255.255
+denied-peer-ip=127.0.0.0-127.255.255.255
+denied-peer-ip=169.254.0.0-169.254.255.255
+denied-peer-ip=172.16.0.0-172.31.255.255
+denied-peer-ip=192.0.0.0-192.0.0.255
+denied-peer-ip=192.168.0.0-192.168.255.255
+denied-peer-ip=198.18.0.0-198.19.255.255
+denied-peer-ip=224.0.0.0-255.255.255.255
+denied-peer-ip=::1
+denied-peer-ip=fc00::-fdff:ffff:ffff:ffff:ffff:ffff:ffff:ffff
+denied-peer-ip=fe80::-febf:ffff:ffff:ffff:ffff:ffff:ffff:ffff
+denied-peer-ip=203.0.113.9
+no-multicast-peers
+# allow-loopback-peers is left unset: loopback peers stay denied
+
+# Abuse limits (RFC 8656 section 21.3.1)
+user-quota=12
+total-quota=1200
+max-bps=3000000
+
+# Only if clients never need TCP relaying (RFC 6062)
+no-tcp-relay
+
+# Keep enough to trace abuse (RFC 8656 section 21.3.2)
+log-file=/var/log/turnserver/turn.log
+simple-log
+```
+
+Points that matter more than any single line:
+
+- **Allowed wins.** In coturn, an address that matches both `allowed-peer-ip` and `denied-peer-ip` is allowed. That is useful for one exception inside a denied range, and dangerous if someone adds a broad allow "to fix a call" later. Review allow lines as carefully as firewall rules.
+- **Upgrade.** coturn 4.13.1 started denying link-local, ULA and site-local peers by default, auto-denies its own database backend endpoints, and canonicalises IPv4-in-IPv6 encodings before peer checks. Older servers need those ranges listed explicitly, and anything before 4.5.2 has the CVE-2020-26262 loopback bypass.
+- **Put the relay where a mistake is cheap.** A TURN server in its own network segment, whose host firewall drops traffic from the relay port range to anything internal, survives a policy typo. A TURN server on the same subnet as the database does not.
+- **Credentials belong to sessions.** Issue them per page load or per call with a short expiry, and never ship a static TURN password in a client application.
+
+## The egress side: TURN relays you do not run
+
+The same property that makes TURN useful, "relay anything to anyone the client names", makes third-party relays attractive for hiding traffic. On 16 June 2026, Symantec and Carbon Black published an investigation of a DragonForce ransomware intrusion (observed from December 2025) in which a Go backdoor they call Backdoor.Turn obtained an *anonymous* Microsoft Teams visitor token, used a legitimate Microsoft TURN relay during connection setup, and then ran a QUIC session to the attackers' server. Defenders saw only outbound connections to Teams infrastructure. The technique builds on Praetorian's "Ghost Calls" research from August 2025. Note the anonymous token: when anyone can get relay credentials, as with any public meeting service, the relay's authentication says nothing about who is behind the traffic. You cannot block a relay your users need for calls, but you can narrow who uses it:
+
+- Decide which hosts should make WebRTC media connections at all. Servers, build agents and domain controllers usually should not. Block UDP/3478 and TURN/TLS endpoints from them.
+- For desktops, allow the TURN endpoints of the conferencing services you use, as published by the vendor, rather than "UDP anywhere".
+- Alert on long-lived, high-volume relayed sessions from hosts with no user logged in, and on STUN/TURN to providers you do not use. The magic cookie makes UDP TURN easy to fingerprint; TURN over TLS on 443 needs flow metadata (duration, volume, destination) instead.
+
+## Gotchas
+
+1. **Authentication is not authorisation.** Every web visitor is an authenticated TURN user. The peer policy, not the password, is what keeps them out of your network.
+2. **`0.0.0.0` means "this host" on Linux.** A deny list without `0.0.0.0/8` lets a client reach host services one-way, as scenario 4 showed.
+3. **The server's own addresses are not private.** Services bound to a wildcard answer on the public IP too. Deny the relay's own addresses explicitly.
+4. **IPv4-mapped IPv6.** On a dual-stack relay, `::ffff:127.0.0.1` is loopback. Canonicalise before matching, as `canonical()` does.
+5. **Replies are filtered, requests are not.** A dropped reply does not mean nothing happened. Count one-way delivery as a successful attack in your tests.
+6. **SASLprep and padding.** Interoperability bugs in long-term auth usually come from a missing SASLprep step or a component rewriting padding bytes, both visible in the RFC 5769 vectors.
+7. **TCP relaying widens the target list.** RFC 6062 lets clients relay TCP, including HTTP to metadata services. Disable it unless your clients need it.
+8. **"Allowed" overrides "denied" in coturn.** One broad allow line undoes the deny list.
+9. **Unauthenticated indications.** Send and Data indications carry no integrity; they rely on the 5-tuple. That is by design; do not expose the relay port range to spoofing from networks you control without source filtering.
+
+## Exercises
+
+1. Add `ChannelBind` and ChannelData to `turnd.py` and `turnc.py` (RFC 8656 section 12). Check that ChannelBind to a denied peer gets 403, and measure the per-packet overhead against Send indications.
+2. Give the relay an IPv6 relayed address and test `::1`, `::ffff:127.0.0.1` and a ULA address against `DEFAULT_DENY`. Then remove the `canonical()` call and see which one slips through.
+3. Add a per-user allocation quota and a per-allocation byte budget to `turnd.py`, and show the server rejecting the thirteenth allocation with 486 (Allocation Quota Reached).
+4. Add MESSAGE-INTEGRITY-SHA256 (RFC 8489) to `stun.py` and negotiate it with PASSWORD-ALGORITHMS. What changes in the 401 response?
+5. Write a flow-log query (or a short Python filter over `ss -uni` snapshots on a test host) that lists UDP flows to port 3478 lasting more than ten minutes. Run it on a machine with a video call open.
+6. Write a test that a deployment pipeline could run against a staging TURN server: allocate with test credentials and assert 403 for every address in your deny list, including the server's own addresses and `0.0.0.0`.
+
+## Verification
+
+- Ran: `./lab.sh` (which runs `vectors.py` and `lab.py`) on Linux 6.12.94 with Python 3.13.5, unprivileged, inside `unshare -urn`. The listings are the files that ran and the outputs are pasted unchanged; the expiry digits and password prefixes in scenario 6 change with the clock on every run.
+- The codec reproduces the RFC 5769 test vectors for sections 2.1, 2.2 and 2.4.
+- Not run here: coturn or any other production TURN server, TURN over TCP or TLS, IPv6 relaying, real cloud metadata endpoints, and anything on the Internet. The coturn configuration and version history come from coturn's example configuration and ChangeLog.
+
+## Sources
+
+- RFC 8656, *Traversal Using Relays around NAT (TURN)*: <https://www.rfc-editor.org/rfc/rfc8656>
+- RFC 8489, *Session Traversal Utilities for NAT (STUN)*: <https://www.rfc-editor.org/rfc/rfc8489>
+- RFC 5769, *Test Vectors for STUN*: <https://www.rfc-editor.org/rfc/rfc5769>
+- RFC 6062, *TURN Extensions for TCP Allocations*: <https://www.rfc-editor.org/rfc/rfc6062>
+- RFC 4787, *NAT Behavioral Requirements for Unicast UDP*: <https://www.rfc-editor.org/rfc/rfc4787>
+- RFC 6890, *Special-Purpose IP Address Registries*: <https://www.rfc-editor.org/rfc/rfc6890>
+- draft-uberti-behave-turn-rest, *A REST API for Access to TURN Services*: <https://datatracker.ietf.org/doc/html/draft-uberti-behave-turn-rest-00>
+- coturn example configuration: <https://github.com/coturn/coturn/blob/master/examples/etc/turnserver.conf>
+- coturn ChangeLog: <https://github.com/coturn/coturn/blob/master/ChangeLog>
+- coturn security advisory GHSA-6g6j-r9rf-cm7p (CVE-2020-26262): <https://github.com/coturn/coturn/security/advisories/GHSA-6g6j-r9rf-cm7p>
+- Symantec (Broadcom) protection bulletin, *Hidden in Teams: DragonForce Attackers Weaponize Microsoft Teams Relays to Stay Hidden* (June 2026): <https://www.broadcom.com/support/security-center/protection-bulletin/hidden-in-teams-dragonforce-attackers-weaponize-microsoft-teams-relays-to-stay-hidden>
