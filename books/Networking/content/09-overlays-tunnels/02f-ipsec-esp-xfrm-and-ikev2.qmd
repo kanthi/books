@@ -1,0 +1,489 @@
+---
+title: "IPsec by Hand: ESP with ip xfrm, and What IKEv2 Automates"
+author:
+  - name: "K19G"
+  - name: "grok-bot"
+---
+
+# IPsec by Hand: ESP with ip xfrm, and What IKEv2 Automates
+
+## Learning goals
+
+- Name the two kernel tables behind every Linux IPsec tunnel, the SPD (policies) and the SAD (states), and say which one decides *whether* a packet is protected and which one decides *how*
+- Build a manually keyed ESP tunnel between two namespaces with `ip xfrm`, and see on the wire that the inner packet is gone
+- Account for every byte of ESP tunnel overhead, from outer IP header to ICV
+- Read the anti-replay window and the `/proc/net/xfrm_stat` counters when packets disappear
+- Explain what IKEv2 adds on top (authentication, key exchange, rekeying, NAT traversal, dead peer detection) and where post-quantum key exchange fits
+
+## Thesis
+
+IPsec looks hard because its configuration files are long, but the data plane is small. The kernel keeps two tables. The **Security Policy Database** says "traffic from this prefix to that prefix must be ESP-protected, through this tunnel". The **Security Association Database** holds the keys, the SPI and the counters for each direction. If a packet matches a policy and an SA exists, the kernel encrypts it. If a packet arrives that a policy says should have been protected but was not, the kernel drops it. That is all ESP is. IKEv2, which strongSwan or Libreswan run, is a control plane that authenticates the peers and writes those two tables for you, then rewrites them before the keys get old. Learn the tables first. Then every IKE log line maps onto a row you have already seen.
+
+## Mental model
+
+```text
+  left namespace                                        right namespace
+  172.16.1.1 (lo)                                        172.16.2.1 (lo)
+       |                                                        ^
+       v                                                        |
+  [ SPD: dir out ]  src 172.16.1.0/24 dst 172.16.2.0/24   [ SPD: dir in ]
+  "must be ESP, tunnel 10.0.0.1 -> 10.0.0.2, reqid 1"     "must have arrived as ESP"
+       |                                                        ^
+       v                                                        |
+  [ SAD ] spi 0x1001, AES-GCM key, seq++               [ SAD ] spi 0x1001, same key,
+       |                                                  replay window, ICV check
+       v                                                        |
+  wan-l 10.0.0.1  ======  outer IP proto 50 (ESP)  ======>  wan-r 10.0.0.2
+
+  One SA per direction: 0x1001 carries left -> right, 0x2001 carries right -> left.
+```
+
+## The two tables
+
+### Policies (SPD)
+
+A policy is a selector plus an action. The selector is usually a source prefix, a destination prefix and optionally a protocol and ports. The action is a **template**: "protect with ESP, tunnel mode, from this outer address to that outer address, using an SA with reqid 1". Linux has three directions:
+
+| Direction | Checked when | Typical use |
+|-----------|--------------|-------------|
+| `out` | a locally sent or forwarded packet is about to leave | encrypt traffic to the far site |
+| `in` | a packet is delivered to this host after decapsulation | insist that traffic from the far site arrived protected |
+| `fwd` | a decapsulated packet is about to be *forwarded* | the same check, for a gateway that routes to a LAN behind it |
+
+The lab tunnels between addresses owned by the two namespaces, so it needs `out` and `in`. A real site-to-site gateway that forwards to a LAN also needs `fwd` policies. strongSwan installs all three for you.
+
+### States (SAD)
+
+An SA is one direction of one tunnel. It is identified by the triple (destination address, protocol, **SPI**). The SPI is the 32-bit number at the start of every ESP packet. It tells the receiver which key to use. The SA holds:
+
+- the algorithm and key (here AES-GCM-128 as `rfc4106(gcm(aes))`, with a 16-byte key and a 4-byte salt, which is why the key is 20 bytes)
+- the mode (`tunnel` wraps the whole inner IP packet; `transport` protects only the payload of host-to-host traffic)
+- the sequence counter for sending and the **anti-replay window** for receiving
+- lifetimes in seconds, bytes and packets. Manually keyed SAs have none. IKE uses them to trigger rekeying.
+
+A policy points at an SA through the template (addresses, protocol, mode, reqid). If a policy matches but no SA exists, the kernel cannot send the packet. With IKE running, that is the moment the kernel asks the daemon to negotiate one ("acquire").
+
+### Route-based vs policy-based, once more
+
+The site-tunnels chapter introduced the distinction. With bare policies, as in this lab, the SPD steers traffic: routing only has to get the packet to the right egress, and the policy catches it there. With a route-based design, you create an XFRM interface (`ip link add ipsec0 type xfrm if_id 7`) or a VTI. Policies match "everything with if_id 7", and the routing table decides what enters the tunnel. Route-based is easier to combine with OSPF or BGP over the tunnel. The SA and the bytes on the wire are identical either way.
+
+## ESP on the wire
+
+RFC 4303 defines the packet. In tunnel mode with AES-GCM (RFC 4106) it is:
+
+```text
++-----------------+----------+----------+--------+----------------------------+------------------+--------+
+| outer IPv4 (20) | SPI (4)  | Seq (4)  | IV (8) | inner IP packet, encrypted | pad + padlen + NH| ICV(16)|
++-----------------+----------+----------+--------+----------------------------+------------------+--------+
+                  |<---- ESP header ---->|        |<----------- encrypted -------------------->|
+                  |<-------------------------- authenticated by GCM ------------------------------------>|
+```
+
+- **SPI** and **sequence number** travel in clear. Anyone on the path can see which SA a packet belongs to and count packets.
+- The **IV** must never repeat under one key. Linux's `seqiv` generator derives it from the sequence number, so it is unique without being random. You will see that in the lab output.
+- The **trailer** is padding, a pad-length byte and a next-header byte (4 for IPv4-in-tunnel). The encrypted part must end on a 4-byte boundary.
+- The **ICV** is the GCM tag. If one bit of the packet changes, or the key is wrong, the ICV check fails and the packet is dropped. The sender gets no error.
+
+## Lab: two namespaces, one manually keyed ESP tunnel
+
+This lab runs as an ordinary user. `unshare -urnm` creates a private user, network and mount namespace in which you are root, so `ip netns`, `ip xfrm` and raw sockets work without `sudo`. The host is not touched. The box has no `ping` and no `tcpdump`, so three tiny Python helpers stand in for them: `ping.py` sends ICMP echoes from a chosen source address, `sniff.py` prints one line per IPv4 packet arriving on an interface (using an `AF_PACKET` socket, like tcpdump), and `inject.py` re-sends a captured frame to stage a replay.
+
+Manual keys are for learning only. Never run production IPsec with static keys: there is no rekeying, so a long-lived key and a sequence counter that never resets are exactly what ESP is designed to avoid.
+
+`lab.sh`:
+
+```bash
+#!/bin/sh
+# Run as: unshare -urnm sh lab.sh
+# Two namespaces, one veth "Internet" between them, and a manually keyed
+# IPsec ESP tunnel (ip xfrm) protecting 172.16.1.0/24 <-> 172.16.2.0/24.
+set -e
+mount -t tmpfs tmpfs /run; mkdir -p /run/netns
+ip netns add left; ip netns add right
+ip link add wan-l type veth peer name wan-r
+ip link set wan-l netns left; ip link set wan-r netns right
+L="ip netns exec left"; R="ip netns exec right"
+for ns in left right; do ip -n $ns link set lo up; done
+ip -n left  addr add 10.0.0.1/24 dev wan-l; ip -n left  link set wan-l up
+ip -n right addr add 10.0.0.2/24 dev wan-r; ip -n right link set wan-r up
+ip -n left  addr add 172.16.1.1/32 dev lo
+ip -n right addr add 172.16.2.1/32 dev lo
+ip -n left  route add 172.16.2.0/24 via 10.0.0.2 src 172.16.1.1
+ip -n right route add 172.16.1.0/24 via 10.0.0.1 src 172.16.2.1
+SNIFF="python3 $(pwd)/sniff.py"
+stat() { $R awk -v want="$1" '$1 ~ want && $2 != 0 {printf "   right %s %s\n", $1, $2}' /proc/net/xfrm_stat; }
+pingit() { $L python3 $(pwd)/ping.py 172.16.1.1 172.16.2.1 "$1" "${2:-56}" | sed "s/^/   /"; }
+
+echo "== 1. no IPsec: what the Internet link carries"
+$R $SNIFF wan-r 1.5 & sleep 0.3; pingit 2; wait
+
+# One SA per direction. AES-GCM-128 via rfc4106: 16-byte key + 4-byte salt.
+K_LR=0x$(printf '11%.0s' $(seq 20)); K_RL=0x$(printf '22%.0s' $(seq 20))
+sa() { # ns src dst spi key
+  ip -n $1 xfrm state add src $2 dst $3 proto esp spi $4 reqid 1 mode tunnel \
+     replay-window 32 aead 'rfc4106(gcm(aes))' $5 128; }
+for ns in left right; do
+  sa $ns 10.0.0.1 10.0.0.2 0x1001 $K_LR
+  sa $ns 10.0.0.2 10.0.0.1 0x2001 $K_RL
+done
+pol() { # ns dir src-net dst-net tunnel-src tunnel-dst
+  ip -n $1 xfrm policy add dir $2 src $3 dst $4 \
+     tmpl src $5 dst $6 proto esp reqid 1 mode tunnel; }
+pol left  out 172.16.1.0/24 172.16.2.0/24 10.0.0.1 10.0.0.2
+pol left  in  172.16.2.0/24 172.16.1.0/24 10.0.0.2 10.0.0.1
+pol right out 172.16.2.0/24 172.16.1.0/24 10.0.0.2 10.0.0.1
+pol right in  172.16.1.0/24 172.16.2.0/24 10.0.0.1 10.0.0.2
+
+echo "== 2. ESP tunnel up: same ping, now encrypted"
+$R $SNIFF wan-r 1.5 /tmp/esp-frame.bin & sleep 0.3; pingit 2; wait
+echo "-- right: ip -s xfrm state (inbound SA)"
+$R ip -s xfrm state get src 10.0.0.1 dst 10.0.0.2 proto esp spi 0x1001 | sed 's/^/   /'
+
+echo "== 3. overhead: inner 1000-byte ping"
+$R $SNIFF wan-r 1.0 & sleep 0.3; pingit 1 972; wait
+
+echo "== 4. replay a captured ESP packet 3 times"
+$L python3 $(pwd)/inject.py wan-l /tmp/esp-frame.bin 3; sleep 0.3; stat 'XfrmInStateSeqError'
+
+echo "== 5. wrong key on right's inbound SA"
+K_BAD=0x$(printf '33%.0s' $(seq 20))
+$R ip xfrm state update src 10.0.0.1 dst 10.0.0.2 proto esp spi 0x1001 reqid 1 \
+   mode tunnel replay-window 32 aead 'rfc4106(gcm(aes))' $K_BAD 128
+echo "-- after 'state update' with the bad key, the SA still holds:"
+$R ip xfrm state get src 10.0.0.1 dst 10.0.0.2 proto esp spi 0x1001 | grep aead | sed 's/^\s*/   /'
+pingit 2
+echo "-- delete + add with the bad key instead"
+ip -n right xfrm state delete src 10.0.0.1 dst 10.0.0.2 proto esp spi 0x1001
+sa right 10.0.0.1 10.0.0.2 0x1001 $K_BAD
+pingit 2; stat 'XfrmInStateProtoError'
+ip -n right xfrm state delete src 10.0.0.1 dst 10.0.0.2 proto esp spi 0x1001
+sa right 10.0.0.1 10.0.0.2 0x1001 $K_LR
+echo "-- good key restored"
+pingit 2
+
+echo "== 6. left 'forgets' its out policy: plaintext reaches right"
+ip -n left xfrm policy delete dir out src 172.16.1.0/24 dst 172.16.2.0/24
+$R $SNIFF wan-r 1.0 & sleep 0.3; pingit 1; wait; stat 'XfrmInTmplMismatch'
+echo "-- right without an 'in' policy"
+ip -n right xfrm policy delete dir in src 172.16.1.0/24 dst 172.16.2.0/24
+pingit 2
+```
+
+`ping.py`:
+
+```python
+#!/usr/bin/env python3
+"""Minimal ICMP echo (this box has no ping binary). usage: ping.py SRC DST COUNT [SIZE]"""
+import os, socket, struct, sys, time
+src, dst, count = sys.argv[1], sys.argv[2], int(sys.argv[3])
+size = int(sys.argv[4]) if len(sys.argv) > 4 else 56
+def csum(b):
+    b += b"\0" * (len(b) & 1)
+    s = sum(struct.unpack(f"!{len(b)//2}H", b)); s = (s >> 16) + (s & 0xffff); s += s >> 16
+    return ~s & 0xffff
+s = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_ICMP)
+s.bind((src, 0)); s.settimeout(1.0)
+ok, ident = 0, os.getpid() & 0xffff
+for seq in range(1, count + 1):
+    payload = bytes(range(256)) * (size // 256 + 1)
+    payload = payload[:size]
+    hdr = struct.pack("!BBHHH", 8, 0, 0, ident, seq)
+    pkt = struct.pack("!BBHHH", 8, 0, csum(hdr + payload), ident, seq) + payload
+    s.sendto(pkt, (dst, 0))
+    try:
+        while True:
+            r = s.recv(65535)
+            if r[20] == 0 and struct.unpack("!HH", r[24:28]) == (ident, seq):
+                ok += 1; break
+    except socket.timeout:
+        pass
+    time.sleep(0.2)
+print(f"{count} sent, {ok} replies ({src} -> {dst}, {size}-byte payload)")
+```
+
+`sniff.py`:
+
+```python
+#!/usr/bin/env python3
+"""Print one line per IPv4 packet seen on an interface (AF_PACKET, no tcpdump).
+
+usage: sniff.py IFACE SECONDS [save-first-esp-to-file]
+"""
+import socket, struct, sys, time
+iface, secs = sys.argv[1], float(sys.argv[2])
+save = sys.argv[3] if len(sys.argv) > 3 else None
+s = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(0x0800))
+s.bind((iface, 0)); s.settimeout(0.2)
+end, saved = time.time() + secs, False
+names = {1: "ICMP", 6: "TCP", 17: "UDP", 50: "ESP"}
+while time.time() < end:
+    try:
+        frame, addr = s.recvfrom(65535)
+    except socket.timeout:
+        continue
+    if addr[2] == socket.PACKET_OUTGOING:
+        continue  # only what arrives on this side
+    ip = frame[14:]
+    tot, proto = struct.unpack("!H", ip[2:4])[0], ip[9]
+    src, dst = socket.inet_ntoa(ip[12:16]), socket.inet_ntoa(ip[16:20])
+    line = f"{src:>11} > {dst:<11} {names.get(proto, proto):4} len={tot}"
+    if proto == 50:
+        spi, seq = struct.unpack("!II", ip[20:28])
+        line += f"  spi=0x{spi:08x} seq={seq}  payload-head={ip[28:36].hex()}"
+        if save and not saved:
+            open(save, "wb").write(frame); saved = True
+    elif proto == 1:
+        line += f"  icmp type={ip[20]} payload-head={ip[28:36].hex()}"
+    print(line, flush=True)
+```
+
+`inject.py`:
+
+```python
+#!/usr/bin/env python3
+"""Re-send a saved Ethernet frame on IFACE, unchanged (a replay)."""
+import socket, sys
+s = socket.socket(socket.AF_PACKET, socket.SOCK_RAW)
+s.bind((sys.argv[1], 0))
+frame = open(sys.argv[2], "rb").read()
+for _ in range(int(sys.argv[3])):
+    s.send(frame)
+print(f"replayed {sys.argv[3]} copies of a {len(frame)}-byte frame on {sys.argv[1]}")
+```
+
+Run it:
+
+```bash
+unshare -urnm sh lab.sh
+```
+
+Output:
+
+```text
+== 1. no IPsec: what the Internet link carries
+ 172.16.1.1 > 172.16.2.1  ICMP len=84  icmp type=8 payload-head=0001020304050607
+ 172.16.1.1 > 172.16.2.1  ICMP len=84  icmp type=8 payload-head=0001020304050607
+   2 sent, 2 replies (172.16.1.1 -> 172.16.2.1, 56-byte payload)
+== 2. ESP tunnel up: same ping, now encrypted
+   10.0.0.1 > 10.0.0.2    ESP  len=140  spi=0x00001001 seq=1  payload-head=80edd0062960eea0
+ 172.16.1.1 > 172.16.2.1  ICMP len=84  icmp type=8 payload-head=0001020304050607
+   10.0.0.1 > 10.0.0.2    ESP  len=140  spi=0x00001001 seq=2  payload-head=80edd0062960eea3
+ 172.16.1.1 > 172.16.2.1  ICMP len=84  icmp type=8 payload-head=0001020304050607
+   2 sent, 2 replies (172.16.1.1 -> 172.16.2.1, 56-byte payload)
+-- right: ip -s xfrm state (inbound SA)
+   src 10.0.0.1 dst 10.0.0.2
+   	proto esp spi 0x00001001(4097) reqid 1(0x00000001) mode tunnel
+   	replay-window 32 seq 0x00000000 flag  (0x00000000)
+   	aead rfc4106(gcm(aes)) 0x1111111111111111111111111111111111111111 (160 bits) 128
+   	lastused 2026-11-13 09:24:34
+   	anti-replay context: seq 0x2, oseq 0x0, bitmap 0x00000003
+   	sel src 0.0.0.0/0 dst 0.0.0.0/0 uid 0
+   	lifetime config:
+   	  limit: soft (INF)(bytes), hard (INF)(bytes)
+   	  limit: soft (INF)(packets), hard (INF)(packets)
+   	  expire add: soft 0(sec), hard 0(sec)
+   	  expire use: soft 0(sec), hard 0(sec)
+   	lifetime current:
+   	  168(bytes), 2(packets)
+   	  add 2026-11-13 09:24:34 use 2026-11-13 09:24:34
+   	stats:
+   	  replay-window 0 replay 0 failed 0
+== 3. overhead: inner 1000-byte ping
+   10.0.0.1 > 10.0.0.2    ESP  len=1056  spi=0x00001001 seq=3  payload-head=80edd0062960eea2
+ 172.16.1.1 > 172.16.2.1  ICMP len=1000  icmp type=8 payload-head=0001020304050607
+   1 sent, 1 replies (172.16.1.1 -> 172.16.2.1, 972-byte payload)
+== 4. replay a captured ESP packet 3 times
+replayed 3 copies of a 154-byte frame on wan-l
+   right XfrmInStateSeqError 3
+== 5. wrong key on right's inbound SA
+-- after 'state update' with the bad key, the SA still holds:
+   aead rfc4106(gcm(aes)) 0x1111111111111111111111111111111111111111 128
+   2 sent, 2 replies (172.16.1.1 -> 172.16.2.1, 56-byte payload)
+-- delete + add with the bad key instead
+   2 sent, 0 replies (172.16.1.1 -> 172.16.2.1, 56-byte payload)
+   right XfrmInStateProtoError 2
+-- good key restored
+   2 sent, 2 replies (172.16.1.1 -> 172.16.2.1, 56-byte payload)
+== 6. left 'forgets' its out policy: plaintext reaches right
+ 172.16.1.1 > 172.16.2.1  ICMP len=84  icmp type=8 payload-head=0001020304050607
+   1 sent, 0 replies (172.16.1.1 -> 172.16.2.1, 56-byte payload)
+   right XfrmInTmplMismatch 1
+-- right without an 'in' policy
+   2 sent, 2 replies (172.16.1.1 -> 172.16.2.1, 56-byte payload)
+```
+
+### Reading section 1 and 2: the inner packet disappears
+
+Without IPsec, the capture on `wan-r` shows the ICMP echo as it is: `172.16.1.1 > 172.16.2.1`, 84 bytes, and the payload bytes `00 01 02 ...` that `ping.py` put there.
+
+With the SAs and policies in place, the same ping produces a different packet on the "Internet" link: `10.0.0.1 > 10.0.0.2`, protocol ESP, 140 bytes, SPI `0x00001001`. The inner addresses and payload are no longer visible. The 8 bytes after the sequence number are the IV. Only the last byte changes between packets, because `seqiv` mixes the sequence number into a fixed per-SA value.
+
+The capture also shows the decrypted inner ICMP after each ESP packet. That is not a leak. After the kernel decrypts an ESP packet, it re-injects the inner packet as if it had arrived on the same interface, and `AF_PACKET` sockets (and tcpdump) see it a second time. On a real gateway this confuses people every week: "tcpdump shows plaintext on the WAN!" Capture on the sender side, or on a box in the middle, to see what the wire actually carries.
+
+`ip -s xfrm state` on the receiving SA shows `anti-replay context: seq 0x2 ... bitmap 0x00000003`: the highest sequence number seen is 2, and the two lowest bits of the window are set because packets 1 and 2 arrived. `lifetime current: 168(bytes), 2(packets)` is the inner traffic, two 84-byte packets.
+
+### Reading section 3: where the overhead comes from
+
+The inner ping is 1000 bytes (20 IP + 8 ICMP + 972 payload). The ESP packet is 1056 bytes. The arithmetic:
+
+| Piece | Bytes | Running total |
+|-------|------:|------:|
+| inner IP packet | 1000 | 1000 |
+| pad-length + next-header | 2 | 1002 |
+| padding to a 4-byte boundary | 2 | 1004 |
+| ICV (GCM tag) | 16 | 1020 |
+| IV | 8 | 1028 |
+| SPI + sequence number | 8 | 1036 |
+| outer IPv4 header | 20 | 1056 |
+
+The 84-byte ping from section 2 checks out the same way: 84 + 2 = 86, pad to 88, + 16 + 8 + 8 + 20 = 140. The fixed part is 52 bytes (20 + 8 + 8 + 16), and the trailer adds 2 to 5 more, so the overhead is 54 to 57 bytes depending on the inner length. On a 1500-byte path the encrypted part can be at most 1448 bytes, so the largest inner IPv4 packet that fits is 1446 bytes. If you add NAT traversal (below), you add 8 bytes of UDP header on top. With a CBC cipher plus a separate HMAC, the IV and tag sizes change. Always measure your own combination, the same way the WireGuard MTU chapter does for WireGuard.
+
+### Reading section 4: replay protection is real
+
+`inject.py` re-sent the first ESP frame captured in section 2, unchanged, three times. The packet has a valid SPI and a valid ICV, because it is a genuine packet. The receiver still dropped all three copies, and `XfrmInStateSeqError 3` counted them. Sequence number 1 is already marked in the window. Without anti-replay protection, an attacker who recorded your traffic could replay a "delete" or a "transfer" command packet. The window (`replay-window 32` here) also lets packets arrive somewhat out of order without being dropped. On a high-rate link with reordering, a window that is too small shows up as the same counter climbing. Modern stacks use much larger windows for that reason.
+
+### Reading section 5: a wrong key fails silently, and `update` does not change keys
+
+The first attempt used `ip xfrm state update` to put a bad key on the right side. It "worked", exited 0, and the SA still printed the old key. Pings kept succeeding. The kernel's update operation changes things like lifetimes and encapsulation, not the key material. To change a key you delete the SA and add a new one. That is also how IKE rekeys: it installs a new SA with a new SPI and then deletes the old one.
+
+With the bad key really installed, pings failed with no error anywhere visible to the sender. The receiver counted `XfrmInStateProtoError 2`: the ICV check failed, so ESP rejected the packets. When "the tunnel is up but nothing passes", read this file on the receiver before anything else:
+
+```bash
+watch -n1 "grep -v ' 0$' /proc/net/xfrm_stat"
+```
+
+(not run here as a watch loop; the lab reads the same file once per step.)
+
+| Counter | Usually means |
+|---------|---------------|
+| `XfrmInNoStates` | ESP arrived for an SPI this host has no SA for (rekey race, peer rebooted, wrong peer) |
+| `XfrmInStateProtoError` | ICV or decryption failed: key mismatch, corruption, wrong algorithm |
+| `XfrmInStateSeqError` | replay or reordering beyond the window |
+| `XfrmInTmplMismatch` | a packet matched an `in`/`fwd` policy but did not arrive through the required SA, often plaintext |
+| `XfrmOutNoStates` | an `out` policy matched but no SA exists yet (IKE has not finished, or has failed) |
+| `XfrmInStateExpired` / `XfrmOutStateExpired` | traffic hit an SA past its lifetime, usually a rekey problem |
+
+### Reading section 6: the `in` policy is your firewall
+
+Left deleted its `out` policy, so the next ping left in clear. The capture shows plaintext ICMP on the wire. Right dropped it and counted `XfrmInTmplMismatch 1`. Right's `in` policy says traffic from 172.16.1.0/24 must arrive through ESP, and this packet did not.
+
+Then right also deleted its `in` policy, and the plaintext pings were answered. Without an `in` (or `fwd`) policy, the kernel accepts unprotected packets from the "protected" prefix. Anyone on the path who can forge a source address in 172.16.1.0/24 can then talk to right without a key. An IPsec configuration that only has `out` policies encrypts traffic in one direction and protects nothing in the other. strongSwan installs matching `in` and `fwd` policies for every CHILD_SA. Hand-built or vendor-translated configurations sometimes do not.
+
+## What IKEv2 automates
+
+IKEv2 (RFC 7296) runs over UDP 500, or UDP 4500 once NAT is detected. One IKE SA protects the control channel, and one or more CHILD_SAs are the ESP SA pairs you just built by hand.
+
+```text
+Initiator                                              Responder
+IKE_SA_INIT  --  SA proposals, KE (e.g. X25519), nonces, NAT-D  -->
+             <--  chosen proposal, KE, nonces, NAT-D, [cookie]    --
+   (both sides now derive IKE keys; everything below is encrypted)
+[IKE_INTERMEDIATE  --  additional key exchanges (RFC 9242/9370)  -->]
+IKE_AUTH     --  IDs, AUTH (certificate / PSK / EAP), first CHILD_SA proposal, traffic selectors  -->
+             <--  IDs, AUTH, chosen CHILD_SA, narrowed traffic selectors  --
+   (both sides install SPD policies and SAD states: what lab.sh did by hand)
+CREATE_CHILD_SA  -- later: new CHILD_SAs, rekeying, IKE SA rekey -->
+INFORMATIONAL    -- delete SAs, dead peer detection (liveness)  -->
+```
+
+Mapped onto the lab:
+
+| Lab step | IKEv2 piece |
+|----------|-------------|
+| choosing `rfc4106(gcm(aes))` | proposal negotiation in IKE_SA_INIT / IKE_AUTH |
+| `K_LR`, `K_RL` | derived from the Diffie-Hellman (or KEM) shared secret and nonces, fresh per CHILD_SA |
+| SPI `0x1001` / `0x2001` | each side picks the SPI it wants to *receive* on |
+| `ip xfrm policy ... 172.16.1.0/24 172.16.2.0/24` | traffic selectors (TSi/TSr), which the responder may narrow |
+| delete + add the SA | rekeying with CREATE_CHILD_SA before lifetime expiry, then INFORMATIONAL delete |
+| nothing | peer authentication. The lab trusts whoever knows the key; IKE proves identity with certificates, PSK or EAP |
+
+### NAT traversal
+
+ESP is IP protocol 50 and has no ports, so a NAT that rewrites ports cannot handle it. IKEv2 detects NAT in IKE_SA_INIT (NAT_DETECTION payloads carry hashes of the addresses and ports). If NAT is detected, both sides move to UDP 4500 and wrap ESP in UDP (RFC 3948). That costs another 8 bytes of overhead and needs NAT keepalives, the same mapping-lifetime problem as in the NAT traversal chapter. In `ip xfrm` terms the SA gains `encap espinudp 4500 4500 0.0.0.0`.
+
+### A strongSwan configuration, for comparison
+
+(not run here; written from the strongSwan swanctl documentation. strongSwan is not installed on the lab box.)
+
+```text
+connections {
+  site-a-b {
+    version = 2
+    local_addrs  = 10.0.0.1
+    remote_addrs = 10.0.0.2
+    proposals = aes256gcm16-prfsha384-x25519-ke1_mlkem768
+    local {
+      auth = pubkey
+      certs = left.crt
+      id = left.example.net
+    }
+    remote {
+      auth = pubkey
+      id = right.example.net
+    }
+    children {
+      lan-lan {
+        local_ts  = 172.16.1.0/24
+        remote_ts = 172.16.2.0/24
+        esp_proposals = aes128gcm16-x25519-ke1_mlkem768
+        start_action = trap
+        dpd_action = restart
+      }
+    }
+  }
+}
+```
+
+`swanctl --list-sas` then shows the IKE SA and the CHILD_SA. `ip xfrm state` and `ip xfrm policy` show the rows strongSwan installed: the same shape as the lab, with real SPIs, real keys and lifetimes. `start_action = trap` installs the policies first and negotiates on the first matching packet. That is the "acquire" path, and before IKE finishes it shows up as `XfrmOutNoStates`.
+
+### Post-quantum key exchange
+
+A recorded IKE exchange protected only by ECDH could be decrypted later by a large enough quantum computer ("harvest now, decrypt later"). RFC 9370 lets IKEv2 run up to seven *additional* key exchanges after the first one, in IKE_INTERMEDIATE messages (RFC 9242). All the shared secrets are mixed into the keys. A hybrid proposal such as `x25519-ke1_mlkem768` therefore stays secure if either X25519 or ML-KEM-768 holds. strongSwan 6.0 and later supports this syntax.
+
+The ML-KEM-in-IKEv2 specification (draft-ietf-ipsecme-ikev2-mlkem, approved by the IESG and in the RFC Editor queue as of this writing) points out the operational catch. ML-KEM-768 and ML-KEM-1024 keys can push IKE_SA_INIT past typical path MTUs, and IKE_SA_INIT cannot use IKEv2 fragmentation (RFC 7383). Put the post-quantum KEM in an additional exchange (`ke1_`), where IKE_INTERMEDIATE messages can be fragmented. Do not make it the only key exchange in IKE_SA_INIT on paths you have not measured.
+
+## Case
+
+This is an illustrative scenario, not a real named incident.
+
+A branch tunnel had run for months. One morning, the branch could reach the data centre but every reply from the data centre timed out. Both sides showed the IKE SA as established. On the data-centre gateway, `ip xfrm state` showed two inbound SAs for the branch, one with a large byte count and one, newer, with almost none. On the branch, `/proc/net/xfrm_stat` showed `XfrmInNoStates` climbing. The data centre had rekeyed the CHILD_SA and deleted the old one, but the branch had missed the INFORMATIONAL exchange during a short WAN flap. The data centre was now sending on an SPI the branch did not know. `swanctl --rekey --child lan-lan` from the branch fixed it immediately. The lasting fix was enabling dead peer detection with `dpd_action = restart` and alerting on any non-zero `XfrmInNoStates` rate.
+
+## Trap
+
+Trusting tcpdump on the receiving gateway. As section 2 showed, the decrypted inner packets appear on the same interface right after the ESP packets. People see plaintext and conclude "the tunnel isn't encrypting", or they see ICMP and conclude ESP is being bypassed. Capture on the sending side or in the middle. Confirm with the counters: `lifetime current` bytes on the SA should grow with your traffic.
+
+The second trap is MTU. 54 to 57 bytes of ESP overhead, plus 8 for NAT-T, means a 1500-byte inner packet with DF set cannot cross a 1500-byte path. If ICMP "fragmentation needed" is filtered anywhere, large TCP transfers hang while ping works. Clamp TCP MSS on the tunnel, or set the tunnel interface MTU, and test with large packets as part of turn-up.
+
+## Boring rule
+
+For every protected prefix pair, check four things: an `out` policy, an `in` policy (plus `fwd` on a gateway), an SA in each direction, and zero-rate error counters in `/proc/net/xfrm_stat`. Use IKEv2 with certificates, never static keys. Make the post-quantum KEM an additional key exchange, not the first one.
+
+## Try this
+
+1. Change `mode tunnel` to `mode transport` in both the SAs and the policies, and change the selectors to the `10.0.0.x` addresses. Ping 10.0.0.2 and compare the captured length with section 2. Which 20 bytes went away?
+2. Replace AES-GCM with `enc 'cbc(aes)' 0x<16 bytes> auth-trunc 'hmac(sha256)' 0x<32 bytes> 128`. Re-run section 3 and redo the overhead table. Why are the IV and padding different?
+3. Shrink `replay-window` to 0 and repeat section 4. What happens to the replayed frames now? Then set it to 32 and inject the frames in reverse order.
+4. Add `encap espinudp 4500 4500 0.0.0.0` to both SAs on both sides and re-run the sniffer. Extend `sniff.py` so it decodes the UDP header and the SPI behind it.
+5. Rebuild the lab route-based: create `ip link add ipsec0 type xfrm dev wan-l if_id 7` on each side, add `if_id 7` to the SAs and policies, change the policy selectors to `0.0.0.0/0`, and route 172.16.2.0/24 into `ipsec0`. (If the kernel refuses the `xfrm` link type, note it, as with any kernel feature that is not built in.)
+
+## Verification
+
+- `unshare -urnm sh lab.sh` ran on Linux 6.12.94+ (a KVM guest), iproute2 6.15.0 and Python 3.13.5, as an unprivileged user, with no `sudo` and no extra packages, on 2026-11-13. All traffic stayed between two private network namespaces.
+- The four listings are the exact files that ran. The output is pasted unedited. Timestamps, IV bytes and the AF_PACKET line order differ per run.
+- The box has no `ping`, `tcpdump` or `dummy` link type, so `ping.py`, `sniff.py` and loopback /32 addresses are used instead.
+- Not run here: strongSwan or any IKE daemon (not installed), NAT traversal, XFRM interfaces, ML-KEM key exchange. Those parts are written from RFC 7296, RFC 3948, RFC 9370, the ML-KEM-in-IKEv2 draft and the strongSwan documentation, and are marked as not run.
+
+## Sources
+
+- RFC 4301, *Security Architecture for the Internet Protocol*: <https://www.rfc-editor.org/rfc/rfc4301>
+- RFC 4303, *IP Encapsulating Security Payload (ESP)*: <https://www.rfc-editor.org/rfc/rfc4303>
+- RFC 4106, *The Use of Galois/Counter Mode (GCM) in IPsec ESP*: <https://www.rfc-editor.org/rfc/rfc4106>
+- RFC 7296, *Internet Key Exchange Protocol Version 2 (IKEv2)*: <https://www.rfc-editor.org/rfc/rfc7296>
+- RFC 3948, *UDP Encapsulation of IPsec ESP Packets*: <https://www.rfc-editor.org/rfc/rfc3948>
+- RFC 7383, *IKEv2 Message Fragmentation*: <https://www.rfc-editor.org/rfc/rfc7383>
+- RFC 9242, *Intermediate Exchange in IKEv2*: <https://www.rfc-editor.org/rfc/rfc9242>
+- RFC 9370, *Multiple Key Exchanges in IKEv2*: <https://www.rfc-editor.org/rfc/rfc9370>
+- draft-ietf-ipsecme-ikev2-mlkem, *Post-quantum Key Exchange with ML-KEM in IKEv2*: <https://datatracker.ietf.org/doc/draft-ietf-ipsecme-ikev2-mlkem/>
+- `ip-xfrm(8)`: <https://man7.org/linux/man-pages/man8/ip-xfrm.8.html>
+- Linux kernel, XFRM proc counters (`xfrm_proc.rst`): <https://docs.kernel.org/networking/xfrm/xfrm_proc.html>
+- strongSwan documentation, swanctl.conf and algorithm proposals: <https://docs.strongswan.org/docs/latest/swanctl/swanctlConf.html>, <https://docs.strongswan.org/docs/latest/config/proposals.html>
