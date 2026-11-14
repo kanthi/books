@@ -1,0 +1,424 @@
+---
+title: "Linux Neighbour Tables in Production: Timers, Table Limits and ARP Flux"
+author:
+  - name: "K19G"
+  - name: "grok-bot"
+---
+
+# Linux Neighbour Tables in Production: Timers, Table Limits and ARP Flux
+
+Neighbour tables map network-layer IP addresses to link-layer MAC addresses. While [ARP, ND, and Local Resolution](07-arp-nd-and-local-resolution.qmd) established basic entry states and resolution flows, maintaining these tables across dense container environments, multi-homed hosts, and high-throughput routing platforms introduces significant operational challenges. Garbage collection thresholds, state transition timers, and multi-interface ARP behavior directly govern traffic reachability and host stability under load.
+
+When neighbour tables exceed host-wide capacity limits or multi-homed hosts incorrectly advertise addresses across physical interfaces, networks experience packet drops, silent connection timeouts, or ARP flux. Understanding the exact kernel mechanisms driving neighbour table state transitions and memory bounds is critical for diagnosing low-level networking anomalies.
+
+## Learning goals
+
+- Differentiate host-wide global garbage collection limits from per-namespace sysctl interfaces.
+- Calculate and trace state transition timelines for neighbour entries through `REACHABLE`, `STALE`, `DELAY`, `PROBE`, and `FAILED`.
+- Analyze the impact of host-wide neighbour table exhaustion and evaluate kernel overflow behaviors.
+- Diagnose ARP flux phenomena on multi-homed Linux systems using `arp_ignore` and `arp_announce`.
+- Configure production sysctls for high-density container hosts and Direct Server Return (DSR) load balancers.
+
+## Version note
+
+The behaviors, source code references, and sysctls documented in this chapter reflect Linux kernel v6.12 (`net/core/neighbour.c`, `net/ipv4/arp.c`), `iproute2` v6.15.0, and Python 3.13 standard library executing on unprivileged Linux 6.12 network namespaces.
+
+## Host-Wide Limits and Garbage Collection Mechanics
+
+The Linux kernel manages IPv4 ARP (`arp_cache`) and IPv6 Neighbour Discovery (`ndisc_cache`) tables via internal `struct neigh_table` instances. To limit kernel memory allocation, each table enforces a three-tier threshold model governed by global sysctls.
+
+| Sysctl Parameter | Default Value | Kernel Behavior / Action |
+| :--- | :--- | :--- |
+| `gc_thresh1` | 128 | Minimum entry threshold. Below this count, periodic garbage collection is completely inactive. |
+| `gc_thresh2` | 512 | Soft entry threshold. Forced garbage collection runs during allocation if entries exceed this limit and last flush was > 5 seconds ago. |
+| `gc_thresh3` | 1024 | Hard maximum threshold. Non-permanent entries cannot exceed this limit. Allocations failing at this limit trigger kernel overflow logs. |
+| `gc_stale_time` | 60 s | Per device. An unreferenced entry not used for this long is removed by periodic GC (only when the table holds at least `gc_thresh1` entries). |
+
+Periodic garbage collection scans entries based on age and state. When entry counts exceed `gc_thresh2`, the kernel performs forced garbage collection during allocation cycles, removing unreferenced entries that are in `FAILED` or `NOARP` states, or entries that have not been updated within 5 seconds. Up to `(gc_entries - gc_thresh2)` entries are removed in a single pass. Note that `gc_interval` has been unused in the Linux kernel since version 2.6.8.
+
+::: {.callout-important}
+`PERMANENT` entries (`ip neigh add ... nud permanent`) and `NTF_EXT_LEARNED` entries (`extern_learn`, installed by a control plane such as an EVPN daemon or by switchdev drivers) are exempt from `gc_entries` accounting and are never reclaimed by the garbage collector. The `entries` figure that `ip -s ntable` prints counts them; the thresholds do not.
+:::
+
+### Namespace Scope of Neighbour Limits
+
+A critical architectural constraint in Linux container networking is the scope of table thresholds. While interface parameters (like `base_reachable_time_ms`) are namespaced, the table memory structures and `gc_thresh*` configuration parameters are strictly host-wide.
+
+```
++-------------------------------------------------------------------------------+
+| Initial Network Namespace (Host Netns)                                        |
+| /proc/sys/net/ipv4/neigh/default/gc_thresh1/2/3  <-- System-wide limits       |
+|                                                                               |
+| +-------------------------+ +-------------------------+ +-------------------+ |
+| | Container Netns 'a'     | | Container Netns 'b'     | | Host Interfaces   | |
+| | (No gc_thresh sysctls)  | | (No gc_thresh sysctls)  | | eth0, lo          | |
+| +-------------------------+ +-------------------------+ +-------------------+ |
+|              \                           |                         /          |
+|               \                          |                        /           |
+|  +-------------------------------------------------------------------------+  |
+|  | Shared Host-Wide Kernel Table: arp_cache (All entries sum up here)       |  |
+|  +-------------------------------------------------------------------------+  |
++-------------------------------------------------------------------------------+
+```
+
+The `default` sysctl directory containing `gc_thresh1`, `gc_thresh2`, and `gc_thresh3` is registered exclusively in the initial network namespace (`arp_init` calls `neigh_sysctl_register(NULL, &arp_tbl.parms, NULL)`). Executing a `sysctl` write or netlink `ntable` change from inside a child network namespace returns `ENOENT` (`No such file or directory`). 
+
+Consequently, entries generated inside hundreds of independent network namespaces (such as Kubernetes pods) all aggregate into the same single host-wide `arp_cache` or `ndisc_cache` table.
+
+## State Machine Timers and Resolution Flow
+
+Neighbour entries transition through defined states as network traffic flows and timers expire. Per-device timers control the lifetime and probe behavior of each entry.
+
+```text
+ new traffic                 ARP reply / NA
+ ----------> INCOMPLETE ----------------------> REACHABLE <-----------------+
+              |  mcast_probes requests,            |                       |
+              |  retrans_time_ms apart             | reachable_time        |
+              v  (no answer)                       | (0.5x..1.5x base)     |
+            FAILED <----------+                    v                       |
+                              |                  STALE                     |
+                              |                    | next packet sent      |
+                              |                    v                       |
+                              |                  DELAY ---- upper-layer ---+
+                              |                    |        confirmation   |
+                              |                    | delay_first_probe_time|
+                              |                    v                       |
+                              +-- ucast_probes --- PROBE ---- reply -------+
+                                  unanswered
+```
+
+A `FAILED` entry that sees new traffic starts again from `INCOMPLETE`.
+
+| Parameter | Default Value | Functional Description |
+| :--- | :--- | :--- |
+| `base_reachable_time_ms` | 30000 ms (30 s) | Base for how long an entry stays `REACHABLE`. The kernel draws the real `reachable_time` uniformly from 0.5x to 1.5x of it, per device parameter set, and redraws it at most every 300 s. |
+| `delay_first_probe_time` | 5 s | Delay interval spent in `DELAY` state before sending the first unicast probe in `PROBE` state. |
+| `retrans_time_ms` | 1000 ms (1 s) | Retransmission interval between probe attempts. |
+| `ucast_probes` | 3 | Maximum unicast probes sent while in `PROBE` state before marking entry `FAILED`. |
+| `mcast_probes` | 3 | Maximum broadcast/multicast requests sent for an `INCOMPLETE` entry before failing. |
+| `unres_qlen_bytes` | `SK_WMEM_DEFAULT` | Maximum memory queue limit for packets waiting for resolution (supersedes legacy `unres_qlen`). |
+
+When a host attempts to reach a non-existent or unconfigured IP target, the kernel enters `INCOMPLETE` state and broadcasts `mcast_probes` requests (default 3) spaced `retrans_time_ms` apart. If no response arrives, the entry transitions to `FAILED`. A TCP `connect()` to such a target fails after about 3 seconds with `EHOSTUNREACH` (`No route to host`), long before any SYN retransmission timer would give up.
+
+Modern Linux kernels (v5.16+) also support `NTF_MANAGED` entries (`ip neigh add ... managed`). Managed entries are automatically maintained in a resolved state by periodic probes driven by the kernel at intervals governed by `interval_probe_time_ms` (default 5000 ms).
+
+## ARP Flux and Multi-Homed Host Mechanics
+
+Linux implements a weak host model (RFC 1122). Network interfaces are not isolated boundaries; IP addresses belong to the host system rather than to individual physical interfaces. By default, a Linux host receiving an ARP request on interface A for an IP address configured on interface B will issue an ARP response out of interface A using interface A's MAC address.
+
+This is the root of **ARP flux**. When two of a host's interfaces sit in the same broadcast domain, both answer the same request with their own MAC, and the requester keeps whichever reply arrived last, so the address flips between MACs. The same rule makes a real server in a Direct Server Return pool answer for the load balancer's VIP. The lab below cannot share one segment between two interfaces (the build box kernel cannot create bridges), so it shows the underlying rule with two separate links.
+
+```
+                         ARP Request: "Who has 10.9.2.1?"
+                         -------------------------------->
+  +--------------------+                                   +--------------------+
+  | Remote Host (p1)   |                                   | Multi-Homed (h)    |
+  | 10.9.1.2/24        |                                   |                    |
+  | dev: p1            | <-------------------------------- | dev: e1 (10.9.1.1) |
+  +--------------------+   ARP Reply (Default behavior):   | dev: e2 (10.9.2.1) |
+                           "10.9.2.1 is-at e1's MAC"       +--------------------+
+                           (weak host model: any local address)
+```
+
+To control ARP resolution logic on multi-homed hosts, two primary per-interface sysctl flags are provided:
+
+### `arp_ignore` Modes
+- **0 (Default)**: Reply to ARP requests for any local IP configured on any interface.
+- **1**: Reply only if the target IP address is explicitly configured on the incoming interface receiving the request.
+- **2**: Reply only if the target IP is configured on the incoming interface AND the sender's IP address resides in the same subnet.
+- **3**: Do not reply for scope host addresses; reply only for scope global and link addresses.
+- **8**: Never reply to ARP requests.
+
+The active `arp_ignore` setting is calculated as `max(conf/all/arp_ignore, conf/<if>/arp_ignore)`.
+
+### `arp_announce` Modes
+- **0 (Default)**: Put the triggering packet's source address in the ARP request, even if it belongs to a different interface.
+- **1**: Avoid source addresses that are not in the target's subnet if possible.
+- **2 (Recommended for multi-homed and DSR hosts)**: Ignore the packet's source address and use the best local address for the target, preferring a primary address on the outgoing interface in the target's subnet.
+
+In Direct Server Return (DSR) load balancing (such as LVS-DR), real server nodes configure the Virtual IP (VIP) on the loopback interface (`lo`). Setting `arp_ignore=1` and `arp_announce=2` on `all` and physical interfaces prevents real servers from responding to ARP requests for the VIP, ensuring only the active load balancer answers ARP queries for the service address.
+
+## The lab
+
+The following environment executes inside unprivileged network namespaces using Linux 6.12, `iproute2` 6.15.0, and standard Python 3.13 scripts without host modification.
+
+```{.python filename="timeline.py"}
+# timeline.py NS DEV ADDR SECONDS: print every change of one neighbour entry, with time.
+import subprocess, sys, time
+ns, dev, addr, dur = sys.argv[1], sys.argv[2], sys.argv[3], float(sys.argv[4])
+t0, last = time.monotonic(), None
+while (t := time.monotonic() - t0) < dur:
+    out = subprocess.run(["ip", "-n", ns, "neigh", "show", addr, "dev", dev],
+                         capture_output=True, text=True).stdout.split()
+    state = out[-1] if out else "(none)"
+    if state != last:
+        print(f"   t={t:5.2f}s  {state}", flush=True); last = state
+    time.sleep(0.05)
+```
+
+```{.python filename="send.py"}
+# send.py DST [SRC]: one UDP datagram to DST:9, optionally from a chosen source address.
+import socket, sys
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+if len(sys.argv) > 2: s.bind((sys.argv[2], 0))
+s.sendto(b"x", (sys.argv[1], 9))
+```
+
+```{.python filename="connect.py"}
+# connect.py DST: time a TCP connect to a neighbour that never answers ARP.
+import socket, sys, time
+t = time.monotonic()
+try:
+    socket.create_connection((sys.argv[1], 80), timeout=30)
+except OSError as e:
+    print(f"   connect() -> {e.strerror} after {time.monotonic() - t:.2f} s")
+```
+
+```{.python filename="arp.py"}
+# arp.py ask IFACE SENDER_IP TARGET_IP   -> broadcast one ARP request, print replies for 1 s
+# arp.py watch IFACE SECONDS              -> print every ARP request seen on IFACE
+import socket, struct, sys, time, ipaddress
+ETH_P_ARP = 0x0806
+def mac(b): return ":".join(f"{x:02x}" for x in b)
+def ip(b): return str(ipaddress.IPv4Address(b))
+s = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(ETH_P_ARP))
+s.bind((sys.argv[2], 0)); s.settimeout(0.2)
+me = s.getsockname()[4]
+if sys.argv[1] == "ask":
+    sip, tip = (ipaddress.IPv4Address(a).packed for a in sys.argv[3:5])
+    arp = struct.pack("!HHBBH6s4s6s4s", 1, 0x0800, 6, 4, 1, me, sip, bytes(6), tip)
+    s.send(b"\xff" * 6 + me + struct.pack("!H", ETH_P_ARP) + arp)
+    end, n = time.time() + 1, 0
+    while time.time() < end:
+        try: f = s.recv(64)
+        except socket.timeout: continue
+        if struct.unpack("!H", f[20:22])[0] == 2 and f[38:42] == sip:
+            print(f"reply: {ip(f[28:32])} is-at {mac(f[22:28])}"); n += 1
+    if n == 0: print("no reply")
+else:
+    end = time.time() + float(sys.argv[3])
+    while time.time() < end:
+        try: f = s.recv(64)
+        except socket.timeout: continue
+        if struct.unpack("!H", f[20:22])[0] == 1:
+            print(f"request: who-has {ip(f[38:42])} tell {ip(f[28:32])}", flush=True)
+```
+
+```{.bash filename="lab.sh"}
+#!/bin/sh
+# Run as: unshare -urnm sh lab.sh   (unprivileged: user, net and mount namespaces; no sudo)
+H=$(pwd); mount -t tmpfs tmpfs /run; mkdir -p /run/netns
+for ns in a b h p1 p2; do ip netns add $ns; ip -n $ns link set lo up; done
+ip link add a0 netns a type veth peer name b0 netns b
+ip -n a addr add 10.9.0.1/24 dev a0; ip -n b addr add 10.9.0.2/24 dev b0
+ip -n a link set a0 up; ip -n b link set b0 up
+entries() { ip -s ntable show name arp_cache | awk '/entries/{print $NF; exit}'; }
+
+echo "== 1. who owns the limits?"
+echo "   /proc/sys/net/ipv4/neigh/ inside netns a: $(ip netns exec a ls /proc/sys/net/ipv4/neigh | tr '\n' ' ')"
+ip -s ntable show name arp_cache | awk '/thresh1/{print "   arp_cache:", $0; exit}'
+ip netns exec a ip ntable change name arp_cache thresh3 4096 2>&1 | sed 's/^/   ntable change from a netns: /'
+B=$(entries)
+for i in $(seq 1 300); do echo "neigh add 10.9.$((100 + i / 250)).$((i % 250 + 1)) lladdr 02:00:00:00:00:01 nud stale dev a0"; done | ip -n a -batch -
+echo "   host-wide arp_cache entries: before $B, after 300 adds inside netns a: $(entries)"
+ip -n a neigh flush dev a0 nud stale; ip -n a neigh flush dev a0 >/dev/null 2>&1
+echo "   after flush: $(entries)"
+
+echo "== 2. one entry's life (a0: base_reachable_time_ms=4000, delay_first_probe_time=2)"
+ip netns exec a sh -c 'echo 4000 > /proc/sys/net/ipv4/neigh/a0/base_reachable_time_ms; echo 2 > /proc/sys/net/ipv4/neigh/a0/delay_first_probe_time'
+python3 $H/timeline.py a a0 10.9.0.2 24 & TL=$!
+sleep 0.3; echo "   t~0   send"; ip netns exec a python3 $H/send.py 10.9.0.2
+sleep 9;   echo "   t~9   send again"; ip netns exec a python3 $H/send.py 10.9.0.2
+sleep 7;   echo "   t~16  peer loses its address, send again"
+ip -n b addr del 10.9.0.2/24 dev b0; ip netns exec a python3 $H/send.py 10.9.0.2
+wait $TL
+ip -n a -s neigh show dev a0 | sed 's/^/   final: /'
+
+echo "== 3. a neighbour that never answers"
+ip netns exec b python3 $H/arp.py watch b0 6 > /tmp/arpseen & W=$!; sleep 0.3
+ip netns exec a python3 $H/connect.py 10.9.0.77
+wait $W; echo "   ARP requests seen on the wire: $(wc -l < /tmp/arpseen) ($(sort -u /tmp/arpseen | head -1))"
+ip -n a neigh show 10.9.0.77 | sed 's/^/   entry: /'
+
+echo "== 4. ARP flux: host h answers for addresses that live on other interfaces"
+ip link add e1 netns h type veth peer name p1 netns p1
+ip link add e2 netns h type veth peer name p2 netns p2
+ip -n h addr add 10.9.1.1/24 dev e1; ip -n h addr add 10.9.2.1/24 dev e2
+ip -n h addr add 10.9.1.100/32 dev lo                     # a load-balancer VIP (LVS-DR style)
+ip -n p1 addr add 10.9.1.2/24 dev p1; ip -n p2 addr add 10.9.2.2/24 dev p2
+for l in "h e1" "h e2" "p1 p1" "p2 p2"; do set -- $l; ip -n $1 link set $2 up; done
+echo "   h: e1 MAC $(ip -n h -br link show e1 | awk '{print $3}'), e2 MAC $(ip -n h -br link show e2 | awk '{print $3}')"
+for ign in 0 1; do
+    ip netns exec h sh -c "echo $ign > /proc/sys/net/ipv4/conf/all/arp_ignore"
+    for t in 10.9.1.1 10.9.2.1 10.9.1.100; do
+        printf '   arp_ignore=%s  p1 asks who-has %-10s -> %s\n' $ign $t "$(ip netns exec p1 python3 $H/arp.py ask p1 10.9.1.2 $t)"
+    done
+done
+echo "== 5. arp_announce: which source IP goes into h's ARP request on e1"
+for ann in 0 2; do
+    ip netns exec h sh -c "echo $ann > /proc/sys/net/ipv4/conf/all/arp_announce"; ip -n h neigh flush dev e1
+    ip netns exec p1 python3 $H/arp.py watch p1 1.5 > /tmp/ann & W=$!; sleep 0.3
+    ip netns exec h python3 $H/send.py 10.9.1.2 10.9.2.1; wait $W
+    printf '   arp_announce=%s  (packet src 10.9.2.1)  p1 sees: %s\n' $ann "$(head -1 /tmp/ann)"
+done
+```
+
+```text
+== 1. who owns the limits?
+   /proc/sys/net/ipv4/neigh/ inside netns a: a0 lo 
+   arp_cache:     thresh1 128 thresh2 512 thresh3 1024 gc_int 30000 
+   ntable change from a netns: RTNETLINK answers: No such file or directory
+   host-wide arp_cache entries: before 3, after 300 adds inside netns a: 303
+   after flush: 3
+== 2. one entry's life (a0: base_reachable_time_ms=4000, delay_first_probe_time=2)
+   t= 0.00s  (none)
+   t~0   send
+   t= 0.31s  REACHABLE
+   t= 3.29s  STALE
+   t~9   send again
+   t= 9.35s  DELAY
+   t=11.38s  REACHABLE
+   t=14.28s  STALE
+   t~16  peer loses its address, send again
+   t=16.35s  DELAY
+   t=18.37s  PROBE
+   t=21.43s  FAILED
+   final: 10.9.0.2  used 7/12/2probes 3 FAILED 
+== 3. a neighbour that never answers
+   connect() -> No route to host after 3.06 s
+   ARP requests seen on the wire: 3 (request: who-has 10.9.0.77 tell 10.9.0.1)
+   entry: 10.9.0.77 dev a0 FAILED 
+== 4. ARP flux: host h answers for addresses that live on other interfaces
+   h: e1 MAC 52:24:4a:f3:0a:97, e2 MAC 0a:91:42:da:96:c2
+   arp_ignore=0  p1 asks who-has 10.9.1.1   -> reply: 10.9.1.1 is-at 52:24:4a:f3:0a:97
+   arp_ignore=0  p1 asks who-has 10.9.2.1   -> reply: 10.9.2.1 is-at 52:24:4a:f3:0a:97
+   arp_ignore=0  p1 asks who-has 10.9.1.100 -> reply: 10.9.1.100 is-at 52:24:4a:f3:0a:97
+   arp_ignore=1  p1 asks who-has 10.9.1.1   -> reply: 10.9.1.1 is-at 52:24:4a:f3:0a:97
+   arp_ignore=1  p1 asks who-has 10.9.2.1   -> no reply
+   arp_ignore=1  p1 asks who-has 10.9.1.100 -> no reply
+== 5. arp_announce: which source IP goes into h's ARP request on e1
+   arp_announce=0  (packet src 10.9.2.1)  p1 sees: request: who-has 10.9.1.2 tell 10.9.2.1
+   arp_announce=2  (packet src 10.9.2.1)  p1 sees: request: who-has 10.9.1.2 tell 10.9.1.1
+```
+
+## Reading the output
+
+### Section 1: Table Limits and Scope
+The output confirms that inside child network namespace `a`, `/proc/sys/net/ipv4/neigh/` contains only interface directories (`a0`, `lo`), with no global `default` directory present. 
+Attempting to adjust `thresh3` from inside namespace `a` fails with `RTNETLINK answers: No such file or directory` (kernel returns `ENOENT`). 
+When 300 neighbour entries are added in namespace `a`, the global host-wide `arp_cache` counter increases from 3 to 303, demonstrating that namespace entries directly consume host-wide table budget.
+
+::: {.callout-note}
+The lab deliberately does not fill the table to `gc_thresh3`. Because the table is host-wide, doing that from a namespace would force garbage collection and refuse new neighbours for the build box itself. It stays below `gc_thresh2` (3 + 300 entries), and the overflow path is described from `neigh_alloc()` in the v6.12 source instead.
+:::
+
+### Section 2: Neighbour State Transitions
+With `base_reachable_time_ms=4000` (so `reachable_time` is drawn from 2 to 6 s; this run drew about 3 s) and `delay_first_probe_time=2`. The poller samples every 50 ms, so states shorter than that are not printed:
+1. `t=0.31s`: Initial UDP datagram triggers resolution; receiving ARP reply sets state to `REACHABLE`.
+2. `t=3.29s`: Timer expires (~3s), transitioning entry to `STALE`.
+3. `t=9.35s`: The second datagram is sent while the entry is `STALE`. The packet goes out at once to the cached MAC and the entry moves to `DELAY`, waiting 2 s for an upper-layer confirmation (TCP progress would provide one; this UDP flow provides none).
+4. `t=11.38s`: `DELAY` expired, the entry went to `PROBE`, sent one unicast ARP request and got a reply within milliseconds, so the poller only sees the result: `REACHABLE`.
+5. `t=14.28s`: Reachable timer expires again, returning entry to `STALE`.
+6. `t=16.35s`: Datagram sent after peer removes IP address. Entry enters `DELAY`.
+7. `t=18.37s`: After 2s in `DELAY`, kernel transitions to `PROBE` and transmits 3 unicast probes (`ucast_probes`).
+8. `t=21.43s`: Probes unacknowledged; entry transitions to `FAILED`.
+
+### Section 3: Non-Responding Target Resolution
+Executing `connect()` against `10.9.0.77` starts broadcast ARP resolution (`mcast_probes=3`, one request per `retrans_time_ms`).
+Exactly 3 ARP requests are issued on the wire before the entry transitions to `FAILED`. 
+The socket call terminates with `connect() -> No route to host after 3.06 s` (`EHOSTUNREACH`).
+
+### Section 4: ARP Flux Isolation
+With `arp_ignore=0`, host `h` responds out of interface `e1` for requests targeting `10.9.1.1` (on `e1`), `10.9.2.1` (on `e2`), and `10.9.1.100` (on `lo`), reporting `e1`'s MAC address (`52:24:4a:f3:0a:97`) for all three. 
+Setting `arp_ignore=1` forces host `h` to reply exclusively for `10.9.1.1` (configured directly on `e1`), suppressing responses for `10.9.2.1` and loopback VIP `10.9.1.100`.
+
+### Section 5: ARP Request Source IP Selection
+Host `h` sends a UDP datagram to `10.9.1.2` bound to source address `10.9.2.1`. 
+With `arp_announce=0`, the outgoing ARP request uses `10.9.2.1` as the ARP inner sender IP. 
+With `arp_announce=2`, the kernel overrides the socket source IP and uses `10.9.1.1` (matching `e1`'s subnet), preventing remote hosts from updating their tables with invalid IP-to-interface bindings.
+
+## Production Tuning and Configuration
+
+For large-scale Kubernetes nodes, cloud routers, or flat L2 environments with thousands of endpoints, the defaults (`gc_thresh3=1024` per table) are easy to hit: new neighbours stop being created and traffic to them is dropped, while existing entries keep working, which makes the symptom look random. Size the thresholds from the number of neighbours you expect across every namespace on the host; the values below are an example, not a recommendation for every box.
+
+### Tuning System-Wide Table Limits (Not run here)
+
+Apply these settings in the root network namespace (`/etc/sysctl.d/99-neighbour.conf`):
+
+```ini
+# (not run here)
+# Production scaling for Kubernetes worker nodes / Large L2 domains
+net.ipv4.neigh.default.gc_thresh1 = 4096
+net.ipv4.neigh.default.gc_thresh2 = 8192
+net.ipv4.neigh.default.gc_thresh3 = 16384
+
+net.ipv6.neigh.default.gc_thresh1 = 4096
+net.ipv6.neigh.default.gc_thresh2 = 8192
+net.ipv6.neigh.default.gc_thresh3 = 16384
+```
+
+### Tuning DSR Load Balancer Real Servers (Not run here)
+
+To suppress ARP flux on DSR nodes carrying VIPs on loopback adapters:
+
+```ini
+# (not run here)
+# Prevent ARP flux across all interfaces
+net.ipv4.conf.all.arp_ignore = 1
+net.ipv4.conf.all.arp_announce = 2
+net.ipv4.conf.default.arp_ignore = 1
+net.ipv4.conf.default.arp_announce = 2
+```
+
+## Checking a real host
+
+On a running host (in the initial namespace for the kernel log):
+
+```bash
+# Display table entry limits and current entry count
+ip -s ntable show name arp_cache
+
+# Monitor kernel table statistics and overflow counters
+cat /proc/net/stat/arp_cache
+
+# Inspect kernel logs for table allocation failures
+dmesg -T | grep "neighbor table overflow"
+```
+
+## Gotchas
+
+1. **Host-wide container impact**: Neighbours created in any namespace count toward one host-wide `gc_thresh3`. A noisy pod that scans its subnet can stop *other* pods on the node from resolving new neighbours.
+2. **Asymmetric sysctl paths**: Interface parameters like `base_reachable_time_ms` are per-namespace, whereas global `gc_thresh*` parameters only exist in the host init namespace.
+3. **Silent drops at thresh3**: When `gc_thresh3` is reached and forced GC frees no entries, the kernel logs `ndisc_cache: neighbor table overflow!` or `arp_cache: neighbor table overflow!`, increments `table_fulls`, and frees the packet with drop reason `NEIGH_CREATEFAIL` (`ip_finish_output2()` in `net/ipv4/ip_output.c`). The message is rate limited and only appears in the kernel log of the host, not of the container.
+4. **Reachable time randomisation**: Setting `base_reachable_time_ms` to 30000 ms yields actual state durations anywhere from 15000 ms to 45000 ms due to mandatory kernel randomisation.
+5. **`all` versus the interface**: Setting `net.ipv4.conf.eth0.arp_ignore=1` while `net.ipv4.conf.all.arp_ignore=0` results in effective value `0` because Linux uses the `max()` of `all` and `<if>`.
+6. **On-link failures are fast, not slow**: with default probes a failed resolution surfaces as `EHOSTUNREACH` after about 3 s, not after the `tcp_syn_retries` timeout. If an application reports a 2-minute connect timeout to an on-link peer, ARP did resolve and something else is dropping the SYN.
+7. **PERMANENT entries bypass GC**: entries added with `ip neigh add ... nud permanent` do not consume `gc_thresh` slots, but they silently break connectivity when the peer's MAC changes (NIC swap, VM migration, VRRP failover).
+8. **Aggressive timers cost broadcasts**: a low `base_reachable_time_ms` means more unicast probes, and a low `gc_stale_time` or low thresholds mean entries are deleted and re-resolved with broadcasts. On a big L2 segment that load lands on every host.
+9. **IPv6 is a separate table**: `ndisc_cache` has its own `net.ipv6.neigh.default.gc_thresh*`. Raising only the IPv4 values leaves IPv6 at 1024, which is how hosts end up logging `ndisc_cache: neighbor table overflow!`.
+10. **`arp_ignore=1` and `/32` addresses on loopback**: it is exactly what DSR needs, but it also stops the host from answering for any address it moved to `lo` on purpose (for example an anycast service address announced by BGP). Decide per address.
+
+## Exercises
+
+1. With default sysctls, how many dynamic IPv4 neighbour entries can a host hold in total across 50 network namespaces before forced garbage collection can start, and before new entries can be refused? Explain why the number of namespaces does not change the answer.
+2. Modify `lab.sh` to adjust `retrans_time_ms` and `ucast_probes` on interface `a0`. Trace the altered timeline when communicating with a non-responsive destination.
+3. Construct a multi-interface topology and demonstrate how enabling `arp_filter=1` alters packet delivery compared to `arp_ignore=1` when strict policy routing is enabled.
+4. On a disposable VM (never a shared host), lower `gc_thresh2`/`gc_thresh3` in the initial namespace to 64/128, generate traffic to 500 unused on-link addresses, and watch `allocs`, `forced_gc_runs` and `table_fulls` in `ip -s ntable show name arp_cache`. Find the overflow message in the kernel log.
+5. Configure an IPv6 environment using `ndisc_cache` parameters and compare `ndisc_cache` garbage collection behavior against IPv4 `arp_cache`.
+
+## Verification
+
+- Ran on the build box as an unprivileged user (Linux 6.12, iproute2 6.15.0, Python 3.13 standard library) with `unshare -urnm sh lab.sh`; nothing installed. Every listing is the file that ran and the output block is pasted verbatim from the run on 2026-11-14 (IST). The lab was run twice; the timings and MAC addresses differ between runs, the transitions do not.
+- The host-wide `entries` count in section 1 includes whatever else the build box had in its ARP table (3 entries at the time).
+- Read, not run: the `gc_thresh3` overflow path (`neigh_alloc()` and `neigh_forced_gc()` in `net/core/neighbour.c`, `ip_finish_output2()` in `net/ipv4/ip_output.c`), the sysctl files in "Production tuning", `dmesg`, and `arp_filter`.
+
+## Sources
+
+- Linux v6.12 `net/core/neighbour.c` (`neigh_alloc`, `neigh_forced_gc`, `neigh_periodic_work`, `neightbl_set`): <https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/net/core/neighbour.c?h=linux-6.12.y>
+- Linux v6.12 `net/ipv4/arp.c` (`arp_ignore`, `arp_announce` handling, `arp_init`): <https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/net/ipv4/arp.c?h=linux-6.12.y>
+- Linux v6.12 `net/ipv4/ip_output.c` (`ip_finish_output2`, `SKB_DROP_REASON_NEIGH_CREATEFAIL`): <https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/net/ipv4/ip_output.c?h=linux-6.12.y>
+- Linux networking documentation, IP sysctl (`neigh/default/*`, `arp_ignore`, `arp_announce`, `arp_filter`): <https://docs.kernel.org/networking/ip-sysctl.html>
+- ip-neighbour(8) and ip-ntable(8), iproute2: <https://man7.org/linux/man-pages/man8/ip-neighbour.8.html>, <https://man7.org/linux/man-pages/man8/ip-ntable.8.html>
+- RFC 826, An Ethernet Address Resolution Protocol: <https://www.rfc-editor.org/rfc/rfc826>
+- RFC 4861 section 7.3, Neighbor Unreachability Detection (the state machine Linux uses for both ARP and ND): <https://www.rfc-editor.org/rfc/rfc4861#section-7.3>
+- RFC 1122 section 3.3.4.2, multihoming and the weak/strong end system models: <https://www.rfc-editor.org/rfc/rfc1122#section-3.3.4.2>
