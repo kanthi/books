@@ -1,0 +1,759 @@
+---
+title: "ECMP-Aware Tracing: Why traceroute Lies Through Load Balancers, and Paris Traceroute"
+author:
+  - name: "K19G"
+  - name: "grok-bot"
+---
+
+# ECMP-Aware Tracing: Why traceroute Lies Through Load Balancers, and Paris Traceroute
+
+When network operators troubleshoot path latency, packet loss, or routing policy across modern IP networks, `traceroute` is often the first tool they run. However, on networks that employ Equal-Cost Multi-Path (ECMP) routing or Link Aggregation Groups (LAGs), traditional traceroute tools frequently produce misleading or impossible results. Instead of reporting real network paths, standard traceroute often reports non-existent links, missing intermediate routers, false loops, and phantom parallel paths.
+
+These anomalies occur because classic traceroute varies header fields that multi-path load balancers use to assign packets to flow paths. As traceroute increments the IP Time-To-Live (TTL) field to discover successive hops, it simultaneously alters header parameters like source ports, destination ports, or sequence numbers. To a flow-aware load balancer performing 5-tuple hashing, each probe appears as an entirely separate flow and may be dispatched across a different physical path. Consequently, each Hop Count response comes from a different path, rendering the stitched-together sequence of reported hops a synthetic composite that no single packet ever traversed.
+
+Understanding how ECMP load balancing interacts with probe packet structure is essential for modern network operations. By controlling which packet header fields vary and which remain fixed, operators can eliminate multi-path measurement artifacts. This chapter walks through why classic traceroute fails, the Paris traceroute method for flow-consistent path discovery, how Linux routers hash flows, and how to enumerate every path through a load-balanced network. The lab reproduces the anomalies on seven network namespaces without root.
+
+## Learning goals
+
+- Explain how classic UDP traceroute increments packet parameters across probe attempts and why this triggers ECMP load-balancing anomalies.
+- Identify the four classical path measurement anomalies defined by Augustin et al.: false links, missing nodes, false loops, and false diamonds.
+- Describe how Paris traceroute keeps the hashed header fields constant across TTLs and still tells its probes apart.
+- Contrast per-packet, per-flow, and per-destination load balancing mechanisms and evaluate their impact on path measurement.
+- Configure and analyze Linux kernel IPv4 and IPv6 multipath hash policies (`fib_multipath_hash_policy`, `fib_multipath_hash_fields`, and `fib_multipath_hash_seed`).
+- Evaluate how router ICMP source address selection (`icmp_errors_use_inbound_ifaddr`) introduces router interface aliasing during path discovery.
+- Run flow-pinned traces with `traceroute`, `mtr`, Paris traceroute, Dublin Traceroute and scamper, and know which flags pin the flow.
+
+## Version note
+
+The lab ran on Linux 6.12 with iproute2 6.15.0 and Python 3.13, unprivileged, inside user, network and mount namespaces (`unshare -urnm`). The tracer uses ordinary UDP sockets and the Linux `IP_RECVERR` socket option, so it needs no raw sockets. `fib_multipath_hash_seed` needs Linux 6.11 or later. `traceroute`, `mtr`, `paris-traceroute`, `dublin-traceroute` and `scamper` are not installed on the lab host, so their commands below are not run.
+
+## Classic UDP traceroute and flow hashing
+
+Classic UNIX traceroute—including the default implementation of `traceroute(8)` on Linux—operates by transmitting a sequence of UDP datagrams toward an unallocated UDP port at the target destination (typically starting at destination port 33434). Discovery proceeds in rounds based on the IP Time-To-Live (TTL) header field:
+
+1. The probing host sends datagrams with TTL set to 1. The first-hop router decrements the TTL to 0, drops the packet, and returns an ICMP Time Exceeded message (Type 11, Code 0) back to the source.
+2. The host processes the ICMP message, extracts the source IP address of the ICMP payload to identify the first-hop router interface, and records the round-trip time.
+3. The host increments the IP TTL to 2 and repeats the procedure. Intermediate routers return ICMP Time Exceeded messages until a probe reaches the final destination.
+4. Upon reaching the destination host, the packet is received by the network stack. Because no application is listening on UDP port 33434, the destination returns an ICMP Destination Unreachable message (Type 3, Code 3: Port Unreachable), signaling the end of the trace.
+
+```text
+Host (Prober)                  Hop 1 Router                   Hop 2 Router                   Destination
+  |                                 |                              |                              |
+  |-- UDP TTL=1, DPort=33434 ------>|                              |                              |
+  |<- ICMP Time Exceeded -----------|                              |                              |
+  |                                 |                              |                              |
+  |-- UDP TTL=2, DPort=33435 ------------------------------------->|                              |
+  |<- ICMP Time Exceeded ------------------------------------------|                              |
+  |                                 |                              |                              |
+  |-- UDP TTL=3, DPort=33436 ---------------------------------------------------------------------->|
+  |<- ICMP Port Unreachable ----------------------------------------------------------------------|
+```
+
+To correlate incoming ICMP responses with outgoing probes, classic traceroute alters packet parameters for every single probe. Standard Linux `traceroute(8)` increments the UDP destination port number by 1 for each transmitted probe (Port 33434 for TTL 1 Probe 1, 33435 for TTL 1 Probe 2, 33436 for TTL 2 Probe 1, and so forth). ICMP-echo traceroute changes the ICMP sequence number per probe, which also changes the ICMP checksum.
+
+### The conflict with ECMP hashing
+
+Modern high-performance routers and switches do not forward packets purely on a per-packet round-robin basis due to out-of-order packet delivery issues, which severely degrade TCP performance. Instead, layer-3 switches and routers implement Equal-Cost Multi-Path (ECMP) routing and Layer-2 Link Aggregation (LAG) using per-flow deterministic hashing.
+
+To route a packet across one of $N$ parallel equal-cost paths, the router extracts a set of fields from the packet headers—the flow 5-tuple—and computes a hash. The hash is reduced to one of the next hops (modulo, hash-threshold ranges or a resilient bucket table, depending on the implementation):
+
+```text
+next hop = select( hash(src addr, dst addr, protocol, src port, dst port, seed), N next hops )
+```
+
+Because classic UDP traceroute increments the destination UDP port (or source port) with every probe, **every single probe packet generated by classic traceroute constitutes a unique flow 5-tuple**.
+
+```text
+(illustrative hash values)
+Probe 1 (TTL=1): [10.0.0.1 -> 10.0.6.2, UDP, sport 40000, dport 33434] => hash 0x8A31 => path A
+Probe 2 (TTL=2): [10.0.0.1 -> 10.0.6.2, UDP, sport 40000, dport 33435] => hash 0x3F12 => path B
+Probe 3 (TTL=3): [10.0.0.1 -> 10.0.6.2, UDP, sport 40000, dport 33436] => hash 0xC194 => path A
+```
+
+When probes pass through an ECMP load balancer, probe 1 (TTL=1) may hash to Path A, probe 2 (TTL=2) may hash to Path B, and probe 3 (TTL=3) may hash back to Path A. The probing host collects responses from router interfaces along disparate physical paths and combines them into a single linear chain.
+
+## Path measurement anomalies
+
+In their landmark IMC 2006 paper *"Avoiding traceroute anomalies with Paris traceroute"*, Brice Augustin and co-authors named the structural measurement errors that occur when flow-varying traceroute runs over load-balanced topologies.
+
+```text
+Actual Topology (Diamond):
+         +---> Router B (10.0.1.2) ---> Router D (10.0.3.2) ---+
+        /                                                       \
+Router A (10.0.0.2)                                            Router E (10.0.4.2)
+        \                                                       /
+         +---> Router C (10.0.2.2) ----------------------------+
+```
+
+When classic traceroute probes this diamond topology where Router A load-balances traffic across upper and lower paths, four distinct anomalies can manifest depending on how probes hash at Router A.
+
+| Anomaly Type | Mechanism | Resulting Output Representation |
+| :--- | :--- | :--- |
+| **False Link** | TTL k hits one path; TTL k+1 hits a different path. | Reports a direct physical link between two nodes on different parallel paths (e.g., C -> D). |
+| **Missing Node** | A router on one branch is never hit by the probe whose TTL expires at its distance. | A router that carries traffic never appears in the trace. |
+| **False Loop** | The TTL k probe reaches router X over a short branch and the TTL k+1 probe reaches X over a longer branch. | X appears twice in a row (or under two aliases), which looks like a forwarding loop. |
+| **False Diamond** | Several probes per TTL (Linux traceroute sends three by default) land on different branches at TTL k and k+1. | Links drawn between every TTL k router and every TTL k+1 router, a mesh that hides the real adjacencies. |
+
+### Mechanics of a false link
+
+Consider the diamond topology shown above. The top path through B and D requires 3 hops from A to E (A -> B -> D -> E). The bottom path through C requires 2 hops from A to E (A -> C -> E).
+
+Suppose an operator runs classic traceroute where the probes hash as follows:
+- The TTL=1 probe expires at A. Response from A.
+- Probe for TTL=2 (different destination port) hashes to the lower path (A -> C). Response from C.
+- Probe for TTL=3 (different destination port) hashes to the upper path (A -> B -> D). Response from D.
+- Probe for TTL=4 hashes to destination T via E. Response from T.
+
+The traceroute output displays:
+1. `10.0.0.2` (Router A)
+2. `10.0.2.2` (Router C)
+3. `10.0.3.2` (Router D)
+4. `10.0.6.2` (Target T)
+
+The operator concludes that Router C connects directly to Router D (C -> D). In reality, no physical link or IP adjacency exists between C and D. The link reported by classic traceroute is completely fictional.
+
+### Uneven-length diamonds and node repetition
+
+When parallel paths through an ECMP network contain an unequal number of layer-3 hops (an uneven-length diamond), classic traceroute creates additional artifacts.
+
+If a probe with TTL=3 takes the shorter lower path (A -> C -> E), the packet reaches Router E at TTL=3. Router E returns an ICMP Time Exceeded message from its interface `10.0.5.2`.
+
+If the subsequent probe with TTL=4 takes the longer upper path (A -> B -> D -> E), the packet reaches Router E at TTL=4. Router E returns an ICMP Time Exceeded message from its interface `10.0.4.2`.
+
+The output displays Router E at TTL 3 and Router E again at TTL 4 (under different IP addresses). This makes it appear as if the packet passed through Router E twice or encountered an extra intermediate router, when in fact two different probe flows simply encountered the same router at different hop counts.
+
+## The Paris Traceroute solution
+
+To eliminate flow-hashing anomalies, Paris Traceroute maintains invariant values across all 5-tuple header fields that routers evaluate during ECMP hashing:
+
+1. **Source IP Address** (Constant for a host)
+2. **Destination IP Address** (Constant for the target)
+3. **IP Protocol Field** (Fixed to UDP, TCP, or ICMP)
+4. **Source Port** (Fixed per probe flow)
+5. **Destination Port** (Fixed per probe flow)
+
+By fixing all five fields, every probe packet generated for a given trace yields an identical hash value at every ECMP router along the path. Consequently, all probes within that trace follow an identical physical path, ensuring that responses at TTL 1, TTL 2 and onwards represent a true, contiguous linear route.
+
+```text
+Classic Traceroute Probe Stream:
+[TTL=1, SPort=40000, DPort=33434] -> Hash 0x1A (Path 1)
+[TTL=2, SPort=40000, DPort=33435] -> Hash 0x8B (Path 2)
+[TTL=3, SPort=40000, DPort=33436] -> Hash 0x3F (Path 1)
+
+Paris Traceroute Probe Stream (Flow ID 1):
+[TTL=1, SPort=40000, DPort=33434, FlowIdentifier=1] -> Hash 0x1A (Path 1)
+[TTL=2, SPort=40000, DPort=33434, FlowIdentifier=2] -> Hash 0x1A (Path 1)
+[TTL=3, SPort=40000, DPort=33434, FlowIdentifier=3] -> Hash 0x1A (Path 1)
+```
+
+### Telling probes apart without changing the flow
+
+If source and destination ports cannot be changed between probes, how does the probing host match returning ICMP Time Exceeded messages to specific probe attempts and TTLs?
+
+When a router drops a packet because its TTL expired, RFC 792 requires the ICMP error to quote the original IP header plus at least the first 8 bytes of its payload (RFC 1812 asks routers to quote as much as fits in 576 bytes). For UDP those 8 bytes are the whole UDP header: ports, length and checksum. Paris traceroute hides its probe identifier in a quoted field that load balancers do not hash.
+
+```text
++-------------------------------------------------------------------+
+| IPv4 Header (20 Bytes)                                            |
+| Src: 192.168.1.10 | Dst: 10.0.6.2 | Protocol: UDP (17)             |
++-------------------------------------------------------------------+
+| UDP Header (8 Bytes)                                              |
+| Src Port: 40000    | Dst Port: 33434    | Length: 12  | Checksum    |
++-------------------------------------------------------------------+
+| UDP Payload (4 Bytes)                                             |
+| Probe Sequence Number / Magic Identifier                          |
++-------------------------------------------------------------------+
+```
+
+1. **UDP Probes (Checksum Manipulation)**:
+   Paris traceroute fixes both ports and makes the UDP checksum itself the probe identifier: it chooses payload bytes so that the checksum takes the value it wants for each probe. The checksum is quoted in every ICMP error, so the reply can be matched, and load balancers hash on ports, not on the checksum.
+
+2. **IP Identification**:
+   The IPv4 Identification field is quoted too and is not part of any common flow hash, so it can also carry a probe number. Some routers rewrite or zero it, so tools treat it as a secondary signal.
+
+3. **ICMP Probes**:
+   A load balancer that has no ports to hash for ICMP may hash the first four bytes after the IP header instead: type, code and checksum. Classic ICMP traceroute changes the sequence number, and with it the checksum. Paris traceroute changes the Identifier and Sequence Number together so that the checksum stays the same while the pair still identifies the probe.
+
+4. **TCP Probes**:
+   For TCP probes, Paris traceroute keeps the ports constant and puts the probe identifier in the sequence number, which is inside the first 8 quoted bytes and is not hashed.
+
+## Multipath path enumeration (MDA)
+
+While pinning the 5-tuple guarantees that a single trace discovers a valid, non-anomalous path, a single trace only uncovers **one** of many potential paths through an ECMP network. To map the complete topology, an operator must enumerate all available paths.
+
+Systematically varying the flow identifier (for example, incrementing the source port for each distinct trace) allows a measurement tool to explore different branches of an ECMP diamond.
+
+```text
+Flow 1 (SPort 40000): S -> A -> B -> D -> E -> T  (Path 1)
+Flow 2 (SPort 40001): S -> A -> C -> E -> T       (Path 2)
+Flow 3 (SPort 40002): S -> A -> B -> D -> E -> T  (Path 1)
+```
+
+### The Multipath Detection Algorithm (MDA)
+
+Simply sending a random number of flows does not guarantee that all equal-cost paths have been discovered. If a router load-balances traffic across $k$ outbound links, how many probe flows must be transmitted to guarantee with high statistical confidence that every link has been sampled at least once?
+
+This problem is modeled by the **Multipath Detection Algorithm (MDA)**, formulated by Veitch, Augustin, Friedman, and Teixeira (INFOCOM 2009). MDA applies probability theory (specifically coupon collector problem formulations) to multi-path route tracing.
+
+The stopping rule is the useful part. Suppose a hop has shown k distinct next hops so far. Before concluding that there are only k, MDA asks how many flows it would take to see a (k+1)th next hop with high probability if there really were k+1 equally loaded ones. With k+1 next hops, the chance that n random flows all miss a particular one is (k/(k+1))^n, and the chance that some next hop is missed is at most (k+1)(k/(k+1))^n. MDA keeps sending flows until that bound drops below the failure probability it accepts, alpha:
+
+$$ (k+1)\left(\frac{k}{k+1}\right)^{n_k} \le \alpha $$
+
+The short program `mda-table.py` in the lab prints n_k for a few values (genuine output):
+
+```text
+seen k test k+1  n_k a=0.10  n_k a=0.05  n_k a=0.01
+     1        2           5           6           8
+     2        3           9          11          15
+     3        4          13          16          21
+     4        5          18          21          28
+     7        8          33          39          51
+    15       16          79          90         115
+```
+
+Read the first row as: after one next hop has answered six different flows, you may stop with 95% confidence that there is no second one. The lab sends 16 flows, more than the 11 needed at 95% to rule out a third next hop after seeing two. The published MDA spreads the failure probability across all hops of a trace and so uses somewhat larger numbers; this table shows the shape of the rule, not the exact constants of any tool. Uneven load balancing (weighted ECMP) needs more flows still.
+
+MDA dynamically measures the number of distinct interfaces discovered at hop $m$, updates its estimate of $k$, and transmits additional flow-pinned probes until the probability of an undiscovered interface drops below $\alpha$.
+
+### Tooling landscape for flow-consistent tracing
+
+Modern networking toolsets incorporate flow-pinned measurement techniques:
+
+- **`paris-traceroute`**: the original implementation from the 2006 paper; it also has an exhaustive multipath mode.
+- **`scamper`**: CAIDA's measurement tool; its `tracelb` command implements MDA.
+- **Dublin Traceroute**: a Paris-style tracer that sends many flows (by default it varies the destination port) and writes the result as JSON that can be drawn as a graph; it also tracks NAT along the path using the IP ID.
+- **Linux `traceroute(8)`**: the default method increments the destination port, so it is not flow-stable. `-U` uses a constant UDP destination port (default 53), `-T` a constant TCP port (default 80), and `--sport=PORT` pins the source port (and implies `-N 1 -w 5`). Combine `-U` or `-T` with `--sport` to pin the whole 5-tuple.
+- **`mtr`**: `-u` (UDP) or `-T` (TCP) with `-P PORT` for the destination port and `-L LOCALPORT` for the source port pins the flow; with default ICMP mode, check what your version varies before trusting per-hop numbers.
+
+## Load balancing modes and Linux kernel hashing
+
+The effectiveness of traceroute flow-pinning depends directly on the load-balancing strategy implemented by intermediate routers.
+
+```text
++---------------------+-------------------------------------------------------------------+
+| Load Balancing Mode | Description & Impact on Tracing                                   |
++---------------------+-------------------------------------------------------------------+
+| Per-Packet          | Packets are distributed round-robin regardless of headers.         |
+|                     | Flow pinning CANNOT prevent anomalies; MDA must be used.          |
++---------------------+-------------------------------------------------------------------+
+| Per-Flow (5-Tuple)  | Hash calculated over Src/Dst IP, Protocol, Src/Dst Port.           |
+|                     | Standard ECMP mode. Flow pinning fully prevents anomalies.        |
++---------------------+-------------------------------------------------------------------+
+| Per-Destination     | Hash calculated over Destination IP address only.                |
+|                     | All probes to a target take the exact same path regardless of L4. |
++---------------------+-------------------------------------------------------------------+
+```
+
+### Linux fib_multipath_hash_policy
+
+Linux selects the fields its IPv4 ECMP hash uses with `net.ipv4.fib_multipath_hash_policy` (and `net.ipv6.fib_multipath_hash_policy` for IPv6). The kernel's ip-sysctl documentation lists the values:
+
+1. **Policy 0 (Layer 3 Hashing)**:
+   Source and destination addresses only (the default). For IPv6, policy 0 also includes the flow label.
+   - *Impact*: Source and destination ports are ignored. Classic traceroute (which varies ports) produces **consistent** results without false links because L4 port changes do not alter the calculated hash.
+
+2. **Policy 1 (Layer 4 Hashing)**:
+   The 5-tuple: addresses, protocol and ports.
+   - *Impact*: Standard 5-tuple ECMP. Classic traceroute produces path anomalies. Paris Traceroute flow-pinning is required.
+
+3. **Policy 2 (Layer 3 Inner / Outer Hashing)**:
+   Layer 3, or the inner Layer 3 header of encapsulated packets when present (useful for GRE and similar tunnels).
+
+4. **Policy 3 (Custom Fields)**:
+   Custom: the fields come from the `fib_multipath_hash_fields` bitmask.
+
+### Multipath hash seeds and IPv6 flow labels
+
+Linux mixes a per-namespace random key into the hash, so two routers with the same configuration do not make the same choice for the same flow (which would polarise traffic onto the same branches hop after hop). Since Linux 6.11, `net.ipv4.fib_multipath_hash_seed` sets that key explicitly. The lab sets it to 42 on A, which is why its output repeats exactly from run to run; without it, which flow takes which branch changes every time the namespace is recreated. A fixed seed is also what you want across a fleet if you need two routers to agree, and what you do not want on two consecutive tiers.
+
+#### IPv6 Flow Labels and RFC 6438
+
+IPv6 adds the 20-bit flow label. RFC 6437 lets a source put a per-flow value there and RFC 6438 describes using it for ECMP and LAG, so routers can balance without parsing extension headers to reach the ports. Linux's IPv6 policy 0 hashes addresses plus flow label. A tracer therefore has to keep the flow label constant as well as the ports, and any host that changes its flow label mid-connection (Linux does so on some TCP retransmission timeouts to steer around a failed path) changes path through such networks. `traceroute -l` sets the flow label explicitly.
+
+## Router ICMP response behavior and interfaces
+
+Understanding traceroute output requires analyzing how intermediate routers construct ICMP error responses.
+
+When a router interface receives a packet whose TTL expires, it generates an ICMP Time Exceeded packet. The **source IP address** chosen for this ICMP response depends on router kernel configuration and interface architecture.
+
+```text
+   from D --- e-d 10.0.4.2 ---+
+                              [ E ] --- e-t 10.0.6.1 --- T
+   from C --- e-c 10.0.5.2 ---+
+```
+
+### icmp_errors_use_inbound_ifaddr
+
+On Linux routers, the sysctl parameter `net.ipv4.icmp_errors_use_inbound_ifaddr` governs ICMP source IP selection:
+
+- **`icmp_errors_use_inbound_ifaddr = 0` (Default)**:
+  The source is chosen like any locally generated packet: normally an address of the interface the ICMP error leaves through towards the prober. With asymmetric routing that can be an interface the probe never touched.
+- **`icmp_errors_use_inbound_ifaddr = 1`**:
+  The router answers from an address of the interface the expired packet arrived on, which makes the trace describe the forward path.
+
+In multi-path topologies where a router (such as Router E in our lab) connects to two upstream nodes via different interfaces (`10.0.4.2` on interface `eth0` toward D, and `10.0.5.2` on interface `eth1` toward C), `icmp_errors_use_inbound_ifaddr=1` causes Router E to respond as `10.0.5.2` for traffic arriving via C, and as `10.0.4.2` for traffic arriving via D.
+
+This behavior causes a single physical router to appear under different IP addresses (aliases) depending on which ingress link a probe flow traverses.
+
+### ICMP rate limiting
+
+Routers rate-limit ICMP generation to protect the control plane. On Linux, `net.ipv4.icmp_ratelimit` (default 1000 ms between bursts per destination, applied to the types in `icmp_ratemask`, which include Time Exceeded and Destination Unreachable) and the host-wide token bucket `icmp_msgs_per_sec` (default 1000) both apply. Hardware routers usually generate ICMP in software on a slow path and police it hard. The lab sets `icmp_ratelimit=0` and raises `icmp_msgs_per_sec` so that no probe is lost to rate limiting.
+
+When traceroute sends high-frequency probes, intermediate routers may silently drop TTL-expired probes due to rate-limiting thresholds. This results in asterisks (`* * *`) at specific intermediate hops.
+
+**Rule of thumb:** if packet loss appears at an intermediate hop (e.g., Hop 4 shows 20% loss) but **does not persist** at subsequent hops (Hops 5, 6, and 7 show 0% loss), the observed loss is an artifact of ICMP control-plane rate limiting on Hop 4, NOT real data-plane forwarding loss.
+
+### Asymmetric routing and return paths
+
+Traceroute discovers the forward path, but every round-trip time includes the return path of the ICMP error, which each router routes towards the prober independently. If return paths are asymmetric, latency spikes or packet drops reported at a specific hop may reflect congestion on the return path from the router to the probing host, rather than on the forward path to the destination.
+
+## The lab
+
+To explore ECMP load-balancing behavior hands-on, we construct an unprivileged network topology featuring an uneven diamond graph.
+
+```text
+                    10.0.1.0/30        10.0.3.0/30        10.0.4.0/30
+                  +------------- B ------------- D -------------+
+                  |          10.0.1.2        10.0.3.2      10.0.4.2
+   10.0.0.0/30    |                                             |       10.0.6.0/30
+ S ------------- A  (ECMP for 10.0.6.0/24, L4 hash, seed 42)    E ------------- T
+ 10.0.0.1  10.0.0.2                                             |  10.0.6.1  10.0.6.2
+                  |          10.0.2.2                      10.0.5.2
+                  +------------- C -----------------------------+
+                    10.0.2.0/30             10.0.5.0/30
+
+ Path via B: S A B D E T  (T answers at TTL 5)
+ Path via C: S A C E T    (T answers at TTL 4)
+```
+
+### Topology specification
+
+The lab topology consists of 7 interconnected Linux network namespaces (`S`, `A`, `B`, `C`, `D`, `E`, `T`):
+
+1. **Path via B (5 Hops)**: `S` -> `A` -> `B` (10.0.1.2) -> `D` (10.0.3.2) -> `E` (10.0.4.2) -> `T` (10.0.6.2)
+2. **Path via C (4 Hops)**: `S` -> `A` -> `C` (10.0.2.2) -> `E` (10.0.5.2) -> `T` (10.0.6.2)
+
+Node A load-balances traffic destined for `10.0.6.0/24` across Node B (`10.0.1.2`) and Node C (`10.0.2.2`) using kernel multipath routing with L4 hashing (`net.ipv4.fib_multipath_hash_policy=1`) and a fixed seed (`net.ipv4.fib_multipath_hash_seed=42`). Every router has `net.ipv4.icmp_errors_use_inbound_ifaddr=1`, ICMP rate limiting off, and plain static routes back to S.
+
+### Lab files
+
+The lab setup script creates the namespaces, configures veth pairs, sets up routing tables, and applies sysctl hash policies.
+
+`topo.sh`:
+
+```bash
+#!/bin/sh
+# Build an uneven ECMP diamond: S - A =(B - D)= E - T
+#                                     =(C    )=
+# Run inside: unshare -urnm sh topo.sh   (no root, no installs)
+set -e
+sc() { ip netns exec "$1" sh -c "echo $3 > /proc/sys/$(echo $2 | tr . /)"; }
+mount -t tmpfs none /run 2>/dev/null || true
+mkdir -p /run/netns
+for n in S A B C D E T; do ip netns add $n; done
+link() { # link NS1 IF1 ADDR1 NS2 IF2 ADDR2
+  ip link add $2 netns $1 type veth peer name $5 netns $4
+  ip -n $1 addr add $3/30 dev $2; ip -n $1 link set $2 up
+  ip -n $4 addr add $6/30 dev $5; ip -n $4 link set $5 up
+}
+link S s-a 10.0.0.1  A a-s 10.0.0.2
+link A a-b 10.0.1.1  B b-a 10.0.1.2
+link A a-c 10.0.2.1  C c-a 10.0.2.2
+link B b-d 10.0.3.1  D d-b 10.0.3.2
+link D d-e 10.0.4.1  E e-d 10.0.4.2
+link C c-e 10.0.5.1  E e-c 10.0.5.2
+link E e-t 10.0.6.1  T t-e 10.0.6.2
+for n in S A B C D E T; do
+  ip -n $n link set lo up
+  sc $n net.ipv4.ip_forward 1
+  sc $n net.ipv4.icmp_ratelimit 0
+  sc $n net.ipv4.icmp_msgs_per_sec 100000
+  sc $n net.ipv4.icmp_errors_use_inbound_ifaddr 1
+done
+ip -n S route add default via 10.0.0.2
+ip -n A route add 10.0.6.0/24 nexthop via 10.0.1.2 nexthop via 10.0.2.2
+ip -n B route add 10.0.6.0/24 via 10.0.3.2
+ip -n D route add 10.0.6.0/24 via 10.0.4.2
+ip -n C route add 10.0.6.0/24 via 10.0.5.2
+# return traffic towards S
+ip -n B route add 10.0.0.0/24 via 10.0.1.1
+ip -n C route add 10.0.0.0/24 via 10.0.2.1
+ip -n D route add 10.0.0.0/24 via 10.0.3.1
+ip -n E route add 10.0.0.0/24 via 10.0.5.1
+ip -n T route add default via 10.0.6.1
+```
+
+`trace.py` implements both methods with one UDP socket per probe and `IP_RECVERR`, which queues the ICMP error on the socket together with the address of the router that sent it. Classic mode increments the destination port per probe; Paris mode keeps both ports and changes only the first two payload bytes. It sends one probe at a time and waits for the answer, so the order of replies identifies the probe and no checksum trick is needed. Changing the payload does change the UDP checksum; that is harmless here because Linux does not hash the checksum.
+
+`trace.py`:
+
+```python
+#!/usr/bin/env python3
+"""Classic vs Paris UDP traceroute using IP_RECVERR (no raw sockets needed).
+
+classic : destination port increments per probe (33434, 33435, ...), like
+          the original Van Jacobson traceroute, so every probe is a new flow.
+paris   : source and destination ports stay fixed for the whole trace; only
+          the payload changes, so every probe hashes onto the same ECMP path.
+"""
+import socket, struct, sys, select
+
+IP_RECVERR = 11
+SO_EE_ORIGIN_ICMP = 2
+
+def probe(dst, ttl, sport, dport, payload, timeout=1.0):
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.setsockopt(socket.SOL_IP, IP_RECVERR, 1)
+    s.setsockopt(socket.SOL_IP, socket.IP_TTL, ttl)
+    s.bind(("0.0.0.0", sport))
+    s.sendto(payload, (dst, dport))
+    r, _, _ = select.select([s], [], [], timeout)
+    if not r:
+        s.close(); return None, None
+    _, anc, _, _ = s.recvmsg(512, 512, socket.MSG_ERRQUEUE)
+    s.close()
+    for level, typ, data in anc:
+        if level == socket.SOL_IP and typ == IP_RECVERR:
+            errno_, origin, itype, icode, _, info, _ = struct.unpack("=IBBBBII", data[:16])
+            offender = socket.inet_ntoa(data[16 + 4:16 + 8])  # sockaddr_in: family, port, addr
+            return offender, (itype, icode)
+    return None, None
+
+def trace(dst, mode, sport=40000, max_ttl=6, base_port=33434):
+    hops = []
+    seq = 0
+    for ttl in range(1, max_ttl + 1):
+        dport = base_port + seq if mode == "classic" else base_port
+        who, kind = probe(dst, ttl, sport, dport, struct.pack("!H", seq) + b"x" * 30)
+        seq += 1
+        hops.append(who)
+        print(f"{ttl:2d}  {who or '*':<10}  sport={sport} dport={dport}"
+              + ("  (port unreachable: destination)" if kind == (3, 3) else ""))
+        if kind == (3, 3):
+            break
+    return hops
+
+if __name__ == "__main__":
+    dst, mode = sys.argv[1], sys.argv[2]
+    sport = int(sys.argv[3]) if len(sys.argv) > 3 else 40000
+    trace(dst, mode, sport)
+```
+
+`mda.py` runs a Paris trace for 16 different source ports and merges the results.
+
+`mda.py`:
+
+```python
+#!/usr/bin/env python3
+"""Enumerate every interface at every TTL by varying the flow (source port),
+then print the links that each individual flow actually used.
+A tiny version of the Multipath Detection Algorithm idea used by Paris
+traceroute / Dublin traceroute / scamper (no stopping rule, fixed flow count)."""
+import sys
+from trace import probe
+
+dst = sys.argv[1]
+flows = int(sys.argv[2]) if len(sys.argv) > 2 else 16
+paths = {}
+for f in range(flows):
+    sport = 41000 + f
+    path = []
+    for ttl in range(1, 7):
+        who, kind = probe(dst, ttl, sport, 33434, b"mda")
+        path.append(who or "*")
+        if kind == (3, 3):
+            break
+    paths.setdefault(tuple(path), []).append(sport)
+
+print(f"{flows} flows, {len(paths)} distinct paths")
+for p, sports in sorted(paths.items()):
+    print(f"  {' -> '.join(p):<52} flows={len(sports)} e.g. sport {sports[0]}")
+hop_sets = {}
+for p in paths:
+    for i, h in enumerate(p, 1):
+        hop_sets.setdefault(i, set()).add(h)
+for i in sorted(hop_sets):
+    print(f"  ttl {i}: {sorted(hop_sets[i])}")
+links = set()
+for p in paths:
+    links.update(zip(p, p[1:]))
+print("  real links:", sorted(links))
+```
+
+`mda-table.py` prints the MDA stopping numbers used earlier in the chapter:
+
+```python
+#!/usr/bin/env python3
+"""How many flows must reach a hop before you may stop looking for one more
+next hop?  MDA's rule (Veitch et al., 2009): having seen k next hops, keep
+sending until the hypothesis "there are k+1 equally loaded next hops" would
+have shown the (k+1)th with probability >= 1 - alpha:
+    (k+1) * (k/(k+1))**n <= alpha     ->  smallest such n is n_k"""
+import math
+print(f"{'seen k':>6} {'test k+1':>8} {'n_k a=0.10':>11} {'n_k a=0.05':>11} {'n_k a=0.01':>11}")
+for k in (1, 2, 3, 4, 7, 15):
+    row = [math.ceil(math.log(a / (k + 1)) / math.log(k / (k + 1))) for a in (0.10, 0.05, 0.01)]
+    print(f"{k:>6} {k+1:>8} {row[0]:>11} {row[1]:>11} {row[2]:>11}")
+```
+
+`lab.sh` runs everything. Start it with `unshare -urnm sh lab.sh`.
+
+`lab.sh`:
+
+```bash
+#!/bin/sh
+# Run as: unshare -urnm sh lab.sh   (no root, no installs)
+set -e
+cd "$(dirname "$0")"
+. ./topo.sh
+echo "== 0. who is who"
+for n in A B C D E T; do printf '%s: ' $n; ip -n $n -4 -o addr show | awk '$2!="lo"{printf "%s ", $4}'; echo; done
+echo "== 1. ECMP route on A, L4 hash, fixed hash seed"
+sc A net.ipv4.fib_multipath_hash_seed 42; echo "net.ipv4.fib_multipath_hash_seed = $(ip netns exec A cat /proc/sys/net/ipv4/fib_multipath_hash_seed)"
+sc A net.ipv4.fib_multipath_hash_policy 1; echo "net.ipv4.fib_multipath_hash_policy = $(ip netns exec A cat /proc/sys/$(echo net.ipv4.fib_multipath_hash_policy | tr . /))"
+ip -n A route show 10.0.6.0/24
+echo "== 2. classic traceroute (dport changes per probe), three runs"
+for sp in 40000 40001 40002; do echo "-- run sport=$sp"; ip netns exec S python3 trace.py 10.0.6.2 classic $sp; done
+echo "== 3. paris traceroute (ports fixed), three flows"
+for sp in 40000 40001 40002; do echo "-- flow sport=$sp"; ip netns exec S python3 trace.py 10.0.6.2 paris $sp; done
+echo "== 4. enumerate the multipath (16 flows)"
+ip netns exec S python3 mda.py 10.0.6.2 16
+echo "== 5. same classic trace with L3-only hashing (policy 0)"
+sc A net.ipv4.fib_multipath_hash_policy 0; echo "net.ipv4.fib_multipath_hash_policy = $(ip netns exec A cat /proc/sys/$(echo net.ipv4.fib_multipath_hash_policy | tr . /))"
+for sp in 40000 40001; do echo "-- run sport=$sp"; ip netns exec S python3 trace.py 10.0.6.2 classic $sp; done
+```
+
+### Execution output
+
+Output of `unshare -urnm sh lab.sh` (a second run, diffed against the first, was identical):
+
+```text
+== 0. who is who
+A: 10.0.0.2/30 10.0.1.1/30 10.0.2.1/30 
+B: 10.0.1.2/30 10.0.3.1/30 
+C: 10.0.2.2/30 10.0.5.1/30 
+D: 10.0.3.2/30 10.0.4.1/30 
+E: 10.0.4.2/30 10.0.5.2/30 10.0.6.1/30 
+T: 10.0.6.2/30 
+== 1. ECMP route on A, L4 hash, fixed hash seed
+net.ipv4.fib_multipath_hash_seed = 42
+net.ipv4.fib_multipath_hash_policy = 1
+10.0.6.0/24 
+	nexthop via 10.0.1.2 dev a-b weight 1 
+	nexthop via 10.0.2.2 dev a-c weight 1 
+== 2. classic traceroute (dport changes per probe), three runs
+-- run sport=40000
+ 1  10.0.0.2    sport=40000 dport=33434
+ 2  10.0.2.2    sport=40000 dport=33435
+ 3  10.0.3.2    sport=40000 dport=33436
+ 4  10.0.6.2    sport=40000 dport=33437  (port unreachable: destination)
+-- run sport=40001
+ 1  10.0.0.2    sport=40001 dport=33434
+ 2  10.0.2.2    sport=40001 dport=33435
+ 3  10.0.5.2    sport=40001 dport=33436
+ 4  10.0.6.2    sport=40001 dport=33437  (port unreachable: destination)
+-- run sport=40002
+ 1  10.0.0.2    sport=40002 dport=33434
+ 2  10.0.1.2    sport=40002 dport=33435
+ 3  10.0.5.2    sport=40002 dport=33436
+ 4  10.0.4.2    sport=40002 dport=33437
+ 5  10.0.6.2    sport=40002 dport=33438  (port unreachable: destination)
+== 3. paris traceroute (ports fixed), three flows
+-- flow sport=40000
+ 1  10.0.0.2    sport=40000 dport=33434
+ 2  10.0.1.2    sport=40000 dport=33434
+ 3  10.0.3.2    sport=40000 dport=33434
+ 4  10.0.4.2    sport=40000 dport=33434
+ 5  10.0.6.2    sport=40000 dport=33434  (port unreachable: destination)
+-- flow sport=40001
+ 1  10.0.0.2    sport=40001 dport=33434
+ 2  10.0.2.2    sport=40001 dport=33434
+ 3  10.0.5.2    sport=40001 dport=33434
+ 4  10.0.6.2    sport=40001 dport=33434  (port unreachable: destination)
+-- flow sport=40002
+ 1  10.0.0.2    sport=40002 dport=33434
+ 2  10.0.1.2    sport=40002 dport=33434
+ 3  10.0.3.2    sport=40002 dport=33434
+ 4  10.0.4.2    sport=40002 dport=33434
+ 5  10.0.6.2    sport=40002 dport=33434  (port unreachable: destination)
+== 4. enumerate the multipath (16 flows)
+16 flows, 2 distinct paths
+  10.0.0.2 -> 10.0.1.2 -> 10.0.3.2 -> 10.0.4.2 -> 10.0.6.2 flows=7 e.g. sport 41003
+  10.0.0.2 -> 10.0.2.2 -> 10.0.5.2 -> 10.0.6.2         flows=9 e.g. sport 41000
+  ttl 1: ['10.0.0.2']
+  ttl 2: ['10.0.1.2', '10.0.2.2']
+  ttl 3: ['10.0.3.2', '10.0.5.2']
+  ttl 4: ['10.0.4.2', '10.0.6.2']
+  ttl 5: ['10.0.6.2']
+  real links: [('10.0.0.2', '10.0.1.2'), ('10.0.0.2', '10.0.2.2'), ('10.0.1.2', '10.0.3.2'), ('10.0.2.2', '10.0.5.2'), ('10.0.3.2', '10.0.4.2'), ('10.0.4.2', '10.0.6.2'), ('10.0.5.2', '10.0.6.2')]
+== 5. same classic trace with L3-only hashing (policy 0)
+net.ipv4.fib_multipath_hash_policy = 0
+-- run sport=40000
+ 1  10.0.0.2    sport=40000 dport=33434
+ 2  10.0.2.2    sport=40000 dport=33435
+ 3  10.0.5.2    sport=40000 dport=33436
+ 4  10.0.6.2    sport=40000 dport=33437  (port unreachable: destination)
+-- run sport=40001
+ 1  10.0.0.2    sport=40001 dport=33434
+ 2  10.0.2.2    sport=40001 dport=33435
+ 3  10.0.5.2    sport=40001 dport=33436
+ 4  10.0.6.2    sport=40001 dport=33437  (port unreachable: destination)
+```
+
+## Reading the output
+
+### Section 0 and 1: the map and the ECMP route
+
+Section 0 is the key for the rest: E owns both 10.0.4.2 (towards D) and 10.0.5.2 (towards C). Section 1 shows the multipath route on A with two equal-weight next hops and the two sysctls that decide which flow takes which: policy 1 (hash the 5-tuple) and seed 42.
+
+### Section 2: classic traceroute
+
+Each run uses one source port and increments the destination port from 33434, one probe per TTL, so every TTL is a new flow at A.
+
+- **sport 40000** reports A, 10.0.2.2 (C), 10.0.3.2 (D), then T at TTL 4. The TTL 2 probe went via C, the TTL 3 probe via B and expired at D. The trace implies a link C -> D that does not exist, and a four-hop path that no packet took: the C path really is four hops but does not contain D, and the path containing D is five hops.
+- **sport 40001** reports A, C, 10.0.5.2 (E), T at TTL 4. This one happens to be a real path, because the TTL 2, 3 and 4 probes all hashed to C. Nothing in the output tells you it is real.
+- **sport 40002** reports A, 10.0.1.2 (B), 10.0.5.2, 10.0.4.2, T at TTL 5. The TTL 3 probe went via C and expired at E's C-facing interface; the TTL 4 probe went via B and D and expired at E's D-facing interface. The output shows a false link B -> E(10.0.5.2) and then E twice in a row under two different addresses. Without alias resolution, that looks like an extra router; with it, it looks like a loop.
+
+### Section 3: Paris traceroute
+
+With both ports fixed, a trace is one flow. Source ports 40000 and 40002 both hash to B and report the true five-hop path A B D E(10.0.4.2) T. Source port 40001 hashes to C and reports the true four-hop path A C E(10.0.5.2) T. Every trace is a real path. A single Paris trace still shows only one of the paths, and which one depends on the flow you picked.
+
+### Section 4: enumerating the paths
+
+Sixteen source ports found exactly two paths: seven flows via B and nine via C. That split is what a hash over 16 flows looks like, not a configured weight. The per-TTL sets show two interfaces at TTL 2, 3 and 4, and the TTL 4 set mixes a router (10.0.4.2) with the destination (10.0.6.2), the signature of an uneven diamond. The link list is built only from adjacent hops of the same flow, so it holds the seven real links and none of the false ones from Section 2.
+
+### Section 5: hash policy 0
+
+With policy 0 on A, the hash only covers addresses, so changing ports moves nothing. Classic traceroute with source ports 40000 and 40001 both report the five-hop path via B. Classic traceroute is only wrong where something hashes on ports; Paris traceroute is right either way. Note that with policy 0 every flow between S and T takes the same branch, so no source-port trick will reveal the C path; a tool would have to vary the source or destination address.
+
+## In production
+
+When operating in production data centers or service provider networks, operators should utilize flow-pinned tracing commands and audit kernel multipath configurations.
+
+### Production tool invocations
+
+#### Paris Traceroute (Production CLI)
+
+To execute Paris Traceroute using fixed-flow UDP probes:
+
+```bash
+# (not run here)
+paris-traceroute -p udp -s 40000 -d 33434 10.0.6.2
+# multipath (MDA) mode
+paris-traceroute -n -a exh 10.0.6.2
+```
+
+To execute Paris Traceroute using ICMP probes with checksum alignment:
+
+```bash
+# (not run here)
+paris-traceroute -p icmp 10.0.6.2
+```
+
+#### Scamper / Tracelb (CAIDA)
+
+To perform complete MDA multipath enumeration using CAIDA's `scamper`:
+
+```bash
+# (not run here)
+scamper -O json -I "tracelb -P udp-sport 10.0.6.2"
+```
+
+#### Linux traceroute(8)
+
+To enforce flow-pinned UDP tracing with standard Linux `traceroute`:
+
+```bash
+# (not run here)
+traceroute -U --sport=40000 -p 33434 10.0.6.2
+```
+
+To perform flow-pinned TCP SYN tracing:
+
+```bash
+# (not run here)
+traceroute -T --sport=40000 -p 80 10.0.6.2
+```
+
+#### MTR (My Traceroute)
+
+To run `mtr` in flow-pinned mode using TCP or UDP:
+
+```bash
+# (not run here)
+mtr --udp -P 33434 -L 40000 10.0.6.2
+mtr --tcp -P 80 -L 40000 10.0.6.2
+```
+
+#### Dublin Traceroute
+
+To run Dublin Traceroute with 16 flows and save the JSON result:
+
+```bash
+# (not run here)
+# option names vary between releases; check dublin-traceroute --help
+dublin-traceroute --npaths=16 --output-file=trace.json 10.0.6.2
+```
+
+### Kernel sysctl configuration for routers
+
+To view and set Linux router ECMP hash policies in production environments:
+
+```bash
+# (not run here)
+# Inspect current IPv4 multipath policy and seed
+sysctl net.ipv4.fib_multipath_hash_policy
+sysctl net.ipv4.fib_multipath_hash_seed
+
+# Configure 5-tuple L4 hashing for balanced ECMP
+sysctl -w net.ipv4.fib_multipath_hash_policy=1
+
+# Fixed seed (Linux 6.11+); 0 returns to a random seed
+sysctl -w net.ipv4.fib_multipath_hash_seed=1337
+
+# Enable inbound interface IP addressing for ICMP errors
+sysctl -w net.ipv4.icmp_errors_use_inbound_ifaddr=1
+```
+
+## Gotchas
+
+- **Assuming intermediate packet loss indicates network outages**: Asterisks or loss at intermediate hops (e.g., Hop 3 showing 50% loss while Hop 4 shows 0% loss) are almost always caused by control-plane ICMP rate limiting (`net.ipv4.icmp_ratelimit`), not data-plane forwarding drops.
+- **Misassembling asymmetric return paths**: Latency spikes reported at an intermediate hop may reflect path congestion on the return route from that router to the prober, rather than on the forward route to the target destination.
+- **Ignoring IPv6 Flow Labels**: IPv6 routers often incorporate the 20-bit IPv6 Flow Label into ECMP hashes. Failing to pin the Flow Label during IPv6 tracing causes ECMP path jumping even when L4 ports are fixed.
+- **Mistaking router interface aliases for distinct physical routers**: When a router responds with `icmp_errors_use_inbound_ifaddr=1`, probes arriving via different interfaces yield different source IPs for the same physical router.
+- **Overlooking Stateful Firewall Session Limits**: Transmitting hundreds of MDA probe flows with distinct source ports can fill stateful firewall connection tables (e.g., `conntrack`), triggering drop actions or state table exhaustion.
+- **Evaluating uneven ECMP path lengths as routing loops**: In uneven diamonds, probes taking longer paths hit a router at TTL k+1, while probes taking shorter paths hit the same router at TTL k, making the router appear twice in sequence.
+- **A fixed seed hides nothing, a random one hides everything**: with the default random hash key, the same flow can take a different branch after a router reboot. Compare traces taken before and after a change only if you know the seed did not change.
+- **LAG members are invisible**: a LAG hashes the same way, but its members are one IP hop, so traceroute never shows them. Pinning the flow keeps you on one member; it does not tell you which.
+
+## Exercises
+
+1. **MDA sample size**: extend `mda-table.py` to k = 31 and explain why a 32-way ECMP hop needs hundreds of flows before MDA may stop. Then make `mda.py` stop at each hop using the table instead of a fixed 16 flows.
+2. **Identify False Links**: Given the classic traceroute output:
+   `Hop 1: 10.0.0.1`, `Hop 2: 10.1.1.1`, `Hop 3: 10.2.2.1`, `Hop 4: 10.9.9.9`.
+   If `10.1.1.1` is on a 3-hop path and `10.2.2.1` is on a 4-hop parallel path, reconstruct the true graph topology and prove why link `10.1.1.1 -> 10.2.2.1` is false.
+3. **Custom hash fields**: on A, set `fib_multipath_hash_policy=3` and `fib_multipath_hash_fields` to hash only the destination port (bit 0x0020 per the kernel's ip-sysctl documentation; check your kernel's documentation for the bit values). Predict, then check, what classic and Paris traces now show, and why changing only the source port no longer enumerates paths.
+4. **Implement UDP Checksum Alignment**: Write a Python function that takes a fixed source port, fixed destination port, and desired probe sequence number, and calculates a 2-byte compensating payload suffix that keeps the overall UDP checksum constant across all sequence numbers.
+5. **IPv6**: add IPv6 addresses and an IPv6 ECMP route on A, keep `net.ipv6.fib_multipath_hash_policy=0`, and trace with fixed ports from a host where you can set the flow label (for example `traceroute -l` on a lab host). Show that changing only the flow label moves the probe between branches.
+6. **Rate limiting**: restore `net.ipv4.icmp_ratelimit=1000` on C only and run `mda.py` with 64 flows. Which hops now show `*`, and why does the destination still answer?
+
+## Verification
+
+- Ran: `lab.sh` (all five sections) and `mda-table.py`, on Linux 6.12.94, iproute2 6.15.0, Python 3.13.5, unprivileged in `unshare -urnm`. The full output above is pasted unedited. `lab.sh` was run twice and the outputs diffed identical, which the fixed `fib_multipath_hash_seed` makes possible.
+- Not run: `traceroute`, `mtr`, `paris-traceroute`, `scamper` and `dublin-traceroute` (not installed, and no installs were allowed). Their command lines are from the man pages and project documentation; option names, especially Dublin Traceroute's, can differ between versions.
+- Not run: IPv6 tracing. Setting a fixed flow label on a socket needs privileges this environment does not have, so the IPv6 notes are from RFC 6437/6438 and the kernel documentation.
+
+## Sources
+
+- **RFC 792**: *Internet Control Message Protocol (ICMP)*. Internet Engineering Task Force. URL: https://www.rfc-editor.org/rfc/rfc792
+- **RFC 6438**: *Using the IPv6 Flow Label for Equal Cost Multipath Routing and Link Aggregation in Tunnels*. Internet Engineering Task Force. URL: https://www.rfc-editor.org/rfc/rfc6438
+- **Augustin et al. (IMC 2006)**: B. Augustin, X. Cuvellier, B. Orgogozo, F. Viger, T. Friedman, M. Latapy, C. Magnien, R. Teixeira. *"Avoiding traceroute anomalies with Paris traceroute"*. Proceedings of the 6th ACM SIGCOMM conference on Internet measurement (IMC '06). URL: https://paris-traceroute.net/
+- **Veitch et al. (INFOCOM 2009)**: D. Veitch, B. Augustin, R. Teixeira, T. Friedman. *"Failure Control in Multipath Route Tracing"*. IEEE INFOCOM 2009. URL: https://paris-traceroute.net/
+- **Linux Kernel IP Sysctl Documentation**: *IP Sysctl Reference*. Linux Kernel Documentation. URL: https://docs.kernel.org/networking/ip-sysctl.html
+- **traceroute(8) Man Page**: *Linux User's Manual*. Michael Kerrisk (man7.org). URL: https://man7.org/linux/man-pages/man8/traceroute.8.html
+- **mtr(8) Man Page**: *Linux User's Manual*. Michael Kerrisk (man7.org). URL: https://man7.org/linux/man-pages/man8/mtr.8.html
+- **RFC 6437**: *IPv6 Flow Label Specification*. URL: https://www.rfc-editor.org/rfc/rfc6437
+- **RFC 1812**: *Requirements for IP Version 4 Routers* (ICMP error contents, section 4.3.2.3). URL: https://www.rfc-editor.org/rfc/rfc1812
+- **scamper**: CAIDA. URL: https://www.caida.org/catalog/software/scamper/
+- **Dublin Traceroute**: URL: https://dublin-traceroute.net/
+- **ip(7)**, `IP_RECVERR`: URL: https://man7.org/linux/man-pages/man7/ip.7.html
