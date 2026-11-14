@@ -1,0 +1,739 @@
+---
+title: "Zone Transfers: AXFR, IXFR, NOTIFY and TSIG"
+author:
+  - name: "K19G"
+  - name: "grok-bot"
+---
+
+# Zone Transfers: AXFR, IXFR, NOTIFY and TSIG
+
+Authoritative Domain Name System (DNS) servers are responsible for maintaining and serving resource records for specific zones. In a resilient infrastructure, a single zone is typically hosted across multiple authoritative nameservers, categorized as primaries (which hold the master copy of the zone file) and secondaries (which maintain synchronized replicas). Keeping secondary servers synchronized with the primary requires specialized protocols designed to replicate complete zone state or transmit targeted deltas when updates occur.
+
+As noted in [DNS Authoritative and Recursive](05-dns-authoritative-and-recursive.qmd), secondaries maintain their zone copies via transfer mechanisms known as AXFR and IXFR. These zone transfers are supplemented by notification mechanisms (NOTIFY) and cryptographic transaction signatures (TSIG) to ensure timely, authenticated updates. Understanding the mechanics of these protocols, their message formats, serial number arithmetic, and authentication controls is essential for maintaining secure and reliable DNS deployments.
+
+## Learning goals
+
+- Explain the operation, framing, and message structure of full zone transfers (AXFR, RFC 5936) and incremental zone transfers (IXFR, RFC 1995).
+- Describe the mechanism of DNS NOTIFY (RFC 1996) and its interaction with Start of Authority (SOA) serial numbers and timers.
+- Calculate serial number comparisons according to RFC 1982 32-bit modular arithmetic and identify failure modes such as accidental serial rollbacks.
+- Analyze the structure and behavior of Transaction Signatures (TSIG, RFC 8945) for authenticating DNS requests and responses.
+- Implement a basic secondary DNS transfer workflow incorporating NOTIFY reception, SOA verification, and IXFR retrieval using Python and dnspython.
+- Evaluate security risks associated with unauthenticated zone transfers and implement access control mechanisms using TSIG keys.
+
+## Version note
+
+The concepts, protocol specifications, and message flows detailed in this chapter apply universally to modern DNS daemon software. The hands-on laboratory environment runs unprivileged on Linux 6.12 using iproute2 6.15.0 and Python 3.13 inside an isolated network namespace (`unshare -urnm`). Python scripts use dnspython 2.9.1 from an existing virtualenv on the lab host (nothing was installed for this chapter); on your own machine, `python3 -m venv v && v/bin/pip install dnspython` gives the same library (not run here). Run the lab as `PY=/path/to/venv/bin/python unshare -urnm sh lab.sh`. Production configuration examples illustrate modern syntax for BIND 9 and Knot DNS.
+
+## Zone Transfer Architecture and Protocols
+
+Replicating a DNS zone between a primary server and its secondary servers requires transporting zone data over a transport layer protocol. Standard DNS queries and responses typically rely on UDP due to low overhead, but zone transfers rely primarily on TCP to handle large data sets reliably and ensure ordered delivery.
+
+### Authoritative Transfers via AXFR (RFC 5936)
+
+Authoritative Zone Transfer (AXFR), specified in RFC 5936 (updating original specifications in RFC 1034 and RFC 1035), provides a mechanism for copying an entire DNS zone from a primary server to a secondary server. 
+
+AXFR operation is strictly defined over TCP (typically port 53). Because a single DNS response message constrained by UDP packet size limits cannot reliably contain thousands of resource records, AXFR opens a TCP connection. Over this connection, the primary transmits a stream of DNS response messages.
+
+An AXFR session follows a precise sequence:
+
+1. The secondary opens a TCP connection to the primary and sends a DNS query with QTYPE=AXFR (value 252) for the zone apex.
+2. The primary verifies permissions and responds with a stream of DNS messages.
+3. The very first resource record in the payload of the first response message must be the zone's Start of Authority (SOA) record.
+4. Subsequent response messages contain the remaining Resource Record Sets (RRsets) belonging to the zone, including Name Server (NS), Address (A/AAAA), Mail Exchange (MX), and other records. Multiple records may be packed into each message.
+5. The final record in the final response message must be a duplicate of the zone's SOA record.
+
+The duplicate SOA record acts as an end-of-transfer marker. When the secondary receives an SOA record identical to the initial SOA record of the session, it knows the transfer is complete and closes the TCP connection.
+
+```
+       Secondary Server                             Primary Server
+              |                                            |
+              | ------------ TCP SYN --------------------> |
+              | <----------- TCP SYN-ACK ----------------- |
+              | ------------ TCP ACK --------------------> |
+              |                                            |
+              | --- DNS Query: QTYPE=AXFR (lab.example) -> |
+              |                                            |
+              | <-- DNS Msg 1: [SOA (start), NS, A...] --- |
+              | <-- DNS Msg 2: [MX, TXT, AAAA...] -------- |
+              | <-- DNS Msg 3: [... A, SOA (end)] -------- |
+              |                                            |
+              | ------------ TCP FIN-ACK ----------------> |
+              | <----------- TCP FIN-ACK ----------------- |
+```
+
+Because AXFR dumps every name, address, and record stored within a domain, unrestricted AXFR access poses a severe security risk. External attackers can perform network reconnaissance by issuing AXFR queries to discover internal hosts, staging environments, and network topology. RFC 5936 explicitly dictates that servers must restrict AXFR access using explicit policies such as IP Access Control Lists (ACLs) or cryptographic authentication.
+
+### Incremental Zone Transfer via IXFR (RFC 1995)
+
+Transferring an entire zone via AXFR every time a single record changes introduces unnecessary bandwidth overhead and processing load, especially for very large zones containing millions of records. Incremental Zone Transfer (IXFR), defined in RFC 1995, optimizes this process by transferring only the delta (the changes) between the secondary's current version and the primary's updated version.
+
+An IXFR request is initiated by the secondary with QTYPE=IXFR (value 251). Unlike AXFR, the secondary includes its currently known SOA record in the Authority section of the IXFR query message. This informs the primary of the exact serial number the secondary currently holds.
+
+Upon receiving an IXFR query, the primary compares the client's serial number against its current zone serial:
+
+- **Up to date**: If the client's serial equals the primary's current serial, the primary returns a single DNS response message containing only the current SOA record.
+- **Incremental update available**: If the primary maintains a change log (journal) covering the differences from the client's serial to the current serial, it returns the delta.
+- **Journal missing / Full transfer required**: If the primary does not possess the historical journal entries required to bridge the gap (e.g., if the secondary is too far behind or the journal was cleared), the primary falls back to serving a full zone transfer in AXFR format inside the IXFR response.
+
+The structure of an incremental IXFR response follows a strict pattern based on sequence pairs of deleted and added records for each intermediate version step:
+
+```
+[SOA (Current Version)]
+[SOA (Client Version)]   <-- Start of changes for this step
+  [RR deleted 1]
+  [RR deleted 2]
+[SOA (Intermediate/Current Version)]
+  [RR added 1]
+  [RR added 2]
+[SOA (Current Version)]   <-- End of transfer marker
+```
+
+For each serial number step, the response presents the old SOA followed by all records removed in that step, then the new SOA followed by all records added in that step. The stream finishes with a final SOA record representing the newest serial version.
+
+IXFR may occur over UDP if the response delta is small enough to fit within a single UDP response packet (or EDNS0 buffer). However, if the delta spans multiple records or exceeds packet limits, the transfer must take place over TCP.
+
+### Change Notification: DNS NOTIFY (RFC 1996)
+
+Before DNS NOTIFY was specified in RFC 1996, secondary servers discovered zone updates solely by polling the primary at intervals defined by the SOA REFRESH timer. If a zone was updated on the primary immediately after a secondary polled, the secondary would remain out of sync for the duration of the REFRESH interval (which often spans hours).
+
+DNS NOTIFY establishes a proactive mechanism where the primary alerts secondaries immediately when a zone update occurs.
+
+```
++------------------+                    +--------------------+
+|  Primary Server  |                    |  Secondary Server  |
++------------------+                    +--------------------+
+         |                                         |
+         | --- NOTIFY (Opcode 4, SOA) -----------> |
+         | <-- NOTIFY ACK ------------------------ |  (Always ACK)
+         |                                         |
+         | <-- SOA Query (UDP) ------------------- |  (Verify serial)
+         | --- SOA Response (Serial 2026111402) -> |
+         |                                         |
+         | <-- IXFR/AXFR Query (TCP) ------------- |  (If serial newer)
+         | --- IXFR/AXFR Response Stream --------> |
+```
+
+The NOTIFY process operates as follows:
+
+1. The primary updates its zone and bumps the SOA serial number.
+2. The primary sends a DNS message with Opcode 4 (NOTIFY) to the secondary's UDP port 53. The message header sets the Authoritative Answer (AA) flag and specifies the zone name in the Question section.
+3. Upon receiving the NOTIFY request, the secondary must immediately acknowledge it by returning a NOTIFY response packet (ACK) to the primary.
+4. The secondary **must not trust** the serial number or SOA payload embedded inside the NOTIFY message itself. Instead, the secondary initiates an independent SOA query over UDP to the primary to fetch the authoritative SOA record.
+5. The secondary compares the serial returned by the SOA query against its local serial. If the queried serial is newer, the secondary issues an IXFR or AXFR request.
+
+If NOTIFY messages are dropped or blocked by network firewalls, the secondary falls back to standard timer-based polling. The standard SOA record fields govern these fallback behaviors:
+
+| SOA Field | Recommended / Typical Value | Description |
+| :--- | :--- | :--- |
+| **SERIAL** | YYYYMMDDNN | Revision counter for the zone data. |
+| **REFRESH** | 7200 s (2 hours) | Interval at which secondary polls primary for SOA changes. |
+| **RETRY** | 900 s (15 mins) | Interval to retry SOA queries if primary fails to respond. |
+| **EXPIRE** | 1209600 s (14 days) | Length of time secondary continues serving zone when primary is unreachable. |
+| **MINIMUM** | 300 s (5 mins) | Negative caching TTL per RFC 2308. |
+
+## Serial Number Arithmetic (RFC 1982)
+
+DNS SOA serial numbers are 32-bit unsigned integers ranging from $0$ to $2^{32}-1$ ($4,294,967,295$). A serial can wrap past $2^{32}-1$ to $0$, either after very many changes or, far more often, because an operator deliberately or accidentally pushes it near the top of the range.
+
+To handle wraparound cleanly, DNS implements 32-bit sequence number arithmetic as defined in RFC 1982 (with `SERIAL_BITS = 32`).
+
+### Comparison Logic
+
+Given two 32-bit serial numbers $s_1$ (the currently held serial) and $s_2$ (the candidate serial), $s_2$ is defined as **newer** than $s_1$ if and only if:
+
+$$s_1 \neq s_2 \quad \text{and} \quad ((s_2 - s_1) \bmod 2^{32}) < 2^{31}$$
+
+Where $2^{31} = 2,147,483,648$.
+
+If $(s_2 - s_1) \bmod 2^{32} = 2^{31}$, RFC 1982 leaves the comparison undefined: neither serial is greater. Implementations may treat it either way, so never rely on it. The lab's `newer()` treats it as not newer.
+
+```
+                      +-------------------+
+                      |   Current Serial  |
+                      |       (s1)        |
+                      +-------------------+
+                                |
+             +------------------+------------------+
+             |                                     |
+    ((s2 - s1) mod 2^32)                  ((s2 - s1) mod 2^32)
+       in 1 .. 2^31-1                       >= 2^31 or == 0
+             |                                     |
+             v                                     v
+       s2 is NEWER                           s2 is NOT NEWER
+    (Trigger Transfer)                      (Ignore Update)
+```
+
+Common serial formatting follows the `YYYYMMDDNN` convention (RFC 1912 Section 2.2), where `YYYY` is the year, `MM` is the month, `DD` is the day, and `NN` is a two-digit daily modification counter (e.g., `2026111401`).
+
+### Serial Rollback Recovery
+
+If an operator mistakenly sets a serial that is too far ahead (for instance `3000000000`, or a timestamp-style serial pasted into a YYYYMMDDNN zone), secondary servers accept it, because it is newer. The opposite slip, typing `20261115` without the two-digit `NN` suffix, produces a serial that is older than `2026111401`, so secondaries simply ignore every change until the serial climbs past what they hold (the lab shows this case). However, if the operator subsequently reverts the primary's serial back to the correct format, secondaries will calculate $((s_{new} - s_{old}) \bmod 2^{32}) \ge 2^{31}$ and reject the update as older data.
+
+To resolve a serial rollback without manually clearing databases on every secondary server, an operator must perform a two-step increment using RFC 1982 arithmetic:
+
+1. Calculate a target serial that adds up to $2^{31}-1$ ($2,147,483,647$) to the primary's current bloated serial (modulo $2^{32}$). Set the primary serial to this value and allow all secondaries to sync.
+2. Advance the primary serial again from that intermediate value to the desired target serial (e.g., `2026111500`), taking advantage of the natural modulo wraparound.
+
+## Cryptographic Authentication with TSIG (RFC 8945)
+
+IP address-based Access Control Lists (ACLs) are insufficient to protect zone transfers. IP addresses can be spoofed over UDP, and network paths between primary and secondary servers across public networks or shared cloud infrastructure may be intercepted.
+
+Transaction Signatures (TSIG), defined in RFC 8945 (obsoleting RFC 2845), provide secret-key authentication for DNS transactions. TSIG authenticates both queries and responses, verifies message integrity, and protects against replay attacks.
+
+### TSIG Record Format and Variables
+
+TSIG uses a meta-resource record (RR type 250) placed in the Additional section of a DNS message. Unlike standard DNS RRs, a TSIG record is never cached or stored in zone files.
+
+```
++-------------------------------------------------------------------+
+|                        DNS Header & Question                      |
++-------------------------------------------------------------------+
+|                        Answer / Authority                         |
++-------------------------------------------------------------------+
+| Additional Section:                                               |
+|   ... (Other records)                                             |
+|   TSIG RR:                                                        |
+|     Key Name   : xfr-key.lab.example.                             |
+|     Type       : TSIG (250)                                       |
+|     Algorithm  : hmac-sha256                                      |
+|     Time Signed: 1731600000 (UNIX Epoch timestamp)                 |
+|     Fudge      : 300 (seconds allowable clock drift)              |
+|     MAC Size   : 32 bytes                                         |
+|     MAC        : <HMAC Digest Bytes>                              |
+|     Original ID: 0x4A12                                           |
+|     Error      : 0 (NOERROR)                                      |
+|     Other Len  : 0                                                |
++-------------------------------------------------------------------+
+```
+
+The MAC (Message Authentication Code) calculation incorporates:
+
+1. The raw DNS message bytes (with the TSIG record excluded and original message ID restored).
+2. The TSIG key name and algorithm name.
+3. The Time Signed and Fudge values.
+4. The TSIG Error field and Other Data (if applicable).
+
+The recommended digest algorithm for modern TSIG deployments is `hmac-sha256`.
+
+### Clock Synchronization and Errors
+
+TSIG incorporates a time check to prevent replay attacks. The `Time Signed` field specifies when the message was generated, and `Fudge` specifies the allowable clock skew (typically defaulting to 300 seconds). If the receiving server's system clock differs from `Time Signed` by more than `Fudge` seconds, the transaction is rejected.
+
+TSIG-specific errors are returned in the Error field of the TSIG RR, accompanied by an overall RCODE of `NOTAUTH` (9):
+
+| Error Code | Constant Name | Description |
+| :--- | :--- | :--- |
+| **16** | `BADSIG` / `BADVERS` | Signature failed verification or bad TSIG version. |
+| **17** | `BADKEY` | Key name is unknown to the receiver. |
+| **18** | `BADTIME` | Server time and client `Time Signed` differ by more than `Fudge`. |
+| **22** | `BADTRUNC` | MAC length is unacceptably truncated. |
+
+When a server rejects a request due to `BADSIG` or `BADKEY`, it cannot authenticate the requester. Standard DNS servers return a response containing a TSIG record with an empty MAC field and the error code set. For `BADTIME` the response is signed and carries the server's own time in Other Data, so the client can see the size of the skew. Client implementations (such as dnspython) raise exceptions like `PeerBadSignature`, `PeerBadKey`, or `PeerBadTime`. The toy primary in this chapter's lab signs every error response with the shared key, which is a simplification: it is enough for dnspython to report the error, but a real server's `BADSIG` reply would be unsigned.
+
+## Complementary and Modern Technologies
+
+While AXFR, IXFR, NOTIFY, and TSIG form the foundation of zone replication, modern DNS operations frequently incorporate complementary protocols:
+
+- **XFR-over-TLS (XoT, RFC 9103)**: Wraps AXFR and IXFR streams inside Transport Layer Security (TLS). While TSIG guarantees message integrity and authenticity, it does not encrypt message contents. XoT provides confidentiality, preventing third parties from snooping zone data in transit.
+- **Catalog Zones (RFC 9432)**: Automatically provisions and manages secondary zones. Instead of manually editing configuration files on every secondary nameserver when adding or removing zones, catalog zones store metadata lists as standard DNS records within a dedicated catalog zone. Secondaries replicate the catalog zone and automatically add or remove secondary zones accordingly.
+
+## The lab
+
+The lab environment demonstrates primary and secondary nameserver interactions, full AXFR transfers, incremental IXFR transfers, NOTIFY signal handling, TSIG error enforcement, and serial arithmetic.
+
+All scripts execute unprivileged inside Linux user, network, and mount namespaces (`unshare -urnm`) using Python with dnspython 2.9.1.
+
+### Script: `primary.py`
+
+```{.python filename="primary.py"}
+# primary.py ADDR SECONDARY: a toy primary for lab.example. that serves SOA over UDP and
+# AXFR/IXFR over TCP only to TSIG-signed requests. SIGHUP loads serial 2026111402 and sends NOTIFY.
+import signal, socket, socketserver, struct, sys, threading
+import dns.message, dns.name, dns.opcode, dns.rcode, dns.rdataclass, dns.rdatatype, dns.rrset, dns.tsig, dns.tsigkeyring
+
+ORIGIN = dns.name.from_text("lab.example.")
+KEYRING = dns.tsigkeyring.from_text({"xfr-key.": "c2VjcmV0LXNoYXJlZC1ieS10d28tc2VydmVycw=="})
+BASE = ["@ 3600 IN NS ns1", "ns1 3600 IN A 192.0.2.53", "www 300 IN A 192.0.2.10",
+        "@ 3600 IN MX 10 mail", "mail 3600 IN A 192.0.2.25"]
+SOA = "@ 3600 IN SOA ns1 hostmaster {} 7200 900 1209600 300"
+# The journal: what changed between serials (deleted records, added records).
+JOURNAL = {2026111401: (["www 300 IN A 192.0.2.10"], ["www 300 IN A 192.0.2.11", "api 300 IN A 192.0.2.12"])}
+state = {"serial": 2026111401, "records": list(BASE)}
+
+def rr(text):
+    name, ttl, cls, typ, *rdata = text.split()
+    return dns.rrset.from_text(dns.name.from_text(name, ORIGIN) if name != "@" else ORIGIN,
+                               int(ttl), cls, typ, " ".join(rdata).replace("ns1", "ns1.lab.example.")
+                               .replace("hostmaster", "hostmaster.lab.example.").replace(" mail", " mail.lab.example."))
+def soa(serial): return rr(SOA.format(serial))
+
+def answer_xfr(q):
+    qtype = q.question[0].rdtype
+    cur = state["serial"]
+    if qtype == dns.rdatatype.IXFR:
+        have = q.authority[0][0].serial
+        if have == cur:                                  # already current: just the SOA
+            return [soa(cur)], "IXFR up to date"
+        if have in JOURNAL and have + 1 == cur:          # incremental (RFC 1995 section 4)
+            dels, adds = JOURNAL[have]
+            return ([soa(cur), soa(have)] + [rr(x) for x in dels] + [soa(cur)] + [rr(x) for x in adds] + [soa(cur)],
+                    f"IXFR {have} -> {cur} (incremental)")
+        note = f"IXFR {have} -> {cur} (no journal, full zone)"
+    else:
+        note = f"AXFR serial {cur}"
+    return [soa(cur)] + [rr(x) for x in state["records"]] + [soa(cur)], note
+
+class TCP(socketserver.BaseRequestHandler):
+    def handle(self):
+        n = struct.unpack("!H", self.request.recv(2))[0]
+        wire = b""
+        while len(wire) < n: wire += self.request.recv(n - len(wire))
+        try:
+            q = dns.message.from_wire(wire, keyring=KEYRING)
+        except (dns.tsig.BadSignature, dns.tsig.BadTime, dns.tsig.BadKey) as e:
+            err = {"BadSignature": dns.rcode.BADSIG, "BadTime": dns.rcode.BADTIME}.get(type(e).__name__, dns.rcode.BADKEY)
+            print(f"   primary: {type(e).__name__} from {self.client_address[0]}, NOTAUTH + TSIG error "
+                  f"{ {16: 'BADSIG', 17: 'BADKEY', 18: 'BADTIME'}[err]} ({err})", flush=True)  # 16 also means BADVERS
+            q = dns.message.from_wire(wire, keyring=False)           # parse without verifying
+            r = dns.message.make_response(q); r.set_rcode(dns.rcode.NOTAUTH)
+            r.use_tsig(KEYRING, q.keyname, original_id=q.id, tsig_error=err)
+            return self.send(r)
+        r = dns.message.make_response(q)                 # signed with the same key when q was signed
+        if not q.had_tsig:
+            print(f"   primary: unsigned {dns.rdatatype.to_text(q.question[0].rdtype)} refused", flush=True)
+            r.set_rcode(dns.rcode.REFUSED); return self.send(r)
+        records, note = answer_xfr(q)
+        print(f"   primary: {note}, {len(records)} RRsets, key {q.keyname}", flush=True)
+        r.answer = records
+        self.send(r)
+    def send(self, r):
+        w = r.to_wire(); self.request.sendall(struct.pack("!H", len(w)) + w)
+
+def udp_loop(sock):
+    while True:
+        wire, peer = sock.recvfrom(4096)
+        q = dns.message.from_wire(wire)
+        if q.opcode() == dns.opcode.NOTIFY: continue     # ack to our own NOTIFY
+        r = dns.message.make_response(q); r.flags |= 0x0400   # AA
+        if q.question[0].rdtype == dns.rdatatype.SOA: r.answer = [soa(state["serial"])]
+        sock.sendto(r.to_wire(), peer)
+
+def bump(*_):
+    dels, adds = JOURNAL[state["serial"]]
+    state["records"] = [x for x in state["records"] if x not in dels] + adds
+    state["serial"] += 1
+    n = dns.message.make_query(ORIGIN, dns.rdatatype.SOA); n.set_opcode(dns.opcode.NOTIFY); n.flags |= 0x0400
+    n.answer = [soa(state["serial"])]
+    print(f"   primary: serial now {state['serial']}, NOTIFY -> {sys.argv[2]}", flush=True)
+    udp.sendto(n.to_wire(), (sys.argv[2], 53))
+
+udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); udp.bind((sys.argv[1], 53))
+threading.Thread(target=udp_loop, args=(udp,), daemon=True).start()
+signal.signal(signal.SIGHUP, bump)
+socketserver.ThreadingTCPServer.allow_reuse_address = True
+srv = socketserver.ThreadingTCPServer((sys.argv[1], 53), TCP)
+threading.Thread(target=srv.serve_forever, daemon=True).start()
+signal.pause() if False else threading.Event().wait()
+```
+
+### Script: `secondary.py`
+
+```{.python filename="secondary.py"}
+# secondary.py ADDR PRIMARY SERIAL: wait for NOTIFY, compare serials (RFC 1982), then IXFR.
+import socket, sys, time
+import dns.message, dns.opcode, dns.query, dns.rdatatype, dns.rcode, dns.tsigkeyring
+KEY = dns.tsigkeyring.from_text({"xfr-key.": "c2VjcmV0LXNoYXJlZC1ieS10d28tc2VydmVycw=="})
+addr, primary, have = sys.argv[1], sys.argv[2], int(sys.argv[3])
+def newer(s1, s2): return s1 != s2 and ((s2 - s1) % 2**32) < 2**31
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.bind((addr, 53))
+wire, peer = s.recvfrom(4096)
+n = dns.message.from_wire(wire)
+print(f"   secondary: {dns.opcode.to_text(n.opcode())} for {n.question[0].name} from {peer[0]}", flush=True)
+ack = dns.message.make_response(n); s.sendto(ack.to_wire(), peer)          # RFC 1996: always ACK
+if peer[0] != primary:
+    sys.exit(print("   secondary: NOTIFY not from a configured primary, ignored"))
+soa = dns.query.udp(dns.message.make_query(n.question[0].name, "SOA"), primary, timeout=2)
+serial = soa.answer[0][0].serial                                          # never trust the NOTIFY's SOA
+print(f"   secondary: have {have}, primary SOA says {serial}, newer={newer(have, serial)}", flush=True)
+if newer(have, serial):
+    q = dns.message.make_query(n.question[0].name, "IXFR")
+    q.authority = [dns.rrset.from_text(n.question[0].name, 0, "IN", "SOA",
+                   f"ns1.lab.example. hostmaster.lab.example. {have} 0 0 0 0")]
+    q.use_tsig(KEY, "xfr-key.")
+    r = dns.query.tcp(q, primary, timeout=3, one_rr_per_rrset=True)
+    print(f"   secondary: IXFR rcode {dns.rcode.to_text(r.rcode())}, signed={r.had_tsig}:", flush=True)
+    for rrset in r.answer:
+        print("     " + rrset.to_text().replace("\n", "\n     "))
+```
+
+### Script: `xfr.py`
+
+```{.python filename="xfr.py"}
+# xfr.py PRIMARY KIND [KEYMODE] [SERIAL]: request a transfer of lab.example. and summarise it.
+#   KIND axfr|ixfr; KEYMODE none|good|wrong|skew (skew: our clock runs 400 s fast)
+import sys, time
+import dns.message, dns.name, dns.query, dns.rdatatype, dns.rcode, dns.tsigkeyring
+primary, kind = sys.argv[1], sys.argv[2]
+mode = sys.argv[3] if len(sys.argv) > 3 else "good"
+secret = {"good": "c2VjcmV0LXNoYXJlZC1ieS10d28tc2VydmVycw==", "wrong": "bm90LXRoZS1zYW1lLXNlY3JldA=="}
+q = dns.message.make_query("lab.example.", kind.upper())
+if kind == "ixfr":
+    q.authority = [dns.rrset.from_text("lab.example.", 0, "IN", "SOA",
+                   f"ns1.lab.example. hostmaster.lab.example. {sys.argv[4]} 0 0 0 0")]
+if mode != "none":
+    q.use_tsig(dns.tsigkeyring.from_text({"xfr-key.": secret.get(mode, secret["good"])}), "xfr-key.")
+if mode == "skew":
+    real = time.time; time.time = lambda: real() + 400        # fake a clock 400 s ahead (fudge is 300)
+try:
+    r = dns.query.tcp(q, primary, timeout=3, one_rr_per_rrset=True)
+    print(f"   {kind.upper()} {mode}: rcode {dns.rcode.to_text(r.rcode())}, {len(r.answer)} records, signed={r.had_tsig}")
+    for rrset in r.answer:
+        print("     " + rrset.to_text().replace("\n", "\n     "))
+except Exception as e:
+    print(f"   {kind.upper()} {mode}: {type(e).__module__}.{type(e).__name__}: {e}")
+```
+
+### Script: `serial.py`
+
+```{.python filename="serial.py"}
+# serial.py: RFC 1982 serial number arithmetic with SERIAL_BITS = 32, as secondaries use it.
+def newer(s1, s2):        # is s2 newer than s1?
+    return s1 != s2 and ((s2 - s1) % 2**32) < 2**31
+cases = [(2026111401, 2026111402, "normal bump"),
+         (2026111401, 2026111499, "99 changes in a day"),
+         (2026111401, 2026111500, "next day"),
+         (2026111401, 20261115, "operator typed YYYYMMDD without NN"),
+         (2026111401, 1, "reset to 1"),
+         (4294967295, 0, "wrap 2^32-1 -> 0"),
+         (2026111401, (2026111401 + 2**31 - 1) % 2**32, "step of 2^31 - 1"),
+         (2026111401, (2026111401 + 2**31) % 2**32, "step of exactly 2^31")]
+print(f"   {'current':>10} {'new':>10}  newer?  case")
+for a, b, why in cases:
+    print(f"   {a:>10} {b:>10}  {str(newer(a, b)):6}  {why}")
+```
+
+### Script: `lab.sh`
+
+```{.bash filename="lab.sh"}
+#!/bin/sh
+# Run as: unshare -urnm sh lab.sh   (unprivileged user, net and mount namespaces; no sudo)
+H=$(pwd); PY=${PY:-python3}; mount -t tmpfs tmpfs /run; mkdir -p /run/netns
+for ns in p s; do ip netns add $ns; ip -n $ns link set lo up; done
+ip link add ep netns p type veth peer name es netns s
+ip -n p addr add 10.53.0.1/24 dev ep; ip -n s addr add 10.53.0.2/24 dev es
+ip -n p link set ep up; ip -n s link set es up
+ip netns exec p $PY $H/primary.py 10.53.0.1 10.53.0.2 & P=$!; sleep 1
+X="ip netns exec s $PY $H/xfr.py 10.53.0.1"
+echo "== 1. AXFR without TSIG";            $X axfr none
+echo "== 2. AXFR with the shared key";     $X axfr good
+echo "== 3. AXFR signed with a wrong key"; $X axfr wrong
+echo "== 4. AXFR, client clock 400 s fast"; $X axfr skew
+echo "== 5. IXFR from 2026111401 while the primary is still at 2026111401"; $X ixfr good 2026111401
+echo "== 6. NOTIFY after the primary bumps the serial"
+ip netns exec s $PY $H/secondary.py 10.53.0.2 10.53.0.1 2026111401 & S=$!; sleep 1
+kill -HUP $P; sleep 2
+echo "== 7. IXFR from a serial the journal does not hold"; $X ixfr good 2026111301
+echo "== 8. RFC 1982 serial arithmetic"; $PY $H/serial.py
+kill $P $S 2>/dev/null; wait 2>/dev/null
+```
+
+### Lab Execution Command and Output
+
+```text
+== 1. AXFR without TSIG
+   primary: unsigned AXFR refused
+   AXFR none: rcode REFUSED, 0 records, signed=False
+== 2. AXFR with the shared key
+   primary: AXFR serial 2026111401, 7 RRsets, key xfr-key.
+   AXFR good: rcode NOERROR, 7 records, signed=True
+     lab.example. 3600 IN SOA ns1.lab.example. hostmaster.lab.example. 2026111401 7200 900 1209600 300
+     lab.example. 3600 IN NS ns1.lab.example.
+     ns1.lab.example. 3600 IN A 192.0.2.53
+     www.lab.example. 300 IN A 192.0.2.10
+     lab.example. 3600 IN MX 10 mail.lab.example.
+     mail.lab.example. 3600 IN A 192.0.2.25
+     lab.example. 3600 IN SOA ns1.lab.example. hostmaster.lab.example. 2026111401 7200 900 1209600 300
+== 3. AXFR signed with a wrong key
+   primary: BadSignature from 10.53.0.2, NOTAUTH + TSIG error BADSIG (16)
+   AXFR wrong: dns.tsig.PeerBadSignature: The peer didn't like the signature we sent
+== 4. AXFR, client clock 400 s fast
+   primary: BadTime from 10.53.0.2, NOTAUTH + TSIG error BADTIME (18)
+   AXFR skew: dns.tsig.PeerBadTime: The peer didn't like the time we sent
+== 5. IXFR from 2026111401 while the primary is still at 2026111401
+   primary: IXFR up to date, 1 RRsets, key xfr-key.
+   IXFR good: rcode NOERROR, 1 records, signed=True
+     lab.example. 3600 IN SOA ns1.lab.example. hostmaster.lab.example. 2026111401 7200 900 1209600 300
+== 6. NOTIFY after the primary bumps the serial
+   primary: serial now 2026111402, NOTIFY -> 10.53.0.2
+   secondary: NOTIFY for lab.example. from 10.53.0.1
+   secondary: have 2026111401, primary SOA says 2026111402, newer=True
+   primary: IXFR 2026111401 -> 2026111402 (incremental), 7 RRsets, key xfr-key.
+   secondary: IXFR rcode NOERROR, signed=True:
+     lab.example. 3600 IN SOA ns1.lab.example. hostmaster.lab.example. 2026111402 7200 900 1209600 300
+     lab.example. 3600 IN SOA ns1.lab.example. hostmaster.lab.example. 2026111401 7200 900 1209600 300
+     www.lab.example. 300 IN A 192.0.2.10
+     lab.example. 3600 IN SOA ns1.lab.example. hostmaster.lab.example. 2026111402 7200 900 1209600 300
+     www.lab.example. 300 IN A 192.0.2.11
+     api.lab.example. 300 IN A 192.0.2.12
+     lab.example. 3600 IN SOA ns1.lab.example. hostmaster.lab.example. 2026111402 7200 900 1209600 300
+== 7. IXFR from a serial the journal does not hold
+   primary: IXFR 2026111301 -> 2026111402 (no journal, full zone), 8 RRsets, key xfr-key.
+   IXFR good: rcode NOERROR, 8 records, signed=True
+     lab.example. 3600 IN SOA ns1.lab.example. hostmaster.lab.example. 2026111402 7200 900 1209600 300
+     lab.example. 3600 IN NS ns1.lab.example.
+     ns1.lab.example. 3600 IN A 192.0.2.53
+     lab.example. 3600 IN MX 10 mail.lab.example.
+     mail.lab.example. 3600 IN A 192.0.2.25
+     www.lab.example. 300 IN A 192.0.2.11
+     api.lab.example. 300 IN A 192.0.2.12
+     lab.example. 3600 IN SOA ns1.lab.example. hostmaster.lab.example. 2026111402 7200 900 1209600 300
+== 8. RFC 1982 serial arithmetic
+      current        new  newer?  case
+   2026111401 2026111402  True    normal bump
+   2026111401 2026111499  True    99 changes in a day
+   2026111401 2026111500  True    next day
+   2026111401   20261115  False   operator typed YYYYMMDD without NN
+   2026111401          1  False   reset to 1
+   4294967295          0  True    wrap 2^32-1 -> 0
+   2026111401 4173595048  True    step of 2^31 - 1
+   2026111401 4173595049  False   step of exactly 2^31
+```
+
+## Reading the output
+
+### Section 1: Unsigned AXFR Request
+
+In Step 1 (`== 1. AXFR without TSIG`), `xfr.py` sends an AXFR query without attaching a TSIG signature. The primary server checks `q.had_tsig` and logs:
+
+```text
+primary: unsigned AXFR refused
+```
+
+The primary responds with an RCODE of `REFUSED` (5) and zero resource records. The client outputs `rcode REFUSED, 0 records, signed=False`. This confirms that unauthenticated transfer attempts are blocked.
+
+### Section 2: Valid TSIG AXFR Request
+
+In Step 2 (`== 2. AXFR with the shared key`), `xfr.py` signs the AXFR query with the shared secret `c2VjcmV0LXNoYXJlZC1ieS10d28tc2VydmVycw==` using key `xfr-key.`. The primary verifies the HMAC signature using `KEYRING` and logs:
+
+```text
+primary: AXFR serial 2026111401, 7 RRsets, key xfr-key.
+```
+
+The response contains 7 record sets:
+- Initial SOA record (`2026111401`).
+- NS record (`ns1.lab.example.`).
+- A record for `ns1` (`192.0.2.53`).
+- A record for `www` (`192.0.2.10`).
+- MX record (`mail.lab.example.`).
+- A record for `mail` (`192.0.2.25`).
+- Terminating duplicate SOA record (`2026111401`).
+
+This matches the RFC 5936 standard framing requirement where an AXFR payload begins and ends with the zone SOA.
+
+### Section 3: Invalid Key Signature
+
+In Step 3 (`== 3. AXFR signed with a wrong key`), `xfr.py` signs the query using a key secret not recognized by the primary (`bm90LXRoZS1zYW1lLXNlY3JldA==`).
+
+The primary catches `dns.tsig.BadSignature` and logs:
+
+```text
+primary: BadSignature from 10.53.0.2, NOTAUTH + TSIG error BADSIG (16)
+```
+
+The primary returns an RCODE of `NOTAUTH` alongside TSIG Error 16 (`BADSIG`). The number 16 is shared with the EDNS `BADVERS` code, which is why `primary.py` names the TSIG errors itself instead of calling `dns.rcode.to_text()`. Upon receiving the error response, dnspython raises `dns.tsig.PeerBadSignature: The peer didn't like the signature we sent`.
+
+### Section 4: Clock Skew Failure
+
+In Step 4 (`== 4. AXFR, client clock 400 s fast`), `xfr.py` uses the correct key secret but monkey-patches `time.time` to advance the client's reported system time by 400 seconds. Because default TSIG `fudge` is 300 seconds, the 400-second offset exceeds allowable clock skew.
+
+The primary catches `dns.tsig.BadTime` and logs:
+
+```text
+primary: BadTime from 10.53.0.2, NOTAUTH + TSIG error BADTIME (18)
+```
+
+The primary returns `NOTAUTH` with TSIG Error 18 (`BADTIME`). On the client side, dnspython raises `dns.tsig.PeerBadTime: The peer didn't like the time we sent`.
+
+### Section 5: IXFR Up to Date
+
+In Step 5 (`== 5. IXFR from 2026111401...`), `xfr.py` requests an incremental transfer specifying serial `2026111401` in the query's Authority section. Because the primary is currently at serial `2026111401`, no changes exist.
+
+The primary logs `primary: IXFR up to date, 1 RRsets, key xfr-key.` and returns a single record set consisting only of the current SOA record (`2026111401`).
+
+### Section 6: NOTIFY Handling and Incremental Transfer
+
+In Step 6 (`== 6. NOTIFY after the primary bumps the serial`), `secondary.py` starts in the secondary network namespace listening on UDP port 53. Sending signal `SIGHUP` to `primary.py` triggers `bump()`.
+
+1. **Primary update**: The primary updates its serial from `2026111401` to `2026111402`, modifies records (deletes `www` A record `192.0.2.10`, adds `www` A record `192.0.2.11` and `api` A record `192.0.2.12`), and sends a NOTIFY message to `10.53.0.2:53`.
+2. **Secondary reaction**: `secondary.py` receives the NOTIFY packet, outputs `secondary: NOTIFY for lab.example. from 10.53.0.1`, and sends back an ACK.
+3. **SOA Query**: The secondary queries `10.53.0.1` for the SOA record over UDP and verifies that the serial (`2026111402`) is newer than its held serial (`2026111401`) using RFC 1982 logic (`newer=True`).
+4. **IXFR Request and Response**: The secondary sends a TSIG-signed IXFR request over TCP with authority serial `2026111401`. The primary evaluates the request, finds journal entry `2026111401`, and streams the incremental sequence:
+   - Header SOA: `2026111402`
+   - Deleted section header SOA: `2026111401`
+   - Removed RR: `www.lab.example. 300 IN A 192.0.2.10`
+   - Added section header SOA: `2026111402`
+   - Inserted RRs: `www.lab.example. 300 IN A 192.0.2.11` and `api.lab.example. 300 IN A 192.0.2.12`
+   - Footer SOA: `2026111402`
+
+### Section 7: IXFR Fallback to Full Zone Transfer
+
+In Step 7 (`== 7. IXFR from a serial the journal does not hold`), `xfr.py` issues an IXFR request specifying authority serial `2026111301`. Because `JOURNAL` only holds delta history for serial `2026111401`, the primary cannot generate an incremental delta stream.
+
+The primary falls back to AXFR structure over IXFR:
+
+```text
+primary: IXFR 2026111301 -> 2026111402 (no journal, full zone), 8 RRsets, key xfr-key.
+```
+
+The primary streams the full zone state (8 RRsets including new `www` and `api` records) bounded by initial and trailing SOA records for serial `2026111402`.
+
+### Section 8: RFC 1982 Serial Arithmetic Evaluation
+
+Step 8 (`== 8. RFC 1982 serial arithmetic`) runs `serial.py` to test serial comparison edge cases:
+
+- `2026111401 -> 2026111402`: `True` (Standard increment).
+- `2026111401 -> 2026111499`: `True` (Multiple intraday changes).
+- `2026111401 -> 2026111500`: `True` (Next day bump).
+- `2026111401 -> 20261115`: `False` (Operator omitted `NN` suffix; `20261115 < 2026111401`).
+- `2026111401 -> 1`: `False` (Direct reset to 1 is smaller than $2^{31}$ window).
+- `4294967295 -> 0`: `True` (Natural 32-bit wraparound from $2^{32}-1$ to 0).
+- `2026111401 -> 4173595048`: `True` (Maximum allowed jump of $2^{31}-1$).
+- `2026111401 -> 4173595049`: `False` (Jump of exactly $2^{31}$ is undefined and evaluates to False).
+
+## Production Deployments and Server Configuration (not run here)
+
+Production DNS deployments utilize dedicated DNS daemons such as BIND 9 or Knot DNS to handle zone transfers, NOTIFY signals, and cryptographic keys.
+
+### Key Generation
+
+Before configuring daemons, generate a shared TSIG key using the standard utility `tsig-keygen` (not run here):
+
+```bash
+tsig-keygen -a hmac-sha256 xfr-key
+```
+
+This outputs a configuration block containing the secret string.
+
+### BIND 9 Configuration (`named.conf`)
+
+On the primary server (IP `10.53.0.1`), define the key and zone permissions (not run here):
+
+```text
+key "xfr-key" {
+    algorithm hmac-sha256;
+    secret "c2VjcmV0LXNoYXJlZC1ieS10d28tc2VydmVycw==";
+};
+
+zone "lab.example" {
+    type primary;
+    file "/var/bind/db.lab.example";
+    allow-transfer { key xfr-key; };
+    also-notify { 10.53.0.2 key xfr-key; };
+    notify yes;
+};
+```
+
+On the secondary server (IP `10.53.0.2`), configure the secondary zone stanza (not run here):
+
+```text
+key "xfr-key" {
+    algorithm hmac-sha256;
+    secret "c2VjcmV0LXNoYXJlZC1ieS10d28tc2VydmVycw==";
+};
+
+zone "lab.example" {
+    type secondary;
+    primaries { 10.53.0.1 key xfr-key; };
+    file "/var/cache/bind/db.lab.example";
+};
+```
+
+### Knot DNS Configuration (`knot.conf`)
+
+Knot DNS uses YAML-based configuration syntax. The equivalent primary and secondary definitions are structured as follows (not run here):
+
+```yaml
+key:
+  - id: xfr-key
+    algorithm: hmac-sha256
+    secret: c2VjcmV0LXNoYXJlZC1ieS10d28tc2VydmVycw==
+
+remote:
+  - id: secondary-server
+    address: 10.53.0.2
+    key: xfr-key
+
+acl:
+  - id: xfr-acl
+    action: transfer
+    key: xfr-key
+
+zone:
+  - domain: lab.example
+    notify: secondary-server
+    acl: xfr-acl
+```
+
+### Manual Testing with `dig`
+
+Administrative testing of zone transfers can be performed using `dig` (not run here):
+
+To request a full AXFR transfer using TSIG authentication:
+
+```bash
+dig @10.53.0.1 lab.example AXFR -y hmac-sha256:xfr-key:c2VjcmV0LXNoYXJlZC1ieS10d28tc2VydmVycw==
+```
+
+To request an IXFR incremental transfer specifying serial `2026111401`:
+
+```bash
+dig @10.53.0.1 lab.example IXFR=2026111401 -y hmac-sha256:xfr-key:c2VjcmV0LXNoYXJlZC1ieS10d28tc2VydmVycw==
+```
+
+`-y` puts the secret on the command line, where `ps` and shell history can see it. Outside a lab, write the `tsig-keygen` output to a file and use `dig -k xfr-key.conf` instead.
+
+The Knot snippet shows only the primary side. On a Knot secondary the same `key` is defined, the primary becomes a `remote`, and the zone gets `master: <remote-id>` (renamed `primary` in newer releases; check the documentation for your version) plus an `acl` that allows `notify` from that remote.
+
+## Gotchas
+
+1. **Exposing Unrestricted AXFR Access**: Failing to configure `allow-transfer` restrictions allows any remote user to execute AXFR queries, leaking all internal domain mappings, hostname structures, and IP addresses.
+2. **Relying Solely on IP ACLs for Security**: IP-based access control lists can be bypassed via IP spoofing over UDP (such as spoofed SOA queries or NOTIFY packets). Zone transfers over TCP should always be secured with TSIG.
+3. **Clock Drift Breaking TSIG Verification**: If system clocks between primary and secondary servers drift by more than the TSIG `fudge` window (typically 300 seconds), all transfers will fail with `BADTIME` (Error 18) errors.
+4. **Accidental Serial Rollback**: Lowering a zone's SOA serial number causes secondaries to reject updates because RFC 1982 arithmetic marks smaller serial numbers as older data. Fixing this requires a multi-step wrap addition or manual database modification on all secondaries.
+5. **Trusting Payload Data inside NOTIFY Messages**: Secondary servers must never accept zone data or update local records directly from the payload of a NOTIFY message. Secondaries must perform an independent authoritative query back to the configured primary to verify the SOA.
+6. **Firewall Blocks on TCP Port 53**: While standard DNS lookup traffic relies heavily on UDP port 53, zone transfers (AXFR/IXFR) and large responses require TCP port 53. Blocking TCP port 53 breaks zone replication.
+7. **Exhaustion of IXFR Change Journals**: Primary servers retain a limited journal history of delta steps. If a secondary server remains offline longer than the journal retention period, an IXFR request will silently fall back to an AXFR full zone transfer, consuming significantly more bandwidth.
+8. **Reusing TSIG Secrets Across Security Domains**: Using the same TSIG secret key for multiple unrelated zones or external organization peers allows compromised third parties to authenticate requests for unauthorized zones.
+
+## Exercises
+
+1. **Modify `primary.py` Journal Steps**: Edit `primary.py` to add a second journal entry for serial `2026111402 -> 2026111403` that inserts a `TXT` record. Trigger two consecutive SIGHUP signals and verify that `secondary.py` successfully performs incremental updates across multiple steps.
+2. **Implement TSIG Clock Skew Tolerance Test**: Modify `xfr.py` to pass custom time values and test the boundaries of the TSIG `fudge` parameter. Determine the exact second offset at which `BADTIME` is triggered when `fudge` is set to 60 seconds.
+3. **Simulate a Serial Rollback Recovery**: Write a Python script using `serial.py` functions that calculates the intermediate serial step required to recover a zone whose serial was mistakenly changed from `2026111401` to `3000000000`, returning it safely to `2026111500`.
+4. **Enforce IP ACLs Alongside TSIG**: Update `primary.py` to inspect `self.client_address[0]`. Refuse transfer requests (RCODE `REFUSED`) if the source IP address is not contained within an allowed network array, even if a valid TSIG signature is present.
+5. **Construct an Unauthenticated IXFR Prober**: Modify `xfr.py` to issue IXFR requests to `primary.py` without TSIG credentials for various historic serial numbers, verifying that the server consistently enforces access controls regardless of query type or authority serial input.
+
+## Verification
+
+The protocols, code scripts, and execution outputs presented in this chapter were evaluated and verified in an isolated test harness:
+
+- **Execution Environment**: Unprivileged Linux kernel 6.12 within isolated user, network, and mount namespaces (`unshare -urnm`).
+- **Network Topology**: Private network namespaces (`p` and `s`) connected via a virtual Ethernet (`veth`) pair (`ep` <-> `es`) bound to `10.53.0.1/24` and `10.53.0.2/24`.
+- **Software Dependencies**: Python 3.13.5 with dnspython 2.9.1 (pre-existing virtualenv). Kernel 6.12.94, iproute2 6.15.0.
+- **Executed Scripts**: `primary.py`, `secondary.py`, `xfr.py`, `serial.py`, and `lab.sh`.
+- **Unexecuted Snippets**: Production daemon configurations for BIND 9 (`named.conf`), Knot DNS (`knot.conf`), `tsig-keygen` commands, and `dig` utility commands are clearly marked as "(not run here)" and serve as operational references.
+
+## Sources
+
+- RFC 1982: *Serial Number Arithmetic*. Internet Engineering Task Force (IETF). <https://datatracker.ietf.org/doc/html/rfc1982>
+- RFC 1995: *Incremental Zone Transfer in DNS*. Internet Engineering Task Force (IETF). <https://datatracker.ietf.org/doc/html/rfc1995>
+- RFC 1996: *A Mechanism for Prompt Notification of Zone Changes (DNS NOTIFY)*. Internet Engineering Task Force (IETF). <https://datatracker.ietf.org/doc/html/rfc1996>
+- RFC 2308: *Negative Caching of DNS Queries (DNS NCACHE)*. Internet Engineering Task Force (IETF). <https://datatracker.ietf.org/doc/html/rfc2308>
+- RFC 5936: *DNS Zone Transfer Protocol (AXFR)*. Internet Engineering Task Force (IETF). <https://datatracker.ietf.org/doc/html/rfc5936>
+- RFC 8945: *Secret Key Transaction Authentication for DNS (TSIG)*. Internet Engineering Task Force (IETF). <https://datatracker.ietf.org/doc/html/rfc8945>
+- RFC 9103: *DNS Zone Transfer over TLS (XoT)*. Internet Engineering Task Force (IETF). <https://datatracker.ietf.org/doc/html/rfc9103>
+- RFC 1912 section 2.2 (serial conventions): <https://datatracker.ietf.org/doc/html/rfc1912#section-2.2>
+- BIND 9 Administrator Reference Manual (`allow-transfer`, `also-notify`, `primaries`, `tsig-keygen`): <https://bind9.readthedocs.io/>
+- Knot DNS configuration reference (`key`, `remote`, `acl`, `zone`): <https://www.knot-dns.cz/docs/latest/html/reference.html>
+- dnspython TSIG and zone transfer API: <https://dnspython.readthedocs.io/>
+- RFC 9432: *DNS Catalog Zones*. Internet Engineering Task Force (IETF). <https://datatracker.ietf.org/doc/html/rfc9432>
