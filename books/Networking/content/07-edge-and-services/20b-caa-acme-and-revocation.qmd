@@ -1,0 +1,942 @@
+---
+title: "Who May Issue Your Certificate: CAA, ACME Challenges and Revocation After OCSP"
+author:
+  - name: "K19G"
+  - name: "grok-bot"
+---
+
+# Who May Issue Your Certificate: CAA, ACME Challenges and Revocation After OCSP
+
+When an operator automates public TLS certificate issuance for a domain, they grant an external Certification Authority (CA) permission to validate control of their endpoints and sign cryptographic identities. Without explicit administrative controls, any globally trusted CA can issue a valid, publicly trusted TLS certificate for any domain name in the Domain Name System (DNS) tree. If one CA is careless or compromised, or an attacker can bend routing or DNS between a CA and your server during validation, a certificate for your name can be issued to someone else, and browsers will accept it. This chapter is about the three controls an operator actually has: saying which CAs may issue (CAA), choosing how control is proven (ACME challenges), and what happens after a key leaks (revocation and short lifetimes).
+
+This chapter details the operational mechanics used to restrict certificate issuance and validate ownership under Automated Certificate Management Environment (ACME) workflows. You will examine DNS Certification Authority Authorization (CAA) records, how resolvers climb the DNS hierarchy, and how CAs evaluate critical tags and parameters such as specific account identifiers and validation methods. You will explore ACME challenge types (`http-01`, `dns-01`, `tls-alpn-01`), their network signatures, their deployment tradeoffs, and emerging extensions like ACME Renewal Information (ARI) and standing persistent validation (`dns-persist-01`).
+
+Finally, this chapter addresses the structural shift in certificate revocation. You will analyze why Online Certificate Status Protocol (OCSP) queries have been deprecated due to privacy leaks, operational availability risks, and soft-fail design limitations, leading major CAs to remove OCSP extensions entirely. You will study modern alternatives, including short-lived certificates, sharded Certificate Revocation Lists (CRLs), browser-aggregated status mechanisms, and the CA/Browser Forum schedule that takes maximum certificate validity down to 47 days by 2029.
+
+## Learning goals
+
+- Configure DNS CAA records (RFC 8659) to restrict certificate issuance, separate wildcard permissions, enforce reporting endpoints, and apply RFC 8657 account and validation constraints.
+- Trace the CAA relevant-RRset search algorithm, including DNS tree climbing, CNAME resolution, and tree-walking termination logic.
+- Evaluate ACME (RFC 8555) challenge workflows (`http-01`, `dns-01`, `tls-alpn-01`), calculating RFC 7638 JSON Web Key (JWK) thumbprints, key authorizations, and custom X.509 `acmeIdentifier` ALPN extensions.
+- Select optimal ACME challenge strategies for multi-node load balancers, Content Delivery Networks (CDNs), air-gapped environments, and wildcard certificates.
+- Analyze the deprecation of OCSP (RFC 6960), the structure of sharded CRLs (RFC 5280), browser-side aggregation models (CRLite, CRLSets), and short-lived certificate automation.
+- Prepare production deployments for CA/Browser Forum validity lifetime reductions (SC-081v3) and Multi-Perspective Issuance Corroboration (MPIC) requirements.
+
+## Version note
+
+Written against the RFCs and CA announcements current in November 2026. The lab uses Python 3.13.5 with `cryptography` 43.0.0 and OpenSSL 3.5.7 on Linux 6.12. Live DNS queries utilize the Cloudflare DNS-over-HTTPS (DoH) JSON API (`https://cloudflare-dns.com/dns-query`). Real-world operational timelines reference Let's Encrypt production changes, including the total shutdown of OCSP services on August 6, 2025, the general availability of 6-day (160-hour) short-lived certificates via the `shortlived` profile on January 15, 2026, and the CA/Browser Forum SC-081v3 validity reductions taking effect between 2026 and 2029.
+
+## Certification Authority Authorization (CAA) Mechanics
+
+RFC 8659 defines the CAA Resource Record (RR), a mechanism enabling a domain name holder to specify one or more CAs authorized to issue certificates for that domain. Under the CA/Browser Forum Baseline Requirements, all publicly trusted CAs must query CAA records in DNS prior to issuing a certificate.
+
+### CAA Record Format
+
+A CAA record (DNS RR type 257) consists of three fields: an 8-bit flags byte, an ASCII tag string, and a byte-string value.
+
+```text
++------------+--------------------+----------------------------------+
+| Flags (1B) | Tag Length + Tag   | Value                            |
++------------+--------------------+----------------------------------+
+| 0 or 128   | "issue"            | "letsencrypt.org"                |
+| 0          | "issuewild"        | ";"                              |
+| 0          | "iodef"            | "mailto:security@example.com"    |
++------------+--------------------+----------------------------------+
+```
+
+1. **Flags**: An 8-bit unsigned integer. Bit 0 (the high-order bit, value `128`) is designated as the **Issuer Critical Flag**. If a CA processes a CAA record with flag `128` containing a tag it does not understand, it **must not** issue the certificate. All other bits are reserved and must be set to `0`.
+2. **Tag**: An ASCII string representing the property name. RFC 8659 standardizes three canonical tags:
+   - `issue`: Authorizes the specified CA identifier to issue certificates for the domain and its subdomains (unless overridden by `issuewild`).
+   - `issuewild`: Explicitly authorizes or restricts the specified CA identifier from issuing *wildcard* certificates (e.g., `*.example.com`).
+   - `iodef`: Specifies a URL (typically `mailto:` or `https:`) to which CAs may report invalid certificate issuance requests or policy violations.
+3. **Value**: A contiguous octet sequence whose interpretation depends on the tag. A value of `;` (or a string starting with `;`) indicates that no CA is authorized for that specific property.
+
+### Relevant-RRset Search Algorithm
+
+When a CA receives a certificate request for a Fully Qualified Domain Name (FQDN) such as `a.b.c.example.com`, it executes a mandatory DNS discovery process to locate the **relevant CAA RRset**.
+
+```text
+[Certificate Request for: v2.api.shop.test]
+                   │
+                   ▼
+     Does v2.api.shop.test have CAA?
+            ├── YES ──► Use this RRset (STOP)
+            └── NO
+                 │
+                 ▼
+       Does api.shop.test have CAA?
+            ├── YES ──► Use this RRset (STOP)
+            └── NO
+                 │
+                 ▼
+         Does shop.test have CAA?
+            ├── YES ──► Use this RRset (STOP)
+            └── NO
+                 │
+                 ▼
+         Does test (TLD) have CAA?
+            ├── YES ──► Use this RRset (STOP)
+            └── NO ───► no relevant RRset: CAA does not restrict issuance
+```
+
+The algorithm operates according to the following strict operational rules:
+
+1. **Hierarchy Climbing**: The search begins at the target FQDN. If a non-empty CAA RRset exists at that node, that RRset is the *relevant RRset*, and the search terminates immediately. If no CAA records exist at that node, the search climbs up one label toward the root (e.g., from `a.b.c.example.com` to `b.c.example.com`) and checks again.
+2. **CNAME and DNAME Handling**: Each step is an ordinary DNS query for type CAA, so if a label is a CNAME (or sits under a DNAME), the resolver follows the alias and the CA uses whatever CAA RRset comes back for the target. If the target has none, the climb continues with the parent of the *original* name, not the target's parents. RFC 8659 removed the older RFC 6844 rule that also climbed the alias target's tree.
+3. **Property Inheritance**:
+   - For a **non-wildcard request** (`app.example.com`), if the relevant RRset contains `issue` properties, the request is allowed if the target CA matches one of the values. If the relevant RRset contains `issuewild` properties but **no** `issue` property, non-wildcard issuance is permitted by default for any CA because `issuewild` affects wildcard requests exclusively.
+   - For a **wildcard request** (`*.app.example.com`), the search starts at `app.example.com` (RFC 8659 section 3 removes the `*.` label first). If the relevant RRset contains an `issuewild` property, the CA checks *only* the `issuewild` records and ignores `issue` records. If the relevant RRset exists but contains **no** `issuewild` property, the CA falls back to checking `issue` properties.
+4. **Empty RRsets vs. Absence**: An explicit `issue ";"` tells every CA that no non-wildcard issuance is permitted. If no CAA RRset is found anywhere from the name up to the TLD, CAA places no restriction and any CA may issue.
+
+### Errors and Failures
+
+A DNS lookup for CAA can result in success (a valid RRset or NOERROR/NODATA), name not found (NXDOMAIN), or lookup failure (SERVFAIL, connection timeout, DNSSEC validation failure).
+
+| DNS Result Status | CAA Lookup Interpretation | Operational Action |
+| :--- | :--- | :--- |
+| **NOERROR with CAA RRs** | Relevant RRset found | Evaluate flags, tags, and values against request parameters. |
+| **NOERROR (NODATA) / NXDOMAIN** | No CAA at current label | Climb one label toward the root; if the TLD has none either, CAA does not restrict issuance. |
+| **DNSSEC validation failure (bogus)** | Answer cannot be trusted | Refuse to issue. |
+| **SERVFAIL / timeout** | Lookup failure | Refuse, unless the Baseline Requirements exception applies: the failure is outside the CA's infrastructure, the lookup was retried, and the zone has no DNSSEC chain of trust to the root. Do not rely on that exception; a broken authoritative server usually just blocks your renewal. |
+
+### RFC 8657 Extended Parameters
+
+RFC 8657 expands the CAA specification by adding parameters to the `issue` and `issuewild` values, allowing operators to pin issuance to specific ACME accounts or validation methods. Parameters are appended after the CA identifier, separated by semicolons:
+
+`issue "letsencrypt.org; accounturi=https://acme-v02.api.letsencrypt.org/acme/acct/12345; validationmethods=dns-01"`
+
+- **`accounturi`**: Restricts certificate issuance to the specified ACME account URL. Requests initiated by any other account registered with that CA are rejected.
+- **`validationmethods`**: A comma-separated list of allowed ACME challenge method names (`http-01`, `dns-01`, `tls-alpn-01`). If a client attempts to validate domain control using an unlisted method, the CA must refuse to finalize the order.
+
+### Multi-Perspective Issuance Corroboration (MPIC)
+
+Traditionally, a CA performed CAA queries and ACME challenge validation from a single vantage point in its own data center. This created a vulnerability: an attacker performing localized Border Gateway Protocol (BGP) route hijacking or DNS cache poisoning near the CA's data center could spoof CAA or validation responses.
+
+To eliminate single-vantage-point attacks, the CA/Browser Forum passed Ballot SC-067, mandating **Multi-Perspective Issuance Corroboration (MPIC)**. Under MPIC, the CA repeats CAA lookups and challenge validation from several remote network perspectives in different regions, and issuance needs a quorum of them to agree with the primary result. The ballot phases this in; since 15 June 2025 CAs must run it in blocking mode with at least two remote perspectives, and the required count rises in later phases. With fewer than six remote perspectives only one may disagree. In practice this means your DNS and your challenge responder must answer the same way from everywhere: geo-DNS that returns a different CAA set per region, or an anycast responder that only some sites can answer, can fail validation.
+
+## The Automated Certificate Management Environment (ACME)
+
+RFC 8555 standardizes ACME, a protocol that automates certificate provisioning, validation, and renewal over HTTPS using JSON Web Signatures (JWS).
+
+### Protocol Architecture and Lifecycle
+
+An ACME interaction revolves around an **Account Key Pair** (typically ECDSA P-256, or RSA of 2048 bits or more) created by the subscriber. All requests sent to the ACME server are signed using JWS in Flattened JSON Serialization format, authenticated by the client's account URL in the `kid` header parameter.
+
+```text
+Subscriber Client                                       ACME Server
+        │                                                    │
+        ├────── 1. POST /acme/new-acct (Key/JWS) ───────────►│
+        │◄───── Account Created (Location: /acme/acct/12) ───┤
+        │                                                    │
+        ├────── 2. POST /acme/new-order (Identities) ───────►│
+        │◄───── Order Created + Authorizations URLs ─────────┤
+        │                                                    │
+        ├────── 3. GET /acme/authz/123 ─────────────────────►│
+        │◄───── Challenge Objects (http-01, dns-01) ─────────┤
+        │                                                    │
+        │  [ Provision Challenge Resource: File / TXT / Cert ]
+        │                                                    │
+        ├────── 4. POST /acme/chall/456 (Trigger) ──────────►│
+        │◄───── Status: Pending / Valid (Server Validates) ──┤
+        │                                                    │
+        ├────── 5. POST /acme/finalize (Submit CSR) ────────►│
+        │◄───── Order Valid (Certificate URL) ───────────────┤
+        │                                                    │
+        ├────── 6. POST /acme/cert/789 (Fetch Cert) ────────►│
+        │◄───── PEM Certificate Chain ───────────────────────┤
+```
+
+### Key Authorization Computation
+
+Every ACME challenge requires the client to demonstrate possession of the account private key by proving knowledge of the **Key Authorization** string.
+
+The Key Authorization is defined as:
+
+```text
+keyAuthorization = token || "." || base64url(JWK thumbprint of the account key)
+```
+
+1. **Token**: A random string provided by the ACME server in the challenge object.
+2. **JWK Thumbprint**: Calculated per RFC 7638 using the SHA-256 digest of the lexicographically sorted JSON Web Key (JWK) representation of the account public key.
+
+For an Elliptic Curve (EC) key with curve `P-256`, the required JWK fields are sorted alphabetically: `crv`, `kty`, `x`, `y`. Whitespace and formatting outside the canonical JSON structure are stripped prior to hashing.
+
+The RFC 7517 example P-256 key in that canonical form:
+
+```json
+{"crv":"P-256","kty":"EC","x":"f83OJ3D2xF1Bg8vub9tLe1gHMzV76e8Tus9uPHvRVEU","y":"x_mEzs-Meb4FZhBDaN9HM-VQhXAOF28nyWY43C02-VQ"}
+```
+
+The SHA-256 digest of this canonical string is URL-safe Base64 encoded (without trailing padding `=`) to form the JWK thumbprint.
+
+### Validation Methods Comparison
+
+```text
+[http-01 Challenge]
+ACME CA ──► HTTP GET http://example.com/.well-known/acme-challenge/<TOKEN>
+             (port 80; Let's Encrypt follows redirects only to http/https on 80/443)
+
+[dns-01 Challenge]
+ACME CA ──► DNS TXT Query _acme-challenge.example.com
+             (Returns: base64url(SHA256(Key Authorization)))
+
+[tls-alpn-01 Challenge]
+ACME CA ──► TLS Connection example.com:443 (ALPN: acme-tls/1)
+             (Validates: X.509 cert SAN=example.com + acmeIdentifier Extension)
+```
+
+#### `http-01`
+- **Mechanism**: The ACME server performs an HTTP GET request to `http://<domain>/.well-known/acme-challenge/<token>`.
+- **Expected Payload**: The raw Key Authorization ASCII string.
+- **Network Constraints**: The first request always goes to TCP port 80. RFC 8555 lets the server follow redirects; Let's Encrypt follows them only to `http` or `https` URLs on ports 80 and 443 (and does not check the certificate on the HTTPS hop), so a redirect to `:8443` fails.
+- **Limitations**: Cannot be used to issue wildcard certificates (`*.example.com`).
+
+#### `dns-01`
+- **Mechanism**: The subscriber publishes a DNS TXT record at `_acme-challenge.<domain>`.
+- **Expected Payload**: The Base64URL-encoded SHA-256 digest of the Key Authorization string:
+  `TXT value = base64url(SHA-256(keyAuthorization))`
+- **Network Constraints**: Requires programmatic write access to DNS infrastructure or dedicated DNS CNAME delegation.
+- **Capabilities**: At Let's Encrypt it is the only challenge that can authorize a wildcard name today. It also works for hosts that are not reachable from the Internet, because the CA only talks to public DNS.
+
+#### `tls-alpn-01` (RFC 8737)
+- **Mechanism**: The subscriber configures a TLS server on port 443 to negotiate the Application-Layer Protocol Negotiation (ALPN) protocol identifier `acme-tls/1`.
+- **Expected Certificate Payload**: During the TLS handshake, the server presents a self-signed X.509 certificate satisfying two conditions:
+  1. The Subject Alternative Name (SAN) extension contains **only** the target domain name being validated.
+  2. The certificate includes a **critical** extension with OID `1.3.6.1.5.5.7.1.31` (`acmeIdentifier`).
+- **Extension Value**: DER-encoded `OCTET STRING` containing the 32-byte raw SHA-256 hash of the Key Authorization string.
+
+```text
+acmeIdentifier Extension (OID: 1.3.6.1.5.5.7.1.31)
+  Critical: TRUE
+  ASN.1 Structure: OCTET STRING (32 bytes raw SHA-256 digest)
+```
+
+#### Selection Matrix for Enterprise Architecture
+
+| Deployment Scenario | Recommended Challenge Method | Rationale & Architectural Notes |
+| :--- | :--- | :--- |
+| **Edge Load Balancers / Reverse Proxies** | `http-01` (any node can serve the token if they share it) or `tls-alpn-01` (only where TLS terminates on the node itself) | No DNS API credentials on the edge. With several nodes behind one name, every node must be able to answer, because MPIC perspectives may land on different ones. |
+| **Wildcard Provisioning (`*.domain.com`)** | `dns-01` (or `dns-persist-01` with `policy=wildcard` once your CA offers it) | Let's Encrypt does not accept `http-01` or `tls-alpn-01` for wildcards. |
+| **Hosts not reachable from the Internet** | `dns-01` | The CA only queries public DNS; no inbound access to the host is needed. |
+| **Closed Port 80 Environments** | `tls-alpn-01` or `dns-01` | Bypasses port 80 blocks imposed by ISPs or corporate firewalls. |
+| **Mass CDN Multi-Tenant SaaS** | `dns-01` via CNAME Delegation | Point `_acme-challenge.customer.com` to `customer.acme.cdn-provider.net`. |
+
+### Emerging Validation Standards: `dns-persist-01`
+
+`dns-01` needs a fresh TXT record for every authorization, which means DNS API credentials in the issuance path and waiting for propagation at every renewal. CA/Browser Forum Ballot SC-088v3, passed in October 2025, added validation method 3.2.2.4.22, "DNS TXT Record with Persistent Value"; the ACME side is the IETF draft `draft-ietf-acme-dns-persist`, adopted by the ACME working group the same month.
+
+Under `dns-persist-01`, an operator provisions a single, static DNS TXT record at `_validation-persist.<domain>` identifying the authorized CA and account URL:
+
+```text
+_validation-persist.example.com. IN TXT "letsencrypt.org; accounturi=https://acme-v02.api.letsencrypt.org/acme/acct/12345"
+```
+
+The record binds the name to one CA and one ACME account, and it is reused for new orders and every renewal, so DNS write access can stay out of the pipeline and the ACME account key becomes the thing to protect. Without parameters it covers only that exact name; `policy=wildcard` extends it to `*.example.com` and subdomains, and `persistUntil=<unix seconds>` limits how long it may be used. Several CAs can each have their own record at the same label. Let's Encrypt announced staging support for late Q1 2026 and production for Q2 2026; check its current documentation and your client's support before relying on it.
+
+### ACME Renewal Information (ARI) and Short-Lived Profiles
+
+- **ACME Renewal Information (ARI, RFC 9773)**: Allows CAs to signal optimal renewal windows to clients via a standardized REST endpoint. Instead of relying on static local cron schedules (e.g., renewing unconditionally at 60 days), ACME clients query ARI to adjust renewal timers based on CA load, emergency revocation events, or policy adjustments.
+- **Short-Lived Certificates**: Let's Encrypt's default certificates last 90 days. Its `shortlived` profile, generally available since 15 January 2026, issues 160-hour (about 6-day) certificates. A leaked key for one of those is useful for days, not months, which is why the CA/Browser Forum lets very short-lived certificates leave out revocation pointers. The cost is that renewal must work reliably every few days.
+
+## Revocation Architecture: The Post-OCSP Era
+
+When a private key is compromised, or an environment is decommissioned, the binding between the cryptographic identity and the domain name must be revoked before the certificate expires.
+
+### The Downfall of OCSP (RFC 6960)
+
+The Online Certificate Status Protocol (OCSP) permitted clients (such as web browsers) to query a CA's OCSP responder in real time to verify whether a given serial number was valid. Despite its initial adoption, OCSP suffered from three critical design flaws:
+
+```text
+[Legacy OCSP Flow]
+Client ──1. TLS Handshake (Cert)──► Web Server
+Client ──2. Query Serial # ───────► CA OCSP Responder (Privacy Leak & Delay!)
+Client ◄─3. Signed Response ────── CA OCSP Responder
+
+* Problem 1: Privacy Leak - CA tracks every site the user visits.
+* Problem 2: Availability Fail - If OCSP server goes down, browsers soft-fail.
+* Problem 3: Latency - Adds blocking round-trips to every TLS connection.
+```
+
+1. **Privacy Infiltration**: CAs received IP addresses and certificate queries for every site a user visited, creating a real-time browsing tracking log.
+2. **Availability and Latency Overhead**: OCSP responders handled billions of requests daily. Outages caused connection delays. To avoid breaking the web during CA outages, browsers implemented "soft-fail" mode—meaning if an OCSP responder timed out or returned an error, the browser ignored the failure and accepted the certificate anyway, neutralizing the security guarantee.
+3. **Stapling never became universal**: OCSP stapling (the TLS `status_request` extension, RFC 6066) let servers send a cached response in the handshake, and Must-Staple (RFC 7633) let a certificate demand it. Too few servers stapled reliably for browsers to require it.
+
+### The Shift to Partitioned CRLs and Browser Aggregation
+
+CA/Browser Forum Ballot SC-063 (2023) made OCSP optional for publicly trusted TLS CAs and made CRLs mandatory. Let's Encrypt removed OCSP URLs from newly issued certificates on **May 7, 2025**, and completely shut down its OCSP responder infrastructure on **August 6, 2025**.
+
+Modern revocation relies on two complementary mechanisms:
+
+```text
+              +-----------------------------------+
+              | Modern Revocation Model (2026+)   |
+              +-----------------------------------+
+                                │
+        ┌───────────────────────┴───────────────────────┐
+        ▼                                               ▼
+[Partitioned CRLs]                            [Short-Lived Certs]
+(RFC 5280 DER Shards)                         (6-Day / 160-Hour Max)
+  │                                             │
+  ├── CA splits lists into numbered shards      ├── Contains NO OCSP URLs
+  ├── Downloaded via HTTP DP URLs               ├── CRL DP may be omitted 
+  └── Collected by browser vendors             └── Expires within days, so a
+      (e.g., CRLite / CRLSets)                      leaked key is short-lived
+```
+
+1. **Partitioned / Sharded Certificate Revocation Lists (CRLs)**: CAs issue standard X.509 CRLs (RFC 5280) split into shards. Each certificate's CRL Distribution Points extension names the one shard that would list it (for example `http://ye2.c.lencr.org/51.crl`), and each shard carries a critical **Issuing Distribution Point** extension with the same URL, so a relying party can check it has the right shard. The lab fetches one of these.
+2. **Browser-Side Aggregated Status (CRLite / CRLSets)**: Browsers avoid fetching revocation data per connection. Vendors collect CRLs centrally and push compact updates: Mozilla's CRLite encodes revocation status for all publicly logged certificates in a compressed filter, while Chrome's CRLSets carry a curated subset of revocations. Non-browser clients (curl, language runtimes, most API clients) usually check nothing at all unless configured to, which is the strongest argument for short lifetimes.
+
+### Mandated Lifetimes and CA/B Forum Roadmap
+
+To reduce reliance on revocation infrastructure, the CA/Browser Forum passed Ballot **SC-081v3**, enforcing progressive reductions in maximum certificate validity and domain validation reuse:
+
+```text
+[CA/B Forum SC-081v3 Validity Reduction Roadmap]
+
+   398 Days ───► 200 Days ───► 100 Days ───► 47 Days
+ (Historical)   (Mar 2026)     (Mar 2027)    (Mar 2029)
+```
+
+| Enforcement Date | Maximum Certificate Validity | Maximum Domain Validation Reuse |
+| :--- | :--- | :--- |
+| **Historical Baseline** | 398 Days | 398 Days |
+| **15 March 2026** | **200 Days** | 200 Days |
+| **15 March 2027** | **100 Days** | 100 Days |
+| **15 March 2029** | **47 Days** | 10 Days |
+
+Let's Encrypt has announced its own schedule ahead of these limits: a 64-day default on **10 February 2027** and 45 days on **16 February 2028**. Anything that renews on a fixed "every 60 days" cron will break; renew at about two thirds of the lifetime, or follow ARI.
+
+---
+
+## The lab
+
+The environment provides a Python 3.13 environment equipped with `cryptography` version 43.0.0, OpenSSL binaries, and standard network utilities. The scripts below implement DNS CAA evaluation, calculate ACME RFC 7638 thumbprints and challenge tokens, run a real `tls-alpn-01` responder and validator over loopback TLS, and inspect real-world X.509 certificate revocation fields.
+
+### Lab files
+
+#### `caa.py`
+`caa.py`:
+
+```python
+#!/usr/bin/env python3
+"""RFC 8659 CAA evaluation: find the relevant RRset, then decide for one CA.
+
+  caa.py test                      run the offline cases (a made-up zone)
+  caa.py live NAME CA [wild]       look the name up over DoH (Cloudflare JSON API)
+
+The relevant RRset (RFC 8659 section 3): start at the FQDN being issued for and
+climb one label at a time towards the root, stopping at the first non-empty CAA
+RRset.  CNAMEs are followed by the resolver as for any other query.  An empty
+result everywhere means any CA may issue."""
+import json, sys, urllib.request, urllib.parse
+
+def parse(rdata):
+    """'0 issue "letsencrypt.org; accounturi=..."' -> (flags, tag, issuer, params)"""
+    flags, tag, value = rdata.split(" ", 2)
+    value = value.strip().strip('"')
+    issuer, _, rest = value.partition(";")
+    params = {}
+    for p in rest.split(";"):
+        if "=" in p:
+            k, v = p.split("=", 1)
+            params[k.strip()] = v.strip()
+    return int(flags), tag.lower(), issuer.strip().lower(), params
+
+def relevant(name, lookup):
+    # RFC 8659 section 3: for *.X the search starts at X
+    if name.startswith("*."):
+        name = name[2:]
+    labels = name.rstrip(".").split(".")
+    for i in range(len(labels)):
+        here = ".".join(labels[i:])
+        rrs = lookup(here)
+        if rrs:
+            return here, rrs
+    return None, []
+
+def decide(name, ca, wildcard, lookup, account=None, method=None):
+    where, rrs = relevant(name, lookup)
+    if not rrs:
+        return "ALLOW (no CAA anywhere up the tree)"
+    recs = [parse(r) for r in rrs]
+    for flags, tag, _, _ in recs:
+        if flags & 128 and tag not in ("issue", "issuewild", "iodef"):
+            return f"DENY (critical unknown tag '{tag}' at {where})"
+    tags = {t for _, t, _, _ in recs}
+    use = "issuewild" if wildcard and "issuewild" in tags else "issue"
+    cands = [r for r in recs if r[1] == use]
+    if not cands:
+        return f"ALLOW (RRset at {where} has no '{use}' property)"
+    for _, _, issuer, params in cands:
+        if issuer != ca:
+            continue
+        if "accounturi" in params and params["accounturi"] != account:
+            continue
+        if "validationmethods" in params and method not in params["validationmethods"].split(","):
+            continue
+        return f"ALLOW ('{use}' at {where} names {ca}" + (f", {params}" if params else "") + ")"
+    return f"DENY ({len(cands)} '{use}' record(s) at {where}, none permit {ca}" + \
+        (f" with account={account} method={method}" if account or method else "") + ")"
+
+ZONE = {
+    "shop.test": ['0 issue "letsencrypt.org"', '0 issuewild ";"', '0 iodef "mailto:pki@shop.test"'],
+    "api.shop.test": ['0 issue "pki.goog"'],
+    "locked.test": ['0 issue ";"'],
+    "strict.test": ['0 issue "letsencrypt.org; accounturi=https://acme-v02.api.letsencrypt.org/acme/acct/1234; validationmethods=dns-01"'],
+    "future.test": ['0 issue "letsencrypt.org"', '128 tbs "unknown"'],
+    "wildonly.test": ['0 issuewild "letsencrypt.org"'],
+}
+
+def test():
+    look = lambda n: ZONE.get(n, [])
+    cases = [
+        ("www.shop.test", "letsencrypt.org", False, {}),
+        ("www.shop.test", "pki.goog", False, {}),
+        ("*.shop.test", "letsencrypt.org", True, {}),
+        ("api.shop.test", "letsencrypt.org", False, {}),
+        ("v2.api.shop.test", "pki.goog", False, {}),
+        ("nothing.example", "any-ca.example", False, {}),
+        ("locked.test", "letsencrypt.org", False, {}),
+        ("strict.test", "letsencrypt.org", False, {"account": "https://acme-v02.api.letsencrypt.org/acme/acct/1234", "method": "dns-01"}),
+        ("strict.test", "letsencrypt.org", False, {"account": "https://acme-v02.api.letsencrypt.org/acme/acct/1234", "method": "http-01"}),
+        ("strict.test", "letsencrypt.org", False, {"account": "https://acme-v02.api.letsencrypt.org/acme/acct/9999", "method": "dns-01"}),
+        ("future.test", "letsencrypt.org", False, {}),
+        ("wildonly.test", "pki.goog", False, {}),
+    ]
+    for name, ca, wild, kw in cases:
+        print(f"  {name:<18} {ca:<16} -> {decide(name, ca, wild, look, **kw)}")
+
+CNAMES = {}
+
+def doh(name):
+    url = "https://cloudflare-dns.com/dns-query?" + urllib.parse.urlencode({"name": name, "type": "CAA"})
+    req = urllib.request.Request(url, headers={"accept": "application/dns-json"})
+    ans = json.load(urllib.request.urlopen(req, timeout=10)).get("Answer", [])
+    out = []
+    for a in ans:
+        if a["type"] == 5:
+            CNAMES[name] = a["data"].rstrip(".")
+        if a["type"] == 257:
+            d = a["data"]
+            if d.startswith("\\#"):   # RFC 3597 generic form: \# len hex
+                raw = bytes.fromhex("".join(d.split()[2:]))
+                tl = raw[1]
+                d = f'{raw[0]} {raw[2:2+tl].decode()} "{raw[2+tl:].decode()}"'
+            out.append(d)
+    return out
+
+if __name__ == "__main__":
+    if sys.argv[1] == "test":
+        test()
+    else:
+        name, ca = sys.argv[2], sys.argv[3]
+        wild = len(sys.argv) > 4
+        where, rrs = relevant(name, doh)
+        via = f" (answer came via CNAME {where} -> {CNAMES[where]})" if where in CNAMES else ""
+        print(f"  {name}: relevant RRset at {where or '(none)'}{via}: {rrs}")
+        print(f"    {ca}{' (wildcard)' if wild else ''} -> {decide(name, ca, wild, doh)}")
+```
+
+#### `acme.py`
+`acme.py`:
+
+```python
+#!/usr/bin/env python3
+"""ACME challenge values (RFC 8555 section 8, RFC 8737), checked against RFC 7638.
+
+  acme.py vector     RFC 7638 section 3.1 thumbprint example
+  acme.py demo       fixed demo P-256 account key -> http-01, dns-01, tls-alpn-01 values"""
+import base64, hashlib, json, sys
+from cryptography.hazmat.primitives.asymmetric import ec
+
+def b64u(b):
+    return base64.urlsafe_b64encode(b).rstrip(b"=").decode()
+
+def thumbprint(jwk):
+    """RFC 7638: hash the required members only, lexicographic order, no spaces."""
+    req = {"RSA": ("e", "kty", "n"), "EC": ("crv", "kty", "x", "y")}[jwk["kty"]]
+    canon = json.dumps({k: jwk[k] for k in req}, separators=(",", ":"), sort_keys=True)
+    return b64u(hashlib.sha256(canon.encode()).digest())
+
+RFC7638_JWK = {"kty": "RSA", "e": "AQAB", "alg": "RS256", "kid": "2011-04-29",
+    "n": "0vx7agoebGcQSuuPiLJXZptN9nndrQmbXEps2aiAFbWhM78LhWx4cbbfAAtVT86zwu1RK7aPFFxuhDR1L6tSoc_BJECPebWKRXjBZCiFV4n3oknjhMstn64tZ_2W-5JsGY4Hc5n9yBXArwl93lqt7_RN5w6Cf0h4QyQ5v-65YGjQR0_FDW2QvzqY368QQMicAtaSqzs8KJZgnYb9c7d0zgdAZHzu6qMQvRL5hajrn1n91CbOpbISD08qNLyrdkt-bFTWhAI4vMQFh6WeZu0fM4lFd2NcRwr3XPksINHaQ-G_xBniIqbw0Ls1jF44-csFCur-kEgU8awapJzKnqDKgw"}
+RFC7638_EXPECTED = "NzbLsXh8uDCcd-6MNwXF4W_7noWXFZAfHkxZsRGC9Xs"
+
+def ec_jwk(key):
+    n = key.public_key().public_numbers()
+    return {"kty": "EC", "crv": "P-256", "x": b64u(n.x.to_bytes(32, "big")), "y": b64u(n.y.to_bytes(32, "big"))}
+
+if __name__ == "__main__":
+    if sys.argv[1] == "vector":
+        got = thumbprint(RFC7638_JWK)
+        print(f"  RFC 7638 3.1 thumbprint: {got}")
+        print(f"  expected:                {RFC7638_EXPECTED}  match={got == RFC7638_EXPECTED}")
+    else:
+        token = sys.argv[2] if len(sys.argv) > 2 else "evaGxfADs6pSRb2LAv9IZf17Dt3juxGJ-PCt92wr-oA"
+        key = ec.derive_private_key(0x1234567890abcdef, ec.SECP256R1())   # fixed demo key, never use
+        jwk = ec_jwk(key)
+        ka = f"{token}.{thumbprint(jwk)}"
+        print(f"  account JWK thumbprint: {thumbprint(jwk)}")
+        print(f"  token:                  {token}")
+        print(f"  key authorization:      {ka}")
+        print(f"  http-01: GET http://<name>/.well-known/acme-challenge/{token}")
+        print(f"           body = key authorization ({len(ka)} bytes)")
+        print(f"  dns-01:  _acme-challenge.<name> TXT \"{b64u(hashlib.sha256(ka.encode()).digest())}\"")
+        print(f"  tls-alpn-01: acmeIdentifier extension = SHA-256(key authorization) = {hashlib.sha256(ka.encode()).hexdigest()}")
+```
+
+#### `alpn01.py`
+`alpn01.py`:
+
+```python
+#!/usr/bin/env python3
+"""tls-alpn-01 (RFC 8737) end to end on loopback: a responder and a validator.
+
+  alpn01.py CASE     correct | stale-keyauth | no-alpn | not-critical | extra-san
+
+The responder serves a self-signed certificate for NAME carrying the
+critical acmeIdentifier extension (OID 1.3.6.1.5.5.7.1.31) whose value is the
+DER OCTET STRING of SHA-256(key authorization), but only when the client
+offers ALPN "acme-tls/1".  The validator plays the CA's side."""
+import datetime, hashlib, socket, ssl, sys, tempfile, threading, os
+from cryptography import x509
+from cryptography.x509.oid import NameOID, ObjectIdentifier
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import ec
+
+NAME = "www.shop.test"
+ACME_ID = ObjectIdentifier("1.3.6.1.5.5.7.1.31")
+from acme import thumbprint, ec_jwk
+ACCOUNT_KEY = ec.derive_private_key(0x1234567890abcdef, ec.SECP256R1())   # same demo key as acme.py
+KEYAUTH = "evaGxfADs6pSRb2LAv9IZf17Dt3juxGJ-PCt92wr-oA." + thumbprint(ec_jwk(ACCOUNT_KEY))
+
+def challenge_cert(keyauth, critical=True, sans=(NAME,)):
+    key = ec.generate_private_key(ec.SECP256R1())
+    digest = hashlib.sha256(keyauth.encode()).digest()
+    der_octets = b"\x04\x20" + digest                      # OCTET STRING, 32 bytes
+    now = datetime.datetime.now(datetime.timezone.utc)
+    cert = (x509.CertificateBuilder()
+            .subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "acme-tls-alpn-01")]))
+            .issuer_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "acme-tls-alpn-01")]))
+            .public_key(key.public_key()).serial_number(x509.random_serial_number())
+            .not_valid_before(now - datetime.timedelta(minutes=1)).not_valid_after(now + datetime.timedelta(days=1))
+            .add_extension(x509.SubjectAlternativeName([x509.DNSName(s) for s in sans]), critical=False)
+            .add_extension(x509.UnrecognizedExtension(ACME_ID, der_octets), critical=critical)
+            .sign(key, hashes.SHA256()))
+    d = tempfile.mkdtemp()
+    open(f"{d}/c.pem", "wb").write(cert.public_bytes(serialization.Encoding.PEM))
+    open(f"{d}/k.pem", "wb").write(key.private_bytes(serialization.Encoding.PEM,
+        serialization.PrivateFormat.PKCS8, serialization.NoEncryption()))
+    return f"{d}/c.pem", f"{d}/k.pem"
+
+def responder(sock, certfile, keyfile, offer_alpn):
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.load_cert_chain(certfile, keyfile)
+    if offer_alpn:
+        ctx.set_alpn_protocols(["acme-tls/1"])
+    conn, _ = sock.accept()
+    try:
+        with ctx.wrap_socket(conn, server_side=True) as t:
+            t.recv(1)
+    except (ssl.SSLError, OSError):
+        pass
+
+def validate(port, expected_keyauth):
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE              # self-signed by design (RFC 8737 section 3)
+    ctx.set_alpn_protocols(["acme-tls/1"])
+    with socket.create_connection(("127.0.0.1", port)) as raw:
+        with ctx.wrap_socket(raw, server_hostname=NAME) as t:
+            alpn = t.selected_alpn_protocol()
+            der = t.getpeercert(binary_form=True)
+    if alpn != "acme-tls/1":
+        return f"FAIL: server did not negotiate acme-tls/1 (got {alpn!r})"
+    cert = x509.load_der_x509_certificate(der)
+    sans = cert.extensions.get_extension_for_class(x509.SubjectAlternativeName).value.get_values_for_type(x509.DNSName)
+    if sans != [NAME]:
+        return f"FAIL: SAN must be exactly [{NAME}], got {sans}"
+    try:
+        ext = cert.extensions.get_extension_for_oid(ACME_ID)
+    except x509.ExtensionNotFound:
+        return "FAIL: no acmeIdentifier extension"
+    if not ext.critical:
+        return "FAIL: acmeIdentifier extension is not critical"
+    want = b"\x04\x20" + hashlib.sha256(expected_keyauth.encode()).digest()
+    if ext.value.value != want:
+        return f"FAIL: acmeIdentifier {ext.value.value[2:].hex()[:16]}... != expected {want[2:].hex()[:16]}..."
+    return f"PASS: alpn={alpn} SAN={sans} acmeIdentifier critical, digest {want[2:].hex()[:16]}... matches"
+
+if __name__ == "__main__":
+    case = sys.argv[1]
+    ka = KEYAUTH
+    kw = {}
+    alpn = True
+    if case == "stale-keyauth":
+        ka = "oldtoken-from-last-week." + KEYAUTH.split(".")[1]
+    elif case == "no-alpn":
+        alpn = False
+    elif case == "not-critical":
+        kw["critical"] = False
+    elif case == "extra-san":
+        kw["sans"] = (NAME, "other.shop.test")
+    cert, key = challenge_cert(ka, **kw)
+    srv = socket.socket(); srv.bind(("127.0.0.1", 0)); srv.listen(1)
+    th = threading.Thread(target=responder, args=(srv, cert, key, alpn)); th.start()
+    print(f"  {case:<14} {validate(srv.getsockname()[1], KEYAUTH)}")
+    th.join(2)
+```
+
+#### `revocation.sh`
+`revocation.sh`:
+
+```bash
+#!/bin/sh
+# What revocation information do real certificates carry today? (live, read-only)
+# Needs: openssl, curl, outbound 443/80.
+for host in letsencrypt.org github.com www.google.com cloudflare.com; do
+  pem=$(echo | timeout 10 openssl s_client -connect $host:443 -servername $host 2>/dev/null | openssl x509 2>/dev/null)
+  [ -n "$pem" ] || { echo "$host: no certificate"; continue; }
+  nb=$(echo "$pem" | openssl x509 -noout -startdate | cut -d= -f2)
+  na=$(echo "$pem" | openssl x509 -noout -enddate | cut -d= -f2)
+  days=$(( ( $(date -d "$na" +%s) - $(date -d "$nb" +%s) ) / 86400 ))
+  issuer=$(echo "$pem" | openssl x509 -noout -issuer | sed 's/.*O *= *\([^,]*\).*CN *= *\(.*\)/\1 \/ \2/')
+  ocsp=$(echo "$pem" | openssl x509 -noout -ocsp_uri)
+  crl=$(echo "$pem" | openssl x509 -noout -ext crlDistributionPoints 2>/dev/null | grep -o 'URI:[^ ]*' | head -1 | cut -c5-)
+  echo "$host"
+  echo "  issuer:   $issuer"
+  echo "  lifetime: $days days ($nb -> $na)"
+  echo "  OCSP:     ${ocsp:-none}"
+  echo "  CRL DP:   ${crl:-none}"
+done
+crl=$(echo | timeout 10 openssl s_client -connect letsencrypt.org:443 -servername letsencrypt.org 2>/dev/null \
+      | openssl x509 -noout -ext crlDistributionPoints | grep -o 'http://[^ ]*' | head -1)
+echo "== fetch the CRL letsencrypt.org's certificate points at: $crl"
+code=$(curl -s -m 20 -o /tmp/le.crl -w '%{http_code}' "$crl")
+echo "  over http: HTTP $code"
+if [ "$code" != 200 ]; then
+  # this box's egress proxy refuses plain HTTP; the CRL host serves the same object over HTTPS
+  https=$(echo "$crl" | sed 's#^http:#https:#')
+  code=$(curl -s -m 20 -o /tmp/le.crl -w '%{http_code}' "$https")
+  echo "  over https: HTTP $code"
+fi
+echo "  size:      $(wc -c < /tmp/le.crl) bytes (DER)"
+openssl crl -inform DER -in /tmp/le.crl -noout -lastupdate -nextupdate -issuer | sed 's/^/  /'
+echo "  revoked entries: $(openssl crl -inform DER -in /tmp/le.crl -noout -text | grep -c 'Serial Number:')"
+openssl crl -inform DER -in /tmp/le.crl -noout -text | grep -A1 -E 'Issuing Distribution Point|X509v3 CRL Number' | sed 's/^ */  /' | head -6
+echo "  first revoked entry:"
+openssl crl -inform DER -in /tmp/le.crl -noout -text | grep -m1 -A1 'Serial Number:' | sed 's/^ */    /'
+```
+
+#### `lab.sh`
+`lab.sh`:
+
+```bash
+#!/bin/sh
+# Run as an ordinary user: sh lab.sh   (needs python3-cryptography, openssl, curl, HTTPS egress)
+cd "$(dirname "$0")"
+echo "== 1. CAA decisions on a made-up zone (RFC 8659 / RFC 8657)"
+python3 caa.py test
+echo "== 2. CAA on real names (DoH)"
+python3 caa.py live www.github.com letsencrypt.org
+python3 caa.py live www.github.com letsencrypt.org wild
+python3 caa.py live mail.google.com letsencrypt.org
+python3 caa.py live mail.google.com pki.goog
+echo "== 3. ACME values: RFC 7638 vector, then one fixed demo account"
+python3 acme.py vector
+python3 acme.py demo
+echo "== 4. tls-alpn-01 responder vs validator on loopback"
+for c in correct stale-keyauth no-alpn not-critical extra-san; do python3 alpn01.py $c; done
+echo "== 5. revocation pointers in live certificates"
+sh revocation.sh
+```
+
+### Execution output
+
+```text
+== 1. CAA decisions on a made-up zone (RFC 8659 / RFC 8657)
+  www.shop.test      letsencrypt.org  -> ALLOW ('issue' at shop.test names letsencrypt.org)
+  www.shop.test      pki.goog         -> DENY (1 'issue' record(s) at shop.test, none permit pki.goog)
+  *.shop.test        letsencrypt.org  -> DENY (1 'issuewild' record(s) at shop.test, none permit letsencrypt.org)
+  api.shop.test      letsencrypt.org  -> DENY (1 'issue' record(s) at api.shop.test, none permit letsencrypt.org)
+  v2.api.shop.test   pki.goog         -> ALLOW ('issue' at api.shop.test names pki.goog)
+  nothing.example    any-ca.example   -> ALLOW (no CAA anywhere up the tree)
+  locked.test        letsencrypt.org  -> DENY (1 'issue' record(s) at locked.test, none permit letsencrypt.org)
+  strict.test        letsencrypt.org  -> ALLOW ('issue' at strict.test names letsencrypt.org, {'accounturi': 'https://acme-v02.api.letsencrypt.org/acme/acct/1234', 'validationmethods': 'dns-01'})
+  strict.test        letsencrypt.org  -> DENY (1 'issue' record(s) at strict.test, none permit letsencrypt.org with account=https://acme-v02.api.letsencrypt.org/acme/acct/1234 method=http-01)
+  strict.test        letsencrypt.org  -> DENY (1 'issue' record(s) at strict.test, none permit letsencrypt.org with account=https://acme-v02.api.letsencrypt.org/acme/acct/9999 method=dns-01)
+  future.test        letsencrypt.org  -> DENY (critical unknown tag 'tbs' at future.test)
+  wildonly.test      pki.goog         -> ALLOW (RRset at wildonly.test has no 'issue' property)
+== 2. CAA on real names (DoH)
+  www.github.com: relevant RRset at www.github.com (answer came via CNAME www.github.com -> github.com): ['0 issue "digicert.com"', '0 issue "globalsign.com"', '0 issue "letsencrypt.org"', '0 issue "sectigo.com"', '0 issuewild "digicert.com"', '0 issuewild "letsencrypt.org"', '0 issuewild "sectigo.com"']
+    letsencrypt.org -> ALLOW ('issue' at www.github.com names letsencrypt.org)
+  www.github.com: relevant RRset at www.github.com (answer came via CNAME www.github.com -> github.com): ['0 issue "digicert.com"', '0 issue "globalsign.com"', '0 issue "letsencrypt.org"', '0 issue "sectigo.com"', '0 issuewild "digicert.com"', '0 issuewild "letsencrypt.org"', '0 issuewild "sectigo.com"']
+    letsencrypt.org (wildcard) -> ALLOW ('issuewild' at www.github.com names letsencrypt.org)
+  mail.google.com: relevant RRset at google.com: ['0 issue "pki.goog"']
+    letsencrypt.org -> DENY (1 'issue' record(s) at google.com, none permit letsencrypt.org)
+  mail.google.com: relevant RRset at google.com: ['0 issue "pki.goog"']
+    pki.goog -> ALLOW ('issue' at google.com names pki.goog)
+== 3. ACME values: RFC 7638 vector, then one fixed demo account
+  RFC 7638 3.1 thumbprint: NzbLsXh8uDCcd-6MNwXF4W_7noWXFZAfHkxZsRGC9Xs
+  expected:                NzbLsXh8uDCcd-6MNwXF4W_7noWXFZAfHkxZsRGC9Xs  match=True
+  account JWK thumbprint: YAcUDLCQ7NaGhBfNsITRnqRslixzXSn4uHKpxkktNdg
+  token:                  evaGxfADs6pSRb2LAv9IZf17Dt3juxGJ-PCt92wr-oA
+  key authorization:      evaGxfADs6pSRb2LAv9IZf17Dt3juxGJ-PCt92wr-oA.YAcUDLCQ7NaGhBfNsITRnqRslixzXSn4uHKpxkktNdg
+  http-01: GET http://<name>/.well-known/acme-challenge/evaGxfADs6pSRb2LAv9IZf17Dt3juxGJ-PCt92wr-oA
+           body = key authorization (87 bytes)
+  dns-01:  _acme-challenge.<name> TXT "_Zus-vAPef0Mwm9kLpZnpivrS3lg0xmsFvTioqNaLPA"
+  tls-alpn-01: acmeIdentifier extension = SHA-256(key authorization) = fd9bacfaf00f79fd0cc26f642e9667a62beb4b7960d319ac16f4e2a2a35a2cf0
+== 4. tls-alpn-01 responder vs validator on loopback
+  correct        PASS: alpn=acme-tls/1 SAN=['www.shop.test'] acmeIdentifier critical, digest fd9bacfaf00f79fd... matches
+  stale-keyauth  FAIL: acmeIdentifier b8ed1c11dda1da49... != expected fd9bacfaf00f79fd...
+  no-alpn        FAIL: server did not negotiate acme-tls/1 (got None)
+  not-critical   FAIL: acmeIdentifier extension is not critical
+  extra-san      FAIL: SAN must be exactly [www.shop.test], got ['www.shop.test', 'other.shop.test']
+== 5. revocation pointers in live certificates
+letsencrypt.org
+  issuer:   Let's Encrypt / YE2
+  lifetime: 89 days (Nov  3 13:44:34 2026 GMT -> Feb  1 13:44:33 2027 GMT)
+  OCSP:     none
+  CRL DP:   http://ye2.c.lencr.org/51.crl
+github.com
+  issuer:   Sectigo Limited / Sectigo Public Server Authentication CA DV E36
+  lifetime: 89 days (Oct 30 00:00:00 2026 GMT -> Jan 27 23:59:59 2027 GMT)
+  OCSP:     http://ocsp.sectigo.com
+  CRL DP:   none
+www.google.com
+  issuer:   Google Trust Services / WE2
+  lifetime: 83 days (Nov  3 08:29:37 2026 GMT -> Jan 26 08:29:36 2027 GMT)
+  OCSP:     none
+  CRL DP:   http://c.pki.goog/we2/64OUIVzpZV4.crl
+cloudflare.com
+  issuer:   Google Trust Services / WE1
+  lifetime: 90 days (Nov  3 22:47:56 2026 GMT -> Feb  1 23:47:08 2027 GMT)
+  OCSP:     none
+  CRL DP:   http://c.pki.goog/we1/BZ13AU6xTwM.crl
+== fetch the CRL letsencrypt.org's certificate points at: http://ye2.c.lencr.org/51.crl
+  over http: HTTP 500
+  over https: HTTP 200
+  size:      100776 bytes (DER)
+  lastUpdate=Nov 14 18:59:02 2026 GMT
+  nextUpdate=Nov 23 18:59:01 2026 GMT
+  issuer=C=US, O=Let's Encrypt, CN=YE2
+  revoked entries: 2349
+  X509v3 CRL Number: 
+  1794682742182040973
+  X509v3 Issuing Distribution Point: critical
+  Full Name:
+  first revoked entry:
+    Serial Number: 06B5F67D5ACA6CD53A0705D926A3DC3A92B2
+    Revocation Date: Sep 23 17:51:09 2026 GMT
+```
+
+---
+
+## Reading the output
+
+### Offline CAA Evaluation Suite
+
+The test suite in `caa.py` validates CAA logic against defined offline scenarios:
+
+- **`www.shop.test` (Let's Encrypt Request)**: Evaluated at `www.shop.test` (none found), climbed to `shop.test`. The RRset specifies `issue "letsencrypt.org"` and `issuewild ";"`. Because this is a non-wildcard request, `issue` permits Let's Encrypt. Result: **ALLOW**.
+- **`www.shop.test` (pki.goog Request)**: Evaluated at `shop.test`. The issue property restricts issuance exclusively to `letsencrypt.org`. Result: **DENY**.
+- **`*.shop.test` (Let's Encrypt Wildcard Request)**: Evaluated at `shop.test`. The RRset explicitly specifies `issuewild ";"`, which overrides the `issue` property for wildcard requests. Result: **DENY**.
+- **`api.shop.test` (Let's Encrypt Request)**: CAA record exists directly at `api.shop.test` specifying `issue "pki.goog"`. The search algorithm halts at the most specific node (`api.shop.test`) and does not inherit `shop.test` records. Result: **DENY**.
+- **`v2.api.shop.test` (pki.goog Request)**: Evaluated at `v2.api.shop.test` (none found), climbed to `api.shop.test` (found `issue "pki.goog"`). Result: **ALLOW**.
+- **`nothing.example` (Any CA Request)**: No CAA records present anywhere in the DNS hierarchy up to the root. Absence of CAA permits all CAs. Result: **ALLOW**.
+- **`locked.test` (Any CA Request)**: Specifies `issue ";"`. Explicitly blocks all non-wildcard certificate issuance. Result: **DENY**.
+- **`strict.test` (RFC 8657 Parameters)**: Specifies `issue "letsencrypt.org; accounturi=https://acme-v02.api.letsencrypt.org/acme/acct/1234; validationmethods=dns-01"`.
+  - Request with account `1234` using `dns-01`: Matches both account and method. Result: **ALLOW**.
+  - Request with account `1234` using `http-01`: Failed `validationmethods` check. Result: **DENY**.
+  - Request with account `9999` using `dns-01`: Failed `accounturi` restriction. Result: **DENY**.
+- **`future.test` (Critical Unknown Tag)**: Contains flag `128` (Issuer Critical) with an unrecognized tag `"tbs"`. RFC 8659 mandates that CAs encountering an unknown critical tag must reject issuance. Result: **DENY**.
+- **`wildonly.test` (Non-Wildcard Request)**: Contains `issuewild "letsencrypt.org"`, but **no** `issue` property in the RRset. For non-wildcard requests, `issuewild` is ignored. When an RRset lacks an `issue` property entirely, non-wildcard issuance is unrestricted. Result: **ALLOW**.
+
+### Live DNS CAA Inspection
+
+- **`www.github.com`**: The CAA query for `www.github.com` itself returns an answer, because the resolver followed the CNAME to `github.com`. So the relevant RRset is found at the first label, exactly as RFC 8659 describes, and it lists `digicert.com`, `globalsign.com`, `letsencrypt.org` and `sectigo.com` for `issue`, and three of them for `issuewild`.
+- **`mail.google.com`**: No CAA record exists at `mail.google.com`. The resolver climbs to `google.com`, returning `issue "pki.goog"`. Let's Encrypt requests are rejected, whereas `pki.goog` requests are permitted.
+
+### ACME Calculations and RFC 7638 Vectors
+
+- **RFC 7638 Standard Vector Verification**: The calculated JWK thumbprint for the RFC test key yields `NzbLsXh8uDCcd-6MNwXF4W_7noWXFZAfHkxZsRGC9Xs`, matching the canonical vector specified in the RFC text.
+- **Demo Account Calculations**: The demo EC P-256 account key generates the thumbprint `YAcUDLCQ7NaGhBfNsITRnqRslixzXSn4uHKpxkktNdg`. Combined with the challenge token, it generates an 87-byte Key Authorization string.
+- **Derived Challenge Values**:
+  - `dns-01`: SHA-256 hash of the Key Authorization, Base64URL encoded, producing the TXT record value `_Zus-vAPef0Mwm9kLpZnpivrS3lg0xmsFvTioqNaLPA`.
+  - `tls-alpn-01`: Hexadecimal digest representation `fd9bacfa...` placed inside the DER-encoded `acmeIdentifier` X.509 extension.
+
+### tls-alpn-01 responder and validator
+
+The test suite in `alpn01.py` checks five certificate configurations against the RFC 8737 rules:
+
+1. **Valid Setup**: Self-signed X.509 certificate with matching SAN (`www.shop.test`), critical `acmeIdentifier` extension (OID `1.3.6.1.5.5.7.1.31`), and SHA-256 hash matching the account key authorization. Result: **PASS**.
+2. **Stale Authorization**: Hash encoded in the certificate extension does not match the active challenge token. Result: **FAIL (Digest mismatch)**.
+3. **No ALPN Protocol**: TLS server fails to negotiate `acme-tls/1`. Result: **FAIL (ALPN mismatch)**.
+4. **Non-Critical Extension**: Extension present with correct value, but the critical bit is set to `FALSE`. RFC 8737 mandates the extension MUST be marked critical. Result: **FAIL (Not critical)**.
+5. **Multiple SAN Entries**: Certificate contains extra domain names in the SAN extension. RFC 8737 mandates that the validation certificate MUST contain exactly one SAN entry matching the validated hostname. Result: **FAIL (Invalid SAN count)**.
+
+### Live Certificate and CRL Inspection
+
+Inspection of real-world production certificates observed on November 15, 2026:
+
+- **`letsencrypt.org`**: Issued by Let's Encrypt YE2 intermediate. Validity period is 89 days. Contains **no OCSP URI**, reflecting the August 2025 OCSP turn-off. Points to a CRL Distribution Point at `http://ye2.c.lencr.org/51.crl`.
+- **`github.com`**: Issued by Sectigo DV E36. Validity period is 89 days. It still carries an OCSP URI (`http://ocsp.sectigo.com`) and no CRL DP: OCSP is optional now, not forbidden, and each CA chooses.
+- **`www.google.com` & `cloudflare.com`**: Issued by Google Trust Services. Validity periods are 83 and 90 days respectively. Both certificates omit OCSP URIs and rely on CRL Distribution Points.
+- **Let's Encrypt YE2 CRL Shard Inspection**:
+  - The plain-HTTP fetch got HTTP 500 from this lab host's egress proxy, which blocks plain HTTP; the same URL over HTTPS worked. CRLs are signed, so HTTP is the normal transport and relying parties need port 80 egress to fetch them.
+  - The downloaded DER-encoded CRL file is **100,776 bytes**.
+  - `lastUpdate`: Nov 14 18:59:02 2026 GMT; `nextUpdate`: Nov 23 18:59:01 2026 GMT (a 9-day validity window).
+  - Contains **2,349 revoked certificate entries**.
+  - It carries a critical **Issuing Distribution Point** extension, which marks it as one shard covering only the certificates that point at it.
+
+---
+
+## In production
+
+### BIND9 Zone File CAA Configuration
+
+Below is a production DNS zone file segment for BIND9 demonstrating standard issuance restrictions, wildcard constraints, account pinning, and reporting endpoints:
+
+```text
+; (not run here)
+$TTL 86400
+@       IN  SOA  ns1.example.com. admin.example.com. ( 2026111501 3600 1800 1209600 86400 )
+        IN  NS   ns1.example.com.
+
+; Allow Let's Encrypt and Google Trust Services for normal hostnames
+@       IN  CAA  0 issue "letsencrypt.org"
+@       IN  CAA  0 issue "pki.goog"
+
+; Restrict wildcard certificates exclusively to Let's Encrypt
+@       IN  CAA  0 issuewild "letsencrypt.org"
+
+; Send violation reports to security team
+@       IN  CAA  0 iodef "mailto:cert-security@example.com"
+
+; Account-pinned sub-zone for sensitive infrastructure
+secure  IN  CAA  0 issue "letsencrypt.org; accounturi=https://acme-v02.api.letsencrypt.org/acme/acct/98765432; validationmethods=dns-01"
+```
+
+### Certbot Automating `dns-01` via Cloudflare Plugin
+
+To automate wildcard certificates using `dns-01` validation without exposing main credentials:
+
+```bash
+# (not run here)
+# needs the certbot-dns-cloudflare plugin and a scoped API token in cloudflare.ini
+certbot certonly \
+  --dns-cloudflare \
+  --dns-cloudflare-credentials /etc/letsencrypt/cloudflare.ini \
+  -d "example.com" -d "*.example.com" \
+  --agree-tos \
+  -m security@example.com \
+  --no-eff-email
+```
+
+### Lego Requesting `shortlived` Certificates via `tls-alpn-01`
+
+```bash
+# (not run here)
+# Request a 160-hour certificate with tls-alpn-01; lego must own :443 while it runs.
+# --profile is an option of the run/renew commands in recent lego releases;
+# check `lego run --help` on your version.
+lego \
+  --email "admin@example.com" \
+  --domains "app.example.com" \
+  --tls \
+  --tls.port ":443" \
+  --path "/etc/lego" \
+  run --profile shortlived
+```
+
+### Automatic Caddy `tls-alpn-01` Web Server Engine
+
+Caddy obtains certificates automatically, answering `http-01` and `tls-alpn-01` itself. This is the whole config; if port 80 is closed, Caddy can still complete `tls-alpn-01` on 443:
+
+```text
+# (not run here)
+# /etc/caddy/Caddyfile
+app.example.com {
+    reverse_proxy 127.0.0.1:8080
+}
+```
+
+### Auditing Certificate Transparency (CT) Logs via `crt.sh`
+
+Monitor CT logs continuously to detect rogue or unexpected certificate issuance for your enterprise domains:
+
+```bash
+# (not run here)
+# Query crt.sh JSON API for recent certificate issues
+curl -s "https://crt.sh/?q=%.example.com&output=json" | \
+  jq -r '.[] | [.logged_at, .issuer_name, .name_value] | @tsv' | \
+  sort -u
+```
+
+### Inspecting Live Certificate Extensions via OpenSSL
+
+```bash
+# (not run here)
+# Inspect OCSP and CRL distribution points from a remote web server
+openssl s_client -connect github.com:443 -servername github.com </dev/null 2>/dev/null | \
+  openssl x509 -noout -text | \
+  grep -A 4 "Authority Information Access\|X509v3 CRL Distribution Points"
+```
+
+---
+
+## Gotchas
+
+- **`issuewild ";"` Completely Overrides Parent `issue` Rules**: Setting `issuewild ";"` at the apex blocks all wildcard requests across all CAs, even if multiple `issue "ca.com"` records are present in the same RRset.
+- **Absence of `issue` in a Non-Empty CAA RRset Permits All CAs**: If an RRset contains *only* `iodef` or `issuewild` records, non-wildcard requests find no `issue` property and **any** CA may issue (the `wildonly.test` case in the lab). Always publish explicit `issue` records.
+- **Tree Climbing Stops at the First Non-Empty CAA RRset**: If `sub.example.com` has a CAA record specifying `issue ";"`, the resolver halts immediately and will not climb to `example.com`.
+- **A CNAME hands your CAA decision to the alias target**: If `app.example.com` is a CNAME to `cdn.thirdparty.com`, the CAA query for `app.example.com` returns `cdn.thirdparty.com`'s CAA RRset. If the CDN publishes CAA that does not list the CA you use, issuance for `app.example.com` fails even though your apex allows it. If the target has none, the climb goes on to `example.com`, not to `thirdparty.com`.
+- **`http-01` redirects must stay on 80/443**: A blanket redirect from HTTP to HTTPS is fine, but a redirect to another port, or a login page or WAF challenge in front of `/.well-known/acme-challenge/`, makes validation fail. The final response body must be exactly the key authorization.
+- **`tls-alpn-01` fails behind TLS-terminating proxies**: A CDN, load balancer or WAF that terminates TLS in front of the server answers the handshake itself and does not offer `acme-tls/1`, so the challenge fails. Use it only where the ACME client's TLS listener receives the raw TCP connection.
+- **OCSP Soft-Fail Provides Zero Real-Time Protection Against Attackers**: Because web browsers ignore OCSP lookup timeouts to avoid breaking user connections, an adversary capable of executing a MITM attack can block the browser's OCSP requests to bypass revocation checks entirely.
+- **CRL fetches need plain-HTTP egress**: CRL Distribution Points are `http://` URLs by design (the CRL is signed). Hosts that block port 80 egress, like the lab host here, cannot fetch them, and a client configured to hard-fail on revocation will then refuse every connection.
+
+---
+
+## Exercises
+
+1. **Construct an Isolated CAA Policy**: Write a set of BIND zone file CAA records for `corp.internal` that permits `letsencrypt.org` for non-wildcard issuance, permits `pki.goog` exclusively for wildcards, pins requests to ACME account `https://acme-v02.api.letsencrypt.org/acme/acct/55555` using `dns-01`, and sends reports to `security@corp.internal`.
+2. **Trace CAA Relevant-RRset Resolution**: Given the host `a.b.c.site.com` (which is a CNAME to `x.y.provider.net`), list the exact sequence of DNS hostnames queried by a CA when checking CAA records, assuming `y.provider.net` contains a CAA record.
+3. **Calculate JWK Thumbprint and Key Authorization**: Given an RSA public key with exponent $e = 65537$ and a known modulus $n$, state the ordered JSON keys required by RFC 7638 to compute its JWK thumbprint, and calculate the resulting `dns-01` TXT record value format.
+4. **Design a CDN CNAME ACME Delegation System**: An enterprise manages 10,000 customer domains on a multi-tenant platform. Design an automated system using `dns-01` CNAME delegation that allows customer domains (`app.customer.com`) to delegate validation authority to `_acme-challenge.customer.com.acme.platform.net`.
+5. **Debug an ALPN-01 Certificate Failure**: A developer attempts `tls-alpn-01` validation, but the ACME server returns an authorization error. Inspection shows the temporary certificate includes the correct `acmeIdentifier` OID with the SHA-256 digest, but contains two names in the SAN extension (`app.example.com` and `www.example.com`). Explain why the challenge failed based on RFC 8737 requirements.
+6. **Implement Short-Lived Certificate Auto-Renewal**: Write a bash or Python monitoring script that inspects a local certificate file's expiration timestamp daily and executes a renewal workflow when the remaining validity drops below 48 hours, accommodating 6-day (160-hour) `shortlived` certificate lifespans.
+
+---
+
+## Verification
+
+The code and commands presented in this chapter were executed and validated on the target Linux testing environment.
+
+- **Operating System / Environment**: Linux 6.12 x86_64, Python 3.13.5, OpenSSL 3.5.7, run as an unprivileged user with no package installs. `lab.sh` was run on 15 November 2026 and the output above is pasted unedited; the live DNS answers, certificates and CRL will differ when you run it.
+- **Python Dependencies**: `cryptography==43.0.0` (utilizing OpenSSL backend), `urllib.request` (DoH queries via Cloudflare `https://cloudflare-dns.com/dns-query`).
+- **Execution Profile**: The CAA evaluator, RFC 7638 thumbprints (including the RFC's own test vector), challenge values and the loopback `tls-alpn-01` responder/validator ran locally; no ACME server was contacted and no certificate was requested. The BIND, certbot, lego, Caddy, crt.sh and `openssl s_client` snippets in "In production" were not run.
+- **Live Queries**: Live CAA lookups (`github.com`, `google.com`) and X.509 certificate inspections (`letsencrypt.org`, `github.com`, `google.com`, `cloudflare.com`) were performed against real public endpoints. The Let's Encrypt YE2 CRL shard was fetched over HTTPS egress and parsed using `openssl crl -inform DER -text`.
+
+---
+
+## Sources
+
+- **RFC 8659**: *DNS Certification Authority Authorization (CAA) Resource Record*. IETF, November 2019. <https://www.rfc-editor.org/rfc/rfc8659.html>
+- **RFC 8657**: *Certification Authority Authorization (CAA) Processing for ACME Account Analysis and Validation Methods*. IETF, November 2019. <https://www.rfc-editor.org/rfc/rfc8657.html>
+- **RFC 8555**: *Automatic Certificate Management Environment (ACME)*. IETF, March 2019. <https://www.rfc-editor.org/rfc/rfc8555.html>
+- **RFC 7638**: *JSON Web Key (JWK) Thumbprint*. IETF, September 2015. <https://www.rfc-editor.org/rfc/rfc7638.html>
+- **RFC 8737**: *Automated Certificate Management Environment (ACME) TLS Application-Layer Protocol Negotiation (ALPN) Challenge Extension*. IETF, February 2020. <https://www.rfc-editor.org/rfc/rfc8737.html>
+- **RFC 9773**: *ACME Renewal Information (ARI) Extension*. IETF, June 2025. <https://www.rfc-editor.org/rfc/rfc9773.html>
+- **RFC 5280**: *Internet X.509 Public Key Infrastructure Certificate and Certificate Revocation List (CRL) Profile*. IETF, May 2008. <https://www.rfc-editor.org/rfc/rfc5280.html>
+- **RFC 6960**: *X.509 Internet Public Key Infrastructure Online Certificate Status Protocol - OCSP*. IETF, June 2013. <https://www.rfc-editor.org/rfc/rfc6960.html>
+- **CA/Browser Forum TLS Baseline Requirements** (sections 3.2.2.4, 3.2.2.8 CAA, 3.2.2.9 MPIC). <https://cabforum.org/working-groups/server/baseline-requirements/>
+- **CA/Browser Forum server certificate ballots** (SC-063 OCSP optional, SC-067 MPIC, SC-088v3 persistent DNS validation). <https://cabforum.org/working-groups/server/ballots/>
+- **Ballot SC-081v3**: *Introduce Schedule of Reducing Validity and Data Reuse Periods*. CA/Browser Forum, April 2025. <https://cabforum.org/2025/04/11/ballot-sc081v3-introduce-schedule-of-reducing-validity-and-data-reuse-periods/>
+- **RFC 6066** (TLS `status_request`, OCSP stapling) <https://www.rfc-editor.org/rfc/rfc6066.html> and **RFC 7633** (Must-Staple) <https://www.rfc-editor.org/rfc/rfc7633.html>
+- **Let's Encrypt**: *CAA* documentation. <https://letsencrypt.org/docs/caa/>
+- **Let's Encrypt**: *OCSP Service Has Reached End of Life*, 6 August 2025. <https://letsencrypt.org/2025/08/06/ocsp-service-has-reached-end-of-life.html>
+- **Let's Encrypt**: *6-day and IP Address Certificates are Generally Available*, 15 January 2026. <https://letsencrypt.org/2026/01/15/6day-and-ip-general-availability>
+- **Let's Encrypt**: *DNS-PERSIST-01: A New Model for DNS-based Challenge Validation*, 18 February 2026. <https://letsencrypt.org/2026/02/18/dns-persist-01.html>
+- **Let's Encrypt**: *Upcoming Features* (validity reduction schedule). <https://letsencrypt.org/upcoming-features/>
+- **IETF Draft ACME DNS Persist**: *ACME Validation Using Standing DNS Records*. IETF ACME Working Group, 2025. <https://datatracker.ietf.org/doc/draft-ietf-acme-dns-persist/>
