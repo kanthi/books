@@ -1,0 +1,748 @@
+---
+title: "Private VLANs, Port Isolation and Q-in-Q: Separating Tenants at Layer 2"
+author:
+  - name: "K19G"
+  - name: "grok-bot"
+---
+
+# Private VLANs, Port Isolation and Q-in-Q: Separating Tenants at Layer 2
+
+In high-density network environments—such as multi-tenant data centers, web hosting facilities, residential internet service provider (ISP) networks, hotel guest Wi-Fi networks, corporate DMZs, and out-of-band management networks—operators face a fundamental design dilemma. Multiple untrusted or semi-trusted workloads must reside within the same IPv4 subnet to conserve address space and simplify default gateway routing. However, allowing direct peer-to-peer Layer 2 communication between these hosts presents severe security and operational risks, including ARP spoofing, unauthorized lateral movement, malicious packet sniffing, and broadcast storm degradation.
+
+The naive solution is to place each tenant host into its own dedicated IEEE 802.1Q Virtual Local Area Network (VLAN) and assign each tenant a distinct IP subnet. While this achieves total Layer 2 and Layer 3 isolation, it consumes network administrative overhead rapidly and drains IPv4 address space due to subnetwork network IDs, broadcast addresses, and gateway allocations. In an IPv4 network allocating a `/30` or `/31` prefix per host, address space utilization is extremely inefficient. Furthermore, scaling an infrastructure to thousands of tenants exhausts the traditional 4,094 IEEE 802.1Q VLAN limit long before hardware capacity limits are reached.
+
+Layer 2 isolation technologies solve this problem by decoupling Layer 2 forwarding topologies from Layer 3 IP subnetting. Techniques such as Private VLANs (described in RFC 5517), Linux bridge port isolation, sub-VLAN aggregation (RFC 3069), and IEEE 802.1ad Provider Bridging (Q-in-Q) let operators keep many hosts in one subnet without letting them talk to each other, and carry each customer's own VLANs across a shared provider network.
+
+As a systems or network engineer operating Linux-based infrastructure, software-defined networks (SDN), or bare-metal hypervisors, you will meet these features on switches and build their Linux equivalents yourself. This chapter covers private VLANs and port isolation, the proxy ARP that makes an isolated subnet usable, what changes for IPv6, and Q-in-Q tagging. The lab builds port isolation and RFC 3069-style routing on a Linux bridge without root.
+
+## Learning goals
+
+- Evaluate the architectural tradeoffs between standard 802.1Q VLAN subnets, Private VLANs (PVLANs), switch port isolation, and 802.1ad Q-in-Q tagging.
+- Map the functional roles of Private VLAN port types (promiscuous, isolated, community) and VLAN types (primary, secondary isolated, secondary community).
+- Configure and analyze Linux bridge port isolation using `ip link` and inspect kernel forwarding rules.
+- Explain the operational mechanics of kernel-level Proxy ARP for Private VLANs (`net.ipv4.conf.IFACE.proxy_arp_pvlan`), including routing table lookups, ICMP redirect generation, and dual-ARP race conditions.
+- Implement IPv6 host isolation within a shared Layer 2 domain using off-link Router Advertisement (RA) prefix flags (RFC 4861 / RFC 5942), RA Guard, and DHCPv6 Shield.
+- Analyze how Layer 2 security controls (DHCP Snooping, Option 82, Dynamic ARP Inspection) interact with isolated switch ports and broadcast/multicast containment.
+- Calculate frame size expansion and MTU overhead for 802.1ad Q-in-Q double-tagging across provider backbones.
+
+## Version note
+
+The hands-on lab experiments in this chapter were executed on a Linux host running kernel **Linux 6.12**, **iproute2 version 6.15.0**, and **Python 3.13**. On the specific host environment used for generating outputs, the userland `bridge` utility (`bridge(8)`) was not present, the kernel had no `8021q` module, and the bridge was built without VLAN filtering. Consequently, all Q-in-Q commands, `bridge vlan` syntaxes, and switch vendor configuration examples in this chapter are provided as production reference configurations and clearly marked as **(not run here)**.
+
+## Private VLANs (RFC 5517) and Port Isolation
+
+Private VLANs (PVLANs), formalized in RFC 5517, extend standard IEEE 802.1Q VLAN structure by partitioning a single broadcast domain (the primary VLAN) into multiple secondary sub-domains. This architecture enables Layer 2 segregation of end hosts while allowing all hosts to share a single IPv4 subnet and default gateway.
+
+### Primary and Secondary VLAN Concepts
+
+A Private VLAN domain consists of one Primary VLAN and one or more Secondary VLANs. To the outside network and default gateway, the entire PVLAN structure appears as a single standard VLAN (the Primary VLAN).
+
+1. **Primary VLAN**: The overarching VLAN that carries traffic from promiscuous ports downstream to isolated and community ports. It represents the shared Layer 3 IP subnet.
+2. **Secondary Isolated VLAN**: A sub-VLAN whose ports can communicate *only* with promiscuous ports. Hosts connected to isolated ports within the same isolated VLAN cannot send traffic to or receive traffic from each other.
+3. **Secondary Community VLAN**: A sub-VLAN whose ports can communicate with each other and with promiscuous ports, but cannot communicate with ports in any other community VLAN or isolated VLAN.
+
+```text
++-------------------------------------------------------------------+
+|                        PRIMARY VLAN (100)                         |
+|                                                                   |
+|  +--------------------+  +------------------+  +---------------+  |
+|  | Promiscuous Port   |  | Secondary VLAN   |  | Secondary VLAN|  |
+|  | (Router / Gateway) |  | Isolated (101)   |  | Community(102)|  |
+|  +---------+----------+  +--------+---------+  +-------+-------+  |
++------------|----------------------|--------------------|----------+
+             |                      |                    |
+       [Default GW]           +-----+-----+        +-----+-----+
+                              | Host1 Host2|        | Host3 Host4|
+                              +-----------+        +-----------+
+                              (Cannot talk)        (Can talk to
+                                                   each other)
+```
+
+### Port Roles and Communication Matrix
+
+Ports assigned to a Private VLAN domain operate under three distinct functional roles:
+
+- **Promiscuous Port (P-Port)**: Connects to Layer 3 routers, firewalls, or gateways. A promiscuous port can send and receive frames to and from *all* other ports in the PVLAN domain (isolated, community, or other promiscuous ports).
+- **Isolated Port (I-Port)**: Connects to individual tenant hosts. An isolated port can send frames *only* to promiscuous ports. Frames received on an isolated port are blocked from reaching any other isolated or community port.
+- **Community Port (C-Port)**: Connects to hosts belonging to a specific peer group (e.g., a server cluster). A community port can talk to promiscuous ports and other community ports in the *same* community VLAN, but is isolated from all other community VLANs and isolated ports.
+
+| Source Port Type | Target Promiscuous Port | Target Isolated Port | Target Community Port (Same Group) | Target Community Port (Diff Group) |
+| :--- | :--- | :--- | :--- | :--- |
+| **Promiscuous** | Allowed | Allowed | Allowed | Allowed |
+| **Isolated** | Allowed | Denied | Denied | Denied |
+| **Community** | Allowed | Denied | Allowed | Denied |
+
+### Private VLAN Trunks
+
+When a Private VLAN spans multiple physical Ethernet switches, the primary and secondary VLAN mappings must be preserved across inter-switch link trunks. 
+
+A **PVLAN Trunk Port** carries traffic for primary and secondary VLANs while retaining the double-tagging or secondary tag identification required for destination switch ASICs to enforce port isolation rules. In IEEE 802.1Q tagged frames traversing a standard switch trunk, frames originating from an isolated port travel across the trunk tagged with the *Secondary Isolated VLAN ID*. When the egress switch receives the frame, it maps the secondary VLAN ID back to the primary domain and permits egress *only* on promiscuous ports.
+
+### Switch Port Isolation (Protected Ports)
+
+Full RFC 5517 Private VLAN configuration requires Enterprise-grade switch ASICs capable of secondary VLAN mapping tables. Simpler layer 2 managed switches offer a lightweight alternative known as **Port Isolation** or **Protected Ports**.
+
+When ports on a managed switch are configured as "protected" or "isolated":
+- Protected ports cannot forward Layer 2 frames (unicast, multicast, or broadcast) to other protected ports on the same switch.
+- Protected ports *can* forward frames to unprotected ports.
+- Unprotected ports can forward frames to any port (protected or unprotected).
+
+Port isolation does not utilize secondary VLAN tags; it is an ASIC-level egress filtering mask enforced locally on the switch.
+
+### Enterprise Switch Configuration Reference
+
+The following snippet illustrates a generic enterprise switch configuration establishing a Private VLAN domain with a gateway on a promiscuous port and tenant servers on isolated ports.
+
+```text
+! (not run here)
+! Step 1: Define Secondary and Primary VLANs
+vlan 101
+  private-vlan isolated
+!
+vlan 100
+  private-vlan primary
+  private-vlan association 101
+!
+! Step 2: Configure Promiscuous Gateway Port
+interface GigabitEthernet1/0/1
+  description Default Gateway Router
+  switchport mode private-vlan promiscuous
+  switchport private-vlan mapping 100 101
+!
+! Step 3: Configure Isolated Tenant Ports
+interface GigabitEthernet1/0/2
+  description Tenant A Server
+  switchport mode private-vlan host
+  switchport private-vlan host-association 100 101
+!
+interface GigabitEthernet1/0/3
+  description Tenant B Server
+  switchport mode private-vlan host
+  switchport private-vlan host-association 100 101
+```
+
+## VLAN Aggregation and Sub-VLANs (RFC 3069)
+
+In service provider networks, assigning a full IP subnet per customer causes IP address fragmentation. RFC 3069 defines **VLAN Aggregation for Efficient IP Address Allocation**, introducing the concepts of **Super-VLANs** and **Sub-VLANs**.
+
+In an RFC 3069 architecture:
+- Multiple **Sub-VLANs** (each containing a subset of customer hosts) share a single IPv4 subnet address space.
+- A **Super-VLAN** aggregates all Sub-VLANs into a logical Layer 3 interface on the router/switch.
+- Sub-VLANs have no default gateway IP assigned directly to their VLAN interfaces; instead, they share the single IP address assigned to the Super-VLAN interface.
+- Hosts within Sub-VLANs are prevented from communicating at Layer 2.
+
+```text
+                 +--------------------------------+
+                 |       Router / L3 Switch       |
+                 | Super-VLAN 10 Interface        |
+                 | IP: 10.20.0.1/24 (Proxy ARP)   |
+                 +---------------+----------------+
+                                 |
+         +-----------------------+-----------------------+
+         |                                               |
++--------+-------+                               +-------+--------+
+| Sub-VLAN 11    |                               | Sub-VLAN 12    |
+| Host A: 10.20.0.11                             | Host B: 10.20.0.12
++----------------+                               +----------------+
+```
+
+Because Hosts A and B share the same IP subnet (e.g., `10.20.0.0/24`) but are segregated into isolated Sub-VLANs at Layer 2, Host A believes Host B is directly on-link. When Host A attempts to send traffic to Host B, it broadcasts an ARP request for `10.20.0.12`.
+
+Since Sub-VLAN 11 and Sub-VLAN 12 cannot bridge traffic directly, Host B never receives Host A's ARP request. To enable communication, the Super-VLAN gateway router **must act as a Proxy ARP agent**. The router intercepts Host A's ARP request for Host B, replies with its own MAC address, receives the Ethernet frames from Host A, and forwards them across Layer 3 into Sub-VLAN 12 toward Host B.
+
+## Port Isolation in the Linux Kernel
+
+The Linux kernel bridge implementation provides native port isolation functionality without requiring complex secondary VLAN definitions. This feature is controlled per-port using the `isolated` flag on bridge slave interfaces.
+
+### The `isolated` Slave Flag
+
+When a Linux bridge slave interface has its `isolated` flag set to `on`:
+1. Frames received on an isolated slave interface **cannot** be forwarded to any other slave interface that also has the `isolated` flag enabled.
+2. Frames received on an isolated slave interface **can** be forwarded to non-isolated slave interfaces.
+3. Frames received on non-isolated slave interfaces can be forwarded to both isolated and non-isolated slave interfaces.
+
+This model directly implements the RFC 5517 promiscuous-versus-isolated port paradigm within a single Linux software bridge. Linux bridge port isolation does not support community groups; all isolated ports on a single bridge belong to a single isolation domain.
+
+### Linux Port Isolation Management Syntaxes
+
+Port isolation can be managed using either `ip link` or the `bridge link` utility.
+
+Setting isolation using `ip link`:
+
+```bash
+# (not run here)
+# Set port eth1 as an isolated bridge port
+ip link set dev eth1 type bridge_slave isolated on
+
+# Disable isolation on port eth0 (e.g., router interface)
+ip link set dev eth0 type bridge_slave isolated off
+```
+
+Setting isolation using `bridge link`:
+
+```bash
+# (not run here)
+# Enable isolation on eth1
+bridge link set dev eth1 isolated on
+
+# Inspect bridge port flags
+bridge link show
+```
+
+Checking isolation state via sysfs:
+
+```bash
+# (not run here)
+cat /sys/class/net/eth1/brport/isolated
+# Outputs: 1 (enabled) or 0 (disabled)
+```
+
+## Linux Router Integration and Proxy ARP
+
+When bridge port isolation prevents hosts on the same IPv4 subnet from reaching each other at Layer 2, inter-host communication requires Layer 3 hairpin forwarding through the default gateway router.
+
+```text
+    +-------------------------------------------------------+
+    |                    LINUX ROUTER (r)                   |
+    |                                                       |
+    |  ip_forward = 1                                       |
+    |  proxy_arp_pvlan = 1                                  |
+    |  send_redirects = 0                                   |
+    |                                                       |
+    |  IP:  10.20.0.1/24                                    |
+    +---------------------------+---------------------------+
+                                | (p-r)
+    +---------------------------+---------------------------+
+    |                     LINUX BRIDGE (sw)                 |
+    |                                                       |
+    |   p-r (isolated off)                                  |
+    |   p-h1 (isolated on)        p-h2 (isolated on)        |
+    +---------+----------------------------+----------------+
+              |                            |
+       (h1 eth0)                    (h2 eth0)
++-------------+-------------+  +-----------+----------------+
+| Host 1 (h1)               |  | Host 2 (h2)                |
+| IP:  10.20.0.11/24        |  | IP:  10.20.0.12/24        |
++---------------------------+  +----------------------------+
+```
+
+### The `proxy_arp_pvlan` Kernel Parameter
+
+Under standard Linux kernel behavior, Proxy ARP (`net.ipv4.conf.IFACE.proxy_arp=1`) responds to ARP requests for destinations reachable via *other* interfaces. However, if an ARP request arrives on `eth0` for an IP address that the routing table states is reachable *out of that same interface `eth0`*, standard Proxy ARP ignores the request to prevent routing loops and unnecessary hairpinning.
+
+In a Private VLAN or isolated port domain, Host 1 and Host 2 reside on the *same* interface from the router's perspective. To force the router to answer ARP requests for addresses located on the same logical ingress interface, the kernel provides the `proxy_arp_pvlan` sysctl:
+
+```bash
+# (not run here)
+sysctl -w net.ipv4.conf.eth0.proxy_arp_pvlan=1
+```
+
+When `proxy_arp_pvlan=1` is enabled on an interface:
+1. The kernel enables Proxy ARP behavior specifically for intra-interface traffic.
+2. It does **not** require globally enabling `proxy_arp=1` on the interface.
+3. When Host 1 issues an ARP request for Host 2 (`10.20.0.12`), the router checks its routing table. Because `10.20.0.12` is reachable out of `eth0`, the router replies to Host 1 with its own MAC address.
+4. Host 1 records 10.20.0.12 with the router's MAC in its neighbour table.
+5. Subsequent IP packets sent from Host 1 to Host 2 are framed at Layer 2 to the router's MAC address.
+6. The router receives the packets, decrements IP TTL, and forwards (hairpins) them back out `eth0`, this time addressed to Host 2's real MAC address.
+
+### Requirements: `ip_forward` and `send_redirects`
+
+For Private VLAN routing to function cleanly, two additional IP stack controls must be set on the gateway router:
+
+1. **IP Forwarding Enabled**: `net.ipv4.ip_forward` must be set to `1`. If packet forwarding is disabled, the router will answer ARP requests due to `proxy_arp_pvlan`, but will drop incoming data traffic.
+2. **ICMP Redirects Disabled**: when a Linux router forwards a packet out the interface it arrived on, it assumes the sender could have reached the next hop directly and sends an ICMP Redirect (type 5, code 1, redirect for host), rate-limited per destination. Here the advice is wrong: the destination is already on-link for the sender, which is exactly the problem. In the lab the redirects were harmless (Linux hosts already treat the destination as on-link and keep using the MAC the router gave them), but they are noise, every hairpinned flow produces them, and you should not rely on how every host stack reacts. Turn them off on the gateway interface:
+
+```bash
+# (not run here)
+sysctl -w net.ipv4.conf.all.send_redirects=0
+sysctl -w net.ipv4.conf.eth0.send_redirects=0
+```
+
+## IPv6 Considerations: Neighbor Discovery and Off-Link Prefixes
+
+Unlike IPv4, IPv6 does not use ARP. Neighbor discovery in IPv6 relies on ICMPv6 Neighbor Solicitation (NS) and Neighbor Advertisement (NA) messages sent over multicast addresses (Solicited-Node Multicast `ff02::1:ffXX:XXXX`).
+
+### The IPv6 Proxy ND Challenge
+
+Linux does **not** possess an IPv6 kernel equivalent to `proxy_arp_pvlan`. While Linux supports static Neighbor Discovery Proxying (`ip -6 neigh add proxy ...`), it does not offer a dynamic `proxy_nd_pvlan` sysctl that automatically replies to Neighbor Solicitations for all on-link hosts.
+
+### The RFC 4861 / RFC 5942 On-Link Model Solution
+
+The standard IPv6 solution for Private VLAN and isolated host domains is to make hosts treat the IPv6 subnet prefix as **off-link**, as defined in RFC 4861 and refined in RFC 5942.
+
+Under normal IPv6 Stateless Address Autoconfiguration (SLAAC), a router sends Router Advertisements (RAs) containing Prefix Information Options (PIO). The PIO contains two critical control flags:
+- **L-Flag (On-Link Indicator)**: When set (`1`), tells the host that addresses within this prefix are directly reachable on the local Layer 2 link without going through a router.
+- **A-Flag (Autonomous Address-Configuration)**: When set (`1`), tells the host to use this prefix to autoconfigure a SLAAC IPv6 address.
+
+To enforce IPv6 host isolation at Layer 3 without proxy ND:
+1. The gateway router advertises RAs with the **L-flag cleared (`L=0`)** and the **A-flag set (`A=1`)**.
+2. Upon receiving the RA, the host autoconfigures an IPv6 address (e.g., `2001:db8:1::10/64`) because `A=1`.
+3. Because `L=0`, the host's IPv6 protocol stack marks the `/64` prefix as **off-link**.
+4. When the host sends traffic to another IP in `2001:db8:1::/64` (e.g., `2001:db8:1::20`), the host does **not** send a Neighbor Solicitation for the target host's address. Instead, it immediately forwards the packet to the Default Gateway's Link-Local IPv6 address (`fe80::1`).
+5. The gateway router forwards the packet to the destination host.
+
+```text
+# Generic radvd.conf prefix stanza enforcing off-link configuration
+# (not run here)
+prefix 2001:db8:1::/64 {
+    AdvOnLink off;        # L-flag = 0 (Forces traffic to Default Gateway)
+    AdvAutonomous on;     # A-flag = 1 (Enables SLAAC address generation)
+};
+```
+
+### IPv6 First-Hop Security
+
+Because isolated ports block inter-host communication, rogue IPv6 hosts cannot directly launch Neighbor Advertisement spoofing against peers. However, to prevent tenant hosts on isolated ports from impersonating IPv6 routers, the switch infrastructure must deploy:
+- **RA Guard (RFC 6105)**: Blocks incoming ICMPv6 Router Advertisement packets on isolated host-facing ports.
+- **DHCPv6-Shield (RFC 7610)**: Blocks incoming DHCPv6 server response messages originating from host ports.
+
+## Operational Interactions: Broadcast, Multicast, DHCP, and DAI
+
+Port isolation drastically alters standard Layer 2 broadcast and security protocol behaviors.
+
+### Broadcast and Multicast Containment
+
+On a standard Linux bridge or Ethernet switch, broadcast frames (such as ARP requests or IPv4 subnet broadcasts) and unlearned multicast frames are flooded out *every* operational slave interface except the receiving ingress interface.
+
+When port isolation (`isolated on`) is configured:
+- A broadcast or multicast frame received on an **isolated port** is flooded **only to non-isolated ports**.
+- Isolated ports **never** receive broadcast or multicast frames originated by another isolated port.
+- Non-isolated ports (e.g., gateway router ports) receive broadcast frames from isolated ports and can reply normally.
+
+This limits who hears ARP, DHCP, mDNS and NetBIOS broadcasts, so tenants cannot discover each other by listening. It does not stop a tenant from flooding the gateway.
+
+### DHCP Snooping and Option 82
+
+In Private VLAN environments, hosts depend on central DHCP servers attached to promiscuous/non-isolated ports. To prevent malicious hosts on isolated ports from running rogue DHCP servers, switches employ **DHCP Snooping**.
+
+DHCP Snooping marks isolated ports as **untrusted** and promiscuous gateway ports as **trusted**:
+- DHCP client requests (DISCOVER, REQUEST) received on untrusted ports are forwarded only to trusted ports.
+- DHCP server responses (OFFER, ACK) received on untrusted ports are dropped immediately.
+- **DHCP Option 82 (Relay Agent Information Info)**: Switch ASICs append Option 82 metadata (circuit-id, remote-id) specifying the physical switch port and PVLAN ID from which the request originated, allowing the central DHCP server to assign static or leased IP addresses tailored to exact port locations.
+
+### Dynamic ARP Inspection (DAI)
+
+When Proxy ARP is utilized across isolated domains, tenant hosts receive ARP replies containing the router's MAC address for peer IP destinations. If a malicious tenant attempts to broadcast falsified ARP replies to claim another host's IP, **Dynamic ARP Inspection (DAI)** intercepts ARP packets on untrusted isolated ports. DAI validates the ARP sender IP-to-MAC binding against the hardware DHCP Snooping database before allowing the frame to traverse the switch.
+
+## IEEE 802.1ad Provider Bridging (Q-in-Q)
+
+While Private VLANs and port isolation address tenant segregation within a single broadcast domain, service providers offering Metro Ethernet or Layer 2 VPN (L2VPN) services must transport hundreds of distinct customer VLAN topologies across a shared core network. IEEE 802.1ad (commonly known as **Q-in-Q** or **Double-Tagging**) solves this scaling challenge.
+
+### S-Tag and C-Tag Frame Architecture
+
+Standard IEEE 802.1Q tagging appends a single 4-byte header to an Ethernet frame. IEEE 802.1ad prepends an outer **Service Tag (S-Tag)** to an inner customer frame that already contains a **Customer Tag (C-Tag)**.
+
+```text
+Standard Ethernet Frame (Un-tagged):
++-------------------+-------------------+-------------------+----------+
+| Dest MAC (6B)     | Src MAC (6B)      | EtherType (2B)    | Payload  |
++-------------------+-------------------+-------------------+----------+
+
+IEEE 802.1Q Single-Tagged Frame (C-Tag):
++---------------+---------------+-------------------+---------------+----------+
+| Dest MAC (6B) | Src MAC (6B)  | TPID: 0x8100 (2B) | TCI/VID (2B)  | Payload  |
++---------------+---------------+-------------------+---------------+----------+
+
+IEEE 802.1ad Double-Tagged Frame (Q-in-Q):
++---------------+---------------+-------------------+---------------+-------------------+---------------+----------+
+| Dest MAC (6B) | Src MAC (6B)  | S-TPID: 0x88a8(2B)| S-VID (2B)    | C-TPID: 0x8100(2B)| C-VID (2B)    | Payload  |
++---------------+---------------+-------------------+---------------+-------------------+---------------+----------+
+```
+
+Key Protocol Differences:
+- **C-Tag (Customer Tag)**: EtherType / TPID (Tag Protocol Identifier) = `0x8100`. Carries customer-internal VLAN IDs (1–4094).
+- **S-Tag (Service Tag)**: EtherType / TPID = `0x88a8` (IEEE 802.1ad standard). Carries service provider VLAN IDs (1–4094). Legacy provider implementations sometimes used `0x9100` or `0x8100` as outer TPIDs.
+- **Tag Transparency**: The provider core network routes traffic based *exclusively* on the outer S-VID (`0x88a8`). The inner C-Tag (`0x8100`) passes through the provider network completely unaltered, allowing customers to use arbitrary overlapping VLAN IDs inside their assigned S-VLAN.
+
+### Frame Overhead and MTU Calculations
+
+Each 802.1Q/802.1ad VLAN tag adds **4 bytes** of header overhead to the physical Ethernet frame.
+
+- Standard Un-tagged Ethernet Frame (Max Transmission Unit): 1500 bytes IP payload + 14 bytes Ethernet header + 4 bytes FCS = **1518 bytes**.
+- Single-Tagged 802.1Q Frame: 1500 bytes IP + 14 bytes Eth + 4 bytes C-Tag + 4 bytes FCS = **1522 bytes**.
+- Double-Tagged 802.1ad Q-in-Q Frame: 1500 bytes IP + 14 bytes Eth + 4 bytes S-Tag + 4 bytes C-Tag + 4 bytes FCS = **1526 bytes**.
+
+To prevent packet fragmentation or frame drops at provider edge interfaces, all intermediate switches, routers, and physical trunks in the provider core must be configured with an increased Maximum Transmission Unit (MTU) headroom—typically setting physical interface MTUs to **1504 bytes (IP MTU equivalent)** or jumbo frame sizes (e.g., 9000 bytes).
+
+### Linux Q-in-Q Configuration Reference
+
+Linux supports 802.1ad double tagging via raw `ip link` sub-interface configurations or VLAN-aware bridges.
+
+Stacked `ip link` syntax:
+
+```bash
+# (not run here)
+# 1. Create outer Service VLAN interface (S-Tag VID 100, TPID 802.1ad)
+ip link add link eth0 name eth0.100 type vlan proto 802.1ad id 100
+
+# 2. Create inner Customer VLAN interface (C-Tag VID 10, TPID 802.1q)
+ip link add link eth0.100 name eth0.100.10 type vlan id 10
+
+# 3. Bring up interfaces
+ip link set dev eth0.100 up
+ip link set dev eth0.100.10 up
+```
+
+VLAN-Aware Bridge syntax for Q-in-Q Provider Edge:
+
+```bash
+# (not run here)
+# Create a bridge using 802.1ad protocol for outer encapsulation
+ip link add dev br-provider type bridge vlan_filtering 1 vlan_protocol 802.1ad
+ip link set dev br-provider up
+
+# Configure customer-facing port eth1 to push S-Tag 100 on untagged ingress
+bridge vlan add dev eth1 vid 100 pvid untagged
+```
+
+### Kernel Support Probe Script
+
+The shell script below probes kernel module availability and tests whether 802.1ad VLAN device creation or bridge VLAN filtering are supported on the current execution host.
+
+`qinq-probe.sh`:
+
+```bash
+#!/bin/sh
+# Can this kernel do QinQ? Run as: unshare -urn sh qinq-probe.sh
+ip link add eth0 type veth peer name eth1
+echo '$ ip link add link eth0 name eth0.100 type vlan proto 802.1ad id 100'
+ip link add link eth0 name eth0.100 type vlan proto 802.1ad id 100
+echo '$ ip link add br0 type bridge vlan_filtering 1 vlan_protocol 802.1ad'
+ip link add br0 type bridge vlan_filtering 1 vlan_protocol 802.1ad
+echo '$ ip link add br0 type bridge   # plain bridge'
+ip link add br0 type bridge && echo ok
+echo "loaded bridge/vlan modules: $(ls /sys/module | grep -E '^(bridge|8021q)$' | tr '\n' ' ')"
+```
+
+Executing this script on the target environment generates diagnostic outputs indicating missing kernel modules or netlink attributes:
+
+```text
+$ ip link add link eth0 name eth0.100 type vlan proto 802.1ad id 100
+Error: Unknown device type.
+$ ip link add br0 type bridge vlan_filtering 1 vlan_protocol 802.1ad
+RTNETLINK answers: Operation not supported
+$ ip link add br0 type bridge   # plain bridge
+ok
+loaded bridge/vlan modules: bridge 
+```
+
+## The lab
+
+To demonstrate Linux bridge port isolation, Proxy ARP, ICMP redirect dynamics, and broadcast containment without requiring physical switches, we execute a rootless network namespace laboratory using `unshare -urnmu`.
+
+The topology consists of a central Linux bridge (`sw`) holding four veth interfaces:
+1. Port `p-r` connects router `r` (10.20.0.1/24). It stays a normal (promiscuous) port.
+2. Port `p-h1` connects tenant `h1` (10.20.0.11/24); isolated from Section 2 on.
+3. Port `p-h2` connects tenant `h2` (10.20.0.12/24); isolated from Section 2 on.
+4. Port `p-h3` connects `h3` (10.20.0.13/24), which stays a normal port.
+
+Every host's interface is called `eth0` inside its own namespace; MAC addresses are random on each run.
+
+Every namespace, including `r`, runs `udp.py` as a UDP echo server that reports the TTL it received. This host's `ip_default_ttl` is 127 rather than the usual 64, so 127 means the datagram was switched and 126 means it was routed once.
+
+```text
+               +----------------------------------------+
+               |           ROUTER NAMESPACE (r)         |
+               |                                        |
+               | IP:  10.20.0.1/24                      |
+               +-------------------+--------------------+
+                                   | eth0
+                                   |
+                                   | p-r (isolated off)
+               +-------------------+--------------------+
+               |           SWITCH NAMESPACE (sw)        |
+               |           Bridge Device: br0           |
+               |                                        |
+               | p-h1 (isolated) p-h2 (isolated) p-h3   |
+               +------+--------------+-------------+----+
+                      |              |             |
+                 eth0 |         eth0 |        eth0 |
+                      |              |             |
+           +----------+---+      +---+----------+  +-----+----------+
+           | TENANT (h1)  |      | TENANT (h2)  |  | TENANT (h3)  |
+           | 10.20.0.11   |      | 10.20.0.12   |  | 10.20.0.13   |
+           | (Isolated)   |      | (Isolated)   |  | (Un-isolated)|
+           +--------------+      +--------------+  +--------------+
+```
+
+### Lab files
+
+Two files: `udp.py` (echo server and client, with DF set) and `pvlan.sh` (the topology and the six tests). Run `unshare -urnmu sh pvlan.sh`.
+
+`udp.py`:
+
+```python
+#!/usr/bin/env python3
+"""Tiny UDP echo with DF set.  server: udp.py serve PORT
+client: udp.py send IP PORT PAYLOAD_BYTES  -> prints reply TTL or timeout"""
+import socket, sys
+IP_MTU_DISCOVER, IP_PMTUDISC_DO, IP_RECVTTL, IP_TTL = 10, 2, 12, 2
+if sys.argv[1] == "serve":
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.setsockopt(socket.SOL_IP, IP_RECVTTL, 1)
+    s.bind(("0.0.0.0", int(sys.argv[2])))
+    while True:
+        data, anc, _, peer = s.recvmsg(65535, 64)
+        ttl = next((int.from_bytes(d[:4], "little") for l, t, d in anc if t == IP_TTL), -1)
+        s.sendto(f"{socket.gethostname()} got {len(data)} B from {peer[0]} ttl={ttl}".encode(), peer)
+else:
+    ip, port, n = sys.argv[2], int(sys.argv[3]), int(sys.argv[4])
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.setsockopt(socket.SOL_IP, IP_MTU_DISCOVER, IP_PMTUDISC_DO)
+    s.settimeout(1.5)
+    try:
+        s.sendto(b"x" * n, (ip, port))
+        print(f"  {n:4d} B -> {ip}: {s.recv(200).decode()}")
+    except socket.timeout:
+        print(f"  {n:4d} B -> {ip}: timeout")
+    except OSError as e:
+        print(f"  {n:4d} B -> {ip}: {e.strerror}")
+```
+
+`pvlan.sh`:
+
+```bash
+#!/bin/sh
+# Private VLAN behaviour with Linux bridge port isolation.
+# sw: bridge br0; r = router on a promiscuous (non-isolated) port;
+# h1, h2 on isolated ports; h3 on a normal port.
+# Run as: unshare -urnmu sh pvlan.sh   (no root, no installs)
+set -e
+cd "$(dirname "$0")"
+mount -t tmpfs none /run; mkdir -p /run/netns
+sc() { ip netns exec "$1" sh -c "echo $3 > /proc/sys/$(echo $2 | tr . /)"; }
+rd() { ip netns exec "$1" cat /proc/sys/$(echo $2 | tr . /); }
+for n in sw r h1 h2 h3; do ip netns add $n; ip -n $n link set lo up; done
+ip -n sw link add br0 type bridge
+ip -n sw link set br0 up
+for h in r h1 h2 h3; do
+  ip link add eth0 netns $h type veth peer name p-$h netns sw
+  ip -n sw link set p-$h master br0
+  ip -n sw link set p-$h up
+  ip -n $h link set eth0 up
+done
+ip -n r  addr add 10.20.0.1/24  dev eth0
+ip -n h1 addr add 10.20.0.11/24 dev eth0
+ip -n h2 addr add 10.20.0.12/24 dev eth0
+ip -n h3 addr add 10.20.0.13/24 dev eth0
+for h in h1 h2 h3; do ip -n $h route add default via 10.20.0.1; done
+PIDS=""
+for h in r h1 h2 h3; do ip netns exec $h unshare -u sh -c "hostname $h; exec python3 udp.py serve 9000" & PIDS="$PIDS $!"; done
+trap 'kill $PIDS 2>/dev/null' EXIT
+echo "ip_default_ttl on this host: $(rd h1 net.ipv4.ip_default_ttl)"
+sleep 0.5
+flush() { for h in r h1 h2 h3; do ip -n $h neigh flush dev eth0; done; }
+matrix() {
+  for pair in "h1 10.20.0.1" "h1 10.20.0.12" "h1 10.20.0.13" "h2 10.20.0.11" "h3 10.20.0.12"; do
+    set -- $pair; printf '%s ->' $1; ip netns exec $1 python3 udp.py send $2 9000 64
+  done
+}
+echo "== 1. plain bridge, no isolation"
+matrix
+echo "== 2. isolate h1 and h2 (bridge_slave isolated on)"
+ip -n sw link set p-h1 type bridge_slave isolated on
+ip -n sw link set p-h2 type bridge_slave isolated on
+ip -n sw -d link show p-h1 | grep -o 'isolated [a-z]*'
+ip -n sw -d link show p-r  | grep -o 'isolated [a-z]*'
+flush; matrix
+echo "   h1 neighbour table: $(ip -n h1 neigh show dev eth0 | tr '\n' ';')"
+echo "== 3. router answers ARP for the isolated hosts (RFC 3069 style)"
+sc r net.ipv4.ip_forward 1
+sc r net.ipv4.conf.eth0.proxy_arp_pvlan 1
+for k in proxy_arp proxy_arp_pvlan send_redirects; do echo "   r eth0 $k = $(rd r net.ipv4.conf.eth0.$k)"; done
+flush; matrix
+echo "   h1 neighbour table: $(ip -n h1 neigh show dev eth0 | tr '\n' ';')"
+echo "   r MAC: $(ip -n r link show eth0 | awk '/ether/{print $2}')"
+echo "== 4. what the router sent back: ICMP redirects counter"
+ip netns exec r cat /proc/net/snmp | awk '/^Icmp:/{if(!h){split($0,k);h=1}else{split($0,v);for(i in k)if(k[i]=="OutRedirects")print "   r Icmp OutRedirects =", v[i]}}'
+echo "   h1 route get 10.20.0.12: $(ip -n h1 route get 10.20.0.12 | head -1)"
+echo "   h1 accept_redirects = $(rd h1 net.ipv4.conf.eth0.accept_redirects)"
+echo "== 5. turn redirects off on the router, retest"
+sc r net.ipv4.conf.all.send_redirects 0
+sc r net.ipv4.conf.eth0.send_redirects 0
+flush; matrix
+ip netns exec r cat /proc/net/snmp | awk '/^Icmp:/{if(!h){split($0,k);h=1}else{split($0,v);for(i in k)if(k[i]=="OutRedirects")print "   r Icmp OutRedirects =", v[i]}}'
+echo "== 6. a broadcast from h1: who hears it"
+for h in r h2 h3; do ip netns exec $h python3 -c "
+import socket;s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);s.setsockopt(socket.SOL_SOCKET,socket.SO_BROADCAST,1);s.bind(('0.0.0.0',9100));s.settimeout(1.5)
+try: d,a=s.recvfrom(100);print('   $h heard',d.decode(),'from',a[0])
+except socket.timeout: print('   $h heard nothing')" & done
+sleep 0.3
+ip netns exec h1 python3 -c "import socket;s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);s.setsockopt(socket.SOL_SOCKET,socket.SO_BROADCAST,1);s.sendto(b'hello-from-h1',('10.20.0.255',9100))"
+sleep 1.8
+```
+
+### Execution output
+
+The full, unedited execution output of `pvlan.sh` across all six experimental stages is captured below.
+
+```text
+ip_default_ttl on this host: 127
+== 1. plain bridge, no isolation
+h1 ->    64 B -> 10.20.0.1: r got 64 B from 10.20.0.11 ttl=127
+h1 ->    64 B -> 10.20.0.12: h2 got 64 B from 10.20.0.11 ttl=127
+h1 ->    64 B -> 10.20.0.13: h3 got 64 B from 10.20.0.11 ttl=127
+h2 ->    64 B -> 10.20.0.11: h1 got 64 B from 10.20.0.12 ttl=127
+h3 ->    64 B -> 10.20.0.12: h2 got 64 B from 10.20.0.13 ttl=127
+== 2. isolate h1 and h2 (bridge_slave isolated on)
+isolated on
+isolated off
+h1 ->    64 B -> 10.20.0.1: r got 64 B from 10.20.0.11 ttl=127
+h1 ->    64 B -> 10.20.0.12: timeout
+h1 ->    64 B -> 10.20.0.13: h3 got 64 B from 10.20.0.11 ttl=127
+h2 ->    64 B -> 10.20.0.11: timeout
+h3 ->    64 B -> 10.20.0.12: h2 got 64 B from 10.20.0.13 ttl=127
+   h1 neighbour table: 10.20.0.12 FAILED ;10.20.0.1 lladdr be:e7:8e:bd:c3:e1 REACHABLE ;10.20.0.13 lladdr 06:da:48:a6:8a:e6 REACHABLE ;
+== 3. router answers ARP for the isolated hosts (RFC 3069 style)
+   r eth0 proxy_arp = 0
+   r eth0 proxy_arp_pvlan = 1
+   r eth0 send_redirects = 1
+h1 ->    64 B -> 10.20.0.1: r got 64 B from 10.20.0.11 ttl=127
+h1 ->    64 B -> 10.20.0.12: h2 got 64 B from 10.20.0.11 ttl=126
+h1 ->    64 B -> 10.20.0.13: h3 got 64 B from 10.20.0.11 ttl=127
+h2 ->    64 B -> 10.20.0.11: h1 got 64 B from 10.20.0.12 ttl=126
+h3 ->    64 B -> 10.20.0.12: h2 got 64 B from 10.20.0.13 ttl=127
+   h1 neighbour table: 10.20.0.12 lladdr be:e7:8e:bd:c3:e1 REACHABLE ;10.20.0.1 lladdr be:e7:8e:bd:c3:e1 REACHABLE ;10.20.0.13 lladdr 06:da:48:a6:8a:e6 REACHABLE ;
+   r MAC: be:e7:8e:bd:c3:e1
+== 4. what the router sent back: ICMP redirects counter
+   r Icmp OutRedirects = 3
+   h1 route get 10.20.0.12: 10.20.0.12 dev eth0 src 10.20.0.11 uid 0 
+   h1 accept_redirects = 1
+== 5. turn redirects off on the router, retest
+h1 ->    64 B -> 10.20.0.1: r got 64 B from 10.20.0.11 ttl=127
+h1 ->    64 B -> 10.20.0.12: h2 got 64 B from 10.20.0.11 ttl=126
+h1 ->    64 B -> 10.20.0.13: h3 got 64 B from 10.20.0.11 ttl=127
+h2 ->    64 B -> 10.20.0.11: h1 got 64 B from 10.20.0.12 ttl=126
+h3 ->    64 B -> 10.20.0.12: h2 got 64 B from 10.20.0.13 ttl=127
+   r Icmp OutRedirects = 3
+== 6. a broadcast from h1: who hears it
+   h3 heard hello-from-h1 from 10.20.0.11
+   r heard hello-from-h1 from 10.20.0.11
+   h2 heard nothing
+```
+
+## Reading the output
+
+### Section 1: a plain bridge
+
+Every pair answers with `ttl=127`: one broadcast domain, frames switched directly, nothing routed.
+
+### Section 2: two isolated ports
+
+`ip -d link` confirms `isolated on` for `p-h1` and `isolated off` for `p-r`. The matrix is the private VLAN matrix: `h1 -> 10.20.0.1` (router, normal port) works, `h1 -> 10.20.0.13` (h3, normal port) works, `h3 -> 10.20.0.12` works, and the two isolated hosts time out in both directions. The neighbour table explains why: `10.20.0.12 FAILED`. h1's ARP broadcast for h2 was flooded only to non-isolated ports, so h2 never saw it, and h1 never got as far as sending the datagram.
+
+### Section 3: the router answers ARP for the isolated hosts
+
+On `r`: `ip_forward=1`, `proxy_arp_pvlan=1`, and `proxy_arp` left at 0, which shows the kernel documentation's point that `proxy_arp_pvlan` works on its own. Now `h1 -> h2` and `h2 -> h1` both succeed with `ttl=126`, one routed hop. h1's neighbour table maps 10.20.0.12 to the same MAC as 10.20.0.1, the router's MAC, so h1 frames its packets to the router, which forwards them back out the same interface to h2. 10.20.0.13 still maps to h3's own MAC and `h1 -> h3` still arrives with `ttl=127`: h3 is not isolated, its own ARP reply reached h1, and that traffic stays switched.
+
+### Section 4: redirects
+
+`r`'s `Icmp OutRedirects` is 3. Every packet r forwards out the interface it came in on qualifies for a redirect; the count is lower than the number of hairpinned packets because Linux rate-limits redirects per destination. `ip route get 10.20.0.12` on h1 shows the destination as directly on-link (`dev eth0`, no `via`), so a redirect has nothing to change, and the traffic kept working.
+
+### Section 5: redirects off
+
+After `send_redirects=0` on `all` and `eth0`, the same matrix passes and the counter stays at 3: no new redirects.
+
+### Section 6: broadcast
+
+h1 sends one UDP broadcast to 10.20.0.255. `r` and `h3`, on normal ports, hear it; `h2`, on an isolated port, hears nothing. Isolation applies to broadcast and multicast as well as unicast.
+
+## In production
+
+When deploying Private VLANs, port isolation, and Proxy ARP in production Linux environments, configurations must be persisted using standard networking daemons, sysctl files, or enterprise switch templates.
+
+### Systemd-networkd Production Example
+
+With `systemd-networkd` (version 251 or later), set `Isolated=` in the `[Bridge]` section of the port's `.network` file (see systemd.network(5)):
+
+```ini
+# /etc/systemd/network/10-bridge-slave-eth1.network
+# (not run here)
+[Match]
+Name=eth1
+
+[Network]
+Bridge=br0
+
+[Bridge]
+Isolated=yes
+```
+
+### Production Gateway Sysctl Configuration
+
+To ensure a Linux gateway router persistently handles Private VLAN Proxy ARP routing while suppressing ICMP redirects, create a dedicated `/etc/sysctl.d/` drop-in configuration file:
+
+```ini
+# /etc/sysctl.d/90-pvlan-gateway.conf
+# (not run here)
+# Enable global IPv4 packet forwarding
+net.ipv4.ip_forward = 1
+
+# Enable Proxy ARP for Intra-Interface Private VLAN Traffic on eth0
+net.ipv4.conf.eth0.proxy_arp_pvlan = 1
+
+# Disable ICMP Redirect Generation (Prevents path invalidation)
+net.ipv4.conf.all.send_redirects = 0
+net.ipv4.conf.eth0.send_redirects = 0
+```
+
+Apply immediately in production:
+
+```bash
+# (not run here)
+sysctl --system
+```
+
+## Gotchas
+
+- **Two ARP replies for non-isolated hosts**: with `proxy_arp_pvlan`, the router answers ARP for any address whose route points back out the same interface, including hosts on normal ports such as h3, while the real host answers too. Linux keeps the first answer for `locktime` (default one second) and ignores a different one inside that window, so usually the faster responder wins; in the lab, h3's own answer won. If the router wins, the traffic just hairpins through it.
+- **Redirects**: without `send_redirects=0`, the gateway sends a redirect for hairpinned traffic. In the lab they changed nothing because the destination was already on-link, but they are wasted packets and log noise, and host stacks differ in what they do with them.
+- **Lack of IPv6 `proxy_arp_pvlan` Kernel Dynamic Equivalent**: Linux lacks a sysctl for dynamic intra-interface IPv6 Neighbor Discovery proxying. IPv6 tenant isolation must be designed using off-link prefix flags (`L=0`) in Router Advertisements or static `ip -6 neigh add proxy` configurations.
+- **Q-in-Q MTU Blackholes**: Adding 802.1ad outer S-Tags increases frame sizes by 4 bytes (or 8 bytes for double tagging). If provider core trunks are left at standard 1500-byte MTU, customer frames carrying 1500-byte IP payloads will be dropped silently due to MTU exhaustion.
+- **DHCP Snooping Option 82 Rejection**: Many enterprise switches automatically append Option 82 metadata to DHCP requests coming from isolated ports. If the upstream DHCP server or relay agent is not configured to accept Option 82 headers, it will drop client DHCP requests silently.
+- **Asymmetric Traffic Paths with Promiscuous Trunks**: When Private VLANs span multiple physical switches, primary and secondary VLAN mappings must be configured identically across all trunk interfaces. Mismatched secondary VLAN IDs cause frames to egress wrong port roles or drop silently at ASIC ingress.
+- **The bridge device is not isolated**: if the host that runs the bridge has an address on `br0`, every isolated port can reach that host. Isolation is between ports of one bridge only; a second path (another bridge, a routed interface, a VXLAN port left non-isolated) is a way around it.
+- **Kernel Module Dependencies**: Configuring 802.1ad VLAN sub-interfaces requires the `8021q` kernel module. Without it, `ip link add ... type vlan` fails with `Error: Unknown device type.`; a bridge built without VLAN filtering rejects `vlan_filtering 1` with `RTNETLINK answers: Operation not supported`, both seen in the probe above.
+
+## Exercises
+
+1. **Calculate Q-in-Q Frame Sizes**: A customer transmits a standard 1500-byte IP packet over an Ethernet connection. Calculate the precise frame byte length (including Ethernet header, C-Tag, S-Tag, and Frame Check Sequence) at the customer interface, single-tagged provider interface, and double-tagged Q-in-Q core trunk. Determine the minimum MTU required on the provider switches.
+2. **Diagnose Proxy ARP Redirect Failure**: In a test lab, Host A (`10.0.0.10`) can ping Host B (`10.0.0.20`) for 5 seconds after clearing ARP caches, after which all ICMP traffic times out. Packet captures show Host A receiving `ICMP Redirect` messages from gateway `10.0.0.1`. Explain the exact sequence of packet exchanges causing this failure and write the `sysctl` commands to fix it.
+3. **Simulate IPv6 Off-Link Prefix Isolation**: Using `unshare` or network namespaces, set up an IPv6 gateway using `radvd` or `dnsmasq`. Configure the daemon to advertise prefix `2001:db8:100::/64` with the on-link flag disabled (`L=0`). Verify using `ip -6 route show` on a host namespace that the default route is targeted to the router link-local address and that no on-link route exists for the `/64` prefix.
+4. **Isolation and the bridge's own address**: give `br0` in `sw` the address 10.20.0.254/24, run the echo server there, and check from isolated h1 and h2. Explain the result and how you would stop it.
+5. **Who wins the ARP race**: in Section 3, add a 50 ms delay on h3's link with `tc` on a lab host (the lab host here has no `tc`), flush h1's neighbour table, and send to h3 again. Which MAC does h1 store, what TTL arrives, and what changes if you set h1's `net.ipv4.neigh.eth0.locktime` to 0?
+6. **Community ports**: Linux has one isolation group per bridge. Design two "communities" using two bridges and a router, and list what you lose compared with a switch's community VLANs.
+
+## Verification
+
+The experiments and outputs in this chapter were verified against a live Linux kernel environment.
+
+### Verification Matrix
+
+| Component / Feature | Operational Status in Lab | Verification Method / Command |
+| :--- | :--- | :--- |
+| **Linux Bridge Port Isolation** | **VERIFIED RUN** | Executed in rootless unshare namespace via `pvlan.sh`. Confirmed via `ip -d link` ("isolated on"). |
+| **Proxy ARP PVLAN Forwarding** | **VERIFIED RUN** | Set through `/proc/sys/net/ipv4/conf/eth0/proxy_arp_pvlan` in `r`. Confirmed inter-tenant ICMP/UDP delivery with decremented TTL=126. |
+| **ICMP Redirect Metrics** | **VERIFIED RUN** | Confirmed generation of ICMP OutRedirects in `/proc/net/snmp` and verified suppression via `send_redirects=0`. |
+| **Broadcast Isolation** | **VERIFIED RUN** | Verified via UDP broadcast listener in `pvlan.sh`. Isolated node `h2` received 0 broadcast frames. |
+| **IEEE 802.1ad Q-in-Q Execution** | **NOT RUN** | Probe executed (`qinq-probe.sh`). Kernel lacked `8021q` module and bridge VLAN filtering. Output captured in script logs. |
+| **Switch Vendor PVLAN Configuration** | **NOT RUN** | Reference text only. Labelled explicitly as `(not run here)`. |
+
+### Exact system versions
+
+- Linux 6.12.94, iproute2 6.15.0, Python 3.13.5, unprivileged in `unshare -urnmu`. The `pvlan.sh` output above is unedited from one run.
+- Not run: Q-in-Q, `bridge vlan`, vendor switch configuration, radvd and the systemd-networkd file. The Q-in-Q facts come from IEEE 802.1ad as summarised in the ip-link(8) and kernel bridge documentation.
+
+## Sources
+
+- **RFC 5517**: *Cisco Systems' Private VLANs: Scalable Security in a Multi-Client Environment* (Informational, 2010). <https://www.rfc-editor.org/rfc/rfc5517.html>
+- **RFC 3069**: *VLAN Aggregation for Efficient IP Address Allocation* (Informational, 2001). <https://www.rfc-editor.org/rfc/rfc3069.html>
+- **RFC 4861**: *Neighbor Discovery for IP version 6 (IPv6)* (Draft Standard, 2007). <https://www.rfc-editor.org/rfc/rfc4861.html>
+- **RFC 5942**: *IPv6 Subnet Model: The Relationship between Links and IPv6 Subnets* (Proposed Standard, 2010). <https://www.rfc-editor.org/rfc/rfc5942.html>
+- **RFC 6105**: *IPv6 Router Advertisement Guard* (Informational, 2011). <https://www.rfc-editor.org/rfc/rfc6105.html>
+- **Linux Kernel IP Sysctl Documentation**: *IPv4 and IPv6 Protocol Parameters*. <https://docs.kernel.org/networking/ip-sysctl.html>
+- **Linux Kernel Bridge Documentation**: *Ethernet Bridge implementation*. <https://docs.kernel.org/networking/bridge.html>
+- **ip-link(8) Man Page**: *Configure network devices*. <https://man7.org/linux/man-pages/man8/ip-link.8.html>
+- **bridge(8) Man Page**: *Show / manipulate bridge addresses and devices*. <https://man7.org/linux/man-pages/man8/bridge.8.html>
+- **RFC 7610**: *DHCPv6-Shield: Protecting against Rogue DHCPv6 Servers*. <https://www.rfc-editor.org/rfc/rfc7610.html>
+- **systemd.network(5)**: `[Bridge]` section, `Isolated=`. <https://www.freedesktop.org/software/systemd/man/latest/systemd.network.html>
