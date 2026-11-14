@@ -1,0 +1,572 @@
+---
+title: "The PROXY Protocol: Keeping the Client Address Through an L4 Proxy"
+author:
+  - name: "K19G"
+  - name: "grok-bot"
+---
+
+# The PROXY Protocol: Keeping the Client Address Through an L4 Proxy
+
+Put a TCP proxy in front of a service and the service loses something it used to have for free: the client's address. Every connection now comes from the proxy. Logs show one IP, rate limits throttle everybody at once, allow-lists stop working, and an abuse report becomes impossible to answer. HTTP proxies paper over this with `X-Forwarded-For` or `Forwarded`, but a layer 4 proxy cannot edit headers it does not understand, and SMTP, IMAP, SSH, MySQL and TLS-passthrough traffic have no such header anyway.
+
+The PROXY protocol is the common fix. The proxy writes one small header at the very start of the backend connection: "this connection was really from 203.0.113.7:51514 to 198.51.100.10:443". The backend reads it, strips it, and carries on as if the client had connected directly. HAProxy, nginx, Envoy, Traefik, Caddy, Postfix, Dovecot, Exim and most cloud load balancers speak it. It is also an easy way to let anybody on the Internet choose their own source address, if you configure it wrong.
+
+This chapter builds both header versions from the specification, runs a proxy and five kinds of backend in a private network namespace, and shows the failures you will meet in production: spoofing through a backend that "accepts PROXY if present", headers that arrive in pieces, backends that were not told about the header, and health checks.
+
+## Learning goals
+
+- Encode and decode PROXY protocol v1 (text) and v2 (binary) headers, including TLVs and the CRC32C checksum.
+- Explain why a receiver must require the header on a listener and must not guess whether it is present.
+- Restrict who may send the header, and say what that restriction does and does not protect.
+- Read the header correctly from a byte stream, without over-reading and without assuming one `recv()` is enough.
+- Configure the sending and receiving side in HAProxy, nginx and Postfix, and recognise the symptoms of a mismatch.
+- Decide when the PROXY protocol is the right tool and when `Forwarded`, TLS client certificates or direct server return are better.
+
+## Version note
+
+The lab ran on the book's build box: Linux 6.12.94, iproute2 6.15.0 and Python 3.13.5 (standard library only), as an unprivileged user inside `unshare -urn`, which gives the lab a private network namespace where it may put extra addresses on `lo`. No packages were installed. The specification is the HAProxy document "The PROXY protocol, Versions 1 & 2" (revision 2020/03/05), fetched from haproxy.org on 2026-11-14. The HAProxy, nginx, Postfix and AWS snippets in the production section come from their current documentation and are **not run here**.
+
+## Where the address goes
+
+```text
+   client 203.0.113.7:51514
+        |
+        |  TCP to 198.51.100.10:443
+        v
+   L4 proxy (HAProxy, NLB, ...)                         backend 10.0.0.2:443
+        |  new TCP connection from 10.0.0.1:40122 -------->  getpeername() = 10.0.0.1
+        |
+        |  with PROXY protocol, the first bytes on that connection are:
+        |  "PROXY TCP4 203.0.113.7 198.51.100.10 51514 443\r\n"  (v1)
+        |  or a 16+ byte binary block                             (v2)
+        |  followed by the client's bytes, untouched
+```
+
+Two properties make it work for every protocol:
+
+1. **It is sent once, first, by the connection initiator.** The proxy writes the header before any client byte. The backend reads it before handing the socket to the application protocol. Nothing is ever sent back.
+2. **It describes the connection, not a request.** One header per TCP connection. That is why the specification says a proxy that multiplexes several clients' requests over one backend connection "MUST NOT" use it (section 2): the backend would attribute every request to the first client.
+
+### Version 1
+
+One line of US-ASCII:
+
+```text
+PROXY TCP4 192.168.0.1 192.168.0.11 56324 443\r\n
+PROXY TCP6 2001:db8::50 2001:db8::2 40000 443\r\n
+PROXY UNKNOWN\r\n
+```
+
+Fields are separated by exactly one space, ports and IPv4 octets have no leading zeros, and the line ends with CRLF (a bare LF is invalid). The longest legal line is 107 bytes (`PROXY UNKNOWN` with two full IPv6 addresses and two five-digit ports), so a receiver that has not seen CRLF in the first 107 bytes must give up. `UNKNOWN` means "I speak the protocol but cannot describe this connection"; the receiver then uses the real socket addresses.
+
+### Version 2
+
+Version 2 is binary, fixed-offset and extensible:
+
+```text
+offset  size  field
+0       12    signature 0D 0A 0D 0A 00 0D 0A 51 55 49 54 0A   ("\r\n\r\n\0\r\nQUIT\n")
+12      1     version (high nibble, always 2) | command (low nibble: 0 LOCAL, 1 PROXY)
+13      1     address family (high nibble) | transport (low nibble)
+                0x11 TCP/IPv4  0x12 UDP/IPv4  0x21 TCP/IPv6  0x22 UDP/IPv6
+                0x31 UNIX stream  0x32 UNIX dgram  0x00 UNSPEC
+14      2     length of everything that follows (network order)
+16      12    IPv4: src addr, dst addr, src port, dst port    (36 for IPv6, 216 for UNIX)
+...     ...   TLVs: type (1 byte), length (2 bytes), value
+```
+
+The signature is deliberately hostile to other protocols. It starts with an empty line, contains a NUL, and spells `QUIT`, so an HTTP, SMTP, FTP or TLS server that receives it by mistake fails at once instead of half-working (section 5 of the spec).
+
+The **LOCAL** command means "this connection is the proxy's own, for example a health check": the receiver must accept it and use the real endpoints. The **length** field lets a receiver skip address blocks and TLVs it does not understand. The receiver must always honour it, even for LOCAL.
+
+Registered TLVs (section 2.2):
+
+| Type | Name | Carries |
+|------|------|---------|
+| 0x01 | ALPN | the ALPN protocol the client negotiated, e.g. `h2` |
+| 0x02 | AUTHORITY | the host name the client asked for, normally the TLS SNI |
+| 0x03 | CRC32C | checksum of the whole header, computed with this field zeroed |
+| 0x04 | NOOP | padding, ignored |
+| 0x05 | UNIQUE_ID | an opaque ID of up to 128 bytes for correlating logs across proxies |
+| 0x20 | SSL | client-side TLS facts: version, cipher, client-certificate CN, verify result |
+| 0x30 | NETNS | the network namespace name the connection arrived in |
+| 0xE0–0xEF | custom | application specific; AWS uses 0xEA for the VPC endpoint ID |
+
+## The lab
+
+Three files: the codec, the lab and a shell wrapper.
+
+`proxyproto.py` builds v1 and v2 headers and reads exactly one header from a socket. The reader is the interesting part. It reads 5 bytes to tell `PROXY` (v1) from the v2 signature, then reads exactly as many bytes as the format says, never more, so the application data that follows stays in the socket for whoever handles the connection next.
+
+```{.python filename="proxyproto.py"}
+"""PROXY protocol v1 and v2 (haproxy.org proxy-protocol.txt), standard library only."""
+import ipaddress, socket, struct
+
+SIG = b"\r\n\r\n\x00\r\nQUIT\n"            # 12-byte v2 signature
+LOCAL, PROXY = 0x0, 0x1
+TLV_NAMES = {0x01: "ALPN", 0x02: "AUTHORITY", 0x03: "CRC32C", 0x04: "NOOP", 0x05: "UNIQUE_ID",
+             0x20: "SSL", 0x30: "NETNS"}
+
+def _crc_table():
+    poly, table = 0x82F63B78, []            # CRC-32C (Castagnoli), reflected
+    for i in range(256):
+        c = i
+        for _ in range(8):
+            c = (c >> 1) ^ poly if c & 1 else c >> 1
+        table.append(c)
+    return table
+_T = _crc_table()
+
+def crc32c(data):
+    c = 0xFFFFFFFF
+    for b in data:
+        c = _T[(c ^ b) & 0xFF] ^ (c >> 8)
+    return c ^ 0xFFFFFFFF
+
+def v1(src, dst):
+    (sip, sport), (dip, dport) = src, dst
+    fam = "TCP6" if ipaddress.ip_address(sip).version == 6 else "TCP4"
+    return f"PROXY {fam} {sip} {dip} {sport} {dport}\r\n".encode()
+
+def v2(src=None, dst=None, command=PROXY, tlvs=(), with_crc=False):
+    if command == LOCAL:
+        fam, addr = 0x00, b""
+    else:
+        (sip, sport), (dip, dport) = src, dst
+        s, d = ipaddress.ip_address(sip), ipaddress.ip_address(dip)
+        fam = 0x11 if s.version == 4 else 0x21            # TCP over IPv4 / IPv6
+        addr = s.packed + d.packed + struct.pack("!HH", sport, dport)
+    body = addr + b"".join(struct.pack("!BH", t, len(v)) + v for t, v in tlvs)
+    if with_crc:
+        body += struct.pack("!BHI", 0x03, 4, 0)
+    hdr = SIG + bytes([0x20 | command, fam]) + struct.pack("!H", len(body)) + body
+    if with_crc:
+        hdr = hdr[:-4] + struct.pack("!I", crc32c(hdr))
+    return hdr
+
+class ProxyError(Exception):
+    pass
+
+def recv_exact(sock, n):
+    buf = b""
+    while len(buf) < n:
+        chunk = sock.recv(n - len(buf))
+        if not chunk:
+            raise ProxyError(f"connection closed after {len(buf)} of {n} header bytes")
+        buf += chunk
+    return buf
+
+def read_header(sock):
+    """Read exactly one PROXY header from a stream socket, never a byte more.
+    Returns dict(version, command, src, dst, tlvs). Raises ProxyError on anything else."""
+    first = recv_exact(sock, 5)
+    if first == b"PROXY":                                  # v1: read up to CRLF, max 107 bytes
+        line = first
+        while not line.endswith(b"\r\n"):
+            if len(line) >= 107:
+                raise ProxyError("v1 line longer than 107 bytes")
+            line += recv_exact(sock, 1)
+        parts = line[:-2].decode("ascii").split(" ")
+        if parts[1] == "UNKNOWN":
+            return {"version": 1, "command": "UNKNOWN", "src": None, "dst": None, "tlvs": {}}
+        if len(parts) != 6 or parts[1] not in ("TCP4", "TCP6"):
+            raise ProxyError(f"bad v1 line {line!r}")
+        for p in parts[4:]:
+            if not p.isdigit() or (p != "0" and p.startswith("0")) or int(p) > 65535:
+                raise ProxyError(f"bad v1 port {p!r}")
+        src = (str(ipaddress.ip_address(parts[2])), int(parts[4]))
+        dst = (str(ipaddress.ip_address(parts[3])), int(parts[5]))
+        return {"version": 1, "command": "PROXY", "src": src, "dst": dst, "tlvs": {}}
+    rest = recv_exact(sock, 7)
+    head = first + rest
+    if head != SIG:
+        raise ProxyError(f"no PROXY header (first bytes {head[:8]!r})")
+    ver_cmd, fam, length = struct.unpack("!BBH", recv_exact(sock, 4))
+    if ver_cmd >> 4 != 2 or ver_cmd & 0xF not in (LOCAL, PROXY):
+        raise ProxyError(f"bad version/command 0x{ver_cmd:02x}")
+    body = recv_exact(sock, length)
+    raw = SIG + bytes([ver_cmd, fam]) + struct.pack("!H", length) + body
+    out = {"version": 2, "command": "LOCAL" if ver_cmd & 0xF == LOCAL else "PROXY",
+           "src": None, "dst": None, "tlvs": {}}
+    alen = {0x11: 12, 0x12: 12, 0x21: 36, 0x22: 36, 0x31: 216, 0x32: 216}.get(fam, 0)
+    if fam in (0x11, 0x12, 0x21, 0x22) and length >= alen:
+        n = 4 if fam >> 4 == 1 else 16
+        a = body[:alen]
+        sport, dport = struct.unpack("!HH", a[2 * n:])
+        out["src"] = (str(ipaddress.ip_address(a[:n])), sport)
+        out["dst"] = (str(ipaddress.ip_address(a[n:2 * n])), dport)
+    p, off = body[alen:], 16 + alen
+    while p:
+        if len(p) < 3:
+            raise ProxyError("truncated TLV")
+        t, l = struct.unpack("!BH", p[:3])
+        v = p[3:3 + l]
+        if len(v) != l:
+            raise ProxyError("TLV overruns header length")
+        if t == 0x03:
+            zeroed = raw[:off + 3] + b"\x00\x00\x00\x00" + raw[off + 7:]
+            if crc32c(zeroed) != struct.unpack("!I", v)[0]:
+                raise ProxyError("CRC32C mismatch")
+            out["tlvs"]["CRC32C"] = "ok"
+        elif t != 0x04:
+            out["tlvs"][TLV_NAMES.get(t, f"0x{t:02x}")] = v.decode(errors="replace") if t in (1, 2) else v.hex()
+        p, off = p[3 + l:], off + 3 + l
+    if out["command"] == "LOCAL":                          # health check: use the real endpoints
+        out["src"] = out["dst"] = None
+    return out
+```
+
+`lab.py` puts four addresses on `lo` and runs, all as threads in one process:
+
+- an L4 proxy on `10.0.0.1` with one listening port per experiment, each configured to send a different header (or none) to a different backend;
+- five backends on `10.0.0.2`: **strict** (port 9000, header required, only from the proxy's address), **plain** (9001, no PROXY support), **guessing** (9002, "parses PROXY if the bytes look like one", reachable by anyone), **naive** (9003, assumes the header arrives in one `recv()`), and Python's real `http.server` (9004), which was never told about the header;
+- a client on `10.0.0.50` and an attacker on `10.0.0.66`.
+
+```{.python filename="lab.py"}
+"""PROXY protocol lab. Run inside `unshare -urn` (see lab.sh): 10.0.0.1 = L4 proxy,
+10.0.0.2 = backends, 10.0.0.50 = real client, 10.0.0.66 = attacker."""
+import http.server, ipaddress, socket, threading, time
+import proxyproto as pp
+
+PROXY_IP, BACKEND_IP, CLIENT_IP, ATTACKER_IP = "10.0.0.1", "10.0.0.2", "10.0.0.50", "10.0.0.66"
+TRUSTED = [ipaddress.ip_network("10.0.0.1/32")]          # only the proxy may send PROXY headers
+log = []
+
+def listen(ip, port, handler):
+    s = socket.socket()
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s.bind((ip, port))
+    s.listen()
+    def loop():
+        while True:
+            c, peer = s.accept()
+            threading.Thread(target=handler, args=(c, peer), daemon=True).start()
+    threading.Thread(target=loop, daemon=True).start()
+
+def reply(c, who):
+    data = c.recv(4096)
+    c.sendall(f"hello {who[0]}:{who[1]} you sent {data[:24]!r}\n".encode())
+    c.close()
+
+# ---- backends ----
+def strict(c, peer):              # port 9000: header REQUIRED, and only from trusted sources
+    if not any(ipaddress.ip_address(peer[0]) in n for n in TRUSTED):
+        log.append(f"strict : refused {peer[0]} (not a trusted proxy)")
+        return c.close()
+    c.settimeout(3)
+    try:
+        h = pp.read_header(c)
+    except (pp.ProxyError, socket.timeout, UnicodeDecodeError, ValueError) as e:
+        log.append(f"strict : dropped {peer[0]}: {e}")
+        return c.close()
+    who = h["src"] or peer
+    log.append(f"strict : v{h['version']} {h['command']} client={who[0]}:{who[1]} tlvs={h['tlvs']}")
+    reply(c, who)
+
+def plain(c, peer):               # port 9001: no PROXY support at all
+    log.append(f"plain  : client={peer[0]}:{peer[1]}")
+    reply(c, peer)
+
+def guessing(c, peer):            # port 9002: WRONG, "accepts PROXY if present", open to all
+    first = c.recv(5, socket.MSG_PEEK)
+    who = peer
+    if first == b"PROXY" or first == pp.SIG[:5]:
+        who = pp.read_header(c)["src"]
+    log.append(f"guess  : connection from {peer[0]} logged as client={who[0]}:{who[1]}")
+    reply(c, who)
+
+def naive_once(c, peer):          # port 9003: WRONG, assumes the header arrives in one recv()
+    data = c.recv(232)
+    ok = data.startswith(pp.SIG) and len(data) >= 16 + int.from_bytes(data[14:16], "big")
+    log.append(f"naive  : first recv() returned {len(data)} bytes -> "
+               + ("header complete" if ok else "partial header, connection rejected"))
+    c.close()
+
+class Quiet(http.server.BaseHTTPRequestHandler):  # port 9004: a real HTTP server, not told about PROXY
+    def log_message(self, fmt, *args):
+        log.append("http   : " + (fmt % args))
+    def do_GET(self):
+        self.send_response(200); self.end_headers(); self.wfile.write(b"ok\n")
+
+# ---- the L4 proxy ----
+def make_proxy(backend_port, header, bytewise=False):
+    def handle(c, peer):
+        try:
+            relay(c, peer)
+        except OSError:          # backend hung up on us: the client just sees the close
+            c.close()
+    def relay(c, peer):
+        data = c.recv(4096)
+        b = socket.socket()
+        b.bind((PROXY_IP, 0))
+        b.connect((BACKEND_IP, backend_port))
+        hdr = header(peer, c.getsockname())
+        if bytewise:                        # TCP may deliver the header in pieces: simulate it
+            for i in range(len(hdr)):
+                b.send(hdr[i:i + 1]); time.sleep(0.002)
+        else:
+            b.sendall(hdr)
+        b.sendall(data)
+        resp = b""
+        while chunk := b.recv(4096):
+            resp += chunk
+        c.sendall(resp)
+        c.close(); b.close()
+    return handle
+
+def client(src, dst, payload=b"GET / HTTP/1.0\r\n\r\n"):
+    s = socket.socket()
+    s.bind((src, 0))
+    s.settimeout(3)
+    s.connect(dst)
+    s.sendall(payload)
+    out = b""
+    try:
+        while chunk := s.recv(4096):
+            out += chunk
+    except (ConnectionResetError, socket.timeout):
+        pass
+    s.close()
+    return out.decode(errors="replace").splitlines()[0] if out else "(connection closed, no reply)"
+
+def run(title, src, dst, payload=b"GET / HTTP/1.0\r\n\r\n"):
+    log.clear()
+    answer = client(src, dst, payload)
+    time.sleep(0.05)
+    print(f"\n--- {title}")
+    for line in log:
+        print("  " + line)
+    print(f"  client got: {answer}")
+
+def main():
+    listen(BACKEND_IP, 9000, strict)
+    listen(BACKEND_IP, 9001, plain)
+    listen(BACKEND_IP, 9002, guessing)
+    listen(BACKEND_IP, 9003, naive_once)
+    srv = http.server.ThreadingHTTPServer((BACKEND_IP, 9004), Quiet)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    tlvs = [(0x01, b"h2"), (0x02, b"app.example.net"), (0x05, b"req-7f3a91")]
+    v2 = lambda peer, local: pp.v2(peer, local, tlvs=tlvs, with_crc=True)
+    v1 = lambda peer, local: pp.v1(peer, local)
+    none = lambda peer, local: b""
+    local = lambda peer, local: pp.v2(command=pp.LOCAL)
+    def tampered(peer, local):     # flip one bit of the source address after the CRC was computed
+        h = bytearray(pp.v2(peer, local, tlvs=tlvs, with_crc=True)); h[19] ^= 0x01
+        return bytes(h)
+    proxies = {8001: (9001, none, False), 8002: (9000, v2, False), 8003: (9000, v1, False),
+               8004: (9000, local, False), 8005: (9003, v2, True), 8006: (9000, v2, True),
+               8007: (9004, v2, False), 8008: (9000, tampered, False)}
+    for port, (bport, hdr, bw) in proxies.items():
+        listen(PROXY_IP, port, make_proxy(bport, hdr, bw))
+    time.sleep(0.1)
+    print("CRC-32C check value of '123456789':", hex(pp.crc32c(b"123456789")), "(expected 0xe3069283)")
+    h = v2((CLIENT_IP, 40000), (PROXY_IP, 8002))
+    print(f"v2 header with ALPN, AUTHORITY, UNIQUE_ID, CRC32C: {len(h)} bytes")
+    print("  " + h[:16].hex(" ") + "  <- signature, ver/cmd 0x21, fam 0x11, len")
+    print("  " + h[16:28].hex(" ") + "  <- src 10.0.0.50, dst 10.0.0.1, ports 40000, 8002")
+    run("1. L4 proxy, no PROXY protocol", CLIENT_IP, (PROXY_IP, 8001))
+    run("2. proxy sends v2 (+TLVs, CRC32C) to the strict backend", CLIENT_IP, (PROXY_IP, 8002))
+    run("3. proxy sends v1 to the strict backend", CLIENT_IP, (PROXY_IP, 8003))
+    run("4. proxy health check with a LOCAL command", PROXY_IP, (PROXY_IP, 8004))
+    forged = b"PROXY TCP4 203.0.113.7 10.0.0.2 4444 9002\r\nGET / HTTP/1.0\r\n\r\n"
+    run("5. attacker connects straight to the 'PROXY if present' backend", ATTACKER_IP, (BACKEND_IP, 9002), forged)
+    run("6. attacker connects straight to the strict backend", ATTACKER_IP, (BACKEND_IP, 9000), forged)
+    run("7. attacker goes through the proxy and smuggles a header in the payload", ATTACKER_IP,
+        (PROXY_IP, 8002), forged)
+    run("8. header delivered one byte per segment, backend reads once", CLIENT_IP, (PROXY_IP, 8005))
+    run("9. header delivered one byte per segment, backend reads exactly", CLIENT_IP, (PROXY_IP, 8006))
+    run("10. proxy sends v2 to an HTTP server that was not told about it", CLIENT_IP, (PROXY_IP, 8007))
+    run("11. one bit of the header flipped in transit", CLIENT_IP, (PROXY_IP, 8008))
+
+main()
+```
+
+```{.bash filename="lab.sh"}
+#!/bin/sh
+# Rootless: a private network namespace where we are "root" only inside it.
+exec unshare -urn sh -c '
+  ip link set lo up
+  for a in 10.0.0.1 10.0.0.2 10.0.0.50 10.0.0.66; do ip addr add $a/32 dev lo; done
+  python3 lab.py
+'
+```
+
+The output, from one run (source ports differ from run to run):
+
+```text
+$ ./lab.sh
+CRC-32C check value of '123456789': 0xe3069283 (expected 0xe3069283)
+v2 header with ALPN, AUTHORITY, UNIQUE_ID, CRC32C: 71 bytes
+  0d 0a 0d 0a 00 0d 0a 51 55 49 54 0a 21 11 00 37  <- signature, ver/cmd 0x21, fam 0x11, len
+  0a 00 00 32 0a 00 00 01 9c 40 1f 42  <- src 10.0.0.50, dst 10.0.0.1, ports 40000, 8002
+
+--- 1. L4 proxy, no PROXY protocol
+  plain  : client=10.0.0.1:40415
+  client got: hello 10.0.0.1:40415 you sent b'GET / HTTP/1.0\r\n\r\n'
+
+--- 2. proxy sends v2 (+TLVs, CRC32C) to the strict backend
+  strict : v2 PROXY client=10.0.0.50:58095 tlvs={'ALPN': 'h2', 'AUTHORITY': 'app.example.net', 'UNIQUE_ID': '7265712d376633613931', 'CRC32C': 'ok'}
+  client got: hello 10.0.0.50:58095 you sent b'GET / HTTP/1.0\r\n\r\n'
+
+--- 3. proxy sends v1 to the strict backend
+  strict : v1 PROXY client=10.0.0.50:37091 tlvs={}
+  client got: hello 10.0.0.50:37091 you sent b'GET / HTTP/1.0\r\n\r\n'
+
+--- 4. proxy health check with a LOCAL command
+  strict : v2 LOCAL client=10.0.0.1:56763 tlvs={}
+  client got: hello 10.0.0.1:56763 you sent b'GET / HTTP/1.0\r\n\r\n'
+
+--- 5. attacker connects straight to the 'PROXY if present' backend
+  guess  : connection from 10.0.0.66 logged as client=203.0.113.7:4444
+  client got: hello 203.0.113.7:4444 you sent b'GET / HTTP/1.0\r\n\r\n'
+
+--- 6. attacker connects straight to the strict backend
+  strict : refused 10.0.0.66 (not a trusted proxy)
+  client got: (connection closed, no reply)
+
+--- 7. attacker goes through the proxy and smuggles a header in the payload
+  strict : v2 PROXY client=10.0.0.66:42975 tlvs={'ALPN': 'h2', 'AUTHORITY': 'app.example.net', 'UNIQUE_ID': '7265712d376633613931', 'CRC32C': 'ok'}
+  client got: hello 10.0.0.66:42975 you sent b'PROXY TCP4 203.0.113.7 1'
+
+--- 8. header delivered one byte per segment, backend reads once
+  naive  : first recv() returned 1 bytes -> partial header, connection rejected
+  client got: (connection closed, no reply)
+
+--- 9. header delivered one byte per segment, backend reads exactly
+  strict : v2 PROXY client=10.0.0.50:60171 tlvs={'ALPN': 'h2', 'AUTHORITY': 'app.example.net', 'UNIQUE_ID': '7265712d376633613931', 'CRC32C': 'ok'}
+  client got: hello 10.0.0.50:60171 you sent b'GET / HTTP/1.0\r\n\r\n'
+
+--- 10. proxy sends v2 to an HTTP server that was not told about it
+  client got: (connection closed, no reply)
+
+--- 11. one bit of the header flipped in transit
+  strict : dropped 10.0.0.1: CRC32C mismatch
+  client got: (connection closed, no reply)
+```
+
+## Reading the results
+
+**The header dump.** 71 bytes: the 16-byte fixed part (signature, `0x21` = version 2 + PROXY, `0x11` = TCP over IPv4, length `0x0037` = 55), the 12-byte IPv4 address block (`0a000032` is 10.0.0.50, `9c40` is port 40000, `1f42` is 8002), then four TLVs: ALPN (5 bytes), AUTHORITY (18), UNIQUE_ID (13) and CRC32C (7). The CRC-32C implementation is checked against the standard check value for `123456789`, `0xE3069283`, before it is trusted with anything else.
+
+**1, 2 and 3: the point of the protocol.** Without a header the backend sees the proxy (`10.0.0.1`). With v2 or v1 it sees the real client (`10.0.0.50`) and, with v2, what the proxy learned on the client side: the negotiated ALPN, the requested host name and a connection ID it can put in its own logs.
+
+**4: health checks.** The proxy connects on its own behalf with `LOCAL`. The strict backend accepts it and reports the real peer, `10.0.0.1`. A backend that rejects LOCAL, or a proxy that sends no header at all on health checks to a backend that requires one, produces the classic "every backend is down but they are all fine" outage. AWS documents the same thing from the other side: after you enable proxy protocol on a Network Load Balancer target group, health-check connections carry a header too, and targets that cannot parse it fail their health checks.
+
+**5: spoofing through a guessing backend.** This is the misconfiguration the specification forbids in so many words: the receiver "MUST not try to guess whether the protocol header is present or not ... Otherwise it would open a major security breach by allowing untrusted parties to spoof their connection addresses" (section 2). The attacker at `10.0.0.66` connected straight to the backend, wrote its own `PROXY TCP4 203.0.113.7 ...` line, and was logged as `203.0.113.7`. Any allow-list, rate limit or audit trail keyed on the client address is now under the attacker's control. This is not a lab curiosity. CVE-2026-53791 is exactly this bug in the rsync daemon before 3.5.0: an attacker who could connect straight to `rsyncd` sent a crafted PROXY header with a forged source address and walked past `hosts allow` / `hosts deny` (NVD; fixed in rsync 3.5.0).
+
+**6: the two rules that close it.** The strict backend requires the header on that listener *and* only accepts connections from the proxy's address. The attacker is refused before a byte is parsed. The second rule matters even when the first holds: a backend that requires the header but accepts it from anybody can still be fed any address by anybody who can reach it.
+
+**7: smuggling through the trusted proxy fails.** The attacker sends a forged PROXY line as its first bytes *through* the proxy. The proxy prepends its own, real header, and the strict backend reads exactly one header, so the forged line arrives as application data (`you sent b'PROXY TCP4 203.0.113.7 1'`). This only works because the reader stops at the end of the first header. A receiver that loops "while the next bytes look like a PROXY header" reopens hole 5.
+
+**8 and 9: TCP is a byte stream.** The proxy wrote the header one byte per segment. The naive backend's first `recv()` returned 1 byte and it gave up. The strict reader asks for exactly what the format needs and loops until it has it. The specification allows a receiver to be impatient (it "may reject an incomplete line which does not contain the CRLF sequence in the first atomic read operation") but recommends tolerance. Real proxies send the header in one write, so this rarely shows up until something in the path splits segments, a userspace TCP stack is involved, or a test harness writes slowly.
+
+**10: a backend that was not told.** Python's `http.server` received the v2 signature, which begins with `\r\n`, read an empty request line and closed the connection without answering. Other servers answer `400 Bad Request` or log a TLS "unknown protocol" error. That is the signature doing its job: fail fast and visibly rather than parse garbage as a request.
+
+**11: CRC32C.** One bit of the source address was flipped after the checksum was computed, and the strict backend dropped the connection. The checksum protects against corruption and buggy intermediaries, not attackers: anyone who can forge a header can compute a CRC.
+
+## Production configuration (not run here)
+
+### Sending side: HAProxy
+
+```text
+# haproxy.cfg (not run here)
+frontend smtp_in
+    mode tcp
+    bind :25
+    default_backend mta
+
+backend mta
+    mode tcp
+    # v2 header on every connection; add the TLVs you will actually log
+    server mx1 10.0.0.2:25 send-proxy-v2 proxy-v2-options crc32c,unique-id check
+```
+
+`send-proxy` sends v1, `send-proxy-v2` sends v2, and `proxy-v2-options` adds TLVs: `ssl`, `cert-cn`, `ssl-cipher`, `cert-sig`, `cert-key`, `authority`, `crc32c` and `unique-id` (HAProxy configuration manual, "proxy-v2-options"). By default HAProxy also sends the header on health checks when the server uses it for normal traffic, unless the check has its own `port` or `addr`; `check-send-proxy` forces it in that case.
+
+### Receiving side: HAProxy behind another proxy
+
+```text
+frontend public
+    bind :443 accept-proxy           # header REQUIRED on this bind line
+    # or, when only some sources are proxies:
+    # tcp-request connection expect-proxy layer4 if { src -f /etc/haproxy/proxies.lst }
+```
+
+`accept-proxy` on a `bind` line makes the header mandatory for that listener. `tcp-request connection expect-proxy layer4` makes it mandatory only for the listed sources, which is the safe form of "some clients come through a proxy and some do not": the decision is taken from the real source address, not from the bytes the client sends.
+
+### Receiving side: nginx
+
+```text
+# nginx (not run here); requires the realip module for set_real_ip_from
+server {
+    listen 443 ssl proxy_protocol;    # every connection on this listener must start with a header
+    set_real_ip_from 10.0.0.1;        # trust the header's address only from this proxy...
+    real_ip_header   proxy_protocol;  # ...and then use it as $remote_addr
+    allow 10.0.0.1;                   # ...and refuse everyone else outright
+    deny  all;
+}
+```
+
+The trap here is that `set_real_ip_from` does not stop anybody from *sending* a header. It only controls whether nginx replaces `$remote_addr` with it. `$proxy_protocol_addr` is still whatever the connecting host wrote, so anything that logs or acts on `$proxy_protocol_addr` directly must sit behind a firewall or `allow`/`deny` that limits the listener to the proxies. An nginx listener with `proxy_protocol` rejects connections that lack the header and logs "broken header". That message is the first thing to look for when a new proxy is put in front.
+
+### Receiving side: Postfix
+
+```text
+# main.cf (not run here)
+postscreen_upstream_proxy_protocol = haproxy   # when postscreen is the listener
+# or, without postscreen:
+# smtpd_upstream_proxy_protocol = haproxy
+```
+
+Mail servers are where the PROXY protocol earns its keep, because SPF, DNSBL lookups, greylisting and rate limits all depend on the real client address. They are also where a parsing bug hurts most, because the parser runs before any authentication. Treat PROXY-protocol parsers as an exposed attack surface and keep them patched. Exim 4.100.1 (September 2026) fixed an out-of-bounds write in its PROXY protocol v1 parsing (CVE-2026-94054) and a read of uninitialised stack memory (CVE-2026-94056), both reachable when an attacker controls what arrives as the proxy header. Both are another argument for the source-address restriction in scenario 6: a parser that only trusted proxies can reach is a much smaller target.
+
+### Cloud load balancers
+
+- AWS Network Load Balancer: proxy protocol v2 is a target-group attribute. Through a VPC endpoint service the header carries a custom TLV `PP2_TYPE_AWS` (`0xEA`) whose first value byte is the subtype `PP2_SUBTYPE_AWS_VPCE_ID` (`0x01`), followed by the endpoint ID (AWS NLB documentation, "Proxy protocol").
+- Other providers have similar switches and custom TLVs. Before you rely on one, check which TLV types the provider documents and test that your parser skips the types it does not know.
+
+## When not to use it
+
+- **HTTP through an HTTP-aware proxy.** If the proxy terminates HTTP, use `Forwarded` (RFC 7239) or `X-Forwarded-For` and strip any copies that arrive from clients. The PROXY protocol describes the TCP connection and would attribute every request on a reused upstream connection to the first client.
+- **Direct server return or transparent proxying.** If the load balancer preserves the client source address (DSR, IPVS in DR mode, NLB with client IP preservation, Linux `IP_TRANSPARENT`), there is nothing to restore and adding a header only adds a failure mode.
+- **Identity.** The header says where a connection came from, as claimed by a proxy you trust. It is not authentication. If the backend needs to know *who* the client is, use TLS client certificates (and the SSL TLV, or terminate mTLS at the backend).
+- **UDP.** v2 has UDP families, but a header on every datagram, or on the first datagram of a flow, is something sender and receiver have to agree on outside the specification. Check what your proxy actually does before you depend on it.
+
+## Gotchas
+
+- **Turning it on at one end only.** Enabling `send-proxy-v2` before the backend accepts it breaks every connection. Enabling `accept-proxy` before the proxy sends it breaks them too. Roll out with a dedicated listener (a second port that requires the header), move traffic to it, then remove the old one.
+- **Health checks.** Check that health-check connections carry a header (or LOCAL) when the backend requires one, and that the backend accepts LOCAL.
+- **Mixing proxied and direct clients on one listener.** That is exactly the "guess" the specification forbids. Use two listeners, or decide by source address as in `expect-proxy layer4 if { src ... }`.
+- **Trusting the header from anybody.** Firewall the backend so only proxies can reach PROXY-enabled listeners. nginx's `set_real_ip_from` is not a firewall.
+- **Chained proxies.** Each hop must *consume* the incoming header and *produce* a new one carrying the original client. A middle proxy that forwards bytes without parsing hands the backend two headers, and a strict backend treats the second as application data.
+- **Server-speaks-first protocols.** SMTP, FTP, IMAP and SSH servers must not send their banner before the header has been read (section 2). A backend that greets first and then reads the header times out against a proxy that waits for the banner.
+- **TLS passthrough.** With TLS passing through the proxy, the header comes *before* the ClientHello. The backend's TLS stack must be told to strip it first, otherwise the first TLS record looks corrupt.
+- **Logging the wrong field.** After the header is parsed, keep logging the proxy's address as well as the client's. When the proxy itself misbehaves you will need to know which one it was.
+
+## Exercises
+
+1. Extend `proxyproto.py` with the IPv6 family and run scenario 2 with `2001:db8::50` as the client. Check that the address block is 36 bytes and the length field changes accordingly.
+2. Add a backend that accepts the header from anybody but requires it. Show that the attacker can still choose an address, and write down which firewall rule fixes it.
+3. Make the proxy in scenario 7 forward the client's bytes *without* adding its own header (a non-parsing middle hop). What does the strict backend log now? What rule should a middle hop follow?
+4. Add the `0xEA` AWS TLV with a fake `vpce-0123456789abcdef0` ID and teach the reader to decode it, while still skipping custom types it does not know.
+5. Time how long the strict backend waits for a header from a client that connects and sends nothing, and add the "at least 3 seconds" timeout the specification suggests. What does a missing timeout cost you under a connection flood?
+6. Replace the lab proxy with HAProxy on a machine where you can install it, configure `send-proxy-v2 proxy-v2-options crc32c,authority`, and decode the real header with `proxyproto.read_header`.
+
+## Verification
+
+- Every listing in "The lab" ran as shown on the build box (Linux 6.12.94, Python 3.13.5, iproute2 6.15.0) inside `unshare -urn`. No root, no installs, nothing left the box. The output block is pasted from that run.
+- The CRC-32C implementation reproduces the standard check value `0xE3069283` for `123456789`.
+- The header layout, TLV numbers, the 107-byte v1 limit, the LOCAL semantics and the "MUST not guess" and multiplexing rules are quoted or paraphrased from the PROXY protocol specification (2020/03/05 revision).
+- HAProxy options are from the current HAProxy configuration manual (`send-proxy-v2`, `proxy-v2-options`, `accept-proxy`, `expect-proxy layer4`). The nginx, Postfix and AWS material is from their documentation. None of those configurations were run here.
+
+## Sources
+
+- W. Tarreau, "The PROXY protocol, Versions 1 & 2", HAProxy Technologies, revision 2020/03/05: <https://www.haproxy.org/download/3.2/doc/proxy-protocol.txt>
+- HAProxy configuration manual: `send-proxy-v2`, `proxy-v2-options`, `accept-proxy`, `tcp-request connection expect-proxy`: <https://docs.haproxy.org/>
+- nginx, "Accepting the PROXY protocol" and `ngx_http_realip_module`: <https://docs.nginx.com/nginx/admin-guide/load-balancer/using-proxy-protocol/>, <https://nginx.org/en/docs/http/ngx_http_realip_module.html>
+- Postfix, `postscreen_upstream_proxy_protocol` and `smtpd_upstream_proxy_protocol`: <https://www.postfix.org/postconf.5.html>
+- AWS, Network Load Balancer target groups, "Proxy protocol" (PP2_TYPE_AWS 0xEA): <https://docs.aws.amazon.com/elasticloadbalancing/latest/network/edit-target-group-attributes.html>
+- NVD, CVE-2026-53791 (rsync daemon PROXY header source spoofing, fixed in 3.5.0): <https://nvd.nist.gov/vuln/detail/CVE-2026-53791>; rsync advisory GHSA-h2q9-5fr8-w635: <https://github.com/RsyncProject/rsync/security/advisories/GHSA-h2q9-5fr8-w635>
+- NVD, CVE-2026-94054 and CVE-2026-94056 (Exim before 4.100.1, PROXY protocol parsing): <https://nvd.nist.gov/vuln/detail/CVE-2026-94054>, <https://nvd.nist.gov/vuln/detail/CVE-2026-94056>
+- RFC 7239, Forwarded HTTP Extension.
+- RFC 4960 Appendix B: the CRC-32C (Castagnoli) checksum the CRC32C TLV uses.
