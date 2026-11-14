@@ -1,0 +1,974 @@
+---
+title: "TCP Loss Recovery on Linux: RTO, Fast Retransmit, SACK, RACK and Tail Loss Probes"
+author:
+  - name: "K19G"
+  - name: "grok-bot"
+---
+
+# TCP Loss Recovery on Linux: RTO, Fast Retransmit, SACK, RACK and Tail Loss Probes
+
+Packet loss is an inevitable reality of IP networking. When packets drop across a route due to congestion, queue overflow, bit errors, or transient path changes, the transport layer must detect the missing data and retransmit it efficiently. For an operator, understanding how Linux detects and repairs lost segments is essential for troubleshooting latency spikes, throughput degradation, and unexplained connection stalls.
+
+A single dropped segment can cause a stream to stall for hundreds of milliseconds if the kernel relies on conservative timers, or it can be repaired seamlessly within a single round-trip time (RTT) if modern mechanisms like SACK and RACK-TLP are active. When loss recovery fails or degrades, connection goodput drops dramatically, application latency tails balloon, and system resources are consumed processing out-of-order buffers.
+
+This chapter covers the internals of TCP loss detection and repair on Linux. We examine the progression of recovery algorithms from classical timer-based Retransmission Timeouts (RTO) and 3-duplicate-ACK Fast Retransmit, through Selective Acknowledgments (SACK) and NewReno, to modern time-based detection via RACK (Recent Acknowledgment) and Tail Loss Probes (TLP). You will learn how Linux tracks missing data, how kernel counters reflect specific loss events, and how to diagnose recovery anomalies using `ss` and `nstat`.
+
+## Learning goals
+
+- Differentiate between timer-based (RTO, TLP) and ACK-based (Fast Retransmit, SACK, RACK) loss detection mechanisms.
+- Explain the RFC 6298 RTO computation formula and why Linux enforces a 200 ms minimum RTO (`TCP_RTO_MIN`).
+- Describe how SACK (RFC 2018) and DSACK (RFC 2883) enable exact hole identification and spurious retransmission detection.
+- Detail the operation of RACK-TLP (RFC 8985), including time-based loss marking, adaptive reordering windows, and Tail Loss Probe generation.
+- Map Linux kernel SNMP counters (`nstat`) and socket statistics (`ss -ti`) to underlying loss recovery events.
+- Analyze synthetic laboratory loss scenarios to observe the exact behavioral differences between legacy and modern recovery configurations.
+
+## Version note
+
+The analysis and lab measurements in this chapter were gathered on a system running Linux kernel 6.12.94, `iproute2` 6.15.0 (`ss`, `nstat`), and Python 3.13.5. CUBIC was used as the default congestion control algorithm. All lab tests were executed inside unprivileged user, network, and mount namespaces without requiring `root` privileges. Impairment was injected directly at the layer-3 packet forwarder script rather than using `tc/netem`.
+
+## Retransmission Timeout (RTO)
+
+The Retransmission Timeout (RTO) is TCP's fallback recovery mechanism. If an acknowledgment is not received within an expected window of time, the sender assumes the segment (or its ACK) was lost in transit and retransmits the unacknowledged data.
+
+### RFC 6298 RTO Calculation
+
+The sender continuously tracks the smoothed round-trip time (SRTT) and round-trip time variation (RTTVAR) based on measurements of the time elapsed between sending a segment and receiving its ACK.
+
+The classic RFC 6298 algorithm updates these estimates upon receiving a new RTT measurement $R$:
+
+$$\text{RTTVAR} \leftarrow (1 - \beta) \cdot \text{RTTVAR} + \beta \cdot |\text{SRTT} - R|$$
+
+$$\text{SRTT} \leftarrow (1 - \alpha) \cdot \text{SRTT} + \alpha \cdot R$$
+
+where $\alpha = 1/8$ and $\beta = 1/4$.
+
+The RTO is computed as:
+
+$$\text{RTO} = \text{SRTT} + \max(G, 4 \cdot \text{RTTVAR})$$
+
+where $G$ is the clock granularity (typically 1 ms in Linux).
+
+RFC 6298 specifies a lower bound for RTO of 1.0 second ($\text{RTO} = \max(\text{RTO}, 1.0\text{s})$). However, modern low-latency networks make a 1-second timeout excessively punishing.
+
+### Linux Implementation Details
+
+Linux departs from the 1-second RFC floor. `TCP_RTO_MIN` in `include/net/tcp.h` is 200 ms (`HZ/5`), and Linux applies it to the variance term rather than to the whole timeout: the RTTVAR-like term is never allowed below `TCP_RTO_MIN`, so the effective RTO is roughly SRTT + 200 ms on a quiet path. That is why every scenario in the lab reports `rto=224ms` on a 20 ms path. The floor can be lowered per route (`ip route ... rto_min 50ms`) or, since Linux 6.11, per socket with `TCP_RTO_MIN_US`; do that only inside a data centre where you control both ends.
+
+When an RTO timer expires:
+1. The unacknowledged segment at the head of the retransmit queue is retransmitted.
+2. The congestion window (`cwnd`) is collapsed to 1 segment (the loss window).
+3. The slow start threshold (`ssthresh`) is reduced by the congestion-control module (RFC 5681 says $\max(\text{FlightSize}/2, 2 \cdot \text{SMSS})$; CUBIC uses a factor of 0.7).
+4. The connection re-enters the Slow Start phase.
+5. Exponential Backoff is applied: the RTO value doubles for each consecutive timeout ($\text{RTO} \leftarrow \text{RTO} \cdot 2$) until an ACK acknowledging new data arrives.
+
+```text
+Sender                                 Receiver
+  |                                       |
+  |--- Seg 1 (Seq 1000, 1440 bytes) ----->|  (Dropped by network)
+  |--- Seg 2 (Seq 2440, 1440 bytes) ----->|---> Received Seg 2
+  |                                       |<--- ACK 1000 (Dup ACK 1)
+  |                                       |
+  | [RTO Timer Fires (~200ms-224ms)]     |
+  | cwnd collapsed to 1 MSS               |
+  | ssthresh set to flight_size / 2       |
+  |                                       |
+  |--- Seg 1 (Retransmit Seq 1000) ------>|---> Received Seg 1
+  |                                       |<--- ACK 3880 (Cumulative)
+```
+
+Because an RTO resets `cwnd` to 1 and requires slow-starting back up, incurring an RTO causes severe throughput collapse. Modern loss recovery aims to detect and repair losses long before the RTO timer fires.
+
+## Fast Retransmit, Fast Recovery, NewReno, and SACK
+
+To recover from packet loss without waiting for an RTO timer, TCP implementations monitor incoming cumulative acknowledgments for patterns indicating out-of-order delivery.
+
+### Duplicate ACKs and Fast Retransmit (RFC 5681)
+
+When a receiver receives a segment that arrives after a gap in the sequence space (e.g., segment 3 arrives, but segment 2 is missing), it immediately generates an ACK acknowledging the highest in-order sequence number received so far. This duplicate ACK (dupACK) signals to the sender that a segment was delivered out of order.
+
+Under RFC 5681, when a sender receives **3 consecutive duplicate ACKs**, it infers that the segment immediately following the ACKed sequence number was lost rather than merely reordered. The sender enters **Fast Retransmit**:
+1. Retransmits the missing segment immediately without waiting for the RTO timer.
+2. Sets `ssthresh` to $\max(\text{FlightSize}/2, 2 \cdot \text{SMSS})$ (Linux delegates the exact reduction to the congestion-control module).
+3. Inflates `cwnd` by 3 MSS (to account for the 3 segments that generated the 3 dupACKs and have left the network).
+4. Enters **Fast Recovery**, incrementing `cwnd` by 1 MSS for each additional dupACK received, allowing new data to be sent if `cwnd` permits.
+5. Upon receiving a full ACK acknowledging all data in flight prior to loss recovery, sets `cwnd` to `ssthresh` and exits Fast Recovery.
+
+### NewReno Partial ACKs (RFC 6582)
+
+Classic Fast Retransmit works well for a single dropped segment in a window of data. However, if multiple segments are lost in the same window, receiving an ACK for the first retransmitted segment only advances the cumulative ACK number partially—it acknowledges the first repaired hole but reveals that another hole exists further along. This is a **partial ACK**.
+
+Without SACK, RFC 6582 (NewReno) specifies that upon receiving a partial ACK while in Fast Recovery:
+- The sender immediately retransmits the *next* unacknowledged segment.
+- The sender deflates `cwnd` by the amount of new data acknowledged, then adds back 1 MSS.
+- The sender remains in Fast Recovery until all segments in flight when loss recovery was initiated are fully acknowledged.
+
+Because NewReno can only repair **one dropped segment per round-trip time**, a drop of 4 segments in a single window requires 4 full RTTs to repair completely, severely reducing throughput.
+
+### Selective Acknowledgments (SACK, RFC 2018 / RFC 6675)
+
+SACK addresses the multi-drop limitation of NewReno by allowing the receiver to explicitly inform the sender about all non-contiguous blocks of data held in its out-of-order queue.
+
+A SACK-enabled TCP option contains up to 4 SACK blocks, where each block specifies a left and right sequence edge:
+
+$$\text{SACK Block} = [\text{Left Edge (start sequence)}, \text{Right Edge (end sequence)})$$
+
+```text
+Receiver Buffer State:
+Sequence: [1000 .. 2440) [2440 .. 3880) [3880 .. 5320) [5320 .. 6760) [6760 .. 8200)
+Status:   |--- OK -----| |--- MISSING -| |--- OK -----| |--- MISSING -| |--- OK -----|
+
+ACK generated by Receiver:
+Cumulative ACK: 2440
+SACK Option:    Block 1: [3880 - 5320)
+                Block 2: [6760 - 8200)
+```
+
+With RFC 6675 SACK-based loss recovery:
+- The sender maintains a bitmap/scoreboard of the retransmission queue based on returned SACK blocks.
+- The sender can identify *all* missing holes in the sequence space simultaneously during the first RTT following loss detection.
+- The sender retransmits all missing segments in rapid succession during a single RTT, avoiding the one-hole-per-RTT penalty of NewReno.
+
+### Duplicate SACK (DSACK, RFC 2883) and Undo Logic
+
+Duplicate SACK (DSACK) uses the SACK option space to report duplicate segments received by the destination. If a segment was retransmitted spuriously (e.g., due to temporary network reordering that triggered 3 dupACKs), the receiver receives two copies of the segment.
+
+The receiver reports the duplicate arrival by placing a SACK block whose sequence range falls *below* the current cumulative ACK sequence number, or falls within an already SACKed block.
+
+When the sender receives a DSACK:
+1. It recognizes that the original segment was not actually lost, but delayed.
+2. It detects a **spurious retransmission**.
+3. It triggers Linux's "Undo" mechanism: restoring `cwnd` and `ssthresh` back to their values prior to entering Fast Recovery, reverting unnecessary window reductions.
+
+In Linux, kernel counters track these events (`TcpExtTCPDSACKRecv`, `TcpExtTCPPartialUndo`, `TcpExtTCPFullUndo`).
+
+## RACK-TLP: Modern Time-Based Loss Detection (RFC 8985)
+
+Traditional loss recovery relies heavily on ACK counts (3 duplicate ACKs) or rigid timer expirations (RTO). Count-based detection fails under common internet conditions:
+- Small window sizes (e.g., `cwnd` < 4 segments), where receiving 3 dupACKs is mathematically impossible.
+- Tail losses: drops occurring at the very end of a burst, where no subsequent segments are sent to trigger dupACKs.
+- Heavy packet reordering, which triggers spurious Fast Retransmits if the reordering degree exceeds 3 packets.
+
+Linux implements **RACK-TLP** (Recent Acknowledgment and Tail Loss Probe, standardized in RFC 8985), which replaces count-based duplicate ACK thresholds with time-based loss detection.
+
+### Recent Acknowledgment (RACK)
+
+RACK operates on a fundamental physical principle: **if segment $B$ was sent after segment $A$, and segment $B$ is delivered (ACKed or SACKed), then segment $A$ should have arrived unless segment $A$ was lost or delayed.**
+
+Instead of counting dupACKs, RACK tracks the transmission timestamp of every outgoing packet. When an ACK/SACK arrives acknowledging segment $B$:
+1. RACK calculates the time elapsed since segment $A$ was sent.
+2. If segment $A$ was sent earlier than $B$ by more than a dynamic **reordering window** ($R_{\text{win}}$), RACK marks segment $A$ as lost.
+
+RFC 8985 (section 6.2) sets the reordering window to
+
+$$\text{RACK.reo\_wnd} = \min(\text{RACK.reo\_wnd\_mult} \cdot \text{RACK.min\_RTT}/4,\ \text{SRTT})$$
+
+where the multiplier starts at 1, grows by one for each round trip in which a DSACK arrives, and is reset after 16 loss recoveries. Linux implements this in `tcp_rack_reo_wnd()` (`net/ipv4/tcp_recovery.c`) with one aggressive twist: until the connection has *seen* reordering (`tp->reord_seen`), the window is **zero** when the connection is already in recovery or when enough segments are SACKed to meet the classic duplicate-ACK threshold. A brand-new connection therefore treats the first reordering it meets as loss. Scenario 12 shows exactly that.
+
+Separately, Linux keeps a per-connection duplicate-ACK threshold, `tp->reordering` (shown as `reordering` in `ss -ti` and `tcp_info`). It starts at `net.ipv4.tcp_reordering` (3) and is raised, up to `net.ipv4.tcp_max_reordering` (300), when SACK or timestamps prove that the path reorders.
+
+RACK detects lost retransmissions effortlessly: if a retransmitted segment is dropped, subsequent ACKs for higher original data will cause RACK to time-out and re-arm detection for the retransmitted segment within one RTT, whereas classic TCP would be forced to wait for a full RTO.
+
+### Tail Loss Probe (TLP)
+
+Tail Loss Probe addresses packet loss occurring at the end of a write or transaction. When data transmission stops, no trailing packets exist to generate ACKs or SACKs. Without TLP, tail loss can only be detected via an RTO expiration.
+
+TLP arms a **probe timeout (PTO)** whenever data is in flight and the connection is not already in recovery. RFC 8985 (section 7.2) gives
+
+$$\text{PTO} = 2 \cdot \text{SRTT}, \quad \text{plus WCDelAckT (200 ms) if only one segment is in flight}, \quad \text{PTO} = \min(\text{PTO}, \text{RTO})$$
+
+Linux (`tcp_schedule_loss_probe()` in `net/ipv4/tcp_output.c`, v6.12) computes 2·SRTT, adds `TCP_RTO_MIN` (200 ms) when exactly one packet is outstanding and 2 ms otherwise, and then caps the result at the time remaining until the RTO. It only schedules a probe for SACK-capable connections, so with `tcp_sack=0` there is no TLP at all.
+
+When the PTO timer fires:
+1. TLP transmits a single "probe" segment:
+   - If new unacknowledged data is available, TLP sends a new segment.
+   - Otherwise, TLP retransmits the *last* previously sent segment.
+2. The probe segment elicits an immediate ACK or SACK from the receiver.
+3. If the loss was a tail drop, the ACK generated by the probe provides the SACK block or cumulative ACK needed for RACK to immediately trigger Fast Recovery.
+
+#### The Single-Segment Tail Loss Special Case
+
+When only a **single segment is outstanding** in flight, a critical Linux kernel implementation detail governs PTO calculation:
+
+Because the receiver may hold the ACK for a lone segment with its delayed-ACK timer (up to 200 ms), a single outstanding segment could trigger a delayed ACK at the remote end. To prevent TLP from firing before the receiver's delayed ACK timer expires, Linux adds a worst-case delayed-ACK allowance (`TCP_RTO_MIN`, 200 ms) to the PTO calculation for single-segment flights:
+
+$$\text{PTO}_{\text{single}} = 2 \cdot \text{SRTT} + 200\text{ ms}$$
+
+Furthermore, Linux enforces that the PTO can **never exceed the calculated RTO** ($\text{PTO} = \min(\text{PTO}, \text{RTO})$).
+
+Consequently, when a single tail segment is dropped on a link with a small RTT (e.g., 20 ms), $\text{PTO}_{\text{single}}$ evaluates to $2 \cdot 20\text{ ms} + 200\text{ ms} = 240\text{ ms}$. The RTO is 224 ms, and both timers are re-armed by the last ACK, which arrives about one RTT after the tail segment was sent. The probe is capped at the RTO, so **the TLP probe fires at the moment the RTO would have**, about 245 ms after the drop.
+
+Crucially, despite firing at the same wall-clock time as an RTO:
+- **With TLP enabled**: The transmission is a loss probe (`TCPLossProbes`). Here the probe *is* the repair: it retransmits the last segment, the ACK covers everything, and the connection never enters recovery, so `cwnd` and `ssthresh` are untouched.
+- **With TLP disabled**: The expiration is classified as an RTO (`TCPTimeouts`). It collapses `cwnd` to 1 and forces the connection into Slow Start.
+
+## Linux System Control Knobs
+
+The Linux kernel exposes several `sysctl` knobs under `/proc/sys/net/ipv4/` to control loss recovery behavior. In modern Linux distributions, these knobs are per-network-namespace settings.
+
+**These sysctls are diagnostic switches, not tunings.** Turning SACK, RACK or TLP off is useful in a lab to see what they do. In production it only makes recovery slower.
+
+| Sysctl Name | Default Value | Description | Production Recommendation |
+| :--- | :--- | :--- | :--- |
+| `net.ipv4.tcp_sack` | `1` | Enables RFC 2018 Selective Acknowledgments. | **Always 1**. Disabling reverts TCP to NewReno/Reno, impairing multi-drop recovery. |
+| `net.ipv4.tcp_dsack` | `1` | Enables RFC 2883 Duplicate SACK generation and processing. | **Always 1**. Required for spurious retransmit undo and dynamic reordering adaptation. |
+| `net.ipv4.tcp_recovery` | `1` | Bitmap. `0x1`: RACK loss detection (in v6.12 it also replaces RFC 6675 recovery). `0x2`: static RACK reordering window (min_RTT/4). `0x4`: disable RACK's duplicate-ACK threshold heuristic. | **Keep at 1**. On v6.12, clearing `0x1` falls back to duplicate-ACK counting (scenarios 11 and 13). Current kernel documentation says clearing it has no effect because RACK is the only loss detection left, so those two scenarios will look like 10 and 12 on newer kernels. |
+| `net.ipv4.tcp_early_retrans` | `3` | Tail loss probe. `0` disables TLP; `3` or `4` enables it. The old early-retransmit modes are gone. TLP needs SACK and RACK. | **Keep at 3**. |
+| `net.ipv4.tcp_reordering` | `3` | Initial packet reordering threshold (number of packets). | **Leave at default 3**. Linux auto-tunes this up dynamically when DSACKs detect reordering. |
+| `net.ipv4.tcp_max_reordering`| `300` | Maximum dynamic limit for adaptive `tcp_reordering`. | **Leave at default 300**. |
+
+## Kernel Counters (`nstat`) and Socket Statistics (`ss -ti`)
+
+Linux exposes detailed loss recovery metrics via SNMP counters exposed in `/proc/net/netstat` and socket-level internal state via `ss -ti`.
+
+### Key `nstat` Counters
+
+The table below details critical loss recovery counters tracked by `nstat -az`:
+
+| SNMP Counter Name | Technical Meaning | Production Operational Significance |
+| :--- | :--- | :--- |
+| `TcpRetransSegs` | Total number of TCP segments retransmitted across all connections. | Baseline rate indicator. Spikes indicate network loss or packet degradation. |
+| `TcpExtTCPSackRecovery` | Number of times a connection entered SACK-based Fast Recovery. | Measures successful non-blocking recovery from packet loss. |
+| `TcpExtTCPRenoRecovery` | Number of times a connection entered recovery without SACK (Reno/NewReno). | Should be rare. Non-zero means some peers, or something between you and them, did not negotiate SACK. |
+| `TcpExtTCPFastRetrans` | Count of Fast Retransmits triggered by 3 dupACKs or SACK/RACK rules. | High values confirm active loss repair occurring in under 1 RTT. |
+| `TcpExtTCPLossProbes` | Number of Tail Loss Probes (TLP) sent by the kernel. | Indicates tail-end packet drops in application writes or small request/response cycles. |
+| `TcpExtTCPLossProbeRecovery`| Count of loss recoveries successfully initiated by a Tail Loss Probe ACK. | High ratio of recovery to probes confirms TLP effectively prevented RTO stalls. |
+| `TcpExtTCPTimeouts` | Number of RTO timer expirations. | Critical metric. Non-zero values imply severe loss, small windows, or broken RACK-TLP. |
+| `TcpExtTCPLostRetransmit` | A retransmission that was itself detected as lost. | Heavy congestion or a lossy path. RACK finds these within a round trip. |
+| `TcpExtTCPSackRecoveryFail` | A SACK recovery episode that ended in an RTO. | Something recovery could not fix: a lost retransmission without RACK (scenario 11), or lost ACKs. |
+| `TcpExtTCPSlowStartRetrans` | Retransmissions sent in slow start after an RTO. | Moves together with `TCPTimeouts`. |
+| `TcpExtTCPDSACKRecv` | DSACK blocks received from remote endpoints. | Indicates spurious retransmissions occurred due to network reordering or low timeouts. |
+| `TcpExtTCPDSACKOldSent` | DSACK blocks sent to remote endpoints for old duplicate data. | Confirms local receiver detected arriving duplicate segments from sender. |
+| `TcpExtTCPSACKReorder` | Reordering detected via SACK/DSACK analysis. | Signals network path packet reordering; triggers kernel auto-tuning of reordering degree. |
+| `TcpExtTCPTSReorder` | Reordering detected via TCP Timestamps option. | Alternative path reordering metric when TCP Timestamps are enabled. |
+| `TcpExtTCPPartialUndo` | Fast Recovery window reduction partially undone via DSACK/metric checks. | Confirms recovery from transient reordering without severe window penalty. |
+| `TcpExtTCPDSACKIgnoredNoUndo`| A DSACK arrived that the sender did not use for an undo. | Informational; seen together with partial undos. |
+| `TcpExtTCPOFOQueue` | Segments placed into the socket out-of-order queue by receiver. | High values show active packet reordering or uncompleted loss hole filling. |
+
+### Socket Statistics (`ss -ti`) Fields
+
+Executing `ss -ti` exposes real-time TCP metric structures (`struct tcp_info`) for active sockets:
+
+- `retrans:X/Y`: `X` is the current number of active retransmissions in flight for this socket; `Y` is the cumulative count of retransmitted segments over the socket's lifetime.
+- `lost`: Number of segments in flight currently marked as lost by RACK or SACK.
+- `sacked`: Number of segments currently acknowledged by incoming SACK blocks.
+- `reordering`: Current path reordering metric threshold evaluated for this socket (defaults to 3, can dynamically grow up to 300).
+- `rto`: Current Retransmission Timeout value in milliseconds (e.g., `rto:224`).
+- `bytes_retrans`: Cumulative total count of payload bytes retransmitted.
+- `dsack_dups`: Number of duplicate segments detected via DSACK received by this socket.
+
+## Middleboxes, SACK Stripping, and SACK Vulnerabilities
+
+SACK is a fundamental prerequisite for efficient loss recovery in modern networks. However, operators occasionally encounter environments where SACK behavior is broken or disabled.
+
+### Historic Middlebox Interference
+
+During the early 2000s, certain commercial firewalls, WAN accelerators, and intrusive NAT middleboxes routinely stripped unknown TCP options or improperly handled SACK blocks. Additionally, buggy TCP proxies would rewrite TCP sequence numbers in data packets without translating the corresponding sequence boundaries inside SACK options. This resulted in corrupted SACK scoreboards at the sender, forcing connection resets or hangs.
+
+Legacy performance guides from that era frequently advised setting `net.ipv4.tcp_sack = 0` to work around broken corporate firewalls. **This advice is completely obsolete.** Modern internet paths pass SACK options clean through in virtually all non-malicious networks.
+
+### The 2019 "SACK Panic" Vulnerability (CVE-2019-11477)
+
+In 2019, security researchers discovered a series of vulnerabilities in the Linux kernel's TCP SACK implementation, most notably **CVE-2019-11477 (SACK Panic)**.
+
+A peer that advertised a tiny MSS and sent crafted SACK blocks could make the kernel split its retransmit queue into many tiny segments, overflowing the 16-bit `tcp_gso_segs` counter and triggering a kernel panic. The published workarounds until patched kernels shipped were to set `net.ipv4.tcp_sack = 0` or to drop SYNs that advertised a very small MSS.
+
+**Disabling SACK was an emergency workaround, not a fix.** Patched kernels fixed the bug in 2019. If a 2019 runbook left `tcp_sack = 0` behind on your hosts, it is still slowing every lossy transfer they make (scenario 5).
+
+
+## The lab
+
+The laboratory environment isolates TCP loss recovery mechanisms using rootless Linux network namespaces. Two isolated namespaces, `c` (client) and `s` (server), are connected via TUN devices attached to a Python-based packet manipulation script (`link.py`).
+
+```text
++-----------------------+                    +-----------------------+
+|  Client Namespace (c) |                    |  Server Namespace (s) |
+|   10.9.0.1 peer .2    |                    |   10.9.0.2 peer .1    |
+|   [tun0]              |                    |   [tun0]              |
++----------+------------+                    +-----------+-----------+
+           |                                             |
+           +-----------------+                 +---------+
+                             |                 |
+                             v                 v
+                   +---------------------------------+
+                   |           link.py               |
+                   |  - 10 ms 1-way delay (20ms RTT) |
+                   |  - Scripted segment drops/holds |
+                   |  - User-space TUN forwarder     |
+                   +---------------------------------+
+```
+
+### Lab files
+
+To prepare the laboratory environment, run `topo.sh` to initialize the namespaces and TUN interfaces.
+`topo.sh`:
+
+```bash
+#!/bin/sh
+# Two namespaces, c (client, 10.9.0.1) and s (server, 10.9.0.2), joined only
+# by a TUN device in each and link.py in the middle.
+# Run inside: unshare -urnm sh ...   (no root, no installs)
+set -e
+mount -t tmpfs none /run 2>/dev/null || true
+mkdir -p /run/netns
+for n in c s; do
+  ip netns add $n
+  ip -n $n link set lo up
+  ip netns exec $n ip tuntap add dev tun0 mode tun
+done
+ip -n c addr add 10.9.0.1 peer 10.9.0.2 dev tun0
+ip -n s addr add 10.9.0.2 peer 10.9.0.1 dev tun0
+ip -n c link set tun0 up mtu 1500 txqueuelen 10000
+ip -n s link set tun0 up mtu 1500 txqueuelen 10000
+sc() { ip netns exec "$1" sh -c "echo $3 > /proc/sys/$(echo $2 | tr . /)"; }
+gc() { ip netns exec "$1" cat /proc/sys/$(echo $2 | tr . /); }
+```
+
+The forwarding logic and packet manipulation are implemented in `link.py`.
+`link.py`:
+
+```python
+#!/usr/bin/env python3
+"""Userspace impaired link between two network namespaces.
+
+Opens one TUN device inside netns "c" and one inside netns "s" and moves
+IPv4 packets between them with a fixed one-way delay, an optional rate
+limit with a byte-limited queue, and scripted drops/delays of TCP data
+segments selected by their offset in the stream. Logs every scripted
+event and every retransmission it sees (same seq seen twice).
+"""
+import argparse, fcntl, heapq, json, os, select, struct, sys, time
+
+TUNSETIFF, IFF_TUN, IFF_NO_PI = 0x400454CA, 0x0001, 0x1000
+
+def open_tun(nspath, name):
+    here = os.open("/proc/self/ns/net", os.O_RDONLY)
+    fd_ns = os.open(nspath, os.O_RDONLY)
+    os.setns(fd_ns, os.CLONE_NEWNET)
+    fd = os.open("/dev/net/tun", os.O_RDWR)
+    fcntl.ioctl(fd, TUNSETIFF, struct.pack("16sH", name.encode(), IFF_TUN | IFF_NO_PI))
+    os.setns(here, os.CLONE_NEWNET)
+    os.close(here); os.close(fd_ns)
+    os.set_blocking(fd, False)
+    return fd
+
+def tcp_info(pkt):
+    if len(pkt) < 20 or pkt[0] >> 4 != 4 or pkt[9] != 6:
+        return None
+    ihl = (pkt[0] & 15) * 4
+    tot = struct.unpack("!H", pkt[2:4])[0]
+    sp, dp, seq, ack = struct.unpack("!HHII", pkt[ihl:ihl + 12])
+    doff = (pkt[ihl + 12] >> 4) * 4
+    flags = pkt[ihl + 13]
+    plen = tot - ihl - doff
+    return sp, dp, seq, ack, flags, plen
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--delay-ms", type=float, default=10.0, help="one-way delay, each direction")
+    ap.add_argument("--rate-mbit", type=float, default=0.0, help="c->s bottleneck, 0 = unlimited")
+    ap.add_argument("--queue-bytes", type=int, default=0, help="bottleneck queue limit")
+    ap.add_argument("--drop", default="", help="comma list of data segment indexes to drop (first transmission, c->s)")
+    ap.add_argument("--drop-again", default="", help="indexes whose first retransmission is dropped too")
+    ap.add_argument("--drop-tail", type=int, default=0, help="drop the first transmission of every segment that carries any of the last N stream bytes")
+    ap.add_argument("--total", type=int, default=300000, help="stream length in bytes (for --drop-tail)")
+    ap.add_argument("--hold-ms", default="", help="idx:ms reorder, e.g. 30:15 delays segment 30 by 15 ms extra")
+    ap.add_argument("--port", type=int, default=5001)
+    ap.add_argument("--log", default="")
+    a = ap.parse_args()
+
+    tc = open_tun("/run/netns/c", "tun0")
+    ts = open_tun("/run/netns/s", "tun0")
+    drop = {int(x) for x in a.drop.split(",") if x}
+    drop2 = {int(x) for x in a.drop_again.split(",") if x}
+    hold = dict((int(k), float(v)) for k, v in (x.split(":") for x in a.hold_ms.split(",") if x))
+    d = a.delay_ms / 1000
+    heap, n = [], 0                 # (due, n, fd, pkt)
+    seen = {}                       # seq -> times seen
+    isn = None
+    order = {}
+    log = []
+    t0 = None
+    link_free = 0.0                 # bottleneck: when the link finishes sending current packet
+    qdrops = 0
+    pending = []                    # bottleneck FIFO of (pkt) waiting to be serialized
+
+    def now():
+        return time.monotonic()
+
+    while True:
+        timeout = None
+        if heap:
+            timeout = max(0, heap[0][0] - now())
+        r, _, _ = select.select([tc, ts], [], [], timeout)
+        t = now()
+        for fd in r:
+            while True:
+                try:
+                    pkt = os.read(fd, 65535)
+                except BlockingIOError:
+                    break
+                out = ts if fd == tc else tc
+                extra = 0.0
+                info = tcp_info(pkt)
+                if fd == tc and info and info[1] == a.port:
+                    sp, dp, seq, ack, flags, plen = info
+                    if flags & 0x02:            # SYN
+                        isn = (seq + 1) & 0xffffffff
+                        t0 = t
+                    if plen and isn is not None:
+                        off = (seq - isn) & 0xffffffff
+                        if seq not in order:          # index = order of first transmission
+                            order[seq] = len(order)
+                        idx = order[seq]
+                        cnt = seen.get(seq, 0)
+                        seen[seq] = cnt + 1
+                        ms = round((t - t0) * 1000, 1)
+                        if cnt >= 1:
+                            log.append(f"{ms:9.1f} ms  retransmit seg {idx:4d} (seq+{off}, {plen} B, copy {cnt + 1})")
+                        if cnt == 0 and (idx in drop or (a.drop_tail and off + plen > a.total - a.drop_tail)):
+                            log.append(f"{ms:9.1f} ms  DROP       seg {idx:4d} (seq+{off}, {plen} B)")
+                            continue
+                        if cnt == 1 and idx in drop2:
+                            log.append(f"{ms:9.1f} ms  DROP again seg {idx:4d} (first retransmission)")
+                            continue
+                        if cnt == 0 and idx in hold:
+                            extra = hold[idx] / 1000
+                            log.append(f"{ms:9.1f} ms  HOLD       seg {idx:4d} +{hold[idx]:.0f} ms (reorder)")
+                    if flags & 0x01 and t0 is not None and seen.get(seq, 0) <= 1:
+                        log.append(f"{round((t - t0) * 1000, 1):9.1f} ms  FIN from client")
+                due = t + d + extra
+                if fd == tc and a.rate_mbit > 0:
+                    qbytes = max(0.0, link_free - t) * a.rate_mbit * 1e6 / 8
+                    if a.queue_bytes and qbytes + len(pkt) > a.queue_bytes:
+                        log.append(f"{round((t - (t0 or t)) * 1000, 1):9.1f} ms  QUEUE FULL drop ({int(qbytes)} B queued)")
+                        qdrops += 1
+                        continue
+                    start = max(t, link_free)
+                    link_free = start + len(pkt) * 8 / (a.rate_mbit * 1e6)
+                    due = link_free + d + extra
+                n += 1
+                heapq.heappush(heap, (due, n, out, pkt))
+        t = now()
+        while heap and heap[0][0] <= t:
+            _, _, out, pkt = heapq.heappop(heap)
+            try:
+                os.write(out, pkt)
+            except OSError:
+                pass
+        if a.log and log:
+            with open(a.log, "a") as f:
+                f.write("\n".join(log) + "\n")
+            log.clear()
+
+if __name__ == "__main__":
+    main()
+```
+
+The transfer benchmark and socket statistic logging script `xfer.py` writes data across the link.
+`xfer.py`:
+
+```python
+#!/usr/bin/env python3
+"""Send N bytes from netns c to a sink in netns s and report what TCP did.
+
+server: python3 xfer.py serve [--rcvbuf BYTES]
+client: python3 xfer.py send BYTES [--sndbuf BYTES]
+The client prints elapsed time, goodput and the kernel's own counters
+from TCP_INFO (struct tcp_info, linux/tcp.h) just before close.
+"""
+import socket, struct, sys, time
+
+def tcp_info(s):
+    b = s.getsockopt(socket.IPPROTO_TCP, socket.TCP_INFO, 256)
+    # offsets from struct tcp_info in include/uapi/linux/tcp.h
+    f = {}
+    f["state"], f["ca_state"], f["retransmits"], f["probes"], f["backoff"], f["options"] = b[0], b[1], b[2], b[3], b[4], b[5]
+    f["snd_wscale"], f["rcv_wscale"] = b[6] & 15, b[6] >> 4
+    (f["rto"], f["ato"], f["snd_mss"], f["rcv_mss"], f["unacked"], f["sacked"], f["lost"],
+     f["retrans"], f["fackets"]) = struct.unpack_from("9I", b, 8)
+    (f["last_data_sent"], f["last_ack_sent"], f["last_data_recv"], f["last_ack_recv"]) = struct.unpack_from("4I", b, 44)
+    (f["pmtu"], f["rcv_ssthresh"], f["rtt"], f["rttvar"], f["snd_ssthresh"], f["snd_cwnd"],
+     f["advmss"], f["reordering"]) = struct.unpack_from("8I", b, 60)
+    f["rcv_rtt"], f["rcv_space"], f["total_retrans"] = struct.unpack_from("3I", b, 92)
+    return f
+
+def serve(rcvbuf):
+    l = socket.socket()
+    l.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    if rcvbuf:
+        l.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, rcvbuf)
+    l.bind(("10.9.0.2", 5001)); l.listen(1)
+    print("ready", flush=True)
+    c, _ = l.accept()
+    n = 0
+    while True:
+        d = c.recv(1 << 20)
+        if not d:
+            break
+        n += len(d)
+    c.sendall(b"%d\n" % n)
+    c.close()
+
+def send(nbytes, sndbuf):
+    s = socket.socket()
+    if sndbuf:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, sndbuf)
+    s.connect(("10.9.0.2", 5001))
+    t0 = time.monotonic()
+    s.sendall(b"x" * nbytes)            # one write: segments are exactly MSS-sized
+    s.shutdown(socket.SHUT_WR)
+    got = s.recv(64)
+    el = time.monotonic() - t0
+    i = tcp_info(s)
+    s.close()
+    print(f"bytes={int(got)} elapsed={el*1000:.0f}ms goodput={nbytes*8/el/1e6:.2f}Mbit/s "
+          f"total_retrans={i['total_retrans']} rto={i['rto']//1000}ms rtt={i['rtt']/1000:.1f}ms "
+          f"cwnd={i['snd_cwnd']} ssthresh={i['snd_ssthresh']} reordering={i['reordering']} "
+          f"wscale={i['snd_wscale']}/{i['rcv_wscale']}")
+
+if __name__ == "__main__":
+    if sys.argv[1] == "serve":
+        rb = int(sys.argv[3]) if len(sys.argv) > 3 and sys.argv[2] == "--rcvbuf" else 0
+        serve(rb)
+    else:
+        sb = int(sys.argv[4]) if len(sys.argv) > 4 and sys.argv[3] == "--sndbuf" else 0
+        send(int(sys.argv[2]), sb)
+```
+
+The test execution suite `lab-loss.sh` automates the 13 loss recovery scenarios.
+`lab-loss.sh`:
+
+```bash
+#!/bin/sh
+# TCP loss recovery lab. Run as: unshare -urnm sh lab-loss.sh  (no root, no installs)
+set -e
+cd "$(dirname "$0")"
+. ./topo.sh
+KEEP='TcpRetransSegs|TCPSackRecovery|TCPRenoRecovery|TCPFastRetrans|TCPLossProbes|TCPLossProbeRecovery|TCPTimeouts|TCPLostRetransmit|TCPDSACKRecv|TCPDSACKOldSent|TCPSACKReorder|TCPRenoReorder|TCPSpuriousRTOs|TCPSackFailures|TCPRenoFailures|TCPLossUndo|TCPFullUndo|TCPPartialUndo|TCPDSACKUndo|TCPTSReorder|TCPSlowStartRetrans|TCPRcvQDrop|TCPOFOQueue|TCPDSACKIgnoredNoUndo'
+run() { # run "title" "sysctl settings" link-args...
+  title=$1; set_=$2; shift 2
+  echo; echo "=== $title"
+  sc c net.ipv4.tcp_sack 1; sc s net.ipv4.tcp_sack 1
+  sc c net.ipv4.tcp_recovery 1; sc c net.ipv4.tcp_early_retrans 3
+  for kv in $set_; do k=${kv%%=*}; v=${kv#*=}; sc c net.ipv4.$k "$v"; [ $k = tcp_sack ] && sc s net.ipv4.tcp_sack "$v"; echo "client: net.ipv4.$k = $(gc c net.ipv4.$k)"; done
+  echo "link: $*"
+  rm -f /tmp/link.log; touch /tmp/link.log
+  python3 link.py --delay-ms 10 --log /tmp/link.log "$@" & LP=$!
+  ip netns exec s python3 xfer.py serve > /dev/null & SP=$!
+  sleep 0.4
+  NSTAT_HISTORY=/tmp/nstat.c ip netns exec c nstat -n; NSTAT_HISTORY=/tmp/nstat.s ip netns exec s nstat -n
+  ip netns exec c python3 xfer.py send 300000 --sndbuf 1048576
+  wait $SP; sleep 0.1; kill $LP; wait $LP 2>/dev/null || true
+  echo "-- link log (client->server data, ms since SYN)"; cat /tmp/link.log
+  echo "-- client counters"; NSTAT_HISTORY=/tmp/nstat.c ip netns exec c nstat | grep -E "$KEEP" | awk '{printf "  %-26s %s\n", $1, $2}'
+  echo "-- server counters"; NSTAT_HISTORY=/tmp/nstat.s ip netns exec s nstat | grep -E "$KEEP" | awk '{printf "  %-26s %s\n", $1, $2}'
+}
+echo "kernel $(uname -r); 300000 bytes in one write into a 1 MiB send buffer = 207 full segments of 1448 B + one of 264 B (segments 0..207); RTT 20 ms; segment N = Nth new data segment the client sent"
+run "1. no loss (baseline)" ""
+run "2. one segment lost mid-stream, SACK on" "" --drop 30
+run "3. one segment lost mid-stream, SACK off" "tcp_sack=0" --drop 30
+run "4. four consecutive segments lost, SACK on" "" --drop 30,31,32,33
+run "5. four consecutive segments lost, SACK off" "tcp_sack=0" --drop 30,31,32,33
+run "6. last segment lost, TLP on (default)" "" --drop-tail 1
+run "7. last segment lost, TLP off" "tcp_early_retrans=0" --drop-tail 1
+run "8. last two segments lost, TLP on (default)" "" --drop-tail 1449
+run "9. last two segments lost, TLP off" "tcp_early_retrans=0" --drop-tail 1449
+run "10. segment lost and its retransmission lost, RACK on" "" --drop 30 --drop-again 30
+run "11. segment lost and its retransmission lost, RACK off" "tcp_recovery=0" --drop 30 --drop-again 30
+run "12. segments 30 and 130 each reordered by 3 ms, RACK on" "" --hold-ms 30:3,130:3
+run "13. segments 30 and 130 each reordered by 3 ms, RACK off (dupack threshold)" "tcp_recovery=0" --hold-ms 30:3,130:3
+```
+
+### Execution output
+
+The execution output below captures the output generated by `lab-loss.sh`.
+```text
+kernel 6.12.94+; 300000 bytes in one write into a 1 MiB send buffer = 207 full segments of 1448 B + one of 264 B (segments 0..207); RTT 20 ms; segment N = Nth new data segment the client sent
+
+=== 1. no loss (baseline)
+link: 
+bytes=300000 elapsed=124ms goodput=19.41Mbit/s total_retrans=0 rto=224ms rtt=20.5ms cwnd=136 ssthresh=2147483647 reordering=3 wscale=7/7
+-- link log (client->server data, ms since SYN)
+    123.3 ms  FIN from client
+-- client counters
+-- server counters
+
+=== 2. one segment lost mid-stream, SACK on
+link: --drop 30
+bytes=300000 elapsed=183ms goodput=13.08Mbit/s total_retrans=1 rto=224ms rtt=20.3ms cwnd=30 ssthresh=28 reordering=3 wscale=7/7
+-- link log (client->server data, ms since SYN)
+     61.5 ms  DROP       seg   30 (seq+43440, 1448 B)
+     81.7 ms  retransmit seg   30 (seq+43440, 1448 B, copy 2)
+    183.4 ms  FIN from client
+-- client counters
+  TcpRetransSegs             1
+  TcpExtTCPSackRecovery      1
+  TcpExtTCPFastRetrans       1
+-- server counters
+  TcpExtTCPOFOQueue          40
+
+=== 3. one segment lost mid-stream, SACK off
+client: net.ipv4.tcp_sack = 0
+link: --drop 30
+bytes=300000 elapsed=185ms goodput=13.00Mbit/s total_retrans=1 rto=224ms rtt=20.5ms cwnd=31 ssthresh=28 reordering=3 wscale=7/7
+-- link log (client->server data, ms since SYN)
+     61.6 ms  DROP       seg   30 (seq+43440, 1448 B)
+     82.0 ms  retransmit seg   30 (seq+43440, 1448 B, copy 2)
+    184.2 ms  FIN from client
+-- client counters
+  TcpRetransSegs             1
+  TcpExtTCPRenoRecovery      1
+  TcpExtTCPFastRetrans       1
+-- server counters
+  TcpExtTCPOFOQueue          40
+
+=== 4. four consecutive segments lost, SACK on
+link: --drop 30,31,32,33
+bytes=300000 elapsed=184ms goodput=13.03Mbit/s total_retrans=4 rto=224ms rtt=20.3ms cwnd=30 ssthresh=28 reordering=3 wscale=7/7
+-- link log (client->server data, ms since SYN)
+     61.6 ms  DROP       seg   30 (seq+43440, 1448 B)
+     61.6 ms  DROP       seg   31 (seq+44888, 1448 B)
+     61.6 ms  DROP       seg   32 (seq+46336, 1448 B)
+     61.6 ms  DROP       seg   33 (seq+47784, 1448 B)
+     82.0 ms  retransmit seg   30 (seq+43440, 1448 B, copy 2)
+     82.0 ms  retransmit seg   31 (seq+44888, 1448 B, copy 2)
+     82.0 ms  retransmit seg   32 (seq+46336, 1448 B, copy 2)
+     82.0 ms  retransmit seg   33 (seq+47784, 1448 B, copy 2)
+    183.7 ms  FIN from client
+-- client counters
+  TcpRetransSegs             4
+  TcpExtTCPSackRecovery      1
+  TcpExtTCPFastRetrans       4
+-- server counters
+  TcpExtTCPOFOQueue          37
+
+=== 5. four consecutive segments lost, SACK off
+client: net.ipv4.tcp_sack = 0
+link: --drop 30,31,32,33
+bytes=300000 elapsed=244ms goodput=9.82Mbit/s total_retrans=4 rto=224ms rtt=20.3ms cwnd=30 ssthresh=28 reordering=3 wscale=7/7
+-- link log (client->server data, ms since SYN)
+     61.3 ms  DROP       seg   30 (seq+43440, 1448 B)
+     61.3 ms  DROP       seg   31 (seq+44888, 1448 B)
+     61.3 ms  DROP       seg   32 (seq+46336, 1448 B)
+     61.3 ms  DROP       seg   33 (seq+47784, 1448 B)
+     81.7 ms  retransmit seg   30 (seq+43440, 1448 B, copy 2)
+    102.0 ms  retransmit seg   31 (seq+44888, 1448 B, copy 2)
+    122.2 ms  retransmit seg   32 (seq+46336, 1448 B, copy 2)
+    142.5 ms  retransmit seg   33 (seq+47784, 1448 B, copy 2)
+    244.3 ms  FIN from client
+-- client counters
+  TcpRetransSegs             4
+  TcpExtTCPRenoRecovery      1
+  TcpExtTCPFastRetrans       4
+-- server counters
+  TcpExtTCPOFOQueue          56
+
+=== 6. last segment lost, TLP on (default)
+link: --drop-tail 1
+bytes=300000 elapsed=349ms goodput=6.87Mbit/s total_retrans=1 rto=224ms rtt=20.6ms cwnd=218 ssthresh=2147483647 reordering=3 wscale=7/7
+-- link log (client->server data, ms since SYN)
+    102.3 ms  DROP       seg  207 (seq+299160, 840 B)
+    348.9 ms  retransmit seg  207 (seq+299160, 840 B, copy 2)
+-- client counters
+  TcpRetransSegs             1
+  TcpExtTCPLossProbes        1
+-- server counters
+
+=== 7. last segment lost, TLP off
+client: net.ipv4.tcp_early_retrans = 0
+link: --drop-tail 1
+bytes=300000 elapsed=369ms goodput=6.51Mbit/s total_retrans=1 rto=224ms rtt=20.4ms cwnd=2 ssthresh=95 reordering=3 wscale=7/7
+-- link log (client->server data, ms since SYN)
+    122.8 ms  DROP       seg  207 (seq+298584, 1416 B)
+    368.6 ms  retransmit seg  207 (seq+298584, 1416 B, copy 2)
+-- client counters
+  TcpRetransSegs             1
+  TcpExtTCPTimeouts          1
+-- server counters
+
+=== 8. last two segments lost, TLP on (default)
+link: --drop-tail 1449
+bytes=300000 elapsed=191ms goodput=12.56Mbit/s total_retrans=2 rto=224ms rtt=20.4ms cwnd=148 ssthresh=148 reordering=3 wscale=7/7
+-- link log (client->server data, ms since SYN)
+    102.6 ms  DROP       seg  206 (seq+297712, 1448 B)
+    102.6 ms  DROP       seg  207 (seq+299160, 840 B)
+    170.6 ms  retransmit seg  207 (seq+299160, 840 B, copy 2)
+    191.0 ms  retransmit seg  206 (seq+297712, 1448 B, copy 2)
+-- client counters
+  TcpRetransSegs             2
+  TcpExtTCPSackRecovery      1
+  TcpExtTCPFastRetrans       1
+  TcpExtTCPLossProbes        1
+-- server counters
+  TcpExtTCPOFOQueue          1
+
+=== 9. last two segments lost, TLP off
+client: net.ipv4.tcp_early_retrans = 0
+link: --drop-tail 1449
+bytes=300000 elapsed=392ms goodput=6.13Mbit/s total_retrans=2 rto=224ms rtt=20.4ms cwnd=3 ssthresh=106 reordering=3 wscale=7/7
+-- link log (client->server data, ms since SYN)
+    123.7 ms  DROP       seg  206 (seq+297136, 1448 B)
+    123.7 ms  DROP       seg  207 (seq+298584, 1416 B)
+    371.2 ms  retransmit seg  206 (seq+297136, 1448 B, copy 2)
+    391.5 ms  retransmit seg  207 (seq+298584, 1416 B, copy 2)
+-- client counters
+  TcpRetransSegs             2
+  TcpExtTCPSlowStartRetrans  1
+  TcpExtTCPTimeouts          1
+-- server counters
+
+=== 10. segment lost and its retransmission lost, RACK on
+link: --drop 30 --drop-again 30
+bytes=300000 elapsed=206ms goodput=11.66Mbit/s total_retrans=2 rto=224ms rtt=20.4ms cwnd=29 ssthresh=28 reordering=3 wscale=7/7
+-- link log (client->server data, ms since SYN)
+     61.8 ms  DROP       seg   30 (seq+43440, 1448 B)
+     82.1 ms  retransmit seg   30 (seq+43440, 1448 B, copy 2)
+     82.1 ms  DROP again seg   30 (first retransmission)
+    103.3 ms  retransmit seg   30 (seq+43440, 1448 B, copy 3)
+    205.9 ms  FIN from client
+-- client counters
+  TcpRetransSegs             2
+  TcpExtTCPSackRecovery      1
+  TcpExtTCPLostRetransmit    1
+  TcpExtTCPFastRetrans       2
+-- server counters
+  TcpExtTCPOFOQueue          55
+
+=== 11. segment lost and its retransmission lost, RACK off
+client: net.ipv4.tcp_recovery = 0
+link: --drop 30 --drop-again 30
+bytes=300000 elapsed=495ms goodput=4.85Mbit/s total_retrans=2 rto=224ms rtt=20.4ms cwnd=32 ssthresh=28 reordering=3 wscale=7/7
+-- link log (client->server data, ms since SYN)
+     61.7 ms  DROP       seg   30 (seq+43440, 1448 B)
+     82.2 ms  retransmit seg   30 (seq+43440, 1448 B, copy 2)
+     82.2 ms  DROP again seg   30 (first retransmission)
+    330.5 ms  retransmit seg   30 (seq+43440, 1448 B, copy 3)
+    495.1 ms  FIN from client
+-- client counters
+  TcpRetransSegs             2
+  TcpExtTCPSackRecovery      1
+  TcpExtTCPLostRetransmit    1
+  TcpExtTCPFastRetrans       1
+  TcpExtTCPTimeouts          1
+  TcpExtTCPSackRecoveryFail  1
+-- server counters
+  TcpExtTCPOFOQueue          55
+
+=== 12. segments 30 and 130 each reordered by 3 ms, RACK on
+link: --hold-ms 30:3,130:3
+bytes=300000 elapsed=123ms goodput=19.49Mbit/s total_retrans=1 rto=224ms rtt=20.3ms cwnd=181 ssthresh=2147483647 reordering=64 wscale=7/7
+-- link log (client->server data, ms since SYN)
+     61.5 ms  HOLD       seg   30 +3 ms (reorder)
+     82.0 ms  retransmit seg   30 (seq+43440, 1448 B, copy 2)
+    105.3 ms  HOLD       seg  130 +3 ms (reorder)
+    123.3 ms  FIN from client
+-- client counters
+  TcpRetransSegs             1
+  TcpExtTCPSackRecovery      1
+  TcpExtTCPSACKReorder       1
+  TcpExtTCPTSReorder         1
+  TcpExtTCPPartialUndo       1
+  TcpExtTCPFastRetrans       1
+  TcpExtTCPDSACKRecv         1
+  TcpExtTCPDSACKIgnoredNoUndo 1
+  TcpExtTCPDSACKRecvSegs     1
+-- server counters
+  TcpExtTCPDSACKOldSent      1
+  TcpExtTCPOFOQueue          102
+
+=== 13. segments 30 and 130 each reordered by 3 ms, RACK off (dupack threshold)
+client: net.ipv4.tcp_recovery = 0
+link: --hold-ms 30:3,130:3
+bytes=300000 elapsed=124ms goodput=19.43Mbit/s total_retrans=2 rto=224ms rtt=20.3ms cwnd=157 ssthresh=2147483647 reordering=64 wscale=7/7
+-- link log (client->server data, ms since SYN)
+     61.8 ms  HOLD       seg   30 +3 ms (reorder)
+     82.2 ms  retransmit seg   30 (seq+43440, 1448 B, copy 2)
+    105.4 ms  HOLD       seg  130 +3 ms (reorder)
+    123.6 ms  FIN from client
+    125.9 ms  retransmit seg  130 (seq+186800, 1448 B, copy 2)
+-- client counters
+  TcpRetransSegs             2
+  TcpExtTCPSackRecovery      2
+  TcpExtTCPTSReorder         2
+  TcpExtTCPPartialUndo       2
+  TcpExtTCPFastRetrans       2
+  TcpExtTCPDSACKRecv         1
+  TcpExtTCPDSACKIgnoredNoUndo 1
+  TcpExtTCPDSACKRecvSegs     1
+-- server counters
+  TcpExtTCPDSACKOldSent      2
+  TcpExtTCPOFOQueue          102
+```
+
+
+## Reading the output
+
+All times are milliseconds since the client's SYN, as logged by `link.py`. The path RTT is 20.3–20.6 ms. Absolute times move by a few tenths of a millisecond between runs, and a whole transfer sometimes needs one more slow-start round (the baseline took 102 ms in some runs and 124 ms in this one). Compare scenarios with each other, not with the clock.
+
+### Scenario 1: the baseline
+
+No loss: 300000 bytes in 124 ms, `total_retrans=0`, and no loss counter moved on either side. `rto=224ms` is SRTT (about 20 ms) plus the 200 ms floor that Linux applies to the variance term. Every later scenario reports that same RTO, so whenever something waits about 245 ms, a timer fired.
+
+### Scenarios 2 and 3: one hole, with and without SACK
+
+Segment 30 was dropped at 61.5 ms and retransmitted at 81.7 ms, one RTT later. The retransmission is triggered by the ACKs for segments 31, 32 and 33 coming back, not by a timer. With SACK the episode counts as `TCPSackRecovery`; with SACK off (scenario 3: dropped 61.6 ms, repaired 82.0 ms) it counts as `TCPRenoRecovery`. The timing is the same, because one hole needs one round trip either way. On the receiver, `TCPOFOQueue 40` is the number of times a segment went into the out-of-order queue while it waited for the hole to fill: roughly one RTT's worth of later segments. `cwnd=30 ssthresh=28` at the end is CUBIC's multiplicative decrease. The window was cut once, then grew again.
+
+### Scenarios 4 and 5: four holes in one window
+
+This is the case SACK exists for:
+
+```text
+Scenario 4: SACK on                        Scenario 5: SACK off (NewReno)
+  61.6 ms  drop 30 31 32 33                  61.3 ms  drop 30 31 32 33
+  82.0 ms  retransmit 30 31 32 33            81.7 ms  3 dupACKs  -> retransmit 30
+           (SACK blocks show every hole)    102.0 ms  partial ACK -> retransmit 31
+ 183.7 ms  done                             122.2 ms  partial ACK -> retransmit 32
+                                            142.5 ms  partial ACK -> retransmit 33
+                                            244.3 ms  done
+```
+
+With SACK, the first ACKs after the loss carry blocks for 34, 35 and so on. The sender's scoreboard then holds all four holes, and all four go out within a millisecond: `TCPFastRetrans 4`, one `TCPSackRecovery`. Without SACK, the cumulative ACK only says "I still need 30". After 30 is repaired, the next ACK says "now I need 31", which is a partial ACK in RFC 6582 terms. The sender learns about one hole per round trip, so the transfer takes 60 ms longer and goodput falls from 13.03 to 9.82 Mbit/s. On a 200 ms intercontinental path the same four holes would cost 600 ms.
+
+### Scenarios 6 and 7: the last segment lost
+
+Segment 207 is the tail and nothing follows it, so no ACK can reveal the hole.
+
+- TLP on (6): dropped at 102.3 ms, retransmitted at 348.9 ms, 246.6 ms later. Counters: `TCPLossProbes 1`, no `TCPTimeouts`. At the end, `cwnd=218` and `ssthresh` is still at its initial "infinite" value of 2147483647.
+- TLP off (7): dropped at 122.8 ms, retransmitted at 368.6 ms, 245.8 ms later. Counters: `TCPTimeouts 1`. At the end, `cwnd=2 ssthresh=95`.
+
+The wait is the same, and this is not a bug. With exactly one segment outstanding, Linux's probe timeout is 2·SRTT + 200 ms (the worst-case delayed ACK), about 241 ms, and it is capped at the RTO, so the probe fires when the RTO would have. The difference is what the sender does to itself. A loss probe is not a congestion signal, so `cwnd` stays at 218. An RTO collapses `cwnd` and halves the slow-start threshold (CUBIC: ×0.7). The next burst on that connection starts from two segments.
+
+### Scenarios 8 and 9: the last two segments lost
+
+- TLP on (8): segments 206 and 207 were dropped at 102.6 ms. The probe retransmitted the **last** segment, 207, at 170.6 ms. Its ACK carried a SACK block for 207, which let RACK mark 206 as lost, and 206 went out at 191.0 ms, one RTT later. Counters: `TCPLossProbes 1`, `TCPSackRecovery 1`, `TCPFastRetrans 1`. Done in 191 ms with `cwnd=148`.
+- TLP off (9): both segments waited for the RTO (371.2 and 391.5 ms). Counters: `TCPTimeouts 1`, `TCPSlowStartRetrans 1`. The second retransmission is one RTT after the first because after an RTO the sender is back in slow start with `cwnd=1`. Done in 392 ms with `cwnd=3`.
+
+With two segments in flight, the PTO drops to 2·SRTT + 2 ms. The timer is re-armed as ACKs arrive, so it fired about 68 ms after the drop (two RTTs after the last ACK, plus the time for that ACK to come back). The probe turned a 290 ms stall into an 88 ms one.
+
+### Scenarios 10 and 11: a lost retransmission
+
+Segment 30 was dropped, and so was its first retransmission (82.1 ms). With RACK (10), the third copy left at 103.3 ms. RACK compares send times: segments sent *after* the retransmission were being SACKed, so the retransmission must be lost too. That is `TCPLostRetransmit 1`, and the transfer ends at 206 ms. Without RACK (11), nothing in the duplicate-ACK rules can detect a lost retransmission. The sender waited for the RTO (330.5 ms), the SACK recovery episode was declared failed (`TCPSackRecoveryFail 1`, `TCPTimeouts 1`), and the transfer took 495 ms at 4.85 Mbit/s. This is the scenario that makes RACK worth having on lossy paths, where retransmissions get dropped too.
+
+### Scenarios 12 and 13: reordering, not loss
+
+Here nothing is lost. `link.py` delays segments 30 and 130 by 3 ms each, so each arrives after some of its successors.
+
+- RACK on (12): the first hold caused a spurious retransmission of 30 at 82.0 ms. The connection had never seen reordering, and Linux keeps RACK's reordering window at zero until it has (`tcp_rack_reo_wnd()`), so the late segment looked lost. The receiver then got 30 twice and said so with a DSACK (`TCPDSACKOldSent 1` on the server). The client counted it (`TCPDSACKRecv 1`, `TCPSACKReorder 1`, `TCPTSReorder 1`), undid most of the window reduction (`TCPPartialUndo 1`) and raised `reordering` from 3 to 64. The second hold, at 105.3 ms, produced no retransmission at all: the path was now known to reorder, and a 3 ms delay fits within min_RTT/4, about 5 ms.
+- RACK off (13): both holds caused retransmissions (30 at 82.2 ms, 130 at 125.9 ms), giving `TCPFastRetrans 2` and `TCPSackRecovery 2`. The server sent two DSACKs, but the client had finished before the second one arrived, so it shows `TCPDSACKRecv 1`. `reordering` reached 64 here too, and the second retransmission still happened. We did not trace which rule fired. The counters show the difference: two spurious retransmissions without RACK, one with it.
+
+The value of `reordering` after the first DSACK varied between runs (40 in one run, 64 in this one). The direction never did.
+
+
+## In production
+
+When managing production Linux infrastructure, diagnosing transport-layer loss recovery requires monitoring system-wide SNMP metrics, inspecting active socket parameters, and tracing retransmission events in the kernel.
+
+### Monitoring System-Wide Loss Metrics (`nstat`)
+
+Use `nstat` to observe loss recovery trends across network namespaces. The command below filters key TCP recovery counters:
+
+```bash
+# (not run here)
+# absolute values since boot, including zeros, for the recovery counters
+nstat -az TcpRetransSegs TcpExtTCPSackRecovery TcpExtTCPFastRetrans \
+      TcpExtTCPLossProbes TcpExtTCPLossProbeRecovery TcpExtTCPTimeouts \
+      TcpExtTCPLostRetransmit TcpExtTCPDSACKRecv TcpExtTCPSACKReorder
+# deltas since the previous nstat call (nstat keeps a history file)
+nstat TcpRetransSegs TcpExtTCPTimeouts TcpExtTCPLossProbes
+```
+
+A healthy host shows `TCPSackRecovery` and `TCPFastRetrans` tracking closely with `TcpRetransSegs`, while `TCPTimeouts` remains near zero. High rates of `TCPTimeouts` relative to `TCPSackRecovery` indicate path degradation, small transaction sizes failing TLP, or middlebox interference.
+
+### Inspecting Live Socket Recovery State (`ss -ti`)
+
+To examine sockets currently experiencing packet loss or window adjustments, use `ss` with internal TCP info flags (`-ti`):
+
+```bash
+# (not run here)
+# established sockets to port 443 with their retransmission state
+ss -tin state established '( sport = :443 )' | grep -B1 -E 'retrans:|lost:'
+```
+
+### Tracing retransmissions as they happen
+
+The kernel has a tracepoint for every retransmitted segment. `perf` can record it without writing any BPF, and the `tcpretrans` tools in bcc and bpftrace print one line per retransmission with addresses and TCP state.
+
+```bash
+# (not run here)
+perf record -e tcp:tcp_retransmit_skb -a -- sleep 30
+perf script | head
+# or, with bpftrace's bundled tool
+tcpretrans.bt
+```
+
+### Simulating Path Impairment with `tc qdisc`
+
+To validate application resilience under packet loss in staging environments without modifying code, use Linux Traffic Control (`tc`) with the `netem` qdisc:
+
+```bash
+# (not run here)
+# Inject 5% random packet loss and 10ms +/- 2ms jitter on eth0
+tc qdisc add dev eth0 root netem loss 5% delay 10ms 2ms
+
+# Remove impairment rules
+tc qdisc del dev eth0 root
+```
+
+
+## Gotchas
+
+- **Disabling SACK to fix legacy middlebox issues destroys performance.** While 20-year-old firewalls occasionally mishandled SACK, disabling `net.ipv4.tcp_sack` in modern Linux forces fallback to NewReno, degrading recovery speeds from 1 RTT to 1 RTT per dropped packet.
+- **RTO collapses `cwnd` to 1, but TLP does not.** An RTO timer expiration resets `cwnd` to 1 MSS and forces Slow Start. A TLP probe firing at nearly the same time retains `cwnd` and `ssthresh`, preserving pipeline throughput.
+- **Single-segment flights delay TLP probes.** When only one segment is in flight, Linux adds a 200 ms (`TCP_RTO_MIN`) delayed-ACK allowance to the PTO. This causes the TLP probe to fire at the same time as an RTO (~224–245 ms), though it still avoids the `cwnd` reset.
+- **`tcp_reordering` auto-tunes dynamically up to 300.** Manual tweaking of `net.ipv4.tcp_reordering` is rarely needed. When DSACKs detect path reordering, the kernel automatically increases this threshold up to `tcp_max_reordering`.
+- **SACK Panic (CVE-2019-11477) requires kernel patching, not permanent feature removal.** Temporary SACK disables were an emergency stopgap in 2019. Modern production kernels are fully patched.
+- **High `TcpExtTCPLossProbes` indicates tail-drop patterns.** Frequent TLP probes paired with low `TcpExtTCPTimeouts` indicate that your application frequently performs small, bursty writes that end abruptly, leaving tail packets vulnerable to drops.
+- **DSACK allows Linux to "undo" aggressive window cuts.** When packet reordering mimics loss, incoming DSACKs inform the sender that original packets arrived safely, prompting Linux to restore `cwnd` to pre-recovery levels.
+- **The first reordering on a connection costs a spurious retransmission.** Linux keeps RACK's window at zero until reordering has been seen (scenario 12). Links that reorder all the time, such as some bonded or per-packet load-balanced paths, show a steady trickle of `TCPDSACKRecv` and `TCPPartialUndo`.
+- **`tcp_recovery=0` means different things on different kernels.** On 6.12 it switches RACK off. Current kernel documentation says the bit no longer has any effect. Check the version before you trust a comparison.
+
+
+## Exercises
+
+1. **Calculate RFC 6298 RTO**: Given a connection with an initial $\text{SRTT} = 40\text{ ms}$ and $\text{RTTVAR} = 5\text{ ms}$, compute the new $\text{SRTT}$, $\text{RTTVAR}$, and $\text{RTO}$ values following a new sample RTT measurement of $R = 80\text{ ms}$. Assume clock granularity $G = 1\text{ ms}$ and standard $\alpha=1/8, \beta=1/4$ weights.
+2. **TLP with one segment in flight**: Using `link.py` from the lab environment, modify the transfer script to transmit a single 500-byte write. Measure the exact time delta between initial packet transmission and TLP probe retransmission when path RTT is set to 50 ms versus 5 ms. Explain why the delta does not scale linearly with RTT.
+3. **Inspect Production Metrics**: Run `nstat -z` on a busy production server. Compute the ratio of `TcpExtTCPSackRecovery` to `TcpExtTCPTimeouts`. If timeouts account for more than 5% of total recovery events, outline three potential network or OS causes.
+4. **Watch reordering adapt**: Run `link.py --hold-ms 30:3,80:3,130:3,180:3` with RACK on and print `ss -ti` for the client socket after each hold (add a `sleep` loop in another shell). Record how `reordering` and the retransmission count change after each DSACK.
+5. **Simulate Multi-Drop Recovery**: Using the lab environment, configure a drop rule for 8 consecutive segments in a 100-segment burst. Execute the transfer under `tcp_sack=1` and `tcp_sack=0`. Compare the resulting total transfer completion times and `nstat` counters.
+
+
+## Verification
+
+The experiments and outputs documented in this chapter were generated and verified using the following configuration:
+
+- **Operating System / Kernel**: Linux 6.12.94-amd64 (unprivileged user, network, and mount namespaces).
+- **Tooling Versions**: `iproute2` 6.15.0 (`ss`, `nstat`), Python 3.13.5.
+- **Congestion Control**: CUBIC (default Linux default algorithm).
+- **Execution Environment**: Rootless network namespace setup created via `unshare -urnm`. Synthetic packet delays and drops were injected entirely in user-space via `link.py` over Python TUN interfaces.
+
+*Commands executed during lab run*:
+- `topo.sh` (Created TUN interfaces and IP addresses).
+- `link.py` (Handled layer-3 packet forwarding, artificial delay injection, and deterministic drop logic).
+- `xfer.py` (Executed write calls and extracted `struct tcp_info` via socket options).
+- `lab-loss.sh` (Automated the 13 test scenarios and collected `nstat` differences).
+
+*Not run (labelled "(not run here)")*: the `tc`/`netem`, `perf`, `tcpretrans.bt` and production `nstat`/`ss` commands. `tc`, `perf` and bpftrace are not installed on the lab host, and installing packages was out of bounds.
+
+Repeatability: the whole lab was run twice. Events and counters matched; only the byte offsets of the tail segments and the receiver's `TCPOFOQueue` counts differed slightly. Kernel behaviour quoted from `net/ipv4/tcp_output.c`, `tcp_recovery.c` and `Documentation/networking/ip-sysctl.rst` at tag v6.12.
+
+
+## Sources
+
+- **RFC 2018**: Mathison, A., et al. *TCP Selective Acknowledgment Options*. IETF, October 1996. <https://www.rfc-editor.org/rfc/rfc2018>
+- **RFC 2883**: Floyd, S., et al. *An Extension to the Selective Acknowledgment (SACK) Option for TCP*. IETF, July 2000. <https://www.rfc-editor.org/rfc/rfc2883>
+- **RFC 5681**: Allman, M., et al. *TCP Congestion Control*. IETF, September 2009. <https://www.rfc-editor.org/rfc/rfc5681>
+- **RFC 6298**: Paxson, V., et al. *Computing TCP's Retransmission Timer*. IETF, June 2011. <https://www.rfc-editor.org/rfc/rfc6298>
+- **RFC 6582**: Henderson, T., et al. *The NewReno Modification to TCP's Fast Recovery Algorithm*. IETF, April 2012. <https://www.rfc-editor.org/rfc/rfc6582>
+- **RFC 6675**: Blanton, E., et al. *A Conservative Loss Recovery Algorithm Based on Selective Acknowledgment (SACK) for TCP*. IETF, August 2012. <https://www.rfc-editor.org/rfc/rfc6675>
+- **RFC 8985**: Cheng, Y., et al. *The RACK-TLP Loss Detection and Recovery Algorithm for TCP*. IETF, February 2021. <https://www.rfc-editor.org/rfc/rfc8985>
+- **RFC 9293**: Eddy, W. *Transmission Control Protocol (TCP)*. IETF, August 2022. <https://www.rfc-editor.org/rfc/rfc9293>
+- **Linux Kernel Documentation**: *IP Sysctl Documentation* (current). <https://docs.kernel.org/networking/ip-sysctl.html>, and the v6.12 text: <https://github.com/torvalds/linux/blob/v6.12/Documentation/networking/ip-sysctl.rst>
+- **Linux source** v6.12: `net/ipv4/tcp_recovery.c` (`tcp_rack_reo_wnd`) and `net/ipv4/tcp_output.c` (`tcp_schedule_loss_probe`). <https://github.com/torvalds/linux/tree/v6.12/net/ipv4>
+- **CVE-2019-11477**. <https://www.cve.org/CVERecord?id=CVE-2019-11477>
+- **Linux SNMP Counter Documentation**: *Linux Kernel SNMP Counters Explanation*. Kernel.org. <https://docs.kernel.org/networking/snmp_counter.html>
+- **Linux Manual Pages**: `tcp(7)` - *Overview of TCP Protocol Implementation*. Man7.org. <https://man7.org/linux/man-pages/man7/tcp.7.html>
