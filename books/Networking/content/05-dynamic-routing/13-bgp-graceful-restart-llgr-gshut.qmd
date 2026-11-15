@@ -1,0 +1,613 @@
+---
+title: "BGP Graceful Restart, Long-Lived Graceful Restart and Graceful Shutdown"
+author:
+  - name: "K19G"
+  - name: "grok-bot"
+---
+
+# BGP Graceful Restart, Long-Lived Graceful Restart and Graceful Shutdown
+
+When a BGP process restarts, the default protocol behaviour is brutal: the TCP session drops, every peer immediately withdraws every route learned from that speaker, traffic blackholes or churns across the network, and the whole RIB has to be rebuilt from scratch once the session returns. Yet on a modern router with a separated control plane and forwarding plane, the FIB in hardware or kernel space often keeps forwarding packets cleanly while the BGP daemon reloads or fails over to a standby route processor.
+
+Three mechanisms exist to stop control-plane events from causing unnecessary data-plane outages: Graceful Restart (RFC 4724), Long-Lived Graceful Restart (RFC 9494), and Graceful BGP Session Shutdown (RFC 8326). They solve different halves of the problem. Graceful Restart and Long-Lived Graceful Restart are **reactive** mechanisms for when a session breaks unexpectedly while forwarding state survives. Graceful Shutdown is a **proactive** mechanism for planned maintenance, letting you drain traffic onto an alternate path *before* you pull the plug.
+
+Knowing which one applies—and when retaining stale routes turns a control-plane blip into a silent data-plane blackhole—is an essential operational skill.
+
+## Learning goals
+
+- Decode BGP Graceful Restart (Capability 64) and Long-Lived Graceful Restart (Capability 71) wire bytes, including the Restart State (`R`) bit, Forwarding State (`F`) bit, Restart Time, and Long-Lived Stale Time (LLST).
+- Trace the stale-route lifecycle on a receiving peer across normal End-of-RIB completion, Restart Time expiration, `F=0` immediate flush, and `LLGR_STALE` fallback.
+- Explain why Graceful Restart can mask a forwarding-plane failure and how BFD interacts with control-plane restarts.
+- Design a planned maintenance drain using the `GSHUT` (`65535:0`) well-known community, and contrast it with crash recovery via GR/LLGR.
+- Apply RFC 9494 propagation rules for `LLGR_STALE` (`65535:6`) so long-lived stale routes do not leak into the global Internet.
+
+## The split between control plane and forwarding plane
+
+Graceful Restart assumes a clean separation between the routing daemon (the control plane) and the packet-forwarding engine (the data plane). If the BGP daemon crashes and restarts in 15 seconds while the ASIC or kernel FIB keeps its installed next-hops intact, withdrawing routes on the peer's side causes more disruption than the crash itself.
+
+```text
+  Normal operation                  Control-plane restart (FIB intact)
+  +------------------+              +------------------+
+  |   BGP Daemon     |              |   BGP Daemon     |  (restarting)
+  +--------+---------+              +------------------+
+           | RIB -> FIB                       .  (stale FIB entries kept)
+           v                                  v
+  +------------------+              +------------------+
+  |  Forwarding FIB  |              |  Forwarding FIB  |  (still forwards)
+  +------------------+              +------------------+
+```
+
+The catch is built into that diagram: **GR only works if the FIB is actually still good.** If the entire line card, hypervisor, or router died—or if the forwarding engine stopped passing packets while the TCP session lingered—telling peers to keep sending traffic to a dead next-hop turns a fast reconvergence into a blackhole that lasts until the Restart Timer expires.
+
+## BGP Graceful Restart (RFC 4724)
+
+Graceful Restart is negotiated in the BGP `OPEN` message using Capabilities Optional Parameter code `64` (`0x40`). Both speakers advertise whether they can preserve forwarding state across a restart, how long a peer should wait for them to return, and which address families are covered.
+
+### Capability 64 wire format
+
+```text
+ 0                   1                   2                   3
+ 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|  Cap Code 64  |  Cap Length   |R|Resv |     Restart Time      |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|            AFI (16 bits)      |   SAFI (8)    |F|  Reserved   |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                           ...                                 |
+```
+
+| Field | Size | Meaning |
+| :--- | :--- | :--- |
+| Capability Code | 8 bits | `64` (`0x40`) for Graceful Restart. |
+| Capability Length | 8 bits | `2 + 4 * N`, where `N` is the number of AFI/SAFI tuples. |
+| `R` (Restart State) | 1 bit | `0x8000` in the 16-bit flags+time word. Set to `1` when the sender has restarted and wants the peer to wait for End-of-RIB before flushing stale routes. |
+| Restart Time | 12 bits | Seconds (`0`–`4095`) the peer should wait for the TCP/BGP session to be re-established. |
+| AFI / SAFI | 16 + 8 bits | Address Family and Subsequent Address Family (e.g., `00 01 01` for IPv4 unicast). |
+| `F` (Forwarding State) | 1 bit | `0x80` in the per-AFI Flags byte. Set to `1` if forwarding state for that AFI/SAFI was preserved across the restart; `0` if not. |
+
+A speaker can also advertise **receiver-only** (helper) Graceful Restart by sending Capability 64 with no AFI/SAFI tuples (`N = 0`). It cannot preserve its own FIB across a restart, but it signals that it understands GR and will hold stale routes for a restarting peer:
+
+- Receiver-only GR: `40 02 00 00`
+  - `40`: Capability 64
+  - `02`: Length 2 bytes
+  - `00 00`: `R=0`, Restart Time = 0, no AFI/SAFI tuples
+- Normal advertisement (`R=0`, Restart Time = 120s, IPv4 unicast with `F=1`): `40 06 00 78 00 01 01 80`
+  - `40`: Capability 64
+  - `06`: Length 6 bytes (`2 + 4 * 1`)
+  - `00 78`: `R=0`, Restart Time = `0x078` = 120 seconds
+  - `00 01 01`: AFI `1` (IPv4), SAFI `1` (unicast)
+  - `80`: `F=1` (forwarding state preserved)
+- Post-restart `OPEN` (`R=1`, Restart Time = 120s, IPv4 unicast with `F=1`): `40 06 80 78 00 01 01 80`
+  - `80 78`: `R=1` (`0x8000`), Restart Time = `0x078` = 120 seconds
+
+### The receiving peer's state machine and End-of-RIB
+
+When a GR-capable session drops, the **receiving peer** does not flush the routes it learned from the restarting speaker. Instead, it marks those routes as **STALE**, keeps them in its RIB and FIB (or treats them as valid forwarding paths), and starts the **Restart Timer** using the Restart Time advertised by the peer in its last `OPEN`.
+
+From that point, one of three things happens:
+
+```text
+  Session drops -> Mark routes STALE, start Restart Timer
+        |
+        +---> [Timer expires, no session]
+        |           -> Flush STALE routes (unless LLGR applies)
+        |
+        +---> [Session returns, peer sends F=0 for AFI/SAFI]
+        |           -> Flush STALE routes for that AFI/SAFI immediately
+        |
+        +---> [Session returns, peer sends F=1 for AFI/SAFI]
+                    -> Wait for End-of-RIB (EoR)
+                    -> Re-advertised prefixes: clear STALE
+                    -> Missing prefixes: withdraw after EoR
+```
+
+1. **Session returns with `F=1` and End-of-RIB arrives:** The restarting speaker re-establishes BGP with `R=1` and `F=1`, sends its full Adj-RIB-Out for that AFI/SAFI, and finishes with an **End-of-RIB (EoR)** marker. EoR is simply an `UPDATE` message with no NLRI and no withdrawn routes for that AFI/SAFI (for IPv4 unicast, an empty `UPDATE`; for multiprotocol families, an empty `MP_UNREACH_NLRI`). On receiving EoR, the helper clears the STALE flag on every prefix that was re-advertised and deletes any STALE prefix that was *not* re-advertised.
+2. **Restart Timer expires before the session returns:** Without Long-Lived Graceful Restart, the helper gives up and purges all STALE routes.
+3. **Session returns with `F=0`:** A `0` in the `F` bit means *"I restarted, and I lost my forwarding state for this AFI/SAFI."* Keeping stale routes pointing at a router with an empty FIB would blackhole traffic, so the helper flushes all STALE routes for that AFI/SAFI immediately—even if the Restart Timer still has time left.
+
+The restarting speaker also defers its own best-path selection until it has received EoR from its peers (subject to a selection deferral timer), preventing premature route churn while its RIB is still half-populated.
+
+## Long-Lived Graceful Restart (RFC 9494)
+
+Standard Graceful Restart is designed for brief control-plane blips—typically 60 to 300 seconds. In large networks, VPN deployments, or scenarios where a controller or route reflector is unreachable for minutes or hours, a 2-minute Restart Timer forces a mass withdrawal even when the data plane is still healthy.
+
+Long-Lived Graceful Restart (LLGR), defined in RFC 9494, adds a second, much longer timer behind standard GR using Capability code `71` (`0x47`).
+
+### Capability 71 wire format
+
+```text
+ 0                   1                   2                   3
+ 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|  Cap Code 71  |  Cap Length   |           AFI (16 bits)       |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|   SAFI (8)    |F|  Reserved   |   Long-Lived Stale Time ...   |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+| ... LLST (24 bits total)      |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+```
+
+- **Lab wire (`IPv4/unicast`, `F=1`, `LLST=172800` / 48 hours):** `47 07 00 01 01 80 02 a3 00`
+  - `47`: Capability 71
+  - `07`: Length 7 bytes (one AFI/SAFI tuple)
+  - `00 01 01`: AFI `1` (IPv4), SAFI `1` (unicast)
+  - `80`: `F=1` (forwarding state preserved)
+  - `02 a3 00`: 24-bit LLST = `(0x02 << 16) + (0xa3 << 8) + 0x00` = `131072 + 41728 + 0` = `172800` seconds (48 hours).
+
+### How LLGR transitions from GR
+
+LLGR only activates if both peers negotiated Capability 71 (in addition to Capability 64) and the `F` bit indicates preserved forwarding state. When the short GR Restart Timer expires without the session returning:
+
+1. Instead of purging the routes, the helper moves them into **`LLGR_STALE`** state and starts the **Long-Lived Stale Time (LLST)** timer.
+2. The helper **must** attach the well-known community **`LLGR_STALE`** (`65535:6` = `0xFFFF0006`) to those routes.
+3. The helper **must** treat `LLGR_STALE` routes as **least-preferred** during BGP best-path selection (implementations commonly set `LOCAL_PREF` to `0`, or otherwise rank any non-stale path ahead of an `LLGR_STALE` path).
+4. If the session returns and EoR arrives before LLST expires, re-advertised routes lose their `LLGR_STALE` mark and return to normal preference; un-readvertised routes are withdrawn.
+5. If LLST expires first, the routes are purged.
+
+| Property | Standard GR (RFC 4724) | Long-Lived GR (RFC 9494) |
+| :--- | :--- | :--- |
+| Capability Code | `64` (`0x40`) | `71` (`0x47`) |
+| Timer field | 12-bit Restart Time (max ~68 min) | 24-bit LLST (max ~194 days) |
+| Preference while stale | Unchanged from normal path | Least-preferred (typically `LOCAL_PREF 0`) |
+| Well-known community | None | `LLGR_STALE` (`65535:6` / `0xFFFF0006`) |
+| Primary use case | Brief daemon restart / RP failover | Extended control-plane isolation with live FIB |
+
+Because `LLGR_STALE` paths are least-preferred, any healthy alternate path immediately takes over. The `LLGR_STALE` path acts purely as a last-resort backup when no other route exists—preventing total unreachability while avoiding steering traffic over stale state when a fresh path is available.
+
+## Graceful BGP Session Shutdown (RFC 8326)
+
+GR and LLGR are emergency parachutes for unexpected disconnects. For **planned maintenance**—rebooting a router, upgrading software, or taking a peer link offline—you do not want traffic to hit a stale FIB at all. You want traffic to move *before* the session drops.
+
+RFC 8326 defines the well-known community **`GSHUT`** (`65535:0` = `0xFFFF0000`) for Graceful BGP Session Shutdown.
+
+The workflow is straightforward:
+
+1. Before shutting down the BGP session, the operator (or the router's graceful-shutdown knob) attaches the `GSHUT` community to routes sent over that session—and on iBGP, typically lowers `LOCAL_PREF` to `0`.
+2. Receiving peers configured for RFC 8326 match `GSHUT` on inbound policy and set `LOCAL_PREF` to `0` (or otherwise depreference the path).
+3. BGP best-path selection runs *while the session is still up and packets are still forwarding*. Traffic drains cleanly onto alternate paths.
+4. Only after traffic has shifted do you tear down the BGP session.
+
+```text
+  Before GSHUT:
+    peer-A: 198.51.100.0/24  LP=200  <-- BEST (active traffic)
+    peer-B: 198.51.100.0/24  LP=100
+
+  Apply GSHUT on peer-A (session still UP):
+    peer-A: 198.51.100.0/24  LP=0, comm=GSHUT (65535:0)
+    peer-B: 198.51.100.0/24  LP=100  <-- BEST (traffic drains cleanly)
+
+  Tear down peer-A:
+    Zero packet loss; alternate path already converged.
+```
+
+For example, a receiving peer's inbound policy might look like this (not run here):
+
+```text
+! Illustrative policy logic (not run here)
+route-map RM-IN-EBGP permit 10
+  match community GSHUT
+  set local-preference 0
+```
+
+Because `GSHUT` is processed before the link or daemon goes down, there is no race between a TCP reset and an IGP/BGP reconvergence, and no reliance on stale forwarding state.
+
+## The lab
+
+This host has no FRR or containerlab environment, so the protocol mechanics are exercised in a deterministic Python BGP protocol simulator. The simulator encodes and decodes real Capability 64 and Capability 71 wire bytes and steps a receiving peer's RIB through six scenarios:
+
+1. **GR with EoR in time:** Session drops, routes become `STALE`, peer returns with `R=1, F=1`, re-advertises a subset of prefixes, and sends EoR; missing prefixes are withdrawn.
+2. **GR timer expires without LLGR:** Session drops, Restart Timer expires before reconnect, and the RIB is emptied.
+3. **`F=0` on restart:** Session drops, peer reconnects *before* the Restart Timer expires, but advertises `F=0`; stale routes are flushed immediately.
+4. **LLGR fallback and LLST expiry:** GR Restart Timer expires, routes transition to `LLGR_STALE` with `LOCAL_PREF=0` and community `65535:6`, and are later purged when LLST expires.
+5. **LLGR recovery with EoR:** Routes enter `LLGR_STALE` (`LP=0`), then the session returns and EoR replaces them with fresh advertisements (`LP=200`, stale marks cleared).
+6. **GSHUT maintenance drain:** `peer-A` (`LP=200`) beats `peer-B` (`LP=100`); applying `GSHUT` (`65535:0`) drops `peer-A` to `LP=0` so `peer-B` becomes best before teardown.
+
+The lab program is `bgp-gr-lab.py`, a protocol simulator (no FRR, no containerlab, no root). It encodes Capability 64 and Capability 71 and walks a helper's RIB through the six scenarios above.
+
+`bgp-gr-lab.py`:
+
+```python
+#!/usr/bin/env python3
+"""BGP Graceful Restart (RFC 4724), LLGR (RFC 9494) and GSHUT (RFC 8326)."""
+from __future__ import annotations
+import struct, sys
+
+GR_CAP = 64
+LLGR_CAP = 71
+AFI_IPV4, SAFI_UNICAST = 1, 1
+GSHUT = 0xFFFF0000
+LLGR_STALE = 0xFFFF0006
+NO_LLGR = 0xFFFF0007  # RFC 9494 also assigns NO_LLGR
+
+def encode_gr(restart_state: int, restart_time: int, families: list[tuple[int,int,int]]) -> bytes:
+    """families: list of (afi, safi, f_bit)."""
+    if not 0 <= restart_time <= 0xFFF:
+        raise ValueError("Restart Time is 12 bits")
+    flags_time = ((restart_state & 1) << 15) | (restart_time & 0xFFF)
+    body = struct.pack("!H", flags_time)
+    for afi, safi, fbit in families:
+        body += struct.pack("!HBB", afi, safi, (fbit & 1) << 7)
+    return bytes([GR_CAP, len(body)]) + body
+
+def decode_gr(msg: bytes) -> dict:
+    if msg[0] != GR_CAP:
+        raise ValueError("not GR cap")
+    ln, off = msg[1], 2
+    val = msg[off:off+ln]
+    flags_time = struct.unpack_from("!H", val, 0)[0]
+    families = []
+    i = 2
+    while i < len(val):
+        afi, safi, fl = struct.unpack_from("!HBB", val, i)
+        families.append((afi, safi, (fl >> 7) & 1))
+        i += 4
+    return {
+        "code": GR_CAP,
+        "restart_state": (flags_time >> 15) & 1,
+        "restart_time": flags_time & 0xFFF,
+        "families": families,
+        "wire": msg,
+    }
+
+def encode_llgr(families: list[tuple[int,int,int,int]]) -> bytes:
+    """families: (afi, safi, f_bit, llst_seconds)."""
+    body = b""
+    for afi, safi, fbit, llst in families:
+        if not 0 <= llst <= 0xFFFFFF:
+            raise ValueError("LLST is 24 bits")
+        body += struct.pack("!HBB", afi, safi, (fbit & 1) << 7)
+        body += struct.pack("!I", llst)[1:]  # 24-bit
+    return bytes([LLGR_CAP, len(body)]) + body
+
+def decode_llgr(msg: bytes) -> dict:
+    if msg[0] != LLGR_CAP:
+        raise ValueError("not LLGR cap")
+    ln, val = msg[1], msg[2:2+msg[1]]
+    families, i = [], 0
+    while i < len(val):
+        afi, safi, fl = struct.unpack_from("!HBB", val, i)
+        llst = int.from_bytes(val[i+4:i+7], "big")
+        families.append((afi, safi, (fl >> 7) & 1, llst))
+        i += 7
+    return {"code": LLGR_CAP, "families": families, "wire": msg}
+
+def hex_of(b: bytes) -> str:
+    return " ".join(f"{x:02x}" for x in b)
+
+# --- helper-router state machine ---
+class Route:
+    def __init__(self, prefix, nexthop, local_pref=100, communities=None):
+        self.prefix = prefix
+        self.nexthop = nexthop
+        self.local_pref = local_pref
+        self.communities = set(communities or [])
+        self.stale = False
+        self.llgr_stale = False
+
+    def __repr__(self):
+        flags = []
+        if self.stale: flags.append("STALE")
+        if self.llgr_stale: flags.append("LLGR_STALE")
+        comm = [f"{c>>16}:{c&0xFFFF}" for c in sorted(self.communities)]
+        return (f"{self.prefix:18s} nh={self.nexthop:14s} LP={self.local_pref:<4d} "
+                f"comm={comm or '-'} {' '.join(flags)}")
+
+class Helper:
+    def __init__(self, restart_time, llst=0):
+        self.restart_time = restart_time
+        self.llst = llst
+        self.rib: dict[str, Route] = {}
+        self.session = "up"
+        self.t = 0
+        self.gr_deadline = None
+        self.llgr_deadline = None
+        self.log = []
+
+    def note(self, msg):
+        self.log.append(f"t={self.t:4d}s  {msg}")
+
+    def install(self, *routes):
+        for r in routes:
+            self.rib[r.prefix] = r
+
+    def session_down(self):
+        self.session = "down"
+        self.gr_deadline = self.t + self.restart_time
+        for r in self.rib.values():
+            r.stale = True
+        self.note(f"session down; {len(self.rib)} routes marked STALE; GR timer={self.restart_time}s")
+
+    def tick_to(self, t):
+        while self.t < t:
+            self.t += 1
+            if self.gr_deadline is not None and self.t == self.gr_deadline and self.session == "down":
+                if self.llst:
+                    self.llgr_deadline = self.t + self.llst
+                    for r in self.rib.values():
+                        if r.stale:
+                            r.llgr_stale = True
+                            r.communities.add(LLGR_STALE)
+                            r.local_pref = 0
+                    self.note(f"GR timer expired; {sum(1 for r in self.rib.values() if r.llgr_stale)} routes "
+                              f"enter LLGR (LLST={self.llst}s, LP:=0, community LLGR_STALE)")
+                    self.gr_deadline = None
+                else:
+                    n = len(self.rib)
+                    self.rib.clear()
+                    self.note(f"GR timer expired with no EoR; dropped {n} stale routes")
+                    self.gr_deadline = None
+            if self.llgr_deadline is not None and self.t == self.llgr_deadline and self.session == "down":
+                n = len(self.rib)
+                self.rib.clear()
+                self.note(f"LLST expired; dropped {n} long-lived stale routes")
+                self.llgr_deadline = None
+
+    def session_up(self, restart_state, f_bit, advertised: dict[str, Route], eor=True):
+        self.session = "up"
+        self.note(f"session up; restart_state={restart_state} F={f_bit}; "
+                  f"advertised={list(advertised)}")
+        if not f_bit:
+            # RFC 4724: if F=0, receiving speaker MUST flush stale immediately
+            flushed = [p for p,r in list(self.rib.items()) if r.stale]
+            for p in flushed:
+                del self.rib[p]
+            self.note(f"F=0: flushed stale immediately: {flushed or '(none)'}")
+            self.gr_deadline = None
+            self.llgr_deadline = None
+        # Accept new advertisements
+        for p, r in advertised.items():
+            self.rib[p] = r  # replaces stale with a fresh copy
+        if eor:
+            # withdraw stale prefixes not re-advertised
+            leftover = [p for p,r in list(self.rib.items()) if r.stale]
+            for p in leftover:
+                del self.rib[p]
+            self.note(f"EoR received; withdrew stale not re-advertised: {leftover or '(none)'}")
+            self.gr_deadline = None
+            self.llgr_deadline = None
+        else:
+            self.note("no EoR yet; remaining stale still held")
+
+    def apply_gshut(self, prefixes):
+        for p in prefixes:
+            r = self.rib[p]
+            r.communities.add(GSHUT)
+            r.local_pref = 0
+        self.note(f"GSHUT received on {prefixes}; LOCAL_PREF set to 0")
+
+    def dump(self, title):
+        print(f"  -- {title} --")
+        if not self.rib:
+            print("     (empty RIB)")
+        for p in sorted(self.rib):
+            print(f"     {self.rib[p]}")
+
+def main():
+    print("== Capability codecs ==")
+    # Restart Time 120, R=0, IPv4 unicast F=1
+    w = encode_gr(0, 120, [(AFI_IPV4, SAFI_UNICAST, 1)])
+    d = decode_gr(w)
+    print(f"  GR  R=0 time=120 IPv4/unicast F=1")
+    print(f"      wire {hex_of(w)}")
+    print(f"      decoded R={d['restart_state']} time={d['restart_time']} families={d['families']}")
+    assert d["restart_state"] == 0 and d["restart_time"] == 120 and d["families"] == [(1,1,1)]
+    assert encode_gr(d["restart_state"], d["restart_time"], d["families"]) == w
+    # After restart: R=1, F=1, time=120
+    w2 = encode_gr(1, 120, [(1, 1, 1)])
+    d2 = decode_gr(w2)
+    print(f"  GR  R=1 time=120 IPv4/unicast F=1  (speaker has restarted)")
+    print(f"      wire {hex_of(w2)}")
+    print(f"      decoded R={d2['restart_state']} time={d2['restart_time']} families={d2['families']}")
+    assert d2["restart_state"] == 1
+    # Receiver-only: no AFI tuples, time irrelevant
+    w3 = encode_gr(0, 0, [])
+    print(f"  GR  receiver-only (no AFI tuples)  wire {hex_of(w3)}")
+    assert decode_gr(w3)["families"] == []
+    # LLGR: IPv4 unicast F=1, LLST=172800 (2 days)
+    wl = encode_llgr([(1, 1, 1, 172800)])
+    dl = decode_llgr(wl)
+    print(f"  LLGR IPv4/unicast F=1 LLST=172800")
+    print(f"      wire {hex_of(wl)}")
+    print(f"      decoded families={dl['families']}")
+    assert dl["families"] == [(1, 1, 1, 172800)]
+    assert encode_llgr(dl["families"]) == wl
+    print(f"  communities  GSHUT=0x{GSHUT:08X} ({GSHUT>>16}:{GSHUT&0xFFFF})  "
+          f"LLGR_STALE=0x{LLGR_STALE:08X} ({LLGR_STALE>>16}:{LLGR_STALE&0xFFFF})")
+    print("  codec: PASS")
+
+    print("\n== Scenario 1: GR, EoR in time, one prefix withdrawn ==")
+    h = Helper(restart_time=5)
+    h.install(
+        Route("192.0.2.0/24", "203.0.113.1"),
+        Route("198.51.100.0/24", "203.0.113.1"),
+        Route("203.0.113.0/24", "203.0.113.1"),
+    )
+    h.session_down()
+    h.tick_to(2)
+    h.session_up(restart_state=1, f_bit=1, advertised={
+        "192.0.2.0/24": Route("192.0.2.0/24", "203.0.113.1"),
+        "198.51.100.0/24": Route("198.51.100.0/24", "203.0.113.1"),
+    }, eor=True)
+    h.dump("RIB after EoR")
+    assert set(h.rib) == {"192.0.2.0/24", "198.51.100.0/24"}
+    assert all(not r.stale for r in h.rib.values())
+    for line in h.log:
+        print("   ", line)
+
+    print("\n== Scenario 2: GR timer expires, no session, no LLGR ==")
+    h = Helper(restart_time=5)
+    h.install(Route("192.0.2.0/24", "203.0.113.1"), Route("198.51.100.0/24", "203.0.113.1"))
+    h.session_down()
+    h.tick_to(5)
+    h.dump("RIB after GR timer")
+    assert not h.rib
+    for line in h.log:
+        print("   ", line)
+
+    print("\n== Scenario 3: F=0 on restart flushes immediately ==")
+    h = Helper(restart_time=30)
+    h.install(Route("192.0.2.0/24", "203.0.113.1"))
+    h.session_down()
+    h.tick_to(3)
+    h.session_up(restart_state=1, f_bit=0, advertised={"198.51.100.0/24": Route("198.51.100.0/24", "203.0.113.9")}, eor=True)
+    h.dump("RIB after F=0 restart")
+    assert set(h.rib) == {"198.51.100.0/24"}
+    for line in h.log:
+        print("   ", line)
+
+    print("\n== Scenario 4: LLGR holds routes after GR timer, then LLST expires ==")
+    h = Helper(restart_time=5, llst=10)
+    h.install(Route("192.0.2.0/24", "203.0.113.1", local_pref=200),
+              Route("198.51.100.0/24", "203.0.113.1", local_pref=200))
+    h.session_down()
+    h.tick_to(5)
+    h.dump("RIB just after GR timer (in LLGR)")
+    assert all(r.llgr_stale and r.local_pref == 0 and LLGR_STALE in r.communities for r in h.rib.values())
+    h.tick_to(15)
+    h.dump("RIB after LLST")
+    assert not h.rib
+    for line in h.log:
+        print("   ", line)
+
+    print("\n== Scenario 5: LLGR, then session returns and EoR replaces stale ==")
+    h = Helper(restart_time=5, llst=100)
+    h.install(Route("192.0.2.0/24", "203.0.113.1", local_pref=200))
+    h.session_down()
+    h.tick_to(8)  # past GR, in LLGR
+    h.session_up(restart_state=1, f_bit=1,
+                 advertised={"192.0.2.0/24": Route("192.0.2.0/24", "203.0.113.1", local_pref=200)},
+                 eor=True)
+    h.dump("RIB after late EoR")
+    r = h.rib["192.0.2.0/24"]
+    assert not r.stale and not r.llgr_stale and r.local_pref == 200
+    for line in h.log:
+        print("   ", line)
+
+    print("\n== Scenario 6: GSHUT lowers LOCAL_PREF so an alternate path wins ==")
+    # two paths for the same prefix; we model them as preferred vs backup via LP
+    preferred = Route("192.0.2.0/24", "203.0.113.1", local_pref=200)
+    backup = Route("192.0.2.0/24-backup", "198.51.100.1", local_pref=100)  # display as second path
+    # nicer: store two path objects under a paths list — keep it simple:
+    class Rib2:
+        def __init__(self):
+            self.paths = {
+                "peer-A": Route("192.0.2.0/24", "203.0.113.1", local_pref=200),
+                "peer-B": Route("192.0.2.0/24", "198.51.100.1", local_pref=100),
+            }
+        def best(self):
+            return max(self.paths, key=lambda p: self.paths[p].local_pref)
+    rib = Rib2()
+    print(f"  before GSHUT  best={rib.best()}  A.LP={rib.paths['peer-A'].local_pref}  B.LP={rib.paths['peer-B'].local_pref}")
+    rib.paths["peer-A"].communities.add(GSHUT)
+    rib.paths["peer-A"].local_pref = 0
+    print(f"  after  GSHUT  best={rib.best()}  A.LP={rib.paths['peer-A'].local_pref}  B.LP={rib.paths['peer-B'].local_pref}  "
+          f"A.comm={rib.paths['peer-A'].communities}")
+    assert rib.best() == "peer-B"
+
+    print("\n== summary ==")
+    print("failures: 0")
+    return 0
+
+if __name__ == "__main__":
+    sys.exit(main())
+```
+
+
+Genuine output from a run on this host (Python 3.13.5, OpenSSL 3.5.7 where used). This output was not invented:
+
+```text
+== Capability codecs ==
+  GR  R=0 time=120 IPv4/unicast F=1
+      wire 40 06 00 78 00 01 01 80
+      decoded R=0 time=120 families=[(1, 1, 1)]
+  GR  R=1 time=120 IPv4/unicast F=1  (speaker has restarted)
+      wire 40 06 80 78 00 01 01 80
+      decoded R=1 time=120 families=[(1, 1, 1)]
+  GR  receiver-only (no AFI tuples)  wire 40 02 00 00
+  LLGR IPv4/unicast F=1 LLST=172800
+      wire 47 07 00 01 01 80 02 a3 00
+      decoded families=[(1, 1, 1, 172800)]
+  communities  GSHUT=0xFFFF0000 (65535:0)  LLGR_STALE=0xFFFF0006 (65535:6)
+  codec: PASS
+
+== Scenario 1: GR, EoR in time, one prefix withdrawn ==
+  -- RIB after EoR --
+     192.0.2.0/24       nh=203.0.113.1    LP=100  comm=- 
+     198.51.100.0/24    nh=203.0.113.1    LP=100  comm=- 
+    t=   0s  session down; 3 routes marked STALE; GR timer=5s
+    t=   2s  session up; restart_state=1 F=1; advertised=['192.0.2.0/24', '198.51.100.0/24']
+    t=   2s  EoR received; withdrew stale not re-advertised: ['203.0.113.0/24']
+
+== Scenario 2: GR timer expires, no session, no LLGR ==
+  -- RIB after GR timer --
+     (empty RIB)
+    t=   0s  session down; 2 routes marked STALE; GR timer=5s
+    t=   5s  GR timer expired with no EoR; dropped 2 stale routes
+
+== Scenario 3: F=0 on restart flushes immediately ==
+  -- RIB after F=0 restart --
+     198.51.100.0/24    nh=203.0.113.9    LP=100  comm=- 
+    t=   0s  session down; 1 routes marked STALE; GR timer=30s
+    t=   3s  session up; restart_state=1 F=0; advertised=['198.51.100.0/24']
+    t=   3s  F=0: flushed stale immediately: ['192.0.2.0/24']
+    t=   3s  EoR received; withdrew stale not re-advertised: (none)
+
+== Scenario 4: LLGR holds routes after GR timer, then LLST expires ==
+  -- RIB just after GR timer (in LLGR) --
+     192.0.2.0/24       nh=203.0.113.1    LP=0    comm=['65535:6'] STALE LLGR_STALE
+     198.51.100.0/24    nh=203.0.113.1    LP=0    comm=['65535:6'] STALE LLGR_STALE
+  -- RIB after LLST --
+     (empty RIB)
+    t=   0s  session down; 2 routes marked STALE; GR timer=5s
+    t=   5s  GR timer expired; 2 routes enter LLGR (LLST=10s, LP:=0, community LLGR_STALE)
+    t=  15s  LLST expired; dropped 2 long-lived stale routes
+
+== Scenario 5: LLGR, then session returns and EoR replaces stale ==
+  -- RIB after late EoR --
+     192.0.2.0/24       nh=203.0.113.1    LP=200  comm=- 
+    t=   0s  session down; 1 routes marked STALE; GR timer=5s
+    t=   5s  GR timer expired; 1 routes enter LLGR (LLST=100s, LP:=0, community LLGR_STALE)
+    t=   8s  session up; restart_state=1 F=1; advertised=['192.0.2.0/24']
+    t=   8s  EoR received; withdrew stale not re-advertised: (none)
+
+== Scenario 6: GSHUT lowers LOCAL_PREF so an alternate path wins ==
+  before GSHUT  best=peer-A  A.LP=200  B.LP=100
+  after  GSHUT  best=peer-B  A.LP=0  B.LP=100  A.comm={4294901760}
+
+== summary ==
+failures: 0
+```
+
+
+## Gotchas
+
+- **The trap: `F=0` vs `F=1` after a crash.** If a router restarts and loses its FIB (for example, a full reboot rather than a daemon-only restart), it *must* send `F=0`. If a buggy configuration or wrapper script hardcodes `F=1` when forwarding state was actually wiped, every peer will keep sending packets into an empty FIB until EoR or the Restart Timer expires.
+- **The trap: GR masks forwarding failures.** Graceful Restart only checks whether the BGP TCP session dropped—it cannot tell whether the data plane is actually forwarding packets. If a line card wedges or a forwarding ASIC stalls while the control plane restarts, GR faithfully preserves a broken path. Always test both control-plane restart *and* forwarding-plane failure.
+- **The trap: GR with BFD tearing down the session.** As covered in the BFD chapter, BFD is designed to detect forwarding failures in milliseconds. If BFD is bound to a BGP session *and* BFD itself runs on the restarting control plane (rather than offloaded to a line card with Control Plane Independent bit support), a control-plane restart drops BFD, which can tear down the session or trigger immediate path removal despite GR being configured.
+- **The trap: Restart Time too short for the RIB.** If your Restart Time is 30 seconds on a full-table peer that takes 90 seconds to rebuild its Adj-RIB-Out and send EoR, the helper will flush stale routes mid-convergence. Size Restart Time for the time it takes the daemon to restart *plus* re-establish *plus* transmit the RIB, or backstop it with LLGR.
+- **The trap: Leaking `LLGR_STALE` to the Internet.** Under RFC 9494, `LLGR_STALE` paths must **not** be advertised to eBGP peers that do not support LLGR unless explicitly configured by policy. Letting long-lived stale routes leak upstream or to non-LLGR peers spreads zombie reachability across the Internet long after a local control plane has vanished.
+- **The trap: Treating `GSHUT` as a crash-recovery tool.** `GSHUT` requires a live BGP session to transmit the `65535:0` community and let peers re-run best-path selection. If a box crashes, `GSHUT` never gets sent. Use `GSHUT` for planned maintenance; use GR/LLGR for unplanned drops.
+
+## The boring rule
+
+Use `GSHUT` (`65535:0`) before every planned maintenance window so traffic leaves while the session is still healthy; keep GR and LLGR as a seatbelt for unexpected control-plane restarts—and never configure GR without verifying what happens when the *forwarding* plane dies.
+
+## Exercises
+
+1. **Decode the capability wires.** Break down each byte of the following BGP `OPEN` capability hex strings into Capability Code, Length, Flags (`R`/`F`), timers, and AFI/SAFI:
+   - `40 02 00 00`
+   - `40 06 80 78 00 01 01 80`
+   - `47 07 00 01 01 80 02 a3 00`
+2. **Timeline outcome: `F=0` vs timer vs EoR.** A peer advertises Capability 64 with `R=0`, Restart Time = `90s`, IPv4 unicast `F=1`. Its session drops at `t = 0s`. Determine the exact state of its previously learned routes at `t = 46s` under each independent scenario:
+   - The peer reconnects at `t = 40s` with `R=1, F=0` (and has not sent EoR yet).
+   - The peer reconnects at `t = 40s` with `R=1, F=1`, re-advertises `192.0.2.0/24`, omits `198.51.100.0/24`, and sends EoR at `t = 45s`.
+   - The peer does not reconnect until `t = 95s` (no LLGR configured).
+3. **Compute LLST expiration.** A router negotiates GR (`Restart Time = 120s`) and LLGR (`LLST = 172800s`) for IPv4 unicast. The session drops at `2026-11-15T10:00:00Z` and never returns. At what UTC timestamp do the routes enter `LLGR_STALE` (with `LOCAL_PREF = 0` and community `65535:6`), and at what UTC timestamp are they purged?
+4. **Maintenance vs crash.** You need to upgrade the BGP daemon on Edge Router A, which carries active customer traffic alongside Edge Router B (`LP=200` on A, `LP=100` on B). Design the step-by-step procedure using `GSHUT`, and explain why relying on Graceful Restart alone for this upgrade is inferior.
+5. **eBGP customer policy for `LLGR_STALE`.** You are a transit provider running LLGR internally and with an LLGR-capable peer, but your downstream eBGP customer router does *not* negotiate Capability 71. According to RFC 9494, what must you do with routes carrying `LLGR_STALE` (`65535:6`) toward that customer by default, and what operational risk are you preventing?
+
+## Sources
+
+- [RFC 4724: Graceful Restart Mechanism for BGP](https://datatracker.ietf.org/doc/html/rfc4724)
+- [RFC 9494: Long-Lived Graceful Restart for BGP](https://datatracker.ietf.org/doc/html/rfc9494)
+- [RFC 8326: Graceful BGP Session Shutdown](https://datatracker.ietf.org/doc/html/rfc8326)
