@@ -1,0 +1,854 @@
+---
+title: "TLS Session Resumption in Practice: Tickets, Ticket Keys and Fleets"
+author:
+  - name: "K19G"
+  - name: "grok-bot"
+---
+
+# TLS Session Resumption in Practice: Tickets, Ticket Keys and Fleets
+
+TLS session resumption allows a client and server to re-establish a secure channel using cryptographic state established in a prior handshake. A full TLS handshake costs the server a certificate signature (RSA or ECDSA) and a key exchange, and costs the client a certificate chain to verify. Resumption lets a returning client prove it holds a secret from an earlier session, so the server can skip the certificate and the signature. In TLS 1.2 it also skipped the key exchange. In TLS 1.3, as deployed by OpenSSL and every browser, a fresh (EC)DHE exchange still happens on resumption, which changes how much CPU resumption actually saves, as the lab measures.
+
+For systems operators managing load balancers, reverse proxies, and API gateways, understanding how session resumption works under the hood is critical. Misconfigurations in ticket issuance, key management, or multi-tenant SNI routing can degrade connection latency, cause mysterious CPU spikes, or introduce subtle security vulnerabilities. When front-end servers operate as a multi-node fleet behind round-robin load balancers, an improper session resumption design can reduce cache hit rates to zero, invalidating performance optimization efforts entirely.
+
+Furthermore, session resumption introduces distinct security trade-offs. The mechanism used to encrypt session state across cluster nodes relies on Session Ticket Encryption Keys (STEKs). If an operator fails to rotate STEKs properly or persists them insecurely, an attacker who later obtains a key and holds packet captures can decrypt TLS 1.2 sessions after the fact, and can impersonate the server to TLS 1.3 clients holding tickets under that key. Sharing ticket keys across virtual hosts also lets a session established for one name be resumed under another.
+
+This chapter examines the practical architecture of TLS session resumption across TLS 1.2 and TLS 1.3, ticket management mechanics, fleet-wide key rotation schemes, and the concrete performance impact across different signature schemes and post-quantum hybrid key exchange groups.
+
+## Learning goals
+
+- Differentiate between server-side session ID caching and stateless session tickets (RFC 5077 / RFC 8446).
+- Explain how TLS 1.3 resumption operates via `NewSessionTicket` messages, Pre-Shared Key (PSK) identities, and mode selection (`psk_ke` vs `psk_dhe_ke`).
+- Quantify the security risks of Session Ticket Encryption Keys (STEKs) regarding forward secrecy and server impersonation.
+- Design ticket key distribution and rotation for an nginx or HAProxy fleet.
+- Analyze how anti-replay protection mechanisms for early data alter session ticket reuse single-use semantics.
+- Evaluate the CPU performance delta between full handshakes and resumed sessions across RSA-2048, ECDSA P-256, and post-quantum hybrid groups (X25519MLKEM768).
+- Scope ticket keys so that sessions cannot be resumed across tenants on a shared terminator.
+
+## Version note
+
+The lab exercises and benchmark outputs in this chapter were generated on a test host running Linux kernel 6.12.94, Python 3.13.5, and OpenSSL 3.5.7 (built June 9, 2026). All network execution took place over the local loopback interface (`127.0.0.1`). No external edge proxies such as NGINX or HAProxy were running during the execution of the lab scripts; production configurations for those proxies are provided in designated reference sections.
+
+## Session Resumption Mechanics: TLS 1.2 vs TLS 1.3
+
+The primary objective of session resumption is to establish cryptographic material for a new connection using state derived from a previous connection. How that state is identified, stored, and exchanged differs fundamentally between TLS 1.2 (RFC 5246 / RFC 5077) and TLS 1.3 (RFC 8446).
+
+### TLS 1.2: State Caches and RFC 5077 Tickets
+
+In TLS 1.2, session resumption historically relied on two mechanisms: Session IDs and Session Tickets.
+
+#### Session ID (Stateful)
+The server generates a unique 32-byte identifier during a full handshake and stores the master secret alongside connection metadata in an in-memory session cache. The server sends this identifier in the `ServerHello`. When the client re-connects, it sends the 32-byte identifier in its `ClientHello`. If the server finds a matching entry in its memory cache, it resumes the session.
+
+```text
+Client                                   Server
+  |                                         |
+  |--- ClientHello (Session ID: 0x4f2a...) ->|  [Lookup 0x4f2a in RAM Cache]
+  |                                         |  --> Found!
+  |<-- ServerHello (Session ID: 0x4f2a...) -|
+  |<-- [ChangeCipherSpec] ------------------|
+  |<-- Finished ----------------------------|
+  |--- [ChangeCipherSpec] ----------------->|
+  |--- Finished --------------------------->|
+```
+
+This model requires the server (or fleet) to maintain synchronized state across all instances. If the client connects to a different backend node that lacks the Session ID in its RAM cache, the resumption fails, triggering a full handshake.
+
+#### Session Tickets (Stateless - RFC 5077)
+To avoid maintaining large distributed RAM caches, RFC 5077 introduced stateless session tickets. During a full handshake, after negotiating keys, the server serializes the session state (master secret, cipher suite, client identity) into a data structure, encrypts and authenticates it using a symmetric key known only to the server (the Session Ticket Encryption Key, or STEK), and transmits it to the client inside a `NewSessionTicket` handshake message.
+
+```text
+Client                                   Server
+  |                                         |
+  |--- ClientHello (Session Ticket) ------->|  [Decrypt Ticket with STEK]
+  |                                         |  --> Unpack Master Secret
+  |<-- ServerHello -------------------------|
+  |<-- [ChangeCipherSpec] ------------------|
+  |<-- Finished ----------------------------|
+  |--- [ChangeCipherSpec] ----------------->|
+  |--- Finished --------------------------->|
+```
+
+When returning, the client passes this opaque blob back in the `SessionTicket` extension of its `ClientHello`. The server decrypts the ticket using its STEK, restores the session state, and completes a abbreviated handshake without consulting an in-memory cache.
+
+### TLS 1.3: Post-Handshake Tickets and PSK Modes
+
+TLS 1.3 unifies session resumption under the Pre-Shared Key (PSK) architecture. Rather than emitting session tickets during the main handshake phase, the server transmits zero, one, or more `NewSessionTicket` messages *after* the main handshake completes and application data is flowing.
+
+```text
+Client                                   Server
+  |                                         |
+  |=========================================|  <-- Handshake Completed
+  |                                         |
+  |<-- NewSessionTicket (Ticket 1, PSK 1) --|
+  |<-- NewSessionTicket (Ticket 2, PSK 2) --|
+  |                                         |
+  |-- Application Data -------------------->|
+```
+
+Each ticket includes a ticket value (which acts as a PSK identity), an obfuscated ticket age, a lifetime hint (up to a maximum of 604,800 seconds / 7 days per RFC 8446), and a flag set for early data limits.
+
+When the client wishes to resume a session, it sends a `psk_key_exchange_modes` extension in its `ClientHello` alongside a `pre_shared_key` extension listing the saved ticket identities.
+
+TLS 1.3 defines two key exchange modes for PSKs:
+
+1. `psk_ke`: Pure Pre-Shared Key exchange. The key derived for the new connection is based entirely on the secret stored within the ticket. No Ephemeral Diffie-Hellman (ECDHE/DHE) key exchange occurs.
+2. `psk_dhe_ke`: Pre-Shared Key with Diffie-Hellman Key Exchange. The client and server present ephemeral key shares (e.g., X25519, P-256, or post-quantum hybrid groups such as X25519MLKEM768) alongside the PSK binder.
+
+OpenSSL offers and accepts only `psk_dhe_ke` unless `SSL_OP_ALLOW_NO_DHE_KEX` is set, and browsers behave the same way. A resumed handshake therefore still runs the full key exchange, including the ML-KEM half of a hybrid group, and skips only the `Certificate`, `CertificateVerify` (the server's signature) and the client's chain validation.
+
+| Feature / Mechanism | TLS 1.2 Session ID | TLS 1.2 Session Ticket (RFC 5077) | TLS 1.3 PSK (`psk_dhe_ke`) |
+| :--- | :--- | :--- | :--- |
+| **State Storage** | Server In-Memory Cache | Client-side Encrypted Blob | Client-side Encrypted Blob (or Stateful Index) |
+| **Server Key Required** | None (Cache lookup) | Symmetric STEK | Symmetric STEK |
+| **Key Exchange on Resumption** | None | None | Ephemeral DH / Post-Quantum Hybrid |
+| **What a key or cache leak exposes** | Master secrets in the cache | Master secret of every recorded session whose ticket was seen | Ability to impersonate the server to ticket holders; no passive decryption |
+| **Asymmetric Signatures** | Skipped | Skipped | Skipped |
+
+### Stateless vs Stateful Tickets in OpenSSL
+
+While TLS 1.3 session tickets are conceptually client-side state blobs, OpenSSL supports two operational modes:
+
+1. **Stateless (default)**: the ticket is the session itself (resumption PSK, cipher suite, timestamps, SNI) encrypted under the server's ticket key. The server keeps nothing per ticket.
+2. **Stateful (`SSL_OP_NO_TICKET`)**: Setting the `SSL_OP_NO_TICKET` flag in OpenSSL for TLS 1.3 does **not** disable session resumption. Instead, it changes the structure of the ticket. The server issues a `NewSessionTicket` containing an opaque database key, while storing the session parameters in its own local in-memory cache.
+
+Understanding this operational difference is important: when an application sets `SSL_OP_NO_TICKET` in TLS 1.3, it forces stateful server-side caching, causing ticket validation to fail if the client presents the ticket to a sibling node in a multi-server fleet without shared memory or cache synchronization.
+
+### Anti-Replay Protection and Single-Use Rules
+
+TLS 1.3 introduces 0-RTT (Early Data), allowing clients to send application data inside the first flight of packets along with the `ClientHello`. Because 0-RTT data relies on the ticket's pre-shared key before server authentication finishes, it is vulnerable to replay attacks by network eavesdroppers unless protected by anti-replay mechanisms.
+
+OpenSSL turns replay protection on automatically when the server's maximum early data is non-zero (`SSL_CTX_set_max_early_data`, `s_server -max_early_data`). Its documentation describes the mechanism: the server then behaves as if `SSL_OP_NO_TICKET` were set, adds every issued session to its internal cache, and removes it on first resumption. A second use of the same ticket gets a full handshake, "even if a client does not send any early data". `SSL_OP_NO_ANTI_REPLAY` switches this off for applications that protect against replay themselves.
+
+Two consequences matter for operators. Tickets become single use, which RFC 8446 Appendix C.4 recommends for privacy anyway, so clients must keep the fresh tickets each connection delivers. And because the state is back in one server's memory, enabling early data on an OpenSSL-based fleet makes resumption node-local: a shared ticket key no longer helps a client that lands on another node.
+
+## STEK Architecture, Security Risks, and Fleet Design
+
+Session Ticket Encryption Keys (STEKs) enable stateless session resumption across web server fleets. However, their security implications must be carefully managed.
+
+### STEK Cryptographic Structure
+
+nginx and HAProxy accept 48-byte (AES-128) or 80-byte (AES-256) ticket keys. In nginx's 80-byte format the bytes split into three fields:
+
+```text
++------------------------+------------------------+------------------------+
+|   Key Name (16 bytes)  |  HMAC Key (32 bytes)   |  AES Key (32 bytes)    |
+| (Identifier in wire)   | (SHA-256 Authentication)| (AES-256 Encryption)   |
++------------------------+------------------------+------------------------+
+```
+
+Tickets built from such a key follow the structure RFC 5077 section 4 recommends:
+1. The encrypting key is chosen and a random IV generated.
+2. The serialized session is encrypted (AES-CBC with the key's AES part).
+3. An HMAC-SHA256 with the key's HMAC part covers key name, IV and ciphertext.
+4. The ticket is key name, IV, ciphertext and MAC; the key name tells the server which key to try.
+
+Upon resumption, the server reads the first 16 bytes of the incoming ticket, identifies the corresponding key in its configured STEK list, verifies the HMAC, and decrypts the payload.
+
+### Cryptographic Compromise Dynamics
+
+The security risk of a compromised STEK depends on the protocol version and negotiated key exchange mode.
+
+#### TLS 1.2 and TLS 1.3 (`psk_ke`)
+In TLS 1.2 (or TLS 1.3 running pure `psk_ke`), the ticket payload contains the raw session master secret. If an attacker captures encrypted wire traffic from a target connection and later steals the STEK, the attacker can decrypt the ticket, extract the master secret, and retroactively decrypt the target connection and any other session resumed using that ticket. (See Springall et al., "Measuring the Security Harm of TLS Crypto Shortcuts", IMC 2016).
+
+#### TLS 1.3 (`psk_dhe_ke`)
+When `psk_dhe_ke` is used, the final connection key is derived from *both* the ticket PSK and an ephemeral Diffie-Hellman key exchange. If an attacker steals a TLS 1.3 STEK, passive decryption of past recorded traffic remains impossible because the attacker lacks the private ephemeral key shares exchanged over the wire. However, possessing the active STEK allows the attacker to execute active Man-in-the-Middle (MitM) attacks: they can forge valid tickets, authenticate as the server to any client presenting a ticket encrypted under that STEK, and intercept future connections.
+
+Treat ticket keys like private keys, with one difference: they should be short-lived. HAProxy's manual suggests rotating at least every 12 hours and keeping the files on tmpfs, off any permanent storage.
+
+### Fleet STEK Synchronization
+
+In a load-balanced infrastructure with multiple edge nodes terminating TLS, a client's consecutive requests may hit different backend nodes.
+
+```text
+                     +-----------------------+
+                     |  Layer 4 Load Balancer|
+                     |     (Round Robin)     |
+                     +-----------+-----------+
+                                 |
+                 +---------------+---------------+
+                 |                               |
+                 v                               v
+       +-------------------+           +-------------------+
+       |    Node A (STEK 1)|           |    Node B (STEK 2)|
+       +-------------------+           +-------------------+
+```
+
+If Node A and Node B generate independent STEKs locally at startup:
+1. Client connects to Node A, receives a ticket encrypted with Node A's STEK 1.
+2. Client sends a subsequent request; Load Balancer routes it to Node B.
+3. Node B reads the 16-byte Key Identifier, finds no matching key in its local memory, rejects the ticket, and forces a full handshake.
+
+Under this configuration, the fleet's session resumption rate drops significantly, proportional to the number of nodes.
+
+To achieve consistent session resumption across a fleet, all nodes behind the load balancer must share identical STEK key chains.
+
+```text
+                               Centralized STEK Generator
+                               (Rotates keys every 1 hr)
+                                           |
+                    +----------------------+----------------------+
+                    | Push active + decryption key list           |
+                    v                                             v
+        +-----------------------+                     +-----------------------+
+        |   Node A (Primary: K2) |                     |   Node B (Primary: K2) |
+        |   Keys: [K2, K1]      |                     |   Keys: [K2, K1]      |
+        +-----------------------+                     +-----------------------+
+```
+
+### Key Rotation Lifecycle
+
+A rotation scheme keeps a short window of keys:
+
+- **Encryption key**: encrypts every new ticket.
+- **Previous keys**: decrypt tickets issued before the last rotation, for one ticket lifetime.
+- **Next key** (HAProxy's model): distributed one period early and accepted for decryption, so a node that rotates a few seconds before its neighbours does not break resumption on them.
+
+```text
+Time Window T0:   Active: [ Key A (Encrypt/Decrypt) ]
+Time Window T1:   Active: [ Key B (Encrypt/Decrypt) ], Secondary: [ Key A (Decrypt) ]
+Time Window T2:   Active: [ Key C (Encrypt/Decrypt) ], Secondary: [ Key B (Decrypt) ] (Key A retired)
+```
+
+With OpenSSL's default lifetime of 7,200 seconds, keep a retired encryption key for decryption for at least two more hours. Keeping it longer buys nothing: the server rejects older tickets on age anyway.
+
+### Multi-Tenant SNI Boundaries
+
+RFC 8446 section 4.6.1 puts the rule on the client: it MUST only resume if the new SNI is valid for the certificate of the original session, and SHOULD only resume if the SNI is the same. Nothing in the protocol stops a server from accepting a ticket under a different name, and section 7 of the lab shows OpenSSL client and server resuming an `a.lab` session with SNI `b.lab`, because the certificate covers both.
+
+That matters wherever one terminator serves many tenants: a session authenticated for one virtual host (including any client-certificate authentication) can be carried into another that shares the ticket key. Scope ticket keys to a trust boundary: one key set per tenant or per group of names that may share sessions. Where the software allows, also check the hostname recorded in the resumed session against the new SNI.
+
+## The lab
+
+The following hands-on lab demonstrates session resumption behaviors in OpenSSL and Python. It consists of three primary scripts:
+
+1. `tlslab.py`: A Python test suite using the `ssl` module to evaluate stateless vs stateful tickets, server restarts, multi-node fleets, and SNI isolation.
+2. `cli.sh`: A shell script using `openssl s_server` and `openssl s_client` to inspect session structures, ticket reuse, and anti-replay fallback mechanisms.
+3. `srvcpu.py`: A benchmark tool measuring server CPU consumption across full and resumed handshakes using ECDSA, RSA, and post-quantum hybrid groups.
+
+### Lab files
+
+Before running the scripts, execute the certificate generation script to establish the local PKI test assets.
+
+`mkcerts.sh`:
+
+```bash
+#!/bin/sh
+# Self-signed lab certificates: one ECDSA P-256, one RSA-2048, both for a.lab and b.lab
+set -e
+for k in ec rsa; do
+  if [ $k = ec ]; then alg="-newkey ec -pkeyopt ec_paramgen_curve:P-256"; else alg="-newkey rsa:2048"; fi
+  openssl req -x509 $alg -nodes -days 2 -subj /CN=a.lab \
+    -addext "subjectAltName=DNS:a.lab,DNS:b.lab" -keyout $k-key.pem -out $k-cert.pem 2>/dev/null
+done
+ls ec-*.pem rsa-*.pem
+```
+
+`tlslab.py`:
+
+```python
+"""TLS session resumption lab: tickets, ticket keys, fleets and cost (stdlib only)."""
+import socket, ssl, sys, threading, time
+
+def server_ctx(cert="ec", tls12=False, no_ticket=False, tickets=None):
+    c = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    c.load_cert_chain(f"{cert}-cert.pem", f"{cert}-key.pem")
+    if tls12:
+        c.maximum_version = ssl.TLSVersion.TLSv1_2
+    if no_ticket:
+        c.options |= ssl.OP_NO_TICKET
+    if tickets is not None:
+        c.num_tickets = tickets
+    return c
+
+class Node:
+    """One TLS listener on 127.0.0.1 that answers each connection with b'hi'."""
+    def __init__(self, ctx):
+        self.ctx, self.sock = ctx, socket.create_server(("127.0.0.1", 0))
+        self.port = self.sock.getsockname()[1]
+        threading.Thread(target=self.loop, daemon=True).start()
+    def loop(self):
+        while True:
+            raw, _ = self.sock.accept()
+            try:
+                with self.ctx.wrap_socket(raw, server_side=True) as s:
+                    s.recv(16); s.sendall(b"hi")
+            except (ssl.SSLError, OSError):
+                pass
+
+CLIENT = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+CLIENT.check_hostname = False
+CLIENT.verify_mode = ssl.CERT_NONE
+
+def connect(node, session=None, sni="a.lab"):
+    """Return (reused, new_session, tls_version, seconds)."""
+    t = time.perf_counter()
+    with socket.create_connection(("127.0.0.1", node.port)) as raw:
+        with CLIENT.wrap_socket(raw, server_hostname=sni, session=session) as s:
+            s.sendall(b"x"); s.recv(16)   # read, so TLS 1.3 tickets sent after the handshake arrive
+            return s.session_reused, s.session, s.version(), time.perf_counter() - t
+
+def show(label, r):
+    print(f"  {label:44} reused={str(r[0]):5} {r[2]}")
+
+def part(title):
+    print(f"\n== {title}")
+
+part("1. full handshake, then resume with the saved session (TLS 1.3, defaults)")
+n = Node(server_ctx())
+r1 = connect(n); show("first connection", r1)
+s = r1[1]
+print(f"  saved session: has_ticket={s.has_ticket} ticket_lifetime_hint={s.ticket_lifetime_hint}s timeout={s.timeout}s")
+print(f"  server num_tickets={n.ctx.num_tickets}")
+r2 = connect(n, s); show("second connection, session from first", r2)
+r3 = connect(n, s); show("third connection, SAME session again", r3)
+
+part("2. stateless vs stateful TLS 1.3 tickets: where the state lives")
+for label, kw in [("stateless (default)", {}), ("stateful (OP_NO_TICKET)", {"no_ticket": True})]:
+    n = Node(server_ctx(**kw))
+    for _ in range(50):
+        connect(n)
+    s = connect(n)[1]
+    show(f"{label}: resume", connect(n, s))
+    show(f"{label}: resume same ticket again", connect(n, s))
+    st = n.ctx.session_stats()
+    print(f"    server session cache: number={st['number']} hits={st['hits']} misses={st['misses']}")
+
+part("3. num_tickets=0: server issues no tickets")
+n = Node(server_ctx(tickets=0))
+r = connect(n); print(f"  session after connection: has_ticket={r[1].has_ticket}")
+show("try to resume", connect(n, r[1]))
+
+part("4. server restart = new ticket key")
+ctx = server_ctx(); n = Node(ctx)
+s = connect(n)[1]
+show("same process, same key", connect(n, s))
+n2 = Node(server_ctx())      # a fresh SSLContext gets a fresh random ticket key
+show("restarted server (new SSLContext)", connect(n2, s))
+
+part("5. two-node fleet behind round-robin, 200 connections, client keeps latest session")
+def fleet(nodes, n_conn=200):
+    sess, reused = None, 0
+    for i in range(n_conn):
+        r = connect(nodes[i % len(nodes)], sess)
+        reused += r[0]; sess = r[1]
+    return reused
+print(f"  per-node keys (two SSLContexts): resumed {fleet([Node(server_ctx()), Node(server_ctx())])}/200")
+shared = server_ctx()
+print(f"  shared key   (one SSLContext)  : resumed {fleet([Node(shared), Node(shared)])}/200")
+
+part("6. TLS 1.2: session tickets vs session-ID cache")
+for label, kw in [("tickets (default)", {}), ("session IDs only (OP_NO_TICKET)", {"no_ticket": True})]:
+    shared = server_ctx(tls12=True, **kw)
+    a, b = Node(shared), Node(server_ctx(tls12=True, **kw))
+    s = connect(a)[1]
+    print(f"  {label}: has_ticket={s.has_ticket}")
+    show("    same context", connect(a, s))
+    show("    other node, own context", connect(b, s))
+
+part("7. SNI changes between connections")
+n = Node(server_ctx())
+s = connect(n, sni="a.lab")[1]
+try:
+    show("resume a.lab session while sending SNI b.lab", connect(n, s, sni="b.lab"))
+except Exception as e:
+    print(f"  resume a.lab session while sending SNI b.lab -> {type(e).__name__}: {e}")
+
+print(f"\n{ssl.OPENSSL_VERSION}, Python {sys.version.split()[0]}")
+```
+
+`cli.sh`:
+
+```bash
+#!/bin/sh
+# openssl s_server / s_client / s_time view of the same mechanics (loopback only)
+P=44330
+srv() { tail -f /dev/null | openssl s_server -quiet -accept $P -cert ${CERT:-ec}-cert.pem -key ${CERT:-ec}-key.pem "$@" >/dev/null 2>&1 & S=$!; sleep 0.5; }
+stop() { pkill -f "s_server -quiet -accept $P"; wait 2>/dev/null; }
+cli() { sleep 0.3 | openssl s_client -connect 127.0.0.1:$P -servername a.lab "$@" 2>/dev/null; }
+reuse() { cli "$@" | grep -E "^(New|Reused),|^Negotiated TLS1.3 group|^Peer signature type" | sed 's/^/    /'; }
+
+echo "== A. stateless tickets (default): save, inspect, resume twice"
+srv
+cli -sess_out t.pem >/dev/null
+openssl sess_id -in t.pem -noout -text | grep -E "Protocol|Cipher|Session-ID:|Resumption PSK|lifetime hint|Timeout|Max Early" | sed 's/Resumption PSK: .*/Resumption PSK: (48 bytes, elided)/; s/Session-ID: .*/Session-ID: (32 bytes, elided)/' | sed 's/^/    /'
+echo "  resume 1:"; reuse -sess_in t.pem
+echo "  resume 2 (same ticket):"; reuse -sess_in t.pem
+stop
+
+echo "== B. stateful tickets + early data enabled (anti-replay on): single use"
+srv -no_ticket -max_early_data 1024
+cli -sess_out t2.pem >/dev/null
+echo "  resume 1:"; reuse -sess_in t2.pem
+echo "  resume 2 (same ticket):"; reuse -sess_in t2.pem
+stop
+
+echo "== C. stateless tickets + early data enabled (anti-replay on)"
+srv -max_early_data 1024
+cli -sess_out t3.pem >/dev/null
+echo "  resume 1:"; reuse -sess_in t3.pem
+echo "  resume 2 (same ticket):"; reuse -sess_in t3.pem
+stop
+```
+
+`srvcpu.py`:
+
+```python
+"""Server-side CPU per handshake: drive a real openssl s_server, read its CPU time from /proc."""
+import os, socket, ssl, subprocess, sys, time
+HZ = os.sysconf("SC_CLK_TCK")
+def cpu(pid):
+    f = open(f"/proc/{pid}/stat").read().rsplit(")", 1)[1].split()
+    return (int(f[11]) + int(f[12])) / HZ          # utime + stime, seconds
+ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT); ctx.check_hostname = False; ctx.verify_mode = ssl.CERT_NONE
+def conn(port, sess=None):
+    with socket.create_connection(("127.0.0.1", port)) as raw, ctx.wrap_socket(raw, server_hostname="a.lab", session=sess) as s:
+        s.sendall(b"GET / HTTP/1.0\r\n\r\n"); s.recv(64)
+        return s.session_reused, s.session
+N = 2000
+for i, (cert, group) in enumerate([(c, g) for g in ("X25519MLKEM768", "X25519") for c in ("ec", "rsa")]):
+    port = 44400 + i
+    p = subprocess.Popen(["openssl", "s_server", "-quiet", "-www", "-accept", str(port), "-cert", f"{cert}-cert.pem",
+                          "-key", f"{cert}-key.pem", "-groups", group], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    time.sleep(0.5)
+    _, sess = conn(port)
+    c0 = cpu(p.pid)
+    for _ in range(N): conn(port)
+    c1 = cpu(p.pid)
+    hits = 0
+    for _ in range(N):
+        r, s2 = conn(port, sess); hits += r
+    c2 = cpu(p.pid)
+    p.kill(); p.wait()
+    full, res = (c1 - c0) / N * 1e6, (c2 - c1) / N * 1e6
+    print(f"  {group:14} {cert:3} cert: server CPU per full handshake {full:6.0f} us, per resumed {res:6.0f} us ({hits}/{N} resumed)  ratio {full/res:.1f}x")
+```
+
+### Execution output
+
+The following execution output was captured during script execution on the test environment.
+
+The output generated by running the Python test suite:
+```text
+
+== 1. full handshake, then resume with the saved session (TLS 1.3, defaults)
+  first connection                             reused=False TLSv1.3
+  saved session: has_ticket=True ticket_lifetime_hint=7200s timeout=7200s
+  server num_tickets=2
+  second connection, session from first        reused=True  TLSv1.3
+  third connection, SAME session again         reused=True  TLSv1.3
+
+== 2. stateless vs stateful TLS 1.3 tickets: where the state lives
+  stateless (default): resume                  reused=True  TLSv1.3
+  stateless (default): resume same ticket again reused=True  TLSv1.3
+    server session cache: number=0 hits=2 misses=0
+  stateful (OP_NO_TICKET): resume              reused=True  TLSv1.3
+  stateful (OP_NO_TICKET): resume same ticket again reused=True  TLSv1.3
+    server session cache: number=104 hits=2 misses=0
+
+== 3. num_tickets=0: server issues no tickets
+  session after connection: has_ticket=False
+  try to resume                                reused=False TLSv1.3
+
+== 4. server restart = new ticket key
+  same process, same key                       reused=True  TLSv1.3
+  restarted server (new SSLContext)            reused=False TLSv1.3
+
+== 5. two-node fleet behind round-robin, 200 connections, client keeps latest session
+  per-node keys (two SSLContexts): resumed 0/200
+  shared key   (one SSLContext)  : resumed 199/200
+
+== 6. TLS 1.2: session tickets vs session-ID cache
+  tickets (default): has_ticket=True
+      same context                             reused=True  TLSv1.2
+      other node, own context                  reused=False TLSv1.2
+  session IDs only (OP_NO_TICKET): has_ticket=False
+      same context                             reused=True  TLSv1.2
+      other node, own context                  reused=False TLSv1.2
+
+== 7. SNI changes between connections
+  resume a.lab session while sending SNI b.lab reused=True  TLSv1.3
+
+OpenSSL 3.5.7 9 Jun 2026, Python 3.13.5
+```
+
+The output generated by running the OpenSSL CLI suite:
+```text
+== A. stateless tickets (default): save, inspect, resume twice
+        Protocol  : TLSv1.3
+        Cipher    : TLS_AES_256_GCM_SHA384
+        Session-ID: (32 bytes, elided)
+        Resumption PSK: (48 bytes, elided)
+        TLS session ticket lifetime hint: 7200 (seconds)
+        Timeout   : 7200 (sec)
+        Max Early Data: 0
+  resume 1:
+    Negotiated TLS1.3 group: X25519MLKEM768
+    Reused, TLSv1.3, Cipher is TLS_AES_256_GCM_SHA384
+  resume 2 (same ticket):
+    Negotiated TLS1.3 group: X25519MLKEM768
+    Reused, TLSv1.3, Cipher is TLS_AES_256_GCM_SHA384
+== B. stateful tickets + early data enabled (anti-replay on): single use
+  resume 1:
+    Negotiated TLS1.3 group: X25519MLKEM768
+    Reused, TLSv1.3, Cipher is TLS_AES_256_GCM_SHA384
+  resume 2 (same ticket):
+    Peer signature type: ecdsa_secp256r1_sha256
+    Negotiated TLS1.3 group: X25519MLKEM768
+    New, TLSv1.3, Cipher is TLS_AES_256_GCM_SHA384
+== C. stateless tickets + early data enabled (anti-replay on)
+  resume 1:
+    Negotiated TLS1.3 group: X25519MLKEM768
+    Reused, TLSv1.3, Cipher is TLS_AES_256_GCM_SHA384
+  resume 2 (same ticket):
+    Peer signature type: ecdsa_secp256r1_sha256
+    Negotiated TLS1.3 group: X25519MLKEM768
+    New, TLSv1.3, Cipher is TLS_AES_256_GCM_SHA384
+```
+
+The output generated by running the CPU microbenchmark script:
+```text
+  X25519MLKEM768 ec  cert: server CPU per full handshake    385 us, per resumed    300 us (2000/2000 resumed)  ratio 1.3x
+  X25519MLKEM768 rsa cert: server CPU per full handshake    600 us, per resumed    305 us (2000/2000 resumed)  ratio 2.0x
+  X25519         ec  cert: server CPU per full handshake    315 us, per resumed    255 us (2000/2000 resumed)  ratio 1.2x
+  X25519         rsa cert: server CPU per full handshake    530 us, per resumed    245 us (2000/2000 resumed)  ratio 2.2x
+```
+
+## Reading the output
+
+Analyzing the laboratory outputs reveals the practical mechanics of session resumption.
+
+### Reading `tlslab.py` Output
+
+#### Part 1: Default TLS 1.3 Resumption
+```text
+== 1. full handshake, then resume with the saved session (TLS 1.3, defaults)
+  first connection                             reused=False TLSv1.3
+  saved session: has_ticket=True ticket_lifetime_hint=7200s timeout=7200s
+  server num_tickets=2
+  second connection, session from first        reused=True  TLSv1.3
+  third connection, SAME session again         reused=True  TLSv1.3
+```
+- Connection 1 is a full handshake (`reused=False`).
+- OpenSSL's default configuration issues 2 tickets post-handshake (`num_tickets=2`), each configured with a 7200-second (2-hour) lifetime hint.
+- Subsequent connections using the saved session object return `reused=True`. With no early data configured there is no replay protection, so the same stateless ticket works any number of times.
+
+#### Part 2: Stateless vs Stateful State Locations
+```text
+== 2. stateless vs stateful TLS 1.3 tickets: where the state lives
+  stateless (default): resume                  reused=True  TLSv1.3
+  stateless (default): resume same ticket again reused=True  TLSv1.3
+    server session cache: number=0 hits=2 misses=0
+  stateful (OP_NO_TICKET): resume              reused=True  TLSv1.3
+  stateful (OP_NO_TICKET): resume same ticket again reused=True  TLSv1.3
+    server session cache: number=104 hits=2 misses=0
+```
+- In stateless mode, the server session cache counter remains `number=0`. The session state is embedded within the client's ticket payload, so the server maintains zero local cache allocations.
+- In stateful mode (`SSL_OP_NO_TICKET`), the server session cache contains `number=104` entries. This is calculated as 52 initial connections multiplied by 2 tickets issued per connection. Here, `SSL_OP_NO_TICKET` does not disable resumption; instead, it forces ticket state to reside in the server's local RAM cache.
+
+#### Part 3: Disabling Tickets Entirely
+```text
+== 3. num_tickets=0: server issues no tickets
+  session after connection: has_ticket=False
+  try to resume                                reused=False TLSv1.3
+```
+- When `SSL_CTX_set_num_tickets(0)` is configured, the server emits no `NewSessionTicket` messages.
+- The client receives no ticket data (`has_ticket=False`), preventing subsequent session resumption attempts.
+
+#### Part 4: Server Restart Effects
+```text
+== 4. server restart = new ticket key
+  same process, same key                       reused=True  TLSv1.3
+  restarted server (new SSLContext)            reused=False TLSv1.3
+```
+- A new `SSLContext` gets a fresh random ticket key when it is created.
+- Restarting the server process invalidates all previously issued tickets because the new instance cannot decrypt tickets encrypted by the previous instance's STEK.
+
+#### Part 5: Multi-Node Fleet Simulation
+```text
+== 5. two-node fleet behind round-robin, 200 connections, client keeps latest session
+  per-node keys (two SSLContexts): resumed 0/200
+  shared key   (one SSLContext)  : resumed 199/200
+```
+- In a two-node round-robin setup where each node maintains its own independent STEK, the client stores only the most recently received ticket. Because each subsequent request alternates to the sibling node, ticket validation fails every time (`resumed 0/200`).
+- When both nodes share the same STEK, 199 out of 200 connections resume successfully (with only the initial connection requiring a full handshake).
+
+#### Part 6: TLS 1.2 Stateless vs Stateful
+```text
+== 6. TLS 1.2: session tickets vs session-ID cache
+  tickets (default): has_ticket=True
+      same context                             reused=True  TLSv1.2
+      other node, own context                  reused=False TLSv1.2
+  session IDs only (OP_NO_TICKET): has_ticket=False
+      same context                             reused=True  TLSv1.2
+      other node, own context                  reused=False TLSv1.2
+```
+- In TLS 1.2, session tickets and Session IDs operate as separate paths.
+- With `OP_NO_TICKET` enabled in TLS 1.2, `has_ticket` is `False`. Resumption falls back to the 32-byte Session ID cache, which succeeds within the same context but fails across isolated nodes.
+
+#### Part 7: Cross-SNI Ticket Reuse
+```text
+== 7. SNI changes between connections
+  resume a.lab session while sending SNI b.lab reused=True  TLSv1.3
+```
+- The test demonstrates that an OpenSSL client presenting a ticket acquired from `a.lab` while requesting SNI `b.lab` will resume successfully if the server processes both names within the same `SSLContext` and the underlying certificate is valid for both hostnames. This highlights the importance of scoping ticket contexts per tenant in multi-tenant environments.
+
+### Reading `cli.sh` Output
+
+```text
+== A. stateless tickets (default): save, inspect, resume twice
+        Protocol  : TLSv1.3
+        Cipher    : TLS_AES_256_GCM_SHA384
+        Session-ID: (32 bytes, elided)
+        Resumption PSK: (48 bytes, elided)
+        TLS session ticket lifetime hint: 7200 (seconds)
+        Timeout   : 7200 (sec)
+        Max Early Data: 0
+  resume 1:
+    Negotiated TLS1.3 group: X25519MLKEM768
+    Reused, TLSv1.3, Cipher is TLS_AES_256_GCM_SHA384
+  resume 2 (same ticket):
+    Negotiated TLS1.3 group: X25519MLKEM768
+    Reused, TLSv1.3, Cipher is TLS_AES_256_GCM_SHA384
+```
+In section A, without anti-replay protection configured, the client reuses the exact same saved session file twice. Both attempts negotiate the `X25519MLKEM768` key exchange group, confirming that TLS 1.3 `psk_dhe_ke` performs a Diffie-Hellman key exchange on resumption.
+
+```text
+== B. stateful tickets + early data enabled (anti-replay on): single use
+  resume 1:
+    Negotiated TLS1.3 group: X25519MLKEM768
+    Reused, TLSv1.3, Cipher is TLS_AES_256_GCM_SHA384
+  resume 2 (same ticket):
+    Peer signature type: ecdsa_secp256r1_sha256
+    Negotiated TLS1.3 group: X25519MLKEM768
+    New, TLSv1.3, Cipher is TLS_AES_256_GCM_SHA384
+```
+In section B, setting `-max_early_data 1024` enables OpenSSL's internal anti-replay mechanism. 
+
+- On `resume 1`, the ticket is accepted (`Reused, TLSv1.3`) and OpenSSL removes the session from its internal cache.
+- On `resume 2`, the same ticket finds no cache entry, so the server performs a full TLS 1.3 handshake. The client sent no early data at all.
+- The appearance of the line `Peer signature type: ecdsa_secp256r1_sha256` in `resume 2` confirms that an asymmetric signature was calculated by the server, proving that a full handshake occurred instead of resumption.
+
+Section C shows the same result without `-no_ticket`: with early data enabled OpenSSL switches to stateful tickets on its own, so there is no "stateless and single use" mode.
+
+### Reading `srvcpu.py` Output
+
+```text
+  X25519MLKEM768 ec  cert: server CPU per full handshake    385 us, per resumed    300 us (2000/2000 resumed)  ratio 1.3x
+  X25519MLKEM768 rsa cert: server CPU per full handshake    600 us, per resumed    305 us (2000/2000 resumed)  ratio 2.0x
+  X25519         ec  cert: server CPU per full handshake    315 us, per resumed    255 us (2000/2000 resumed)  ratio 1.2x
+  X25519         rsa cert: server CPU per full handshake    530 us, per resumed    245 us (2000/2000 resumed)  ratio 2.2x
+```
+
+The microbenchmark results quantify the server CPU time required for full versus resumed handshakes across different crypto configurations:
+
+1. **Baseline Protocol Overhead**:
+   The execution CPU baseline for a resumed connection ranges between 245 µs and 305 µs. This baseline represents TCP connection handling, socket I/O, event processing, and memory allocation within `openssl s_server`.
+
+2. **RSA-2048 Optimization Impact**:
+   - Full handshake with RSA-2048 certificates requires **530 µs to 600 µs** per connection due to private key signature calculations.
+   - Resuming an RSA session drops CPU execution time to **245 µs – 305 µs**, achieving a **2.0x to 2.2x performance improvement**.
+   - Session resumption saves approximately **280 µs to 300 µs** of server CPU processing per connection by eliminating the RSA signature operation.
+
+3. **ECDSA P-256 Optimization Impact**:
+   - Full handshakes using ECDSA P-256 require **315 µs to 385 µs** per connection.
+   - Resuming an ECDSA session reduces execution time to **255 µs – 300 µs**, yielding a smaller **1.2x to 1.3x speedup**.
+   - Because ECDSA P-256 signatures are computationally lighter than RSA-2048 operations, session resumption saves **60 µs to 85 µs** of CPU time per connection.
+
+4. **Post-Quantum Hybrid Group Overhead (`X25519MLKEM768`)**:
+   - Evaluating `X25519MLKEM768` relative to standard `X25519` shows a modest CPU overhead increment of **55 µs to 70 µs** across both full and resumed connection modes.
+   - Because TLS 1.3 `psk_dhe_ke` executes key agreement on resumed connections, post-quantum key exchange calculations affect both initial and resumed handshakes.
+
+## In production
+
+Implementing session resumption across web server fleets requires configuring primary edge software to manage STEK lifecycles and ticket distribution.
+
+### NGINX Configuration
+
+In NGINX, stateless session ticket decryption is configured using the `ssl_session_ticket_key` directive within the `http` or `server` context.
+
+```text
+# (not run here) nginx.conf
+http {
+    ssl_protocols TLSv1.2 TLSv1.3;
+
+    # Enable server-side session cache as fallback for TLS 1.2 / stateful modes
+    ssl_session_cache   shared:SSL:50m;
+    ssl_session_timeout 1d;
+
+    # Configure STEK key file list
+    # The first file listed is used to ENCRYPT new tickets.
+    # Subsequent files are used strictly to DECRYPT existing client tickets.
+    ssl_session_ticket_key /etc/nginx/stek/active.key;
+    ssl_session_ticket_key /etc/nginx/stek/prev_1h.key;
+    ssl_session_ticket_key /etc/nginx/stek/prev_2h.key;
+
+    # Define custom log format to monitor session resumption rates
+    log_format ssl_monitor '$remote_addr - [$time_local] "$request" '
+                           'ssl_proto=$ssl_protocol ssl_cipher=$ssl_cipher '
+                           'ssl_reused=$ssl_session_reused';
+
+    access_log /var/log/nginx/access.log ssl_monitor;
+}
+```
+
+### HAProxy Configuration
+
+HAProxy defines ticket key chains within its global settings and allows dynamic, zero-downtime key rotation via its Unix Control Socket.
+
+```text
+# (not run here) haproxy.cfg
+global
+    # tls_keys: base64 keys, one per line (openssl rand 80 | openssl base64 -A).
+    # The last 3 keys are used (TLS_TICKETS_NO build default): the penultimate
+    # encrypts, all three decrypt. Rotate by appending a key and reloading.
+    stats socket /var/run/haproxy.sock mode 660 level admin
+
+frontend tls_in
+    bind :443 ssl crt /etc/haproxy/certs/site.pem tls-ticket-keys /etc/haproxy/stek/tls_keys.bin
+    mode http
+    default_backend web_servers
+```
+
+### Generating and Rotating STEKs
+
+To generate an 80-byte OpenSSL-compatible STEK file:
+
+```bash
+# (not run here)
+# Generate an 80-byte random binary STEK key
+openssl rand 80 > /etc/nginx/stek/active.key
+chmod 0400 /etc/nginx/stek/active.key
+```
+
+A production STEK rotation pipeline typically executes the following workflow:
+
+```bash
+# (not run here)
+#!/usr/bin/env bash
+# Production STEK Rotation Script (hourly execution)
+STEK_DIR="/etc/nginx/stek"
+
+# Rotate file hierarchy
+mv "${STEK_DIR}/prev_1h.key" "${STEK_DIR}/prev_2h.key" 2>/dev/null || true
+mv "${STEK_DIR}/active.key"  "${STEK_DIR}/prev_1h.key" 2>/dev/null || true
+
+# Generate new primary key
+openssl rand 80 > "${STEK_DIR}/active.key"
+chmod 0400 "${STEK_DIR}"/*.key
+
+# Reload NGINX gracefully to load updated key paths
+systemctl reload nginx
+```
+
+For HAProxy, key chains can be updated dynamically at runtime without reloading the process:
+
+```bash
+# (not run here)
+echo "show tls-keys" | socat stdio /var/run/haproxy.sock
+# add the next key; it becomes the last one, the previous last one starts encrypting
+echo "set ssl tls-key /etc/haproxy/stek/tls_keys $(openssl rand 80 | openssl base64 -A)" | socat stdio /var/run/haproxy.sock
+```
+
+The runtime command changes one process only. Push the same key to every node, or the fleet is back to per-node keys.
+
+### Monitoring Resumption Metrics and Client Behavior
+
+#### Verification via NGINX Access Logs
+Monitor the `$ssl_session_reused` log variable in NGINX. A healthy fleet architecture should demonstrate a session reuse ratio exceeding 80% for recurring client traffic patterns:
+
+```bash
+# (not run here)
+awk '{print $NF}' /var/log/nginx/access.log | sort | uniq -c
+```
+
+`$ssl_session_reused` is `r` for a resumed session and `.` otherwise. Count per connection, not per request: keep-alive requests on one connection all repeat the same value.
+
+#### Verification via OpenSSL CLI
+To verify that an external endpoint supports session resumption over the network:
+
+```bash
+# (not run here)
+# five reconnects with the first session: look for "Reused" vs "New"
+openssl s_client -connect example.com:443 -servername example.com -reconnect < /dev/null | grep -E '^(New|Reused),'
+# the same test restricted to TLS 1.2 session IDs
+openssl s_client -connect example.com:443 -servername example.com -tls1_2 -no_ticket -reconnect < /dev/null | grep -E '^(New|Reused),'
+```
+
+#### Client Diagnostics (`curl` and Session Caching)
+curl keeps TLS sessions in memory for the life of one process, so resumption only happens between URLs fetched in the same invocation. `--no-sessionid` turns that off, which is useful when you want every connection of a test to pay for a full handshake:
+
+```bash
+# (not run here)
+curl -sv -o /dev/null -o /dev/null https://example.com/ https://example.com/ 2>&1 | grep -i 'resum\|reus'
+curl --no-sessionid -sv -o /dev/null -o /dev/null https://example.com/ https://example.com/
+```
+
+## Gotchas
+
+- **`SSL_OP_NO_TICKET` in TLS 1.3 does not disable resumption**: Setting `SSL_OP_NO_TICKET` switches OpenSSL from stateless client tickets to stateful server-cached tickets. To completely disable session ticket issuance in TLS 1.3, call `SSL_CTX_set_num_tickets(0)`.
+- **Anti-replay protection forces single-use tickets**: Enabling early data (`max_early_data > 0`) causes OpenSSL to record ticket identities in an anti-replay cache. Presenting the same ticket twice triggers fallback to a full handshake.
+- **`psk_dhe_ke` does not bypass key exchange latency**: While TLS 1.3 session resumption skips asymmetric signature generation, it still performs an ephemeral Diffie-Hellman exchange. It saves CPU cycles, but does not eliminate key agreement computation.
+- **A node with different key bytes fails silently**: nothing logs an error when a ticket fails to decrypt; the client just gets a full handshake. Watch the resumption rate per node after every key push.
+- **Early data makes OpenSSL tickets node-local**: with `max_early_data` above zero, replay protection turns tickets stateful and single use, so a shared ticket key no longer helps clients that move between nodes (sections B and C).
+- **Patch the terminator**: nginx 1.31.7 (14 October 2026) fixed CVE-2026-97629, where one of the keys was left uninitialised when ticket key rotation was used, which "might allow to forge a session". Check your branch's CHANGES before relying on `ssl_session_ticket_key` rotation.
+- **Unsynchronized STEKs break multi-node fleets**: Deploying edge termination nodes behind a round-robin load balancer without shared STEKs causes session resumption rates to drop toward zero.
+- **Long-lived ticket keys undo forward secrecy**: a key kept for months lets whoever steals it decrypt every recorded TLS 1.2 session from those months and impersonate the server to TLS 1.3 ticket holders. Rotate on a schedule and keep keys off disk.
+- **Multi-tenant cross-SNI resumption vulnerabilities**: Sharing a single `SSLContext` or STEK across separate tenant domains can allow clients to resume sessions across distinct virtual hosts if SNI validation callbacks are omitted.
+- **Restarts invalidate generated keys**: without configured key files, nginx, HAProxy and OpenSSL generate random keys at startup, so every restart or deploy turns all outstanding tickets into full handshakes (section 4). nginx 1.23.2 and later rotate generated keys automatically when `ssl_session_cache` uses shared memory.
+
+## Exercises
+
+1. **Calculate Fleet Cache Hit Rate Probability**:
+   Given a fleet of $N$ web nodes operating behind a layer-4 round-robin load balancer without shared STEKs, write a mathematical expression representing the probability $P$ that a returning client successfully resumes its session on its second request. Evaluate $P$ for $N = 2, 5, 10$.
+
+2. **Rotation without a cliff**: extend the fleet test in `tlslab.py` to three nodes that share one `SSLContext` while a fourth uses its own. Predict the resumption rate for round-robin and for random node choice, then measure both.
+
+3. **Configure NGINX TLS Session Cache Isolation**:
+   Construct an NGINX configuration snippet featuring two separate `server` blocks matching `tenant-a.lab` and `tenant-b.lab`. Configure distinct `ssl_session_ticket_key` paths for each server block and demonstrate that a session ticket generated by `tenant-a` is rejected when presented to `tenant-b`.
+
+4. **Benchmarking Post-Quantum Hybrid Group Impact**:
+   Modify `srvcpu.py` to benchmark performance across `X25519`, `SecP256r1`, and post-quantum hybrid modes (`X25519MLKEM768`). Compute the percentage CPU overhead increase introduced by post-quantum key exchange during full versus resumed handshakes.
+
+5. **Clean shutdown matters for stateful tickets**: run `cli.sh` section B again, but kill `s_client` before it sends `close_notify` on the first connection. Per the `s_server` manual the server then drops the session from its cache; confirm that `resume 1` becomes a full handshake.
+
+6. **Diagnose Single-Use Ticket Behavior under 0-RTT**:
+   Execute `cli.sh` using `openssl s_client` and `openssl s_server` with early data enabled (`-early_data`). Capture wire outputs showing ticket rejection and full handshake fallback when presenting the same ticket twice.
+
+## Verification
+
+The output data in this chapter was verified on a local system.
+
+### Executed Scripts
+- `mkcerts.sh`: Generated local ECDSA P-256 and RSA-2048 test certificates valid for SAN domains `a.lab` and `b.lab`.
+- `tlslab.py`: Executed all 7 test suites locally using Python 3.13.5 and OpenSSL 3.5.7.
+- `cli.sh`: Verified stateless/stateful ticket reuse and anti-replay single-use mechanisms using `openssl s_client` and `openssl s_server`.
+- `srvcpu.py`: Measured server process CPU usage via `/proc/PID/stat` across 2,000 full and 2,000 resumed connection iterations per cryptographic combination.
+
+### Unexecuted Production Examples
+- Production configuration blocks for NGINX (`nginx.conf`) and HAProxy (`haproxy.cfg`) are marked with `(not run here)` annotations.
+- STEK rotation shell scripts and dynamic socket commands (`socat`) are provided as production reference designs and were not executed during the automated lab run.
+
+Repeatability: `tlslab.py` and `cli.sh` gave identical output on two consecutive runs. `srvcpu.py` ran three times; the figures stayed within 10 µs except one ECDSA resumed value of 465 µs on the very first run, which did not recur.
+
+### Host System Specifications
+- **Operating System**: Linux 6.12.94 x86_64
+- **OpenSSL Library Version**: OpenSSL 3.5.7 (built 9 Jun 2026)
+- **Python Version**: Python 3.13.5
+- **Network Scope**: Local loopback interface (`127.0.0.1`)
+
+## Sources
+
+- **RFC 8446**: *The Transport Layer Security (TLS) Protocol Version 1.3*. Sections 2.2, 4.2.9, 4.2.11, 4.6.1, 8, Appendix C.4, E.1. Available at: https://www.rfc-editor.org/rfc/rfc8446
+- **RFC 5077**: *Transport Layer Security (TLS) Session Resumption without Server-Side State*. Available at: https://www.rfc-editor.org/rfc/rfc5077
+- **RFC 5246**: *The Transport Layer Security (TLS) Protocol Version 1.2*. Section 7.4.1.2 (Session ID). Available at: https://www.rfc-editor.org/rfc/rfc5246
+- **RFC 9325**: *Recommendations for Secure Use of Transport Layer Security (TLS) and Datagram Transport Layer Security (DTLS)* (BCP 195). Available at: https://www.rfc-editor.org/rfc/rfc9325
+- **OpenSSL Documentation**: `SSL_CTX_set_num_tickets(3)`, `SSL_CTX_set_options(3)` (`SSL_OP_NO_TICKET`), `SSL_CTX_set_max_early_data(3)`. Available at: https://www.openssl.org/docs/
+- **NGINX Documentation**: *Module ngx_http_ssl_module Directive Reference*. Available at: https://nginx.org/en/docs/http/ngx_http_ssl_module.html
+- **HAProxy Documentation**: configuration manual (`tls-ticket-keys`), https://docs.haproxy.org/3.2/configuration.html, and management guide (`set ssl tls-key`), https://docs.haproxy.org/3.2/management.html
+- **nginx CHANGES** (1.23.2 automatic key rotation; 1.31.7 CVE-2026-97629): https://nginx.org/en/CHANGES
+- **OpenSSL** `SSL_CTX_set_max_early_data(3)`, section "REPLAY PROTECTION": https://docs.openssl.org/3.5/man3/SSL_CTX_set_max_early_data/
+- **Python Standard Library**: `ssl` module documentation (`SSLSession`, `session_stats`). Available at: https://docs.python.org/3/library/ssl.html
+- **proc_pid_stat(5)**: https://man7.org/linux/man-pages/man5/proc_pid_stat.5.html
+- **Springall, J., Durumeric, Z., & Halderman, J. A. (2016)**: *Measuring the Security Harm of TLS Crypto Shortcuts*. IMC 2016. https://jhalderm.com/pub/papers/forward-secrecy-imc16.pdf
