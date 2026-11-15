@@ -1,0 +1,1038 @@
+---
+title: "Negative Answers in DNS: NXDOMAIN, NODATA, Negative Caching and Compact Denial"
+author:
+  - name: "K19G"
+  - name: "grok-bot"
+---
+
+# Negative Answers in DNS: NXDOMAIN, NODATA, Negative Caching and Compact Denial
+
+DNS operational incidents frequently stem from a common misconception: assuming that failure to fetch a record implies that the authoritative server is unreachable or misconfigured. In production environments, the culprit is often a negative answer that was generated correctly, transmitted with valid headers, and subsequently stored in a recursive resolver cache. When an engineer provisioning infrastructure tests a name *before* the record is created in control planes or route53/Cloudflare zones, the resulting negative response gets cached across global resolvers. Subsequent queries fail silently for minutes or hours, even after the record is published to authoritative servers.
+
+Understanding negative DNS responses requires analyzing wire format semantics, caching rules, and modern DNSSEC extensions. A failure to distinguish between a missing name (`NXDOMAIN`) and a missing type (`NODATA`) leads to subtle application issues. Furthermore, modern zone-signing implementations—such as Cloudflare's online signers—introduce synthetic responses like Compact Denial of Existence (`RFC 9824`), altering traditional wire characteristics and breaking legacy monitoring metrics.
+
+This chapter walks through the wire-level details of negative answers, exploring RFC 2308 negative caching mechanics, resolver TTL caps, empty non-terminals, RFC 8020 ("NXDOMAIN: There Really Is Nothing Underneath"), RFC 9520 resolution failure caching, and DNSSEC compact denial.
+
+## Learning goals
+
+- Differentiate wire responses for `NXDOMAIN` (RCODE 3) versus `NODATA` (`NOERROR` with empty answer section and SOA in authority).
+- Analyze Empty Non-Terminals (ENTs) and explain why querying an intermediate node returns `NODATA` rather than `NXDOMAIN`.
+- Trace RFC 2308 negative TTL calculation using `min(SOA TTL, SOA MINIMUM)` and observe resolver TTL countdowns in practice.
+- Diagnose the "record added after a miss" failure mode and evaluate mitigation strategies across Unbound, BIND, and systemd-resolved.
+- Evaluate RFC 8020 (`harden-below-nxdomain`) tree pruning and explain why resolvers restrict this optimization to DNSSEC-validated signals.
+- Measure RFC 9520 resolution failure caching to understand how resolvers protect authoritative targets during outages.
+- Identify DNSSEC negative evidence paradigms (NSEC range proofs, NSEC3 hashed ranges, RFC 9824 compact denial with type 128 `NXNAME`) from wire-level JSON and dig output.
+
+## Version note
+
+The lab implementation in this chapter relies strictly on standard library Python (version 3.13.5) running within isolated Linux network namespaces (Kernel 6.12.94). It requires no external dependencies such as `dnspython`, `dig`, or third-party DNS daemon binaries. Live external assertions utilize standard HTTPS interfaces (`urllib.request`) querying JSON-over-DoH endpoints provided by Cloudflare Public DNS and Google Public DNS. The Unbound, BIND and systemd-resolved material in "In production" is written from their documentation and was not run; none of them is installed on the lab host.
+
+## Wire Semantics of Non-Existence: NXDOMAIN vs NODATA
+
+A DNS server communicates non-existence in two fundamental ways: telling the client that the queried domain name does not exist at all, or telling the client that the name exists but holds no records of the requested type.
+
+### NXDOMAIN (Name Error)
+
+When an authoritative DNS server receives a query for a name that has no Resource Records (RRs) and is not an ancestor of any existing name, it returns a response with the Header Response Code set to `NXDOMAIN` (`RCODE 3`). 
+
+```text
++-------------------------------------------------------------------+
+| HEADER: RCODE = 3 (NXDOMAIN), ANCOUNT = 0, NSCOUNT = 1            |
++-------------------------------------------------------------------+
+| QUESTION SECTION:                                                 |
+|   nope.lab.test.                IN    A                           |
++-------------------------------------------------------------------+
+| ANSWER SECTION: (empty)                                           |
++-------------------------------------------------------------------+
+| AUTHORITY SECTION:                                                |
+|   lab.test.   4   IN   SOA   ns1.lab.test. hostmaster.lab.test. ...|
++-------------------------------------------------------------------+
+```
+
+Key characteristics of an `NXDOMAIN` response:
+1. **RCODE**: Set to `3` (`NXDOMAIN`).
+2. **Answer Section**: Empty (`ANCOUNT = 0`).
+3. **Authority Section**: Contains the zone's Start of Authority (`SOA`) record (`NSCOUNT = 1`).
+4. **Scope**: An `NXDOMAIN` response applies to the *entire name*. If `nope.lab.test` returns `NXDOMAIN` for an `A` query, it guarantees that no `AAAA`, `TXT`, `MX`, or any other record type exists at `nope.lab.test`.
+
+### NODATA (Empty Answer)
+
+When a name exists in the zone but does not possess the specific type requested by the query, the server returns a `NODATA` response. Note that `NODATA` is an operational state, not an explicit protocol `RCODE`.
+
+```text
++-------------------------------------------------------------------+
+| HEADER: RCODE = 0 (NOERROR), ANCOUNT = 0, NSCOUNT = 1             |
++-------------------------------------------------------------------+
+| QUESTION SECTION:                                                 |
+|   mail.lab.test.                IN    A                           |
++-------------------------------------------------------------------+
+| ANSWER SECTION: (empty)                                           |
++-------------------------------------------------------------------+
+| AUTHORITY SECTION:                                                |
+|   lab.test.   4   IN   SOA   ns1.lab.test. hostmaster.lab.test. ...|
++-------------------------------------------------------------------+
+```
+
+Key characteristics of a `NODATA` response:
+1. **RCODE**: Set to `0` (`NOERROR`).
+2. **Answer Section**: Empty (`ANCOUNT = 0`).
+3. **Authority Section**: Contains the zone's `SOA` record.
+4. **Scope**: A `NODATA` response applies *only to the specific type requested*. If `mail.lab.test` returns `NODATA` for type `A`, the name itself exists (for instance, holding an `MX` record).
+
+| Property | NXDOMAIN | NODATA |
+| :--- | :--- | :--- |
+| **Wire RCODE** | `3` (`NXDOMAIN`) | `0` (`NOERROR`) |
+| **Answer Count** | `0` | `0` |
+| **Authority Section** | Zone `SOA` Record | Zone `SOA` Record |
+| **Meaning** | Name does not exist for *any* record type | Name exists, but requested *type* does not |
+| **Caching Scope** | Caches non-existence of entire name | Caches non-existence of `(name, type)` tuple |
+| **Subtree Impact** | Implies no records exist below this name | Subtree below name may contain active records |
+
+### Empty Non-Terminals (ENTs)
+
+DNS domain names exist within a hierarchical tree structure. An Empty Non-Terminal (ENT) is a domain name that has no resource records of its own, but has domain names beneath it that *do* contain resource records.
+
+Consider a zone file with a single record at `x.b.lab.test`:
+
+```text
+x.b.lab.test.  30  IN  A  192.0.2.20
+```
+
+Because `x.b.lab.test` exists, the domain tree implicitly contains the parent nodes `b.lab.test` and `lab.test`. Even if no records (such as `A`, `TXT`, or `MX`) are assigned directly to `b.lab.test`, the name exists in the domain hierarchy.
+
+```text
+       lab.test. (Zone Apex)
+           |
+        b.lab.test (Empty Non-Terminal: NOERROR / NODATA)
+           |
+       x.b.lab.test (Record present: 192.0.2.20)
+```
+
+If a client queries `b.lab.test A`, the server cannot return `NXDOMAIN`, because `b.lab.test` exists as an ancestor to `x.b.lab.test`. Returning `NXDOMAIN` would assert that the entire sub-tree under `b.lab.test` is non-existent. Therefore, the server MUST return `NOERROR` with an empty answer section (`NODATA`).
+
+## RFC 2308: Negative Caching Mechanics
+
+Before RFC 2308, caching resolvers handled negative responses inconsistently, often leading to query floods against root and authoritative servers. RFC 2308 standardized how resolvers cache `NXDOMAIN` and `NODATA` responses.
+
+### The Negative TTL Calculation
+
+When an authoritative server constructs a negative response (`NXDOMAIN` or `NODATA`), it attaches its `SOA` record in the Authority section. The standard RFC 883/1035 format for an `SOA` record contains seven fields:
+
+```text
+MNAME RNAME SERIAL REFRESH RETRY EXPIRE MINIMUM
+```
+
+RFC 2308 repurposed the seventh field—historically named `MINIMUM`—to mean the *Default Negative Caching TTL*. 
+
+RFC 2308 section 5 puts the calculation on the authoritative side: the server sets the TTL of the SOA copy it places in the authority section to the lower of the SOA's own TTL and the MINIMUM field. The resolver caches the negative answer for that TTL and counts it down like any other:
+
+$$\text{Negative TTL} = \min(\text{SOA Record TTL}, \text{SOA MINIMUM field})$$
+
+```text
++------------------------------------------------------------------+
+| Authoritative Response                                           |
+| SOA Record TTL = 3600s                                           |
+| SOA MINIMUM    = 300s                                            |
++------------------------------------------------------------------+
+                                 |
+                                 v
+          Authoritative sends the SOA in AUTHORITY with
+               TTL = min(3600, 300) = 300 seconds
+                                 |
+                                 v
++------------------------------------------------------------------+
+| Resolver Cache Entry                                             |
+| Key: nope.lab.test (NXDOMAIN)                                    |
+| Expires in: 300 seconds                                          |
++------------------------------------------------------------------+
+```
+
+If the `SOA` record itself has a TTL of 3600 seconds, but the `SOA MINIMUM` field is set to 4 seconds, the cached negative response expires in 4 seconds.
+
+### Caching Scope Differences
+
+The scope of a cached negative response depends on whether it is an `NXDOMAIN` or a `NODATA` answer:
+
+1. **NXDOMAIN Caching**: Cached per domain name. If a query for `ghost.lab.test A` returns `NXDOMAIN`, the resolver caches the non-existence of `ghost.lab.test`. Subsequent queries for `ghost.lab.test MX`, `ghost.lab.test TXT`, or `ghost.lab.test AAAA` during the negative TTL window are answered locally with `NXDOMAIN` without querying the authoritative server.
+2. **NODATA Caching**: Cached per `(name, type)` tuple. If a query for `mail.lab.test A` returns `NODATA`, the resolver caches that `mail.lab.test` has no `A` record. However, if the client immediately queries `mail.lab.test MX`, the resolver MUST query the authoritative server, because other types may exist at that name.
+
+### The "Record Added After a Miss" Problem
+
+A frequent operational failure mode occurs when deploying new endpoints or services:
+
+1. An engineer or deployment script attempts to connect to `new.lab.test`.
+2. The client performs a DNS lookup for `new.lab.test A`.
+3. The authoritative server has not yet received the new record (or propagation is pending). It returns `NXDOMAIN` with a 3600-second negative TTL.
+4. The resolver caches this `NXDOMAIN` response for 3600 seconds.
+5. The engineer publishes the `new.lab.test A -> 192.0.2.30` record to the authoritative server 10 seconds later.
+6. For the remaining 3590 seconds, all client queries routed through that resolver continue to receive the cached `NXDOMAIN` response.
+
+```text
+Client                  Resolver                   Authoritative
+  |                         |                            |
+  |--- Q: new.lab.test A -->|                            |
+  |                         |--- Q: new.lab.test A ----->|
+  |                         |<-- R: NXDOMAIN (TTL=3600s)-|
+  |<-- R: NXDOMAIN ---------|                            |
+  |    (Cache entry created for 3600s)                   |
+  |                         |                            |
+  |        [ Control plane adds record to Auth ]         |
+  |                         |                            |
+  |--- Q: new.lab.test A -->|                            |
+  |<-- R: NXDOMAIN ---------| (Served from cache)        |
+  |    (Ignores authoritative update until TTL=0)        |
+```
+
+### Mitigation Strategies
+
+To reduce the impact of negative cache pinning:
+
+1. **Query Avoidance**: Do not test or poll domain names before automation completes record creation.
+2. **Low SOA MINIMUM**: Set the zone `SOA MINIMUM` field to a small value (e.g., 5 to 60 seconds) for zones with frequent record updates.
+3. **Resolver TTL Capping**: Configure recursive resolvers to cap the maximum negative TTL (`cache-max-negative-ttl` in Unbound, `max-ncache-ttl` in BIND).
+4. **Targeted Cache Flushing**: Execute targeted cache clear operations on recursive resolvers when records are updated (`unbound-control flush_negative`, `rndc flushname`).
+
+## Resolver Negative TTL Caps
+
+Recursive resolvers do not blindly trust arbitrarily high negative TTL values provided by authoritative servers. To protect against long-lasting negative cache poisoning or configuration errors, modern resolvers enforce strict upper caps on negative caching.
+
+Unbound defaults `cache-max-negative-ttl` to 3600 seconds (1 hour), overriding higher authoritative TTL values. Operators can lower this parameter for environments with dynamic record provisioning:
+
+```text
+# Unbound resolver configuration snippet
+server:
+    cache-max-negative-ttl: 60
+    cache-min-negative-ttl: 5
+```
+
+BIND 9 defaults `max-ncache-ttl` to 10800 seconds (3 hours):
+
+```text
+# BIND 9 named.conf configuration snippet
+options {
+    max-ncache-ttl 60;
+};
+```
+
+When a resolver applies an upper cap, the negative TTL is calculated as:
+
+$$\text{Effective Cache TTL} = \min(\text{SOA Record TTL}, \text{SOA MINIMUM}, \text{Resolver Max Negative TTL})$$
+
+If an authoritative server returns an `SOA MINIMUM` of 86400 seconds (24 hours), but the resolver is configured with a maximum negative TTL of 60 seconds, the resolver discards the negative cache entry after 60 seconds.
+
+## RFC 8020: "NXDOMAIN: There Really Is Nothing Underneath"
+
+Historically, recursive resolvers treated `NXDOMAIN` strictly on a per-query basis. If a resolver cached an `NXDOMAIN` for `gone.lab.test`, and a client subsequently queried `a.gone.lab.test`, old resolvers would send a new query upstream for `a.gone.lab.test`.
+
+RFC 8020 ("NXDOMAIN: There Really Is Nothing Underneath") states that an NXDOMAIN denies the name and every name below it. A resolver that caches an NXDOMAIN for `gone.lab.test` SHOULD treat all names at or below it as non-existent and answer later queries for them from the cache. The RFC uses SHOULD, not MUST, precisely because of broken servers like the one in lab section 5.
+
+### Subtree Pruning Semantics
+
+Under RFC 8020, a cached `NXDOMAIN` for `gone.lab.test` allows the resolver to synthesize `NXDOMAIN` responses for:
+- `a.gone.lab.test`
+- `deep.a.gone.lab.test`
+- `any.sub.domain.gone.lab.test`
+
+This optimization prevents query leaks to authoritative servers for invalid subdomains beneath a known non-existent node.
+
+```text
+Cached: gone.lab.test -> NXDOMAIN
+           |
+   ---------------------------------
+   |                               |
+a.gone.lab.test             deep.a.gone.lab.test
+(Synthesized NXDOMAIN)      (Synthesized NXDOMAIN)
+[No Upstream Query Sent]    [No Upstream Query Sent]
+```
+
+### The Legacy Server Problem & DNSSEC Requirement
+
+RFC 8020 relies on authoritative servers correctly implementing Empty Non-Terminals. However, non-compliant or legacy authoritative DNS implementations historically returned `NXDOMAIN` when queried for an ENT (such as `b.lab.test`), even though a child record (`x.b.lab.test`) existed.
+
+If a resolver blindly applied RFC 8020 to such a broken server:
+1. Client queries `b.lab.test A`.
+2. Broken server incorrectly returns `NXDOMAIN` (instead of `NOERROR / NODATA`).
+3. Resolver caches `NXDOMAIN` for `b.lab.test`.
+4. Client queries `x.b.lab.test A`.
+5. Resolver applies RFC 8020, synthesizes `NXDOMAIN` for `x.b.lab.test`, and blocks access to a record that actually exists!
+
+Because of this risk, Unbound's `harden-below-nxdomain` (default yes) is applied only to DNSSEC-secure NXDOMAINs; its manual explains that the old software which returns NXDOMAIN for empty non-terminals does not do DNSSEC. A signed NXDOMAIN comes with NSEC or NSEC3 proof that was generated from the real zone contents, so an empty non-terminal cannot be denied by accident.
+
+## Caching Resolution Failures (RFC 9520)
+
+`NXDOMAIN` and `NODATA` describe responses where an authoritative server was successfully reached and returned a valid DNS message. A different class of failures occurs when the resolver cannot obtain a response due to network timeouts, server crashes, unreachable IP addresses, or misconfigured glue records.
+
+RFC 9520 ("Negative Caching of DNS Resolution Failures", December 2023) requires resolvers to cache resolution failures: timeouts, unreachable servers, and DNSSEC validation failures.
+
+### Failure Cache Rules
+
+1. **Minimum Duration**: Resolvers MUST cache resolution failures for at least 1 second.
+2. **Maximum Duration**: Resolvers MUST NOT cache resolution failures for longer than 5 minutes (300 seconds).
+3. **Protection Objective**: Without failure caching, an application launching dozens of concurrent threads querying a failing domain will cause the recursive resolver to launch an upstream query burst, amplifying Denial of Service (DoS) traffic against authoritative infrastructure.
+
+```text
+Client Burst (10 Queries)       Resolver                     Failing Upstream
+    |                              |                                |
+    |-- Query 1 ------------------>|-- Upstream Query 1 ----------->|
+    |                              |   (Timeout: 300ms)             |
+    |                              |<-- Timeout --------------------|
+    |<- SERVFAIL ------------------|                                |
+    |                              | [Cache SERVFAIL for 2s]        |
+    |-- Query 2 ------------------>|                                |
+    |<- SERVFAIL (Cached) ---------| [No Upstream Query]            |
+    |-- Query 3 ------------------>|                                |
+    |<- SERVFAIL (Cached) ---------| [No Upstream Query]            |
+```
+
+## DNSSEC Denial of Existence Dynamics
+
+In an unsigned zone, an authoritative server returns plain `NXDOMAIN` or `NODATA` text blocks. An attacker in the network path could forge these responses to block communication. DNSSEC prevents forgery by providing cryptographic proofs of non-existence.
+
+### NSEC (RFC 4035)
+
+Next Secure (`NSEC`) records prove non-existence by linking existing records in alphabetical order like a canonical linked list.
+
+If a zone contains records for `a.example` and `c.example`, the `NSEC` record for `a.example` states:
+> "The next name in this zone is `c.example`. Between `a.example` and `c.example`, no names exist."
+
+```text
+[ Record: a.example ] ------ NSEC ------> [ Record: c.example ]
+        |                                       |
+        +--- Proves non-existence of b.example -+
+```
+
+When a client queries `b.example`, the server returns `NXDOMAIN` with the signed `NSEC` record owned by `a.example`, proving that `b.example` does not exist, plus a second `NSEC` proving there is no wildcard (`*.example`) that could have synthesised an answer. Each `NSEC` also carries a type bitmap listing the types that *do* exist at its owner name.
+
+### NSEC3 (RFC 5155)
+
+Because plain `NSEC` records allow an attacker to traverse ("walk") an entire zone by following the chain of next-names, RFC 5155 introduced `NSEC3`.
+
+`NSEC3` hashes domain names (using salted SHA-1) before sorting them:
+
+```text
+[ Hash(a.example): 5JH0... ] --- NSEC3 ---> [ Hash(c.example): GTB1... ]
+```
+
+An `NSEC3` denial of existence response provides signed hashes proving that no domain name in the zone hashes to a value between `5JH0...` and `GTB1...`. RFC 9276 provides operational guidance to set iteration counts to zero and avoid custom salt strings to minimize CPU overhead on resolvers.
+
+### RFC 8198: Aggressive Use of DNSSEC-Validated Cache
+
+Because `NSEC` and `NSEC3` records cover ranges of non-existent names, a validating resolver with RFC 8198 support can synthesise `NXDOMAIN` for names it has never asked about. Once it holds a validated `NSEC` saying "after `m.example` the next name is `p.example`" (and the wildcard proof), a query for `n.example` or `o.example` is answered from the cache. This is a strong defence against random-subdomain floods, and it only works for zones that publish real ranges; compact denial (below) deliberately gives none.
+
+### RFC 9824: Compact Denial of Existence ("Black Lies")
+
+Offline-signed zones carry a pre-computed `NSEC` or `NSEC3` chain. Online signers, which sign answers as they are generated, cannot keep such a chain for zones that change constantly. Earlier schemes ("white lies", RFC 4470) generated minimally covering `NSEC` records around the queried name, but still needed two of them for an NXDOMAIN.
+
+RFC 9824 formalizes **Compact Denial of Existence** (historically termed "Black Lies").
+
+Compact denial answers a query for a non-existent name as if the name existed with no data for the queried type: `NOERROR`, empty answer, and one `NSEC` owned by the queried name whose next name is the name with a `\000` label prepended (the immediate successor in canonical order). One signature per answer, no zone contents disclosed.
+
+```text
+Query: no-such-name-0625.ietf.org A
+
+Response:
+Header: RCODE = 0 (NOERROR)
+Answer: (empty)
+Authority:
+  no-such-name-0625.ietf.org. 1800 IN NSEC \000.no-such-name-0625.ietf.org. RRSIG NSEC NXNAME
+```
+
+```text
+Traditional NSEC (Range Proof)           Compact Denial (RFC 9824)
+------------------------------           -------------------------
+RCODE: 3 (NXDOMAIN)                      RCODE: 0 (NOERROR)
+Proves: Nothing exists between           Proves: Name exists, but requested
+        NameA and NameB                          type is missing
+Uses:   Pre-signed static chains         Uses:   On-the-fly dynamically
+                                                 generated NSEC records
+```
+
+#### The Wire Mechanism of Compact Denial
+
+1. **RCODE manipulation**: The server returns `RCODE 0` (`NOERROR`) instead of `RCODE 3` (`NXDOMAIN`).
+2. **Synthetic NSEC record**: owned by the queried name, with next name `\000.<queried name>`, so it covers nothing but the name itself.
+3. **The NXNAME Signal**: The `NSEC` type bitmap contains a special assignment: type 128 (`NXNAME`).
+
+The presence of `NXNAME` (type 128) in the `NSEC` bitmap signals to a DNSSEC-aware resolver that the host name **does not actually exist**, despite the `NOERROR` RCODE in the response header.
+
+#### Operational Consequences
+
+- **Dashboard and Metric Skew**: Monitoring systems or SIEM tools that count `NXDOMAIN` events by parsing DNS header RCODEs will completely undercount non-existent domain queries for zones using compact denial. These queries appear in network logs as `NOERROR`.
+- **RFC 8020 Breakdown**: Resolvers that do not implement RFC 9824 cannot apply RFC 8020 subtree pruning to compact denial zones, because the header carries `RCODE 0` (`NOERROR`) rather than `NXDOMAIN`.
+- **Restoring NXDOMAIN with EDNS**: RFC 9824 section 5.1 defines the Compact Answers OK (CO) flag, the second bit of the EDNS flags field. A resolver that sets it tells the server it understands NXNAME; a supporting server then sets RCODE 3 on such answers while keeping the compact proof. Without CO the RCODE stays `NOERROR`. A validating resolver may also restore NXDOMAIN itself for downstream clients that did not set DO.
+- **No range, no aggressive caching**: a compact proof covers only the queried name, so RFC 8198 synthesis gains nothing from it. Random-subdomain floods against such zones always reach the online signer.
+
+## The Lab
+
+The lab consists of two parts:
+
+1. **Local Network Namespace Lab (`lab-dns.sh`)**: A Python-based DNS environment running isolated authoritative (`auth.py`) and resolver (`resolver.py`) daemons communicating via loopback interfaces on ports 5300 and 5301. It evaluates `NXDOMAIN` versus `NODATA`, empty non-terminals, RFC 2308 negative caching timelines, RFC 8020 tree behavior, negative TTL caps, and RFC 9520 failure caching.
+2. **Live DoH Analysis (`live.py`)**: A Python script performing HTTPS JSON queries against Cloudflare (`cloudflare-dns.com`) and Google (`dns.google`) public DNS endpoints across real signed and unsigned domains (`isc.org`, `debian.org`, `ietf.org`, `kernel.org`).
+
+### Lab files
+
+Wire-format helpers shared by every program (A, NS, MX, SOA and TXT only):
+
+`wire.py`:
+
+```python
+"""Minimal DNS wire format helpers (RFC 1035), enough for A, MX, SOA, TXT."""
+import struct
+TYPES = {"A": 1, "NS": 2, "SOA": 6, "MX": 15, "TXT": 16, "AAAA": 28}
+NAMES = {v: k for k, v in TYPES.items()}
+RCODES = {0: "NOERROR", 2: "SERVFAIL", 3: "NXDOMAIN"}
+
+def enc_name(n):
+    out = b""
+    for label in n.rstrip(".").split("."):
+        if label:
+            out += bytes([len(label)]) + label.encode()
+    return out + b"\0"
+
+def dec_name(buf, off):
+    labels, jumped, end = [], False, None
+    while True:
+        ln = buf[off]
+        if ln & 0xC0 == 0xC0:
+            if not jumped:
+                end = off + 2
+            off, jumped = struct.unpack("!H", buf[off:off + 2])[0] & 0x3FFF, True
+            continue
+        off += 1
+        if ln == 0:
+            break
+        labels.append(buf[off:off + ln].decode()); off += ln
+    return ".".join(labels).lower() + ".", (end if jumped else off)
+
+def query(qid, name, qtype):
+    return struct.pack("!HHHHHH", qid, 0x0100, 1, 0, 0, 0) + enc_name(name) + struct.pack("!HH", TYPES[qtype], 1)
+
+def rr(name, rtype, ttl, rdata):
+    return enc_name(name) + struct.pack("!HHIH", TYPES[rtype], 1, ttl, len(rdata)) + rdata
+
+def rdata(rtype, value):
+    if rtype == "A":
+        return bytes(int(x) for x in value.split("."))
+    if rtype == "NS":
+        return enc_name(value)
+    if rtype == "MX":
+        pref, host = value.split(); return struct.pack("!H", int(pref)) + enc_name(host)
+    if rtype == "SOA":
+        m, r, *nums = value.split(); return enc_name(m) + enc_name(r) + struct.pack("!IIIII", *map(int, nums))
+    if rtype == "TXT":
+        return bytes([len(value)]) + value.encode()
+    raise ValueError(rtype)
+
+def response(qid, qname, qtype, rcode, answers=(), authority=(), ra=False):
+    flags = 0x8400 | (0x0080 if ra else 0) | rcode       # QR, AA (RA when a resolver answers)
+    if ra:
+        flags &= ~0x0400                                  # resolvers do not set AA
+    return (struct.pack("!HHHHHH", qid, flags, 1, len(answers), len(authority), 0)
+            + enc_name(qname) + struct.pack("!HH", TYPES[qtype], 1) + b"".join(answers) + b"".join(authority))
+
+def parse(buf):
+    qid, flags, qd, an, ns, ar = struct.unpack("!HHHHHH", buf[:12])
+    off = 12; qname, off = dec_name(buf, off); qtype = struct.unpack("!H", buf[off:off + 2])[0]; off += 4
+    secs = []
+    for count in (an, ns):
+        sec = []
+        for _ in range(count):
+            name, off = dec_name(buf, off)
+            t, _c, ttl, rdlen = struct.unpack("!HHIH", buf[off:off + 10]); off += 10
+            rd = buf[off:off + rdlen]
+            if t == 6:
+                _m, o = dec_name(buf, off); _r, o = dec_name(buf, o)
+                val = struct.unpack("!IIIII", buf[o:o + 20])      # serial refresh retry expire minimum
+            elif t == 1:
+                val = ".".join(map(str, rd))
+            elif t == 15:
+                val = f"{struct.unpack('!H', rd[:2])[0]} {dec_name(buf, off + 2)[0]}"
+            else:
+                val = rd.hex()
+            off += rdlen
+            sec.append((name, NAMES.get(t, t), ttl, val))
+        secs.append(sec)
+    return {"id": qid, "rcode": flags & 0xF, "aa": bool(flags & 0x0400), "qname": qname,
+            "qtype": NAMES.get(qtype, qtype), "answer": secs[0], "authority": secs[1]}
+```
+
+The zone. SOA MINIMUM is 4 s so negative entries expire within the lab:
+
+`zone.base`:
+
+```text
+; name           ttl  type value
+lab.test.        600  SOA  ns.lab.test. hostmaster.lab.test. 2026111501 3600 600 86400 4
+lab.test.        600  NS   ns.lab.test.
+www.lab.test.    30   A    192.0.2.10
+mail.lab.test.   30   MX   10 www.lab.test.
+x.b.lab.test.    30   A    192.0.2.20
+```
+
+The toy authoritative server. It re-reads `zone.txt` on every query so records can be added mid-run:
+
+`auth.py`:
+
+```python
+"""Toy authoritative server for lab.test. Re-reads zone.txt on every query.
+usage: auth.py PORT [--broken-ent]   (--broken-ent: answer NXDOMAIN for empty non-terminals, like very old servers)"""
+import socket, sys
+from wire import parse, response, rr, rdata
+ZONE = "lab.test."
+def load():
+    recs = []
+    for line in open("zone.txt"):
+        if line.strip() and not line.startswith(";"):
+            name, ttl, rtype, value = line.split(None, 3)
+            recs.append((name.lower(), int(ttl), rtype, value.strip()))
+    return recs
+def main():
+    port, broken = int(sys.argv[1]), "--broken-ent" in sys.argv
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.bind(("127.0.0.1", port))
+    while True:
+        buf, peer = s.recvfrom(512); q = parse(buf); name, qt = q["qname"], q["qtype"]
+        recs = load()
+        soa = next(r for r in recs if r[2] == "SOA")
+        neg_ttl = min(soa[1], int(soa[3].split()[-1]))          # RFC 2308 section 5
+        soa_rr = rr(ZONE, "SOA", neg_ttl, rdata("SOA", soa[3]))
+        exact = [r for r in recs if r[0] == name]
+        below = [r for r in recs if r[0].endswith("." + name)]
+        hits = [rr(r[0], r[2], r[1], rdata(r[2], r[3])) for r in exact if r[2] == qt]
+        if hits:
+            out = response(q["id"], name, qt, 0, hits)
+        elif exact or (below and not broken):
+            out = response(q["id"], name, qt, 0, authority=[soa_rr])      # NODATA
+        else:
+            out = response(q["id"], name, qt, 3, authority=[soa_rr])      # NXDOMAIN
+        s.sendto(out, peer)
+main()
+```
+
+The toy caching resolver, with switches for RFC 8020, a negative TTL cap and RFC 9520 failure caching:
+
+`resolver.py`:
+
+```python
+"""Toy caching resolver in front of one authoritative server (no delegation walk).
+usage: resolver.py PORT UPSTREAM_PORT [--rfc8020] [--neg-max N] [--fail-cache S]
+Prints one line per upstream query so the lab can count them."""
+import socket, sys, time
+from wire import parse, query, response, rr, rdata, TYPES
+args = sys.argv[1:]
+port, up = int(args[0]), int(args[1])
+rfc8020 = "--rfc8020" in args
+neg_max = int(args[args.index("--neg-max") + 1]) if "--neg-max" in args else 3600
+fail_cache = float(args[args.index("--fail-cache") + 1]) if "--fail-cache" in args else 0
+T0 = time.monotonic()
+pos, nodata, nxdomain, failed = {}, {}, {}, {}   # key -> (expiry, payload)
+def now(): return time.monotonic()
+def log(msg): print(f"  [resolver t={now() - T0:5.1f}s] {msg}", flush=True)
+def soa_rr(soa, ttl):
+    return rr(soa[0], "SOA", ttl, rdata("SOA", "ns.lab.test. hostmaster.lab.test. " + " ".join(map(str, soa[3]))))
+def lookup_cache(name, qt):
+    t = now()
+    if (name, qt) in pos and pos[(name, qt)][0] > t:
+        exp, rrs = pos[(name, qt)]; return 0, [rr(n, ty, int(exp - t), rdata(ty, v)) for n, ty, v in rrs], []
+    cands = [name] + ([name.split(".", k)[-1] for k in range(1, name.count(".") - 1)] if rfc8020 else [])
+    for c in cands:                                   # RFC 8020: an NXDOMAIN ancestor covers the subtree
+        if c in nxdomain and nxdomain[c][0] > t:
+            exp, soa = nxdomain[c]; return 3, [], [soa_rr(soa, int(exp - t))]
+    if (name, qt) in nodata and nodata[(name, qt)][0] > t:
+        exp, soa = nodata[(name, qt)]; return 0, [], [soa_rr(soa, int(exp - t))]
+    if (name, qt) in failed and failed[(name, qt)] > t:
+        return 2, [], []
+    return None
+def ask(name, qt):
+    u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); u.settimeout(0.3)
+    u.sendto(query(7, name, qt), ("127.0.0.1", up))
+    try:
+        r = parse(u.recvfrom(4096)[0])
+    except socket.timeout:
+        log(f"upstream {name} {qt} -> timeout"); return None
+    t = now()
+    if r["answer"]:
+        ttl = min(a[2] for a in r["answer"])
+        pos[(name, qt)] = (t + ttl, [(a[0], a[1], a[3]) for a in r["answer"]])
+    elif r["authority"]:
+        soa = r["authority"][0]; ttl = min(soa[2], neg_max)
+        (nxdomain.__setitem__(name, (t + ttl, soa)) if r["rcode"] == 3 else nodata.__setitem__((name, qt), (t + ttl, soa)))
+    if r["answer"]:
+        what = "NOERROR"
+    else:
+        what = ("NXDOMAIN" if r["rcode"] == 3 else "NOERROR (NODATA)") + f", negative TTL {min(r['authority'][0][2], neg_max)}s"
+    log(f"upstream {name} {qt} -> {what}")
+    return r
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.bind(("127.0.0.1", port))
+while True:
+    buf, peer = s.recvfrom(512); q = parse(buf); name, qt = q["qname"], q["qtype"]
+    hit = lookup_cache(name, qt)
+    if hit is None:
+        r = ask(name, qt)
+        if r is None:
+            if fail_cache:
+                failed[(name, qt)] = now() + fail_cache
+            hit = (2, [], [])
+        else:
+            hit = lookup_cache(name, qt) or (r["rcode"], [], [])
+    s.sendto(response(q["id"], name, qt, hit[0], hit[1], hit[2], ra=True), peer)
+```
+
+A one-shot client:
+
+`q.py`:
+
+```python
+"""q.py PORT NAME TYPE: one query, one line of output."""
+import random, socket, sys
+from wire import parse, query, RCODES
+port, name, qt = int(sys.argv[1]), sys.argv[2], sys.argv[3]
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.settimeout(2)
+s.sendto(query(random.randrange(65536), name, qt), ("127.0.0.1", port))
+r = parse(s.recvfrom(4096)[0])
+kind = RCODES[r["rcode"]] + (" (NODATA)" if r["rcode"] == 0 and not r["answer"] else "")
+ans = ", ".join(f"{a[3]} ttl={a[2]}" for a in r["answer"])
+soa = f" SOA-in-authority ttl={r['authority'][0][2]} (SOA MINIMUM {r['authority'][0][3][4]})" if r["authority"] else ""
+print(f"  {name:22} {qt:4} -> {kind:17} {ans}{soa}")
+```
+
+The driver, run as `unshare -urn sh lab-dns.sh`:
+
+`lab-dns.sh`:
+
+```bash
+#!/bin/sh
+# Run as: unshare -urn sh lab-dns.sh   (private loopback; no root, no installs)
+ip link set lo up
+cd "$(dirname "$0")"
+A=5300; R=5301
+P=""
+bg() { "$@" & P="$P $!"; sleep 0.3; }
+stop() { kill $P 2>/dev/null; wait $P 2>/dev/null; P=""; }
+q() { python3 q.py "$@"; }
+cp zone.base zone.txt
+
+echo "== 1. the three kinds of answer, straight from the authoritative server"
+bg python3 auth.py $A
+q $A www.lab.test A; q $A nope.lab.test A; q $A mail.lab.test A; q $A mail.lab.test MX
+q $A b.lab.test A; q $A x.b.lab.test A
+stop
+
+echo; echo "== 2. a name created after a miss stays invisible for the negative TTL"
+bg python3 auth.py $A; bg python3 -u resolver.py $R $A
+q $R new.lab.test A
+echo "new.lab.test. 30 A 192.0.2.30" >> zone.txt; echo "  (t=0.6s record added to the zone)"
+q $A new.lab.test A | sed 's/^  /  auth:     /'
+for i in 1 2 3 4 5; do sleep 1; q $R new.lab.test A | sed 's/^  /  resolver: /'; done
+stop; cp zone.base zone.txt
+
+echo; echo "== 3. NXDOMAIN covers every type; NODATA covers one type"
+bg python3 auth.py $A; bg python3 -u resolver.py $R $A
+q $R ghost.lab.test A; q $R ghost.lab.test MX; q $R ghost.lab.test TXT
+q $R mail.lab.test A; q $R mail.lab.test MX
+stop
+
+echo; echo "== 4. RFC 8020: nothing below an NXDOMAIN (resolver --rfc8020)"
+bg python3 auth.py $A; bg python3 -u resolver.py $R $A --rfc8020
+q $R gone.lab.test A; q $R a.gone.lab.test A; q $R deep.a.gone.lab.test A
+stop
+
+echo; echo "== 5. ...and why resolvers only trust it with DNSSEC: an old server that NXDOMAINs empty non-terminals"
+for opt in "" --rfc8020; do
+  echo "  -- resolver ${opt:-(no RFC 8020)}"
+  bg python3 auth.py $A --broken-ent; bg python3 -u resolver.py $R $A $opt
+  q $R b.lab.test A
+  q $R x.b.lab.test A
+  stop
+done
+
+echo; echo "== 6. negative TTL capped by the resolver (--neg-max 1) vs the zone's 4 s"
+bg python3 auth.py $A; bg python3 -u resolver.py $R $A --neg-max 1
+q $R new2.lab.test A
+echo "new2.lab.test. 30 A 192.0.2.31" >> zone.txt
+sleep 1.2; q $R new2.lab.test A
+stop; cp zone.base zone.txt
+
+echo; echo "== 7. RFC 9520: caching resolution failures (authoritative server down), 10 client queries"
+for fc in 0 2; do
+  echo "  -- resolver --fail-cache $fc"
+  bg python3 -u resolver.py $R $A --fail-cache $fc
+  for i in 1 2 3 4 5 6 7 8 9 10; do q $R www.lab.test A > /dev/null; done
+  q $R www.lab.test A
+  stop
+done
+```
+
+The live probes, read-only HTTPS GETs to two public DoH JSON APIs:
+
+`live.py`:
+
+```python
+"""Live negative answers through public DoH JSON APIs (read-only GETs)."""
+import json, time, urllib.request
+TYPES = {6: "SOA", 47: "NSEC", 50: "NSEC3"}
+def doh(base, name, qtype="A", do=True):
+    url = f"{base}?name={name}&type={qtype}" + ("&do=1" if do else "")
+    req = urllib.request.Request(url, headers={"accept": "application/dns-json"})
+    return json.load(urllib.request.urlopen(req, timeout=5))
+def show(base, name, qtype="A"):
+    d = doh(base, name, qtype)
+    st = {0: "NOERROR", 3: "NXDOMAIN"}.get(d["Status"], d["Status"])
+    print(f"  {name:32} {qtype:4} {st:8} answers={len(d.get('Answer', []))}")
+    for a in d.get("Authority", []):
+        t = TYPES.get(a["type"])
+        if t == "SOA":
+            f = a["data"].split()
+            print(f"      SOA  ttl={a['TTL']:<5} (zone SOA MINIMUM={f[-1]})")
+        elif t:
+            print(f"      {t:5} ttl={a['TTL']:<5} {a['data'][:70]}")
+CF, GG = "https://cloudflare-dns.com/dns-query", "https://dns.google/resolve"
+print("== L1. same kind of question, four zones, four denial styles (Cloudflare resolver, DO=1)")
+for z in ["isc.org", "debian.org", "ietf.org", "kernel.org"]:
+    show(CF, f"no-such-name-0625.{z}")
+print("\n== L2. compact denial: NXNAME restores the distinction (Google resolver, DO=1)")
+show(GG, "no-such-name-0625.ietf.org")
+show(GG, "www.ietf.org", "MX")
+print("\n== L3. the negative entry ages in the resolver cache (same name, 3 s apart)")
+for _ in range(2):
+    show(CF, "no-such-name-0625.debian.org"); time.sleep(3)
+```
+
+### Execution output
+
+`lab-dns.sh`:
+
+```text
+== 1. the three kinds of answer, straight from the authoritative server
+  www.lab.test           A    -> NOERROR           192.0.2.10 ttl=30
+  nope.lab.test          A    -> NXDOMAIN           SOA-in-authority ttl=4 (SOA MINIMUM 4)
+  mail.lab.test          A    -> NOERROR (NODATA)   SOA-in-authority ttl=4 (SOA MINIMUM 4)
+  mail.lab.test          MX   -> NOERROR           10 www.lab.test. ttl=30
+  b.lab.test             A    -> NOERROR (NODATA)   SOA-in-authority ttl=4 (SOA MINIMUM 4)
+  x.b.lab.test           A    -> NOERROR           192.0.2.20 ttl=30
+
+== 2. a name created after a miss stays invisible for the negative TTL
+  [resolver t=  0.3s] upstream new.lab.test. A -> NXDOMAIN, negative TTL 4s
+  new.lab.test           A    -> NXDOMAIN           SOA-in-authority ttl=3 (SOA MINIMUM 4)
+  (t=0.6s record added to the zone)
+  auth:     new.lab.test           A    -> NOERROR           192.0.2.30 ttl=30
+  resolver: new.lab.test           A    -> NXDOMAIN           SOA-in-authority ttl=2 (SOA MINIMUM 4)
+  resolver: new.lab.test           A    -> NXDOMAIN           SOA-in-authority ttl=1 (SOA MINIMUM 4)
+  resolver: new.lab.test           A    -> NXDOMAIN           SOA-in-authority ttl=0 (SOA MINIMUM 4)
+  [resolver t=  4.4s] upstream new.lab.test. A -> NOERROR
+  resolver: new.lab.test           A    -> NOERROR           192.0.2.30 ttl=29
+  resolver: new.lab.test           A    -> NOERROR           192.0.2.30 ttl=28
+
+== 3. NXDOMAIN covers every type; NODATA covers one type
+  [resolver t=  0.3s] upstream ghost.lab.test. A -> NXDOMAIN, negative TTL 4s
+  ghost.lab.test         A    -> NXDOMAIN           SOA-in-authority ttl=3 (SOA MINIMUM 4)
+  ghost.lab.test         MX   -> NXDOMAIN           SOA-in-authority ttl=3 (SOA MINIMUM 4)
+  ghost.lab.test         TXT  -> NXDOMAIN           SOA-in-authority ttl=3 (SOA MINIMUM 4)
+  [resolver t=  0.3s] upstream mail.lab.test. A -> NOERROR (NODATA), negative TTL 4s
+  mail.lab.test          A    -> NOERROR (NODATA)   SOA-in-authority ttl=3 (SOA MINIMUM 4)
+  [resolver t=  0.4s] upstream mail.lab.test. MX -> NOERROR
+  mail.lab.test          MX   -> NOERROR           10 www.lab.test. ttl=29
+
+== 4. RFC 8020: nothing below an NXDOMAIN (resolver --rfc8020)
+  [resolver t=  0.3s] upstream gone.lab.test. A -> NXDOMAIN, negative TTL 4s
+  gone.lab.test          A    -> NXDOMAIN           SOA-in-authority ttl=3 (SOA MINIMUM 4)
+  a.gone.lab.test        A    -> NXDOMAIN           SOA-in-authority ttl=3 (SOA MINIMUM 4)
+  deep.a.gone.lab.test   A    -> NXDOMAIN           SOA-in-authority ttl=3 (SOA MINIMUM 4)
+
+== 5. ...and why resolvers only trust it with DNSSEC: an old server that NXDOMAINs empty non-terminals
+  -- resolver (no RFC 8020)
+  [resolver t=  0.3s] upstream b.lab.test. A -> NXDOMAIN, negative TTL 4s
+  b.lab.test             A    -> NXDOMAIN           SOA-in-authority ttl=3 (SOA MINIMUM 4)
+  [resolver t=  0.3s] upstream x.b.lab.test. A -> NOERROR
+  x.b.lab.test           A    -> NOERROR           192.0.2.20 ttl=29
+  -- resolver --rfc8020
+  [resolver t=  0.3s] upstream b.lab.test. A -> NXDOMAIN, negative TTL 4s
+  b.lab.test             A    -> NXDOMAIN           SOA-in-authority ttl=3 (SOA MINIMUM 4)
+  x.b.lab.test           A    -> NXDOMAIN           SOA-in-authority ttl=3 (SOA MINIMUM 4)
+
+== 6. negative TTL capped by the resolver (--neg-max 1) vs the zone's 4 s
+  [resolver t=  0.3s] upstream new2.lab.test. A -> NXDOMAIN, negative TTL 1s
+  new2.lab.test          A    -> NXDOMAIN           SOA-in-authority ttl=0 (SOA MINIMUM 4)
+  [resolver t=  1.5s] upstream new2.lab.test. A -> NOERROR
+  new2.lab.test          A    -> NOERROR           192.0.2.31 ttl=29
+
+== 7. RFC 9520: caching resolution failures (authoritative server down), 10 client queries
+  -- resolver --fail-cache 0
+  [resolver t=  0.6s] upstream www.lab.test. A -> timeout
+  [resolver t=  0.9s] upstream www.lab.test. A -> timeout
+  [resolver t=  1.2s] upstream www.lab.test. A -> timeout
+  [resolver t=  1.6s] upstream www.lab.test. A -> timeout
+  [resolver t=  1.9s] upstream www.lab.test. A -> timeout
+  [resolver t=  2.2s] upstream www.lab.test. A -> timeout
+  [resolver t=  2.5s] upstream www.lab.test. A -> timeout
+  [resolver t=  2.8s] upstream www.lab.test. A -> timeout
+  [resolver t=  3.1s] upstream www.lab.test. A -> timeout
+  [resolver t=  3.4s] upstream www.lab.test. A -> timeout
+  [resolver t=  3.8s] upstream www.lab.test. A -> timeout
+  www.lab.test           A    -> SERVFAIL          
+  -- resolver --fail-cache 2
+  [resolver t=  0.6s] upstream www.lab.test. A -> timeout
+  www.lab.test           A    -> SERVFAIL          
+```
+
+`live.py`, run on 2026-11-15 around 07:00 IST:
+
+```text
+== L1. same kind of question, four zones, four denial styles (Cloudflare resolver, DO=1)
+  no-such-name-0625.isc.org        A    NXDOMAIN answers=0
+      SOA  ttl=3600  (zone SOA MINIMUM=3600)
+      NSEC  ttl=3600  ns-ext.isc.org. A RRSIG NSEC
+      NSEC  ttl=3600  _acme-challenge.isc.org. A NS SOA MX TXT AAAA NAPTR RRSIG NSEC DNSKEY 
+  no-such-name-0625.debian.org     A    NXDOMAIN answers=0
+      SOA  ttl=600   (zone SOA MINIMUM=600)
+      NSEC3 ttl=600   1 0 0 - 5JH0UAQG92BKVCT2E30OPMPGJ7NC0DRC RRSIG TLSA
+      NSEC3 ttl=600   1 0 0 - GTB1GPQDV7GOUF2R6OIQ9T75KQLJ076P A NS SOA MX TXT AAAA RRSIG DN
+      NSEC3 ttl=600   1 0 0 - 6JEBQV8TRA1ENIPTTVUFAU6KO19U2FI1
+  no-such-name-0625.ietf.org       A    NOERROR  answers=0
+      SOA  ttl=1800  (zone SOA MINIMUM=1800)
+      NSEC  ttl=1800  \000.no-such-name-0625.ietf.org. RRSIG NSEC NXNAME
+  no-such-name-0625.kernel.org     A    NXDOMAIN answers=0
+      SOA  ttl=180   (zone SOA MINIMUM=180)
+
+== L2. compact denial: NXNAME restores the distinction (Google resolver, DO=1)
+  no-such-name-0625.ietf.org       A    NOERROR  answers=0
+      SOA  ttl=1800  (zone SOA MINIMUM=1800)
+      NSEC  ttl=1800  \000.no-such-name-0625.ietf.org. RRSIG NSEC TYPE128
+  www.ietf.org                     MX   NOERROR  answers=0
+      SOA  ttl=1633  (zone SOA MINIMUM=1800)
+      NSEC  ttl=1633  \000.www.ietf.org. A PTR HINFO TXT AAAA TYPE29 SRV NAPTR CERT SSHFP RR
+
+== L3. the negative entry ages in the resolver cache (same name, 3 s apart)
+  no-such-name-0625.debian.org     A    NXDOMAIN answers=0
+      SOA  ttl=600   (zone SOA MINIMUM=600)
+      NSEC3 ttl=600   1 0 0 - 5JH0UAQG92BKVCT2E30OPMPGJ7NC0DRC RRSIG TLSA
+      NSEC3 ttl=600   1 0 0 - GTB1GPQDV7GOUF2R6OIQ9T75KQLJ076P A NS SOA MX TXT AAAA RRSIG DN
+      NSEC3 ttl=600   1 0 0 - 6JEBQV8TRA1ENIPTTVUFAU6KO19U2FI1
+  no-such-name-0625.debian.org     A    NXDOMAIN answers=0
+      SOA  ttl=600   (zone SOA MINIMUM=600)
+      NSEC3 ttl=600   1 0 0 - 5JH0UAQG92BKVCT2E30OPMPGJ7NC0DRC RRSIG TLSA
+      NSEC3 ttl=600   1 0 0 - GTB1GPQDV7GOUF2R6OIQ9T75KQLJ076P A NS SOA MX TXT AAAA RRSIG DN
+      NSEC3 ttl=600   1 0 0 - 6JEBQV8TRA1ENIPTTVUFAU6KO19U2FI1
+```
+
+## Reading the output
+
+### Section 1: The Three Kinds of Answer
+
+In Section 1 of the local lab output, queries are submitted directly to the authoritative server (`auth.py`) on port 5300:
+
+- `www.lab.test A`: Returns `NOERROR` with `192.0.2.10` and TTL 30.
+- `nope.lab.test A`: Returns `NXDOMAIN`. The answer section is empty. The authority section carries the zone `SOA` with a TTL of 4 seconds (`SOA MINIMUM 4`). This confirms that `nope.lab.test` does not exist for any type.
+- `mail.lab.test A`: Returns `NOERROR` (`NODATA`). The answer section is empty, and the authority section contains the zone `SOA` with TTL 4. Querying `mail.lab.test MX` returns `NOERROR` with `10 www.lab.test.`. This demonstrates that `mail.lab.test` exists, making an `A` query yield `NODATA` rather than `NXDOMAIN`.
+- `b.lab.test A`: Returns `NOERROR` (`NODATA`) with the zone `SOA` in authority. Querying `x.b.lab.test A` returns `192.0.2.20`. This demonstrates an **Empty Non-Terminal (ENT)**: `b.lab.test` has no RRs of its own, but because `x.b.lab.test` exists beneath it, queries to `b.lab.test` return `NODATA` (`NOERROR`).
+
+### Section 2: Record Added After a Miss
+
+Section 2 traces time-dependent negative caching through `resolver.py` on port 5301:
+
+1. At $t=0.3\text{s}$, a query for `new.lab.test A` misses upstream. The authoritative server returns `NXDOMAIN` with negative TTL 4.
+2. The resolver caches `NXDOMAIN`. A client query immediately following receives `NXDOMAIN` with TTL 3.
+3. At $t=0.6\text{s}$, the record `new.lab.test A -> 192.0.2.30` is dynamically added to the authoritative server.
+4. Direct queries to `auth` confirm the authoritative server returns `NOERROR` with `192.0.2.30`. However, queries routed to `resolver` continue returning `NXDOMAIN` as the cached negative TTL counts down ($2\text{s} \rightarrow 1\text{s} \rightarrow 0\text{s}$).
+5. At $t=4.4\text{s}$, the cached negative entry expires. The resolver fetches from upstream and returns `NOERROR` with `192.0.2.30`.
+
+### Section 3: Caching Scope (NXDOMAIN vs NODATA)
+
+- Querying `ghost.lab.test A` populates the resolver cache with `NXDOMAIN`. Subsequent queries for `ghost.lab.test MX` and `ghost.lab.test TXT` at $t=0.3\text{s}$ return `NXDOMAIN` directly from the cache without generating upstream traffic. `NXDOMAIN` covers the name across all types.
+- Querying `mail.lab.test A` caches a `NODATA` entry for type `A`. When the client queries `mail.lab.test MX` at $t=0.4\text{s}$, the resolver MUST issue an upstream query, successfully returning `10 www.lab.test.`. `NODATA` caching is scoped strictly to the `(name, type)` tuple.
+
+### Section 4: RFC 8020 Subtree Pruning
+
+With `resolver.py` configured with `--rfc8020`:
+1. Client queries `gone.lab.test A`. Upstream returns `NXDOMAIN`.
+2. Client queries `a.gone.lab.test A` and `deep.a.gone.lab.test A`.
+3. The resolver synthesizes `NXDOMAIN` locally for both child queries without issuing upstream queries, matching RFC 8020 requirements.
+
+### Section 5: The RFC 8020 Legacy Server Bug
+
+Section 5 contrasts resolver behavior when querying a non-compliant authoritative server that returns `NXDOMAIN` for the ENT `b.lab.test`:
+
+- **Without RFC 8020**: The resolver caches `NXDOMAIN` for `b.lab.test`. When queried for `x.b.lab.test`, the resolver issues an upstream query and receives `NOERROR` (`192.0.2.20`).
+- **With RFC 8020**: The resolver caches `NXDOMAIN` for `b.lab.test`. When queried for `x.b.lab.test`, RFC 8020 forces the resolver to synthesize `NXDOMAIN` locally, incorrectly blocking access to `x.b.lab.test`. This explains why production resolvers require DNSSEC validation before applying RFC 8020 tree pruning.
+
+### Section 6: Capping Negative TTL
+
+The authoritative zone specifies an `SOA MINIMUM` of 4 seconds. `resolver.py` is launched with `--neg-max 1`.
+1. At $t=0.3\text{s}$, upstream returns `NXDOMAIN`. The resolver caps the cached negative TTL to 1 second (`ttl=0` in client response).
+2. At $t=1.5\text{s}$, the negative cache entry has already expired. The resolver queries upstream again, successfully fetching the newly added `new2.lab.test A` record long before the authoritative server's 4-second TTL would have elapsed.
+
+### Section 7: RFC 9520 Failure Caching
+
+Section 7 simulates an unresponsive upstream authoritative server across 10 client queries:
+
+- **Without Failure Caching (`--fail-cache 0`)**: The resolver attempts an upstream query for every incoming client request, resulting in 11 upstream timeouts (0.3s each) and long client delays.
+- **With Failure Caching (`--fail-cache 2`)**: the first query times out upstream and the failure is cached for 2 seconds. The other ten queries (the nine silent ones and the printed one) get `SERVFAIL` straight from the failure cache: one upstream query instead of eleven, and no 0.3 s wait for the clients.
+
+### Live Output Analysis
+
+#### L1: External Zone Denial Styles (Cloudflare Resolver)
+
+- `isc.org` (NSEC): `NXDOMAIN` with two `NSEC` records. `live.py` prints only the record data (next name and type bitmap), not the owner. The first has next name `ns-ext.isc.org` and covers the queried name. The second carries the apex's bitmap (`SOA`, `DNSKEY`, ...) with next name `_acme-challenge.isc.org`, so it is owned by `isc.org` itself and covers `*.isc.org`: the "no wildcard" proof.
+- `debian.org` (NSEC3): `NXDOMAIN` with three `NSEC3` records, the closest-encloser proof of RFC 5155 section 7.2.2 (one matching the closest encloser, here the apex with its full bitmap, one covering the next closer name, one covering the wildcard). `1 0 0 -` reads as SHA-1, no opt-out, zero extra iterations, no salt, exactly what RFC 9276 recommends.
+- `ietf.org` (Compact Denial): Returns `RCODE 0` (`NOERROR`) with `answers=0` despite querying a non-existent name (`no-such-name-0625.ietf.org`). The authority section contains a synthetic `NSEC` record referencing `\000.no-such-name-0625.ietf.org.` with types `RRSIG NSEC NXNAME`.
+- `kernel.org` (Unsigned): Returns standard `NXDOMAIN` with authority `SOA ttl=180`.
+
+#### L2: Compact Denial & Type 128 (Google Resolver)
+
+Google Public DNS JSON API renders the custom DNSSEC type 128 bitmap as `TYPE128`.
+- Non-existent name (`no-such-name-0625.ietf.org`): Returns `NOERROR` with an `NSEC` bitmap containing `TYPE128` (`NXNAME`).
+- Existing name with missing type (`www.ietf.org MX`): Returns `NOERROR` with an `NSEC` bitmap listing real existing record types (`A`, `PTR`, `TXT`, `AAAA`, `SRV`, etc.) without `TYPE128`. This distinction allows DNSSEC resolvers to differentiate "name does not exist" from "type does not exist" when RCODE is `NOERROR`.
+
+#### L3: Resolver Anycast Caching Dynamics
+
+Querying `no-such-name-0625.debian.org` twice, 3 seconds apart, against public recursive resolvers shows TTL values remaining constant (`ttl=600`). In multi-node anycast public DNS infrastructure (such as Cloudflare `1.1.1.1` or Google `8.8.8.8`), back-to-back queries hit different cache nodes or backend instances. Operators should not attempt to measure TTL decrement timelines using anycast public resolvers.
+
+## In Production
+
+### Verifying Wire Responses with Dig
+
+Query an authoritative server directly using `+norecurse` to inspect the raw `SOA` and `RCODE` parameters:
+
+```bash
+# (not run here)
+# Query authoritative server directly for a non-existent record
+dig +norecurse @ns1.example.com nope.example.com A
+```
+
+Inspect DNSSEC negative proofs (`NSEC` / `NSEC3`) by appending `+dnssec`:
+
+```bash
+# (not run here)
+# Query for non-existent record requesting DNSSEC records
+dig +dnssec @1.1.1.1 no-such-name.isc.org A
+```
+
+Check the zone's negative caching baseline by inspecting the seventh field of the `SOA` record:
+
+```bash
+# (not run here)
+# Fetch SOA record to read the SOA MINIMUM value
+dig SOA example.com +short
+```
+
+### Unbound Configuration
+
+Configure negative cache limits and RFC 8020 tree hardening in `/etc/unbound/unbound.conf`:
+
+```text
+# (not run here)
+server:
+    # Cap negative cache entries to 60 seconds
+    cache-max-negative-ttl: 60
+    
+    # Floor negative cache entries to 5 seconds
+    cache-min-negative-ttl: 5
+    
+    # Enforce RFC 8020 (trust NXDOMAIN subtrees for DNSSEC zones)
+    harden-below-nxdomain: yes
+    
+    # Enable RFC 8198 aggressive NSEC caching
+    aggressive-nsec: yes
+```
+
+Flush negative cache entries selectively using `unbound-control`:
+
+```bash
+# (not run here)
+# Purge ALL negative data (NXDOMAIN, NODATA, SERVFAIL); it takes no name argument
+unbound-control flush_negative
+
+# Purge a specific name and type
+unbound-control flush_type nope.example.com A
+```
+
+### BIND 9 Configuration
+
+Configure BIND 9 negative cache bounds in `named.conf.options`:
+
+```text
+# (not run here)
+options {
+    // Limit negative cache retention to 60 seconds
+    max-ncache-ttl 60;
+};
+```
+
+Clear cached responses for a specific domain name using `rndc`:
+
+```bash
+# (not run here)
+# Flush all cached records (positive and negative) for a name
+rndc flushname nope.example.com
+```
+
+### Systemd-Resolved Cache Operations
+
+Flush local stub resolver caches on systemd-managed Linux hosts:
+
+```bash
+# (not run here)
+# Flush systemd-resolved local cache
+resolvectl flush-caches
+```
+
+### Monitoring Metric Adjustments for Compact Denial
+
+Monitoring agents parsing DNS logs (such as DNSTap, Bro/Zeek, or packet captures) traditionally identify non-existent domain events using the filter `dns.rcode == 3`.
+
+When monitoring zones hosted on providers using RFC 9824 Compact Denial of Existence (such as Cloudflare), update log analytics queries to include `NOERROR` responses containing the `NXNAME` signal:
+
+```text
+# (not run here)
+# Example Pseudocode for DNS Log Metric Aggregation
+if rcode == 3:
+    count_nxdomain++
+else if rcode == 0 and "NXNAME" in nsec_type_bitmap:
+    count_nxdomain++
+```
+
+## Gotchas
+
+- **NODATA for one type says nothing about the others**: an empty `AAAA` answer is cached for `AAAA` only. Applications that treat "no AAAA" as "host unknown" (instead of falling back to `A`) turn a normal IPv4-only name into an outage.
+- **SOA MINIMUM field repurposing**: The last number in an `SOA` record is NOT the minimum TTL for positive records; RFC 2308 explicitly redefined it as the negative caching TTL limit.
+- **Public anycast TTL skew**: Consecutive queries to public recursive resolvers (`1.1.1.1`, `8.8.8.8`) often land on different edge nodes, making TTL countdown values appear non-sequential or static.
+- **ENTs break RFC 8020 on legacy auth servers**: Misconfigured authoritative servers that return `NXDOMAIN` for Empty Non-Terminals cause RFC 8020-compliant resolvers to mistakenly block valid downstream child names.
+- **Compact Denial masks NXDOMAIN in dashboards**: RFC 9824 zones respond with `RCODE 0` (`NOERROR`). Security dashboards filtering strictly for `RCODE 3` will undercount missing domain lookups.
+- **DNSSEC validation is required for aggressive caching**: RFC 8198 synthesis needs validated NSEC/NSEC3, and Unbound applies RFC 8020 only to DNSSEC-secure NXDOMAINs.
+- **A failing authoritative server is a load problem for everyone**: without RFC 9520 failure caching every client retry becomes an upstream query (lab section 7). Check that your resolver caches SERVFAIL and how long.
+- **Short SOA MINIMUM increases authoritative load**: Reducing `SOA MINIMUM` to extremely low values (e.g., 1s) mitigates cache pinning, but significantly increases query volume against authoritative DNS servers during miss storms.
+
+## Exercises
+
+1. **Calculate Effective Negative TTL**: Given an authoritative `SOA` record with TTL = 7200s, `SOA MINIMUM` = 900s, and a resolver configured with `cache-max-negative-ttl = 300s`, determine the exact duration a negative response will be cached by the resolver.
+2. **Identify Response Type from Wire Flags**: A client receives a DNS header with `RCODE = 0`, `ANCOUNT = 0`, `NSCOUNT = 1`, and an `SOA` record in the authority section. State whether this is an `NXDOMAIN` or `NODATA` response, and explain how the client resolver handles a subsequent query for a different RR type at the same name.
+3. **Trace ENT Behavior**: Draw the domain hierarchy for a zone containing records for `a.b.c.example.com`. Explain the exact response code (`RCODE`) returned when querying `b.c.example.com A` versus `nonexistent.c.example.com A`.
+4. **Detect Compact Denial**: Write a shell pipeline using `dig +dnssec` to inspect the response for a missing record in a compact denial zone. Identify the exact field and value in the authority section that distinguishes the response from a standard `NODATA` answer.
+5. **Simulate cache pinning**: change `zone.base` so the SOA has TTL 2 and MINIMUM 10, rerun section 2 and predict, then check, when the resolver first returns the new record.
+6. **Print owners**: extend `live.py` to print each authority record's `name` field and confirm the owner names deduced above for `isc.org`, and that the compact-denial `NSEC` is owned by the queried name itself.
+
+## Verification
+
+The experiments and outputs in this chapter were generated in a controlled local Linux environment:
+
+- **Local Execution (`lab-dns.sh`)**: Executed inside an isolated network namespace (`unshare -urn`) using Python 3.13.5 standard library sockets bound to loopback interfaces `127.0.0.1:5300` (authoritative) and `127.0.0.1:5301` (resolver). No third-party DNS packages were installed.
+- **Live Assertion (`live.py`)**: Executed via standard HTTPS `urllib.request` calls querying Cloudflare Public DNS (`https://cloudflare-dns.com/dns-query`) and Google Public DNS (`https://dns.google/resolve`) with `DO=1` (DNSSEC OK) enabled.
+- **Production Directives**: Dig commands, BIND configurations, Unbound parameters, and systemd commands in the "In production" section are labelled `(not run here)`; none of those tools is installed on the lab host.
+- **Repeatability**: `lab-dns.sh` ran twice with the same answers, TTLs and upstream query counts; only the resolver timestamps moved by 0.1 s. The live probes reflect the zones on the day and will drift as operators change signers.
+
+## Sources
+
+- **RFC 1034**: *Domain Names - Concepts and Facilities*. https://www.rfc-editor.org/rfc/rfc1034
+- **RFC 2308**: *DNS NCACHE - Negative Caching of DNS Queries*. https://www.rfc-editor.org/rfc/rfc2308
+- **RFC 4035**: *Protocol Modifications for the DNS Security Extensions*. https://www.rfc-editor.org/rfc/rfc4035
+- **RFC 5155**: *DNS Security (DNSSEC) Hashed Authenticated Denial of Existence*. https://www.rfc-editor.org/rfc/rfc5155
+- **RFC 8020**: *NXDOMAIN: There Really Is Nothing Underneath*. https://www.rfc-editor.org/rfc/rfc8020
+- **RFC 8198**: *Aggressive Use of DNSSEC-Validated Cache*. https://www.rfc-editor.org/rfc/rfc8198
+- **RFC 9276**: *Guidance for NSEC3 Parameter Settings*. https://www.rfc-editor.org/rfc/rfc9276
+- **RFC 9520**: *Attributes for Caching Resolution Failures in DNS*. https://www.rfc-editor.org/rfc/rfc9520
+- **RFC 9824**: *Compact Denial of Existence in DNSSEC*. https://www.rfc-editor.org/rfc/rfc9824
+- **Unbound Documentation**: *unbound.conf(5) Manual Page*. https://unbound.docs.nlnetlabs.nl/en/latest/manpages/unbound.conf.html
+- **BIND 9 Administrator Reference Manual**: `max-ncache-ttl`. https://bind9.readthedocs.io/en/stable/reference.html
+- **unbound-control(8)**: https://unbound.docs.nlnetlabs.nl/en/latest/manpages/unbound-control.html
+- **RFC 4470**: *Minimally Covering NSEC Records and DNSSEC On-line Signing*. https://www.rfc-editor.org/rfc/rfc4470
+- **Cloudflare DNS over HTTPS, JSON format**: https://developers.cloudflare.com/1.1.1.1/encryption/dns-over-https/make-api-requests/dns-json/
+- **Google Public DNS JSON API**: https://developers.google.com/speed/public-dns/docs/doh/json
