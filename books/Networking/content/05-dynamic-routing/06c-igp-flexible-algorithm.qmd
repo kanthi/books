@@ -1,0 +1,592 @@
+---
+title: "IGP Flexible Algorithm (RFC 9350): Constraint Planes Without RSVP-TE"
+author:
+  - name: "K19G"
+  - name: "grok-bot"
+---
+
+# IGP Flexible Algorithm (RFC 9350): Constraint Planes Without RSVP-TE
+
+You want traffic for one service to avoid high-delay satellite hops, traffic for another to stay exclusively on the blue physical plane, and traffic for a third to steer around a shared fibre duct. Historically, you had two choices: build separate physical or virtual topologies with Multi-Topology Routing, or deploy RSVP-TE with Constrained Shortest Path First (CSPF) and maintain thousands of signalled LSP states across your core. Neither scales cleanly when all you really want is a handful of distinct forwarding planes with different rules for what "shortest" and "usable" mean.
+
+IGP Flexible Algorithm (Flex-Algo), specified in RFC 9350, solves this inside the link-state IGP itself. Instead of signalling point-to-point tunnels from every ingress to every egress, every router runs Shortest Path First (SPF) over a pruned view of the topology using a chosen metric and a shared set of link constraints. Each algorithm produces its own routing table and its own Segment Routing forwarding state—a dedicated Prefix-SID label in SR-MPLS or a dedicated locator in SRv6—so a packet's outer label or IPv6 destination address selects the entire constraint plane hop by hop.
+
+Because every router computes the same pruned SPF independently, loop freedom depends on strict consensus. Every router participating in an algorithm must agree on the exact Flexible Algorithm Definition (FAD), apply the exact same pruning rules in the exact same order, and drop out completely if it cannot honour any part of the definition.
+
+## Learning goals
+
+- Explain how Flex-Algo creates isolated forwarding planes using IGP-computed SPF trees and Segment Routing identifiers without RSVP-TE signalling state.
+- Decode and construct an IS-IS Flexible Algorithm Definition (FAD) sub-TLV (type 26) inside Router CAPABILITY TLV 242, including metric types, calculation types, priorities, and constraint sub-TLVs.
+- Trace the RFC 9350 Section 5.3 FAD election rules and predict how priority changes, tie-breaks, or withdrawn advertisements alter the active plane.
+- Apply the RFC 9350 Section 13 link-pruning order and node-participation checks to determine reachability, path selection, and failure modes.
+- Map SR-MPLS Prefix-SID indices and SRGB bases to per-algorithm forwarding labels, and describe how TI-LFA repairs stay within an algorithm's constraints.
+- Configure and audit basic Flex-Algo parameters in FRR `isisd` (from documentation) while accounting for implementation limits around metric types and flags.
+
+## Why constraint planes without RSVP-TE
+
+When you run plain IS-IS or OSPF, every router computes a single shortest-path tree per destination based on the standard IGP metric. That single tree is algorithm 0. As the SRv6 and SR-MPLS TI-LFA chapters earlier in this part showed, Segment Routing replaces LDP and RSVP-TE label distribution with IGP-advertised Prefix-SIDs and Adjacency-SIDs, and TI-LFA computes loop-free backup paths using the same link-state database. Yet by default, all of that still runs on a single topology and a single metric.
+
+RSVP-TE solved traffic engineering by moving path computation to the headend. Each ingress router ran CSPF against a Traffic Engineering Database (TED), found a path that satisfied bandwidth, affinity, and SRLG constraints, and signalled an explicit-route LSP with `PATH` and `RESV` messages. Every transit router had to store soft state for every LSP passing through it, refresh that state periodically, and tear down and re-signal tunnels whenever a link flapped. In a full mesh of $N$ edge routers, that meant $O(N^2)$ tunnels—and $O(N^2)$ state on core P routers that had no business knowing about edge-to-edge service SLAs.
+
+Flex-Algo takes the opposite trade-off. You do not get per-flow bandwidth reservation or arbitrary explicit hop lists; for those, you still need an SR Policy with a Segment Routing Traffic Engineering (SR-TE) stack or a central PCE. What you *do* get is up to 128 topology-wide constraint planes computed natively by the IGP with zero transit signalling state:
+
+```text
+RSVP-TE (Headend CSPF + Signalling)
+  PE1 --[PATH/RESV state]--> P1 --[PATH/RESV state]--> P3 --[PATH/RESV state]--> PE2
+  State on P1, P3: O(N^2) LSPs
+
+Flex-Algo (Distributed IGP SPF + SR Forwarding)
+  Algo 0   (IGP metric):      PE1 ---> P1 ---> SAT ---> PE2   (Label 16002)
+  Algo 128 (Min Delay):       PE1 ---> P1 ---> P3  ---> PE2   (Label 16102)
+  Algo 133 (No SAT/SRLG 103): PE1 ---> P2 ---> P4  ---> PE2   (its own Prefix-SID)
+  State on P1..P4: O(Algorithms * Prefixes), zero per-tunnel state
+```
+
+Every router in the area already holds the full link-state database (LSDB). If every router agrees on the rules for Algorithm 128—say, "prune links without a delay metric, then run SPF using minimum unidirectional link delay"—then every router computes a loop-free shortest-path tree toward every destination advertising Algorithm 128. Packets entering at PE1 simply receive the label or locator bound to PE2 in Algorithm 128. Transit routers never inspect service intent or run CSPF on demand; they do a standard MPLS label swap or IPv6 longest-prefix match in that algorithm's forwarding table.
+
+| Property | Plain IGP (Algo 0) | RSVP-TE | IGP Flex-Algo (Algo 128–255) |
+| :--- | :--- | :--- | :--- |
+| Path computation | Distributed SPF | Headend CSPF | Distributed constrained SPF |
+| Metric options | IGP metric only | IGP, TE, delay (headend) | IGP, Min Link Delay, TE metric |
+| Constraint enforcement | None (all links) | Admin groups, SRLG, bandwidth | Admin groups, SRLG |
+| Transit router state | Per-prefix RIB/FIB | Per-LSP soft state | Per-(algo, prefix) RIB/FIB |
+| Bandwidth reservation | No | Yes (soft state) | No |
+| Fast reroute | LFA / TI-LFA (Algo 0) | FRR facility / detour | TI-LFA per algorithm |
+| Scaling limit | Prefixes | LSP count ($N^2$ mesh) | Number of active algorithms |
+
+Keep the number of algorithms small. Each active algorithm requires its own SPF run on every participating node, its own TI-LFA backup computation, and its own Prefix-SIDs or SRv6 locators. Most production networks run between two and six Flex-Algos—typically a low-latency plane, a dual-plane red/blue separation, and perhaps an exclusion plane that avoids expensive or unverified links.
+
+## Anatomy of a Flexible Algorithm Definition (FAD)
+
+RFC 9350 defines a **Flexible Algorithm Definition (FAD)** as a tuple of three elements bound to an algorithm number in the range **128–255**:
+
+1. **Calculation-Type**: How the graph is solved. Currently, `0` denotes standard SPF.
+2. **Metric-Type**: Which link cost is minimised during SPF.
+3. **Constraints**: Which links are included or excluded before and during SPF (Extended Administrative Groups and Shared Risk Link Groups), plus behavioural flags.
+
+Algorithm numbers `0` and `1` are reserved outside the Flex-Algo range:
+- **Algorithm 0**: Standard SPF over the IGP metric (plain shortest-path routing).
+- **Algorithm 1**: Strict SPF for Segment Routing (RFC 8402), which forbids local policy overrides on the SPF path.
+- **Algorithms 2–127**: Reserved for future IETF assignment.
+- **Algorithms 128–255**: Flexible Algorithms. Any FAD received with an algorithm value outside `128–255` **MUST** be ignored by receivers.
+
+### IS-IS and OSPF advertisement containers
+
+In IS-IS, a router advertises a FAD using the **Flexible Algorithm Definition (FAD) sub-TLV (type 26)** carried inside the **Router CAPABILITY TLV (type 242)** defined in RFC 7981. Because Flex-Algo definitions apply within a single area or level (L1 or L2), the Router CAPABILITY TLV **MUST** have the **S bit clear** (not flooded across level boundaries).
+
+In OSPF (OSPFv2 and OSPFv3), the equivalent definition is carried in a **FAD TLV** inside the area-scoped **Router Information (RI) LSA**.
+
+The IS-IS FAD sub-TLV has a fixed 4-octet header followed by zero or more variable-length sub-sub-TLVs:
+
+```text
+ 0                   1                   2                   3
+ 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|   Type = 26   |    Length     | Flex-Algorithm|  Metric-Type  |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|   Calc-Type   |   Priority    |     Sub-TLVs (variable) ...   |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+```
+
+- **Type (1 octet)**: `26` (`0x1a` in hex).
+- **Length (1 octet)**: Length of the Value field in octets (`4` if no sub-TLVs are present).
+- **Flex-Algorithm (1 octet)**: `128` to `255` (`0x80` to `0xff`).
+- **Metric-Type (1 octet)**: Registered in the IANA IGP Metric-Type Registry:
+  - `0`: IGP metric.
+  - `1`: Minimum Unidirectional Link Delay (RFC 8570, Section 4.2), measured in microseconds.
+  - `2`: Traffic Engineering Default Metric (RFC 5305, Section 3.7).
+- **Calc-Type (1 octet)**: `0` for standard SPF.
+- **Priority (1 octet)**: `0` to `255`, where a higher number is preferred during FAD election.
+
+### FAD sub-TLVs
+
+When a FAD needs constraints or special inter-area behaviour, it appends sub-TLVs inside sub-TLV 26:
+
+| Sub-TLV Type | Name | Encoding | Meaning |
+| :--- | :--- | :--- | :--- |
+| `1` | Exclude Admin Group | Extended Admin Group (RFC 7308), length multiple of 4 | Prune any link that has *any* of these bits set |
+| `2` | Include-Any Admin Group | Extended Admin Group (RFC 7308), length multiple of 4 | Keep a link only if it has *at least one* of these bits set |
+| `3` | Include-All Admin Group | Extended Admin Group (RFC 7308), length multiple of 4 | Keep a link only if it has *all* of these bits set |
+| `4` | FAD Flags | Variable length (1+ octets) | Bit `0` (MSB, `0x80`) = **M-flag** (Flex-Algo prefix metric for inter-area/external; not applicable to SRv6 locators) |
+| `5` | Exclude SRLG | Sequence of 4-octet SRLG values (RFC 5307), length multiple of 4 | Prune any link advertising any listed SRLG |
+
+Look at four concrete wire encodings from our lab model to see how compact these definitions are:
+
+- **Algorithm 128 (Min Delay, priority 200, no constraints)**:
+  `1a 04 80 01 00 c8`
+  Type `0x1a` (26), length `0x04` (4), algo `0x80` (128), metric-type `0x01` (delay), calc-type `0x00` (SPF), priority `0xc8` (200).
+- **Algorithm 129 (IGP metric, priority 200, exclude red, affinity bit 1)**:
+  `1a 0a 81 00 00 c8 01 04 00 00 00 02`
+  Sub-TLV `0x01` (Exclude Admin Group), length `0x04`, 32-bit mask `0x00000002` (bit 1).
+- **Algorithm 132 (IGP metric, priority 200, include-all blue+red)**:
+  `1a 0a 84 00 00 c8 03 04 00 00 00 06`
+  Sub-TLV `0x03` (Include-All Admin Group), length `0x04`, mask `0x00000006` (bit 1 = red and bit 2 = blue in the lab's affinity map).
+- **Algorithm 133 (IGP metric, priority 200, exclude satellite (affinity bit 3) + M-flag + exclude SRLG 103)**:
+  `1a 13 85 00 00 c8 01 04 00 00 00 08 04 01 80 05 04 00 00 00 67`
+  Three sub-TLVs chained: Exclude Admin Group (`01 04 00 00 00 08`), FAD Flags (`04 01 80`, M-flag set), and Exclude SRLG (`05 04 00 00 00 67`, where `0x67` = 103).
+
+Because Extended Admin Groups are arbitrary-length bitmasks in multiples of 4 octets, bit positions `0–31` fit in 4 bytes, `32–63` in 8 bytes, and so on up to 256+ bits. Plan your bit-position allocations centrally across your network before turning on any Flex-Algo; renumbering a colour bit later means editing every router's affinity map and triggering reconvergence.
+
+## Winning the FAD election
+
+If two routers in the same area run Algorithm 129 with different definitions—say, one excludes red links and the other excludes blue links—they will compute conflicting forwarding trees and form permanent routing loops. RFC 9350 prevents this by mandating a deterministic **FAD selection** procedure (Section 5.3) rather than requiring you to type the exact same config on every single node.
+
+For any given Flex-Algo `K` in `[128, 255]`, every router inspects all FADs for `K` advertised in the area (including its own local FAD, if it advertises one):
+
+1. Ignore any FAD with an algorithm number outside `128–255`.
+2. Select the FAD with the **highest Priority** (`0–255`).
+3. If two or more FADs tie for the highest priority, select the one advertised by the router with the **numerically greatest System-ID** (in IS-IS) or **Router ID** (in OSPF).
+
+```text
+Area FAD advertisements for Algo 129:
+  System-ID 0000.0000.0001 : prio 100, exclude red
+  System-ID 0000.0000.0002 : prio 200, exclude red
+  System-ID 0000.0000.0003 : prio 200, exclude red  <-- WINNER (highest prio, highest ID)
+  System-ID 0000.0000.0007 : algo 127, prio 255     <-- IGNORED (algo < 128)
+  System-ID 0000.0000.0009 : prio 100, exclude blue
+
+If 0002 and 0003 withdraw their FADs:
+  System-ID 0000.0000.0009 : prio 100, exclude blue <-- NEW WINNER (plane flips silently!)
+```
+
+Notice two critical rules in Section 5.3 that trip up operators:
+
+- **Non-participating routers can still win the election.** A router that does *not* participate in Algorithm `K` (for instance, a route reflector or a dedicated controller-attached node) **MAY** still advertise a FAD for `K`, and all receivers **MUST** consider that FAD in the election. Conversely, if a router configures a FAD locally without advertising it (as FRR does unless `advertise-definition` is set), other routers never see it, and if no other router advertises a FAD for `K`, nobody has a winning FAD.
+- **Unsupported winning FADs force a node out of the plane.** Suppose a router wants to participate in Algorithm `K`, and it receives a winning FAD—whether from a neighbour or itself—that contains a metric type, calculation type, flag, or sub-TLV it does not support (or no valid FAD exists in the area at all). That router **MUST NOT** fall back to its own local FAD or to Algorithm 0. It **MUST** stop participating in Algorithm `K`, stop advertising participation for `K`, and remove all forwarding state it installed for `K`.
+
+This strict "support the winning FAD or drop out" rule guarantees loop freedom at the cost of reachability if you misconfigure a router or upgrade software unevenly. It also explains why you should advertise each FAD from **at least two redundant routers** with the **same priority and identical definition**, and never leave a stray, lower-priority test FAD sitting on another router. If both primary FAD advertisers reload and a stray router with priority 100 and an inverted constraint is still advertising, the entire plane will silently flip to the stray definition.
+
+## Link attributes and ASLA
+
+Before a router can prune links or sum link delays, it needs link attributes in its LSDB. Historically, IS-IS and OSPF carried link attributes—TE metric, admin groups, SRLGs, and unidirectional link delay—in legacy sub-TLVs designed for RSVP-TE (such as IS-IS Extended IS Reachability TLV 22). That caused a problem: what if an operator wanted one set of link attributes for RSVP-TE and a different set for Flex-Algo, or ran Flex-Algo without enabling RSVP-TE?
+
+RFC 8919 (for IS-IS) and RFC 8920 (for OSPF) solved this by introducing **Application-Specific Link Attributes (ASLA)**. ASLA tags each link-attribute advertisement with a Standard Application Bit Mask (SABM) indicating which control-plane applications may consume those attributes:
+
+- Bit 0: RSVP-TE
+- Bit 1: Segment Routing Policy
+- Bit 2: Loop-Free Alternates (LFA)
+- **Bit 3: Flexible Algorithm (the X-bit)**
+
+Under RFC 9350, when a Flex-Algo uses **Metric-Type 1 (Min Unidirectional Link Delay)** or **Metric-Type 2 (TE Default Metric)**, or evaluates **Admin Group** or **SRLG** constraints, the link attributes **MUST** come from ASLA advertisements (RFC 9350 Section 12), and the Flex-Algorithm application has its own bit in the SABM: **bit 3, the X-bit**.
+
+In IS-IS, there is one legacy escape hatch: the **L-flag** (Legacy Flag) in the ASLA sub-TLV. When the L-flag is set, RFC 9350 says the legacy advertisements MUST be used instead, under the rules of RFC 8919 Section 4.2. Without ASLA (and without an L-flag pointing at legacy TLVs), a link that only advertises delay or admin groups the old RSVP-TE way appears to Flex-Algo as having **no delay** and **no admin groups**.
+
+Three attribute RFCs matter directly for Flex-Algo design:
+
+1. **Extended Administrative Groups (RFC 7308)**: Replaces the legacy 32-bit Administrative Group (resource class / colour) with an arbitrary-length bitmask in multiples of 4 octets. This is why FRR's `affinity-map` supports bit positions `0–255`.
+2. **Minimum Unidirectional Link Delay (RFC 8570, Section 4.2)**: Carries the one-way link propagation and queuing delay in microseconds (24-bit field). In production, you feed this either from static interface values on fixed optical spans or from active two-way/one-way measurement protocols such as **TWAMP** or **STAMP** running on each link. Static values are predictable; measured values catch optical reroutes where a dark-fibre protection switch adds 15 ms overnight.
+3. **Shared Risk Link Groups (RFC 5307)**: 32-bit integers identifying shared physical infrastructure (a common conduit, bridge, or submarine cable). Advertising SRLGs in ASLA lets a Flex-Algo avoid a specific risky corridor without burning affinity colour bits.
+
+## Path computation, pruning order, and loop freedom
+
+Once a router has selected the winning FAD for Algorithm `K` and confirmed that it supports every field in that FAD, it constructs a pruned topology for `K` and runs SPF. RFC 9350 Section 13 specifies the exact **per-link pruning order**. Every participating router evaluates every link $(u, v)$ in the area through these five checks in sequence:
+
+1. **Exclude Admin Group**: If the FAD specifies an Exclude Admin Group and the link advertises any matching bit, **prune the link**.
+2. **Exclude SRLG**: If the FAD specifies Exclude SRLG and the link advertises any matching SRLG value, **prune the link**.
+3. **Include-Any Admin Group**: If the FAD specifies Include-Any Admin Group and the link does *not* advertise at least one matching bit, **prune the link**.
+4. **Include-All Admin Group**: If the FAD specifies Include-All Admin Group and the link does *not* advertise *all* specified bits, **prune the link**.
+5. **Metric-Type availability**: If the FAD specifies a non-IGP metric type (such as `1` for Min Link Delay or `2` for TE Default Metric) and the link does *not* advertise that metric in ASLA, **prune the link**. A missing delay or TE metric **MUST NOT** be treated as `0`.
+
+```text
+Link (u, v) in LSDB
+  |
+  +--> [1] Matches Exclude Admin Group? ---- yes ---> PRUNE
+  |
+  +--> [2] Matches Exclude SRLG? ----------- yes ---> PRUNE
+  |
+  +--> [3] Fails Include-Any Admin Group? -- yes ---> PRUNE
+  |
+  +--> [4] Fails Include-All Admin Group? -- yes ---> PRUNE
+  |
+  +--> [5] Non-IGP metric missing? --------- yes ---> PRUNE (never assume 0!)
+  |
+  +--> SURVIVES with cost = link's Metric-Type value
+```
+
+Notice step 5. If a single core link between P3 and P4 lacks a delay advertisement, Algorithm 128 (delay) prunes `P3-P4` completely. Treating a missing delay as `0` would turn an unmeasured link into the most attractive shortcut in the network, sucking all low-latency traffic onto an unknown path.
+
+Link pruning is only half the filter. For Segment Routing data planes (SR-MPLS and SRv6), RFC 9350 also requires **node pruning**:
+
+- **SR-MPLS**: A node **MUST** prune any router that does not advertise participation in Algorithm `K` in its **SR-Algorithm sub-TLV** (inside Router CAPABILITY TLV 242 in IS-IS, or the RI LSA in OSPF).
+- **SRv6**: A node **MUST** prune any router that does not advertise an **SRv6 Locator** associated with Algorithm `K`.
+
+If a transit router drops out of Algorithm 129—either because it was not configured for 129 or because it does not support a feature in the winning FAD—every other router removes that node from the Algorithm 129 SPF graph. Traffic for Algorithm 129 routes around it if an alternate compliant path exists, or becomes **UNREACHABLE** if no compliant path exists. Flex-Algo **never** falls back to Algorithm 0 or violates its constraints to preserve connectivity. That property is intentional: if your compliance plane requires traffic to stay off red links, silently spilling onto red links during a failure would breach the isolation contract.
+
+## Forwarding planes: SR-MPLS and SRv6
+
+Computing a separate SPF tree for Algorithm 128 does nothing unless the data plane can tell an Algorithm 128 packet apart from an Algorithm 0 packet. Flex-Algo relies on Segment Routing for that separation.
+
+### SR-MPLS Prefix-SIDs per algorithm
+
+In SR-MPLS (covered in the SR-MPLS TI-LFA chapter), each node advertises a **Segment Routing Global Block (SRGB)**—for example, labels `16000–23999`—and a **Prefix-SID** with an algorithm field and a label index. To participate in multiple algorithms, an egress router advertises a distinct Prefix-SID for its loopback in *each* algorithm it supports, using a distinct index per algorithm:
+
+| Destination | Algorithm | Meaning | Prefix-SID Index | Label (SRGB 16000) |
+| :--- | :--- | :--- | :--- | :--- |
+| `PE2` | `0` | Standard IGP SPF | `2` | `16002` |
+| `PE2` | `128` | Min Link Delay | `102` | `16102` |
+| `PE2` | `129` | Exclude Red | `202` | `16202` |
+| `PE2` | `130` | Exclude Satellite | `302` | `16302` |
+
+When PE1 steers a packet into Algorithm 128 toward PE2, it pushes label `16102` (assuming uniform SRGB `16000` across the core). Every transit router looks up `16102` in its MPLS LFIB, which was programmed by Algorithm 128's SPF, and forwards it along the low-delay path `PE1 -> P1 -> P3 -> PE2`. If a node has a different SRGB base, each upstream router computes `outgoing_label = downstream_SRGB_base + index` for Algorithm 128, preserving end-to-end plane isolation without any per-flow state.
+
+### SRv6 Locators per algorithm
+
+In SRv6, there is no MPLS label stack; the IPv6 destination address carries the segment. Each participating router configures a separate **SRv6 Locator** prefix per algorithm (for example, `2001:db8:0:2::/64` for Algorithm 0 and `2001:db8:128:2::/64` for Algorithm 128) and advertises each locator tagged with its algorithm number. Transit routers install each locator into the IPv6 FIB using the next-hop computed by that algorithm's SPF.
+
+### Inter-area behaviour, M-flag, and TI-LFA
+
+By default, IS-IS and OSPF area border routers (L1/L2 routers or ABRs) leak prefixes between areas using the standard IGP metric, which can distort Flex-Algo path selection when a destination is reachable via two border routers. Setting **bit 0 (the M-flag)** in FAD sub-TLV 4 means the Flex-Algorithm-specific prefix metric, the **Flexible Algorithm Prefix Metric (FAPM)** that border routers attach when they re-advertise inter-area and external prefixes, MUST be used for those prefixes, so ingress routers compare end-to-end Flex-Algo costs accurately. RFC 9350 says the M-flag is not applicable to prefixes advertised as SRv6 locators.
+
+Finally, consider fast reroute. As you saw in the TI-LFA chapter, TI-LFA computes post-convergence backup paths using P-space and Q-space over the link-state topology. RFC 9350 Section 14 is explicit: LFA paths (including TI-LFA) for a Flex-Algorithm MUST be computed with the same constraints as its primary paths, MUST use only Prefix-SIDs advertised for that algorithm, and MUST NOT use an Adjacency-SID of a link that was pruned from the algorithm. Every participating router SHOULD advertise at least one algorithm-specific Node-SID so repairs have something to steer with. A link failure on Algorithm 128 (low delay) therefore repairs over a path that also obeys Algorithm 128's rules, rather than leaking onto a satellite hop or a forbidden colour.
+
+## Operational design and FRR `isisd`
+
+Deploying Flex-Algo cleanly requires discipline in four areas before you touch router configs:
+
+1. **Keep the algorithm count small and purposeful.** Every Flex-Algo adds an SPF run, a TI-LFA run, and Prefix-SIDs across every node. Stick to well-defined planes: dual-plane separation (red vs blue), low-latency slicing (delay metric), avoiding expensive or high-jitter links (like satellite or microwave hops), and SRLG diversity.
+2. **Advertise every FAD from at least two routers with identical priority and definition.** Never rely on a single router to hold the winning FAD, and never leave stale definitions with lower priority on lab or staging routers.
+3. **Treat FAD changes as network-wide events.** Modifying a FAD's priority, metric type, or constraints triggers immediate reconvergence for that algorithm across the entire area, just like a topology change. Stage changes in maintenance windows.
+4. **Measure delay accurately if you use Metric-Type 1.** Static link delays work for stable optical paths, but TWAMP/STAMP-based link delay measurement feeding RFC 8570 ensures the IGP sees real latency shifts. Remember that any link missing an ASLA delay advertisement will be pruned.
+
+### FRR `isisd` configuration and limits
+
+FRRouting (`isisd`) supports some features of RFC 9350 on an SR-MPLS data plane; its documentation says compatibility was tested against Cisco. The following configuration and verification commands are **from the FRR docs, not run**:
+
+```text
+! From the FRR docs, not run
+router isis CORE
+ net 49.0001.0000.0000.0001.00
+ segment-routing on
+ segment-routing global-block 16000 23999
+ segment-routing prefix 192.0.2.1/32 index 1
+ segment-routing prefix 192.0.2.1/32 algorithm 129 index 201
+ !
+ affinity-map RED bit-position 1
+ affinity-map SAT bit-position 3
+ !
+ flex-algo 129
+  advertise-definition
+  priority 200
+  metric-type igp
+  affinity exclude-any RED
+  affinity exclude-any SAT
+ !
+interface eth0
+ isis affinity flex-algo RED
+```
+
+Note the critical behaviours and limitations documented in FRR `isisd` (from the FRR docs, not run):
+
+- **FAD advertisement is off by default.** You must include `advertise-definition` inside `flex-algo (128-255)`. FRR notes that if a locally configured FAD is not advertised to the area, the router does not participate.
+- **Only SPF calculation and IGP metric work today.** FRR accepts `metric-type te` and `metric-type delay` in configuration and will advertise that value in the FAD, **but it disables the Flex-Algo locally** because only the `igp` metric type is implemented for path computation.
+- **FAD flags (such as the M-flag) are not supported**, and the documented constraint commands are `affinity exclude-any`, `include-any` and `include-all`. There is no exclude-SRLG command, so a definition like the lab's Algorithm 133 cannot be built in FRR today.
+- **Separate Prefix-SIDs are required.** Each running algorithm needs its own `segment-routing prefix ... algorithm N index M` configuration.
+- **Verification commands** (from the FRR docs, not run):
+  - `show isis flex-algo [128-255]` — inspects the local and winning FADs and participation status.
+  - `show isis topology algorithm N` — displays the pruned SPT for algorithm `N`.
+  - `show isis route algorithm N` — displays the RIB entries computed for algorithm `N`.
+  - `show isis segment-routing node algorithm N` — verifies per-algorithm Prefix-SIDs and SRGB mappings across nodes.
+
+## The lab
+
+Because FRR `isisd` does not yet compute paths for `metric-type delay` or support FAD flags, we verify the full RFC 9350 state machine—FAD wire encoding, priority election, ASLA link pruning, node-participation filtering, and SR-MPLS label assignment—using a pure standard-library Python model (`flexalgo.py`) over a seven-node core topology (`PE1`, `P1..P4`, `PE2`, and a satellite node `SAT`):
+
+```text
+              .---------------- SAT ----------------.
+             /   blue+satellite, SRLG 108, IGP 1,    \
+            /    270 ms per hop                       \
+   PE1 --- P1 ---------------------- P3 ------------- PE2
+    |       |    blue, SRLG 103       |                 |
+    | red   | blue+red                | blue+red,       | red
+    |       |                         | no delay        |
+    +----- P2 ---------------------- P4 ---------------+
+                       red
+   PE1-P1 and P3-PE2 are blue.
+```
+
+Link by link, from the lab source: `PE1-P1` blue (IGP 10, 1.2 ms), `PE1-P2` red (10, 1.5 ms), `P1-P3` blue, SRLG 103 (10, 0.9 ms), `P2-P4` red (10, 1.1 ms), `P1-P2` blue+red (5, 0.3 ms), `P3-PE2` blue (10, 1.0 ms), `P4-PE2` red (10, 1.3 ms), `P1-SAT` and `SAT-PE2` blue+satellite, SRLG 108 (IGP 1 each, 270 ms each), and `P3-P4` blue+red (IGP 20) with no delay advertised.
+
+The SAT path is the classic trap: it is the cheapest IGP path (cost 12) and by far the slowest. Algorithms in the lab: 128 delay; 129 IGP, exclude red; 130 IGP, exclude satellite; 131 delay, exclude satellite; 132 IGP, include-all blue+red; 133 IGP, exclude satellite and SRLG 103, M-flag.
+
+```{.python filename="flexalgo.py"}
+#!/usr/bin/env python3
+"""IGP Flexible Algorithm (RFC 9350) model: FAD encoding and election,
+link pruning rules (section 13), per-algorithm SPF and participation."""
+import heapq, struct
+
+# ---------- topology ----------
+# Links are bidirectional; attributes per link:
+# igp, delay (microseconds; None = not advertised), te, colours (affinity names), srlg
+L = [
+    ("PE1", "P1",  dict(igp=10,  delay=1200,  te=10,  colours={"blue"},        srlg={101})),
+    ("PE1", "P2",  dict(igp=10,  delay=1500,  te=10,  colours={"red"},         srlg={102})),
+    ("P1",  "P3",  dict(igp=10,  delay=900,   te=10,  colours={"blue"},        srlg={103})),
+    ("P2",  "P4",  dict(igp=10,  delay=1100,  te=10,  colours={"red"},         srlg={104})),
+    ("P1",  "P2",  dict(igp=5,   delay=300,   te=5,   colours={"blue", "red"}, srlg={105})),
+    ("P3",  "PE2", dict(igp=10,  delay=1000,  te=10,  colours={"blue"},        srlg={106})),
+    ("P4",  "PE2", dict(igp=10,  delay=1300,  te=10,  colours={"red"},         srlg={107})),
+    ("P1",  "SAT", dict(igp=1,   delay=270000,te=50,  colours={"blue", "satellite"}, srlg={108})),
+    ("SAT", "PE2", dict(igp=1,   delay=270000,te=50,  colours={"blue", "satellite"}, srlg={108})),
+    ("P3",  "P4",  dict(igp=20,  delay=None,  te=20,  colours={"blue", "red"}, srlg={109})),  # no delay advertised
+]
+SRGB_BASE = 16000
+
+def adj():
+    g = {}
+    for a, b, attr in L:
+        g.setdefault(a, []).append((b, attr))
+        g.setdefault(b, []).append((a, attr))
+    return g
+
+# ---------- FAD ----------
+METRIC = {0: "igp", 1: "delay", 2: "te"}
+
+def fad(algo, metric_type=0, calc=0, prio=128, exclude=(), include_any=(), include_all=(),
+        exclude_srlg=(), m_flag=False):
+    return dict(algo=algo, metric_type=metric_type, calc=calc, prio=prio,
+                exclude=set(exclude), include_any=set(include_any), include_all=set(include_all),
+                exclude_srlg=set(exclude_srlg), m_flag=m_flag)
+
+AFFINITY_BITS = {"red": 1, "blue": 2, "satellite": 3}   # FRR: affinity-map NAME bit-position N
+
+def eag(names):
+    """RFC 7308 Extended Admin Group, here 32 bits (one word)."""
+    v = 0
+    for n in names: v |= 1 << AFFINITY_BITS[n]
+    return struct.pack("!I", v)
+
+def encode_isis_fad(f):
+    sub = b""
+    if f["exclude"]:     sub += bytes([1, 4]) + eag(f["exclude"])      # FAEAG
+    if f["include_any"]: sub += bytes([2, 4]) + eag(f["include_any"])  # FAIAnyAG
+    if f["include_all"]: sub += bytes([3, 4]) + eag(f["include_all"])  # FAIAllAG
+    if f["m_flag"]:      sub += bytes([4, 1, 0x80])                    # FADF, M-flag = bit 0
+    if f["exclude_srlg"]:
+        sub += bytes([5, 4 * len(f["exclude_srlg"])]) + b"".join(struct.pack("!I", s) for s in sorted(f["exclude_srlg"]))
+    body = bytes([f["algo"], f["metric_type"], f["calc"], f["prio"]]) + sub
+    return bytes([26, len(body)]) + body                               # FAD sub-TLV type 26
+
+def elect_fad(adverts):
+    """adverts: list of (system_id_hex, fad). Section 5.3: highest priority, then highest System-ID."""
+    valid = [(sid, f) for sid, f in adverts if 128 <= f["algo"] <= 255]
+    return max(valid, key=lambda x: (x[1]["prio"], int(x[0].replace(".", ""), 16)))
+
+# ---------- per-algorithm SPF ----------
+def prune_reason(f, attr):
+    if f["exclude"] & attr["colours"]:            return "exclude admin group"
+    if f["exclude_srlg"] & attr["srlg"]:          return "exclude SRLG"
+    if f["include_any"] and not (f["include_any"] & attr["colours"]): return "include-any not matched"
+    if f["include_all"] and not (f["include_all"] <= attr["colours"]): return "include-all not matched"
+    m = METRIC[f["metric_type"]]
+    if m != "igp" and attr.get(m) is None:        return f"{m} metric not advertised"
+    return None
+
+def spf(src, f, participants):
+    g = adj(); m = METRIC[f["metric_type"]]
+    dist = {src: 0}; prev = {}; pq = [(0, src)]
+    while pq:
+        d, u = heapq.heappop(pq)
+        if d > dist.get(u, 1 << 62): continue
+        for v, attr in g[u]:
+            if v not in participants or u not in participants: continue
+            if prune_reason(f, attr): continue
+            nd = d + attr[m]
+            if nd < dist.get(v, 1 << 62):
+                dist[v] = nd; prev[v] = u; heapq.heappush(pq, (nd, v))
+    return dist, prev
+
+def path(prev, src, dst):
+    if dst not in prev and dst != src: return None
+    p = [dst]
+    while p[-1] != src: p.append(prev[p[-1]])
+    return p[::-1]
+
+def section(t): print(f"\n=== {t} ===")
+
+def main():
+    nodes = sorted(adj())
+    algo0 = fad(0)   # algorithm 0: SPF on IGP metric, no constraints (not a FAD; shown for comparison)
+    defs = {
+        128: fad(128, metric_type=1, prio=200),                          # low latency
+        129: fad(129, exclude={"red"}, prio=200),                        # blue plane only
+        130: fad(130, exclude={"satellite"}, prio=200),                  # avoid satellite
+        131: fad(131, metric_type=1, exclude={"satellite"}, prio=200),  # low latency, no satellite
+        132: fad(132, include_all={"blue", "red"}, prio=200),           # links in both planes only
+        133: fad(133, exclude={"satellite"}, exclude_srlg={103}, prio=200, m_flag=True),  # no satellite, avoid SRLG 103 (P1-P3 duct)
+    }
+
+    section("1. IS-IS FAD sub-TLV encodings (type 26)")
+    for a in (128, 129, 132, 133):
+        print(f"  algo {a}: {encode_isis_fad(defs[a]).hex(' ')}")
+
+    section("2. FAD election for algorithm 129 (RFC 9350 s5.3)")
+    adverts = [
+        ("0000.0000.0001", fad(129, exclude={"red"},  prio=100)),
+        ("0000.0000.0009", fad(129, exclude={"blue"}, prio=100)),
+        ("0000.0000.0002", fad(129, exclude={"red"},  prio=200)),
+        ("0000.0000.0003", fad(129, exclude={"red"},  prio=200)),
+        ("0000.0000.0007", fad(127, exclude={"blue"}, prio=255)),   # invalid algorithm number
+    ]
+    for sid, f in adverts:
+        print(f"  {sid} algo {f['algo']} prio {f['prio']:3d} exclude {sorted(f['exclude'])}")
+    sid, win = elect_fad(adverts)
+    print(f"  winner: {sid} (prio {win['prio']}, exclude {sorted(win['exclude'])}); algo 127 advert ignored")
+    del adverts[2:4]
+    sid, win = elect_fad(adverts)
+    print(f"  if the two prio-200 routers stop advertising: winner {sid}, exclude {sorted(win['exclude'])}  <- the plane flips")
+
+    section("3. PE1 -> PE2 per algorithm (all nodes participate)")
+    everyone = set(nodes)
+    rows = [("0 (IGP SPF)", algo0)] + [(str(a), defs[a]) for a in sorted(defs)]
+    for label, f in rows:
+        dist, prev = spf("PE1", f, everyone)
+        p = path(prev, "PE1", "PE2")
+        print(f"  algo {label:12s} metric={METRIC[f['metric_type']]:5s} path={' > '.join(p) if p else 'UNREACHABLE':32s} cost={dist.get('PE2')}")
+
+    section("4. What algo 0 and algo 128 actually cost in delay")
+    for label, f in [("0", algo0), ("128", defs[128])]:
+        _, prev = spf("PE1", f, everyone)
+        p = path(prev, "PE1", "PE2")
+        g = {(a, b): at for a, b, at in L}; g.update({(b, a): at for a, b, at in L})
+        d = sum(g[(p[i], p[i + 1])]["delay"] for i in range(len(p) - 1))
+        print(f"  algo {label:4s} {' > '.join(p):28s} one-way delay {d/1000:.1f} ms")
+
+    section("5. Pruning log for algo 128 (delay) and 132 (include-all)")
+    for a in (128, 132):
+        for x, y, attr in L:
+            r = prune_reason(defs[a], attr)
+            if r: print(f"  algo {a}: prune {x}-{y}: {r}")
+
+    section("6. Participation: P3 does not advertise algo 129")
+    dist, prev = spf("PE1", defs[129], everyone - {"P3"})
+    p = path(prev, "PE1", "PE2")
+    print(f"  algo 129 PE1->PE2: {' > '.join(p) if p else 'UNREACHABLE'}")
+    dist, prev = spf("PE1", defs[129], everyone - {"P3", "SAT"})
+    p = path(prev, "PE1", "PE2")
+    print(f"  ... and SAT also out: {' > '.join(p) if p else 'UNREACHABLE (algo 129 never falls back to red links)'}")
+
+    section("7. A router that cannot do delay metric (e.g. FRR today)")
+    supported_metric_types = {0}
+    for a in (128, 129, 131):
+        ok = defs[a]["metric_type"] in supported_metric_types
+        print(f"  algo {a}: metric {METRIC[defs[a]['metric_type']]:5s} -> {'participates' if ok else 'MUST stop participating, withdraws algo SIDs'}")
+
+    section("8. Prefix SIDs per algorithm for PE2 (SRGB 16000)")
+    idx = {0: 2, 128: 102, 129: 202, 130: 302}
+    for a, i in idx.items():
+        print(f"  algo {a:3d}: index {i:3d} -> label {SRGB_BASE + i}")
+
+if __name__ == "__main__":
+    main()
+```
+
+Run it with `python3 flexalgo.py` (standard library only). Output, pasted unedited from a run on 2026-11-16:
+```text
+=== 1. IS-IS FAD sub-TLV encodings (type 26) ===
+  algo 128: 1a 04 80 01 00 c8
+  algo 129: 1a 0a 81 00 00 c8 01 04 00 00 00 02
+  algo 132: 1a 0a 84 00 00 c8 03 04 00 00 00 06
+  algo 133: 1a 13 85 00 00 c8 01 04 00 00 00 08 04 01 80 05 04 00 00 00 67
+
+=== 2. FAD election for algorithm 129 (RFC 9350 s5.3) ===
+  0000.0000.0001 algo 129 prio 100 exclude ['red']
+  0000.0000.0009 algo 129 prio 100 exclude ['blue']
+  0000.0000.0002 algo 129 prio 200 exclude ['red']
+  0000.0000.0003 algo 129 prio 200 exclude ['red']
+  0000.0000.0007 algo 127 prio 255 exclude ['blue']
+  winner: 0000.0000.0003 (prio 200, exclude ['red']); algo 127 advert ignored
+  if the two prio-200 routers stop advertising: winner 0000.0000.0009, exclude ['blue']  <- the plane flips
+
+=== 3. PE1 -> PE2 per algorithm (all nodes participate) ===
+  algo 0 (IGP SPF)  metric=igp   path=PE1 > P1 > SAT > PE2             cost=12
+  algo 128          metric=delay path=PE1 > P1 > P3 > PE2              cost=3100
+  algo 129          metric=igp   path=PE1 > P1 > SAT > PE2             cost=12
+  algo 130          metric=igp   path=PE1 > P1 > P3 > PE2              cost=30
+  algo 131          metric=delay path=PE1 > P1 > P3 > PE2              cost=3100
+  algo 132          metric=igp   path=UNREACHABLE                      cost=None
+  algo 133          metric=igp   path=PE1 > P2 > P4 > PE2              cost=30
+
+=== 4. What algo 0 and algo 128 actually cost in delay ===
+  algo 0    PE1 > P1 > SAT > PE2         one-way delay 541.2 ms
+  algo 128  PE1 > P1 > P3 > PE2          one-way delay 3.1 ms
+
+=== 5. Pruning log for algo 128 (delay) and 132 (include-all) ===
+  algo 128: prune P3-P4: delay metric not advertised
+  algo 132: prune PE1-P1: include-all not matched
+  algo 132: prune PE1-P2: include-all not matched
+  algo 132: prune P1-P3: include-all not matched
+  algo 132: prune P2-P4: include-all not matched
+  algo 132: prune P3-PE2: include-all not matched
+  algo 132: prune P4-PE2: include-all not matched
+  algo 132: prune P1-SAT: include-all not matched
+  algo 132: prune SAT-PE2: include-all not matched
+
+=== 6. Participation: P3 does not advertise algo 129 ===
+  algo 129 PE1->PE2: PE1 > P1 > SAT > PE2
+  ... and SAT also out: UNREACHABLE (algo 129 never falls back to red links)
+
+=== 7. A router that cannot do delay metric (e.g. FRR today) ===
+  algo 128: metric delay -> MUST stop participating, withdraws algo SIDs
+  algo 129: metric igp   -> participates
+  algo 131: metric delay -> MUST stop participating, withdraws algo SIDs
+
+=== 8. Prefix SIDs per algorithm for PE2 (SRGB 16000) ===
+  algo   0: index   2 -> label 16002
+  algo 128: index 102 -> label 16102
+  algo 129: index 202 -> label 16202
+  algo 130: index 302 -> label 16302
+```
+
+Read it against the RFC. Section 3 shows four different planes from one LSDB: algorithm 0 and 129 take the 12-cost satellite path, 128 and 131 take the 3.1 ms blue path, 133 is pushed onto the red plane because SRLG 103 removes `P1-P3`, and 132 has no path at all. Section 4 puts a number on the satellite trap: 541.2 ms one way for the IGP-shortest path against 3.1 ms for the delay plane. Section 5 shows `P3-P4` pruned from 128 because it has no delay advertised, which is rule 5 of Section 13 in action. Sections 6 and 7 show participation doing its job: the plane shrinks or vanishes, it never borrows red links or falls back to algorithm 0.
+
+## Gotchas
+
+### The trap: leaving `advertise-definition` off (or relying on one advertiser)
+
+In FRR `isisd` and similar implementations, configuring a `flex-algo` block does not advertise the FAD by default. If no router in the area advertises a valid FAD for Algorithm 129, RFC 9350 Section 5.3 requires every router to stop participating and flush its state. Conversely, if you advertise the FAD from only one router and a stale test router elsewhere in the area advertises a lower-priority FAD with inverted constraints, losing the primary advertiser silently flips the entire plane—just as our lab election shifted from `0000.0000.0003` (`exclude red`) to `0000.0000.0009` (`exclude blue`) when the two priority-200 routers stopped advertising.
+
+### The trap: unsupported metric types or flags silently drop a router out
+
+If the winning FAD specifies `metric-type delay` (type `1`) or sets the M-flag in sub-TLV 4, any router that only supports `metric-type igp` or lacks flag support **must** withdraw from that algorithm. It will not fall back to IGP metrics, and every other router will prune it from the algorithm's topology. In our lab, a router supporting only IGP metrics drops out of Algorithms 128 and 131 while remaining active in Algorithm 129.
+
+### The trap: missing delay metrics prune the link instead of defaulting to zero
+
+If you enable Algorithm 128 (`metric-type delay`) across an area where one core link (`P3-P4`) lacks an ASLA delay advertisement (or only advertises delay in legacy RSVP-TE TLVs without the ASLA X-bit), RFC 9350 Section 13 step 5 prunes that link outright. Never assume a missing metric is `0`.
+
+### The trap: over-constraining with `include-all` creates blackholes with no fallback
+
+Combining multiple bits in an `Include-All` sub-TLV requires every transit link to carry *all* listed colours simultaneously. In our lab, Algorithm 132 (`include-all blue+red`) prunes every link except the cross-links `P1-P2` and `P3-P4`, leaving `PE2` completely **UNREACHABLE** from `PE1`. Because Flex-Algo never falls back to Algorithm 0, any service mapped to an over-constrained algorithm simply drops traffic.
+
+### The trap: partial node participation breaks transit paths
+
+A single non-participating transit router is pruned from the algorithm's graph even if all its physical links satisfy the FAD constraints. In our lab, if `P3` stops advertising Algorithm 129 (`exclude red`), traffic still reaches `PE2` via `PE1>P1>SAT>PE2`; if `SAT` also stops participating, `PE2` becomes **UNREACHABLE** in Algorithm 129—it never spills onto the red plane (`P2-P4`) or Algorithm 0.
+
+### The trap: forgetting per-algorithm Prefix-SIDs or the inter-area M-flag
+
+Enabling `flex-algo 129` on every router computes the RIB, but without a dedicated `segment-routing prefix ... algorithm 129 index ...` (or SRv6 locator) on the egress, ingress routers have no forwarding label for that plane. Across area boundaries, omitting the M-flag (FAD sub-TLV 4, bit 0) causes border routers to leak inter-area prefixes without the Flexible Algorithm Prefix Metric (FAPM), leading to inconsistent end-to-end cost comparisons across multiple ABRs.
+
+## Exercises
+
+1. **Decode a wire FAD.** Given the hex payload `1a 13 85 00 00 c8 01 04 00 00 00 08 04 01 80 05 04 00 00 00 67`, identify every field: TLV type, total value length, algorithm number, metric type, calculation type, priority, and each sub-TLV's type, length, and decoded constraint or flag. Why must `S` be clear in the enclosing Router CAPABILITY TLV 242?
+2. **Trace an election failure.** Five routers advertise FADs for Algorithm 129: `0000.0000.0001` (prio 100, exclude red), `0000.0000.0002` (prio 200, exclude red), `0000.0000.0003` (prio 200, exclude red), `0000.0000.0007` (algo 127, prio 255), and `0000.0000.0009` (prio 100, exclude blue). Which router wins initially? Which router wins if `0002` and `0003` lose power, and what happens to traffic forwarding? How do you prevent this in production?
+3. **Apply Section 13 pruning by hand.** Using the seven-node lab topology, trace why Algorithm 128 (`delay`) selects `PE1>P1>P3>PE2` (3100 µs) while Algorithm 0 (`igp`) selects `PE1>P1>SAT>PE2` (cost 12, 541.2 ms delay). Explain specifically why `P3-P4` is absent from Algorithm 128's graph and why `PE1>P1>P2>P4>PE2` is unreachable in Algorithm 132 (`include-all blue+red`).
+4. **Design a dual-plane + low-latency + SRLG-diverse core.** You operate a core with two physical planes (blue = bit 0, red = bit 1), a costly satellite backup (bit 3), and a shared river crossing (`SRLG 103`) on the primary blue span. Write out the minimal set of Flex-Algos (numbers `128–133`), their metric types, their constraint sub-TLVs, and the Prefix-SID index scheme (assuming SRGB `16000`) for `PE2` (node ID `2`).
+5. **Audit an FRR deployment.** An operator configures `flex-algo 128` with `metric-type delay` and `priority 200` on an FRR `isisd` router, omits `advertise-definition`, and forgets to add an algorithm-128 Prefix-SID. Based on the FRR documentation and RFC 9350, list every reason why Algorithm 128 forwarding state will not appear on this router or its neighbours.
+6. **Reason about TI-LFA over Flex-Algo.** In the seven-node topology running Algorithm 130 (`exclude satellite`), suppose the `P1-P3` link fails. Explain why TI-LFA for Algorithm 130 cannot simply use Algorithm 0's backup path through `SAT`, and describe what constraints the repair list must satisfy to keep traffic loop-free and compliant.
+
+## The boring rule
+
+Keep the number of Flexible Algorithms small, advertise every FAD identically from at least two routers with pinned priorities, verify ASLA attributes on every link, and treat every FAD change like a topology cutover.
+
+## Sources
+
+- [RFC 9350 — IGP Flexible Algorithm](https://datatracker.ietf.org/doc/html/rfc9350)
+- [RFC 8570 — IS-IS Traffic Engineering (TE) Metric Extensions](https://datatracker.ietf.org/doc/html/rfc8570)
+- [RFC 8919 — IS-IS Application-Specific Link Attributes](https://datatracker.ietf.org/doc/html/rfc8919)
+- [RFC 8920 — OSPF Application-Specific Link Attributes](https://datatracker.ietf.org/doc/html/rfc8920)
+- [RFC 7308 — Extended Administrative Groups in MPLS Traffic Engineering (MPLS-TE)](https://datatracker.ietf.org/doc/html/rfc7308)
+- [RFC 7981 — IS-IS Extensions for Advertising Router Information](https://datatracker.ietf.org/doc/html/rfc7981)
+- [RFC 5305 — IS-IS Extensions for Traffic Engineering](https://datatracker.ietf.org/doc/html/rfc5305)
+- [RFC 5307 — IS-IS Extensions in Support of Generalized Multi-Protocol Label Switching (GMPLS)](https://datatracker.ietf.org/doc/html/rfc5307)
+- [RFC 8402 — Segment Routing Architecture](https://datatracker.ietf.org/doc/html/rfc8402)
+- [FRRouting `isisd` Documentation — Flex-Algos](https://docs.frrouting.org/en/latest/isisd.html)
