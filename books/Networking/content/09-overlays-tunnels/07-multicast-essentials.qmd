@@ -1,0 +1,615 @@
+---
+title: "Multicast Essentials: IGMP, MLD, PIM and Snooping"
+author:
+  - name: "K19G"
+  - name: "grok-bot"
+---
+
+# Multicast Essentials: IGMP, MLD, PIM and Snooping
+
+Multicast sends one packet to many receivers without the sender making a copy per receiver. The network makes the copies, and only where the tree branches. That needs three cooperating pieces: hosts that say which groups they want (IGMP for IPv4, MLD for IPv6), switches that use those messages to stop flooding (snooping), and routers that build a distribution tree between segments (PIM). When any one piece is missing, multicast either floods everywhere or silently stops.
+
+You have already seen multicast in this book without naming it. OSPF hellos go to 224.0.0.5. IPv6 neighbour discovery uses solicited-node groups. The VXLAN data plane chapter mentioned a multicast underlay for flooding broadcast, unknown-unicast and multicast (BUM) traffic. This chapter is the missing piece of the overlays part: how group membership works on the wire, and how routers forward it.
+
+## Learning goals
+
+By the end of this chapter you can:
+
+- Read a multicast address and say whether it is link-local, source-specific, or administratively scoped, and which MAC address it maps to
+- Join a group from a socket and find the membership in `ip maddr` and `/proc/net/igmp`
+- Decode an IGMPv3 report and name the record type for an any-source join, a source-specific join, and a leave
+- Explain why a snooping switch without a querier eventually breaks multicast, and check the Linux bridge's snooping and querier settings
+- Describe PIM sparse mode: rendezvous point, shared tree, register, switch to the shortest-path tree, and the RPF check
+- Build a routed PIM lab with FRR on your lab host and know which `show` commands prove each stage
+
+**Version note.** The host-side labs ran on 2026-11-13 on the writing host as an unprivileged user inside `unshare -rn` (a user plus network namespace), Linux 6.12.94+, iproute2 6.15.0, Python 3. Output is pasted verbatim. No packages were installed: there is no `tcpdump`, `tc` or `bridge` binary on that host, so packets were decoded with a small `AF_PACKET` socket in Python instead. The routed FRR/PIM lab needs Docker and Containerlab and was **not run on the writing host**. It is written from the FRR PIM documentation and the RFCs. Run it on your lab host.
+
+## Who sends multicast, and to what
+
+| Address range | Meaning | Routed? |
+|---------------|---------|---------|
+| `224.0.0.0/24` | Local network control block: 224.0.0.1 all hosts, .2 all routers, .5/.6 OSPF, .13 PIM, .18 VRRP, .22 IGMPv3 reports | Never. Sent with TTL 1. |
+| `224.0.1.0` – `231.255.255.255` | Globally assigned and ad-hoc blocks | Yes, if PIM is running |
+| `232.0.0.0/8` | Source-specific multicast (SSM), RFC 4607 | Yes, with (S,G) joins only |
+| `239.0.0.0/8` | Administratively scoped (RFC 2365). The "private" range | Inside your domain only |
+| `ff02::/16` | IPv6 link-local scope (ff02::1 all nodes, ff02::2 all routers, ff02::1:ffXX:XXXX solicited-node) | Never |
+| `ff05::/16`, `ff0e::/16` | IPv6 site and global scope | Yes |
+| `ff3x::/32` | IPv6 SSM (RFC 4607) | Yes, with (S,G) joins |
+
+In IPv6 the fourth hex digit is the scope (RFC 4291). `ff02` is link, `ff05` is site, `ff0e` is global. The scope is in the address, not in a TTL.
+
+Two kinds of service share these ranges:
+
+- **Any-source multicast (ASM).** A receiver asks for group G and accepts any sender. The network has to discover the senders. This is written (*,G).
+- **Source-specific multicast (SSM).** A receiver asks for group G from source S. The network never has to discover anything. This is written (S,G).
+
+## From group address to MAC address
+
+An Ethernet NIC filters on destination MAC. For IPv4 groups the MAC is `01:00:5e` followed by the low 23 bits of the group address. The top 9 bits of the 28-bit group part are thrown away, so 32 IPv4 groups share every MAC. `224.1.1.1`, `225.1.1.1` and `239.129.1.1` all become `01:00:5e:01:01:01`. The kernel's IP layer filters the rest, but the NIC and every switch on the path will deliver all 32.
+
+For IPv6 the MAC is `33:33` followed by the low 32 bits of the group, so ff02::1 is `33:33:00:00:00:01`.
+
+The lab below joins 239.1.1.1 and the interface gains exactly that MAC filter: `01:00:5e:01:01:01`.
+
+## Host signalling: IGMP and MLD
+
+A host tells the local router (and any listening switch) which groups it wants.
+
+| Protocol | Family | Source filtering | Reports sent to |
+|----------|--------|------------------|-----------------|
+| IGMPv1 (RFC 1112) | IPv4 | No | The group itself |
+| IGMPv2 (RFC 2236) | IPv4 | No; adds explicit Leave to 224.0.0.2 | The group itself |
+| IGMPv3 (RFC 3376) | IPv4 | Yes: include or exclude source lists | 224.0.0.22 |
+| MLDv1 (RFC 2710) | IPv6 | No (equivalent of IGMPv2) | The group |
+| MLDv2 (RFC 3810) | IPv6 | Yes (equivalent of IGMPv3) | ff02::16 |
+
+SSM needs IGMPv3 or MLDv2, because only they can carry a source.
+
+An IGMPv3 report carries one or more **group records**. Each record has a type, a group, and a list of sources:
+
+| Type | Name | When the host sends it |
+|-----:|------|------------------------|
+| 1 | MODE_IS_INCLUDE | Answer to a query: "I want G from these sources" |
+| 2 | MODE_IS_EXCLUDE | Answer to a query: "I want G from everyone except these" |
+| 3 | CHANGE_TO_INCLUDE_MODE | State change. With an empty source list this is a leave |
+| 4 | CHANGE_TO_EXCLUDE_MODE | State change. With an empty source list this is an any-source join |
+| 5 | ALLOW_NEW_SOURCES | State change: add sources (a source-specific join) |
+| 6 | BLOCK_OLD_SOURCES | State change: remove sources (a source-specific leave) |
+
+Types 1 and 2 answer queries. Types 3 to 6 are unsolicited and are sent the moment a socket joins or leaves. The host repeats each unsolicited report: the robustness variable defaults to 2, so you see two copies.
+
+The **querier** is the router (or a switch configured to act like one) that sends periodic general queries to 224.0.0.1. Hosts answer, and memberships that are not refreshed expire. With the RFC 3376 defaults (query interval 125 s, robustness 2, query response 10 s) a membership with no answers lives for 260 s. When several routers share a segment, the lowest IP address wins the querier election.
+
+## Lab: join, send, leave (rootless, run)
+
+The goal is to watch the host side on the wire with no root and no installs. Two network namespaces are joined by a veth pair, which behaves like a cable:
+
+```text
+ sender ns (unshare -rn)            receiver ns (unshare -n)
+ v0  10.9.0.1/24  <----- veth ----->  v1  10.9.0.2/24
+ send.py, sniff.py on v0              recv.py / ssm.py on v1
+```
+
+`unshare -rn` gives the outer shell its own user and network namespace, with root inside it only. `unshare -n sleep 20` holds a second network namespace open, and `nsenter -t PID -n` runs commands in it. Nothing touches the host's real interfaces.
+
+The receiver joins a group with `IP_ADD_MEMBERSHIP`. This is the call every multicast application makes, whatever language it is written in:
+
+```{.python filename="recv.py"}
+import socket, struct, sys
+grp, port, ifaddr = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind((grp, port))
+mreq = struct.pack("4s4s", socket.inet_aton(grp), socket.inet_aton(ifaddr))
+s.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
+print(f"joined {grp} on {ifaddr}", flush=True)
+s.settimeout(6)
+try:
+    while True:
+        data, src = s.recvfrom(1500)
+        print(f"got {data.decode()!r} from {src[0]}", flush=True)
+except socket.timeout:
+    pass
+```
+
+The sender must choose an interface (`IP_MULTICAST_IF`) because there is no unicast route to tell it which one, and it sets the TTL explicitly. The default multicast TTL on Linux is 1:
+
+```{.python filename="send.py"}
+import socket, sys
+grp, port, ifaddr, ttl = sys.argv[1], int(sys.argv[2]), sys.argv[3], int(sys.argv[4])
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+s.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF, socket.inet_aton(ifaddr))
+s.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, ttl)
+for i in range(3):
+    s.sendto(f"tick {i}".encode(), (grp, port))
+print(f"sent 3 datagrams to {grp}:{port} ttl={ttl}")
+```
+
+`tcpdump` is not installed on the writing host, so `sniff.py` reads raw frames from v0 with an `AF_PACKET` socket and decodes IGMPv3 reports (IP protocol 2, type 0x22) and UDP. Inside the user namespace the process has `CAP_NET_RAW` for its own network namespace, so this works without root on the host:
+
+```{.python filename="sniff.py"}
+import socket, struct, sys, time
+ifname, secs = sys.argv[1], float(sys.argv[2])
+s = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.ntohs(0x0003))
+s.bind((ifname, 0)); s.settimeout(0.5)
+end = time.time() + secs
+while time.time() < end:
+    try: pkt = s.recv(2048)
+    except socket.timeout: continue
+    dst = ':'.join(f'{b:02x}' for b in pkt[0:6]); et = struct.unpack('!H', pkt[12:14])[0]
+    if et != 0x0800: continue
+    ip = pkt[14:]; ihl = (ip[0] & 0xf) * 4; proto = ip[9]; ttl = ip[8]
+    src = socket.inet_ntoa(ip[12:16]); dsti = socket.inet_ntoa(ip[16:20])
+    if proto == 2:
+        p = ip[ihl:]; t = p[0]
+        if t == 0x22:
+            n = struct.unpack('!H', p[6:8])[0]; recs = []; off = 8
+            for _ in range(n):
+                rt, aux, ns = p[off], p[off+1], struct.unpack('!H', p[off+2:off+4])[0]
+                srcs=[socket.inet_ntoa(p[off+8+4*i:off+12+4*i]) for i in range(ns)]; recs.append((rt, socket.inet_ntoa(p[off+4:off+8]), srcs)); off += 8 + 4*ns + aux*4
+            print(f"IGMPv3 report {src} -> {dsti} dstmac {dst} ttl {ttl} records {recs}", flush=True)
+        else:
+            print(f"IGMP type 0x{t:02x} {src} -> {dsti} dstmac {dst}", flush=True)
+    elif proto == 17:
+        print(f"UDP {src} -> {dsti} dstmac {dst} ttl {ttl}", flush=True)
+```
+
+The driver script builds the namespaces, joins, sends, and prints what each side saw:
+
+```{.bash filename="lab.sh"}
+set -e
+cd "$(dirname "$0")"
+ip link set lo up
+unshare -n sleep 20 & RX=$!
+sleep 0.3
+ip link add v0 type veth peer name v1
+ip link set v1 netns $RX
+ip addr add 10.9.0.1/24 dev v0; ip link set v0 up
+nsenter -t $RX -n sh -c 'ip link set lo up; ip addr add 10.9.0.2/24 dev v1; ip link set v1 up'
+sleep 1
+echo '$ ip maddr show dev v1   # (receiver, before join)'
+nsenter -t $RX -n ip maddr show dev v1
+python3 sniff.py v0 4 > sniff.out &
+SN=$!
+sleep 0.3
+nsenter -t $RX -n python3 recv.py 239.1.1.1 5000 10.9.0.2 > recv.out &
+RP=$!
+sleep 1
+echo '$ ip maddr show dev v1   # (receiver, after join)'
+nsenter -t $RX -n ip maddr show dev v1
+echo '$ cat /proc/net/igmp     # (receiver)'
+nsenter -t $RX -n cat /proc/net/igmp
+echo '$ python3 send.py 239.1.1.1 5000 10.9.0.1 1'
+python3 send.py 239.1.1.1 5000 10.9.0.1 1
+wait $SN
+echo '--- sniff on v0'; cat sniff.out
+wait $RP || true
+echo '--- receiver'; cat recv.out
+kill $RX 2>/dev/null || true
+```
+
+Run it as `unshare -rn bash lab.sh`. Captured output:
+
+```text
+$ ip maddr show dev v1   # (receiver, before join)
+2:	v1
+	link  33:33:00:00:00:01
+	link  01:00:5e:00:00:01
+	link  33:33:ff:75:94:b7
+	inet  224.0.0.1
+	inet6 ff02::1:ff75:94b7
+	inet6 ff02::1
+	inet6 ff01::1
+$ ip maddr show dev v1   # (receiver, after join)
+2:	v1
+	link  33:33:00:00:00:01
+	link  01:00:5e:00:00:01
+	link  33:33:ff:75:94:b7
+	link  01:00:5e:01:01:01
+	inet  239.1.1.1
+	inet  224.0.0.1
+	inet6 ff02::1:ff75:94b7
+	inet6 ff02::1
+	inet6 ff01::1
+$ cat /proc/net/igmp     # (receiver)
+Idx	Device    : Count Querier	Group    Users Timer	Reporter
+1	lo        :     1      V3
+				010000E0     1 0:00000000		0
+2	v1        :     2      V3
+				010101EF     1 0:00000000		0
+				010000E0     1 0:00000000		0
+$ python3 send.py 239.1.1.1 5000 10.9.0.1 1
+sent 3 datagrams to 239.1.1.1:5000 ttl=1
+--- sniff on v0
+IGMPv3 report 10.9.0.2 -> 224.0.0.22 dstmac 01:00:5e:00:00:16 ttl 1 records [(4, '239.1.1.1', [])]
+IGMPv3 report 10.9.0.2 -> 224.0.0.22 dstmac 01:00:5e:00:00:16 ttl 1 records [(4, '239.1.1.1', [])]
+UDP 10.9.0.1 -> 239.1.1.1 dstmac 01:00:5e:01:01:01 ttl 1
+UDP 10.9.0.1 -> 239.1.1.1 dstmac 01:00:5e:01:01:01 ttl 1
+UDP 10.9.0.1 -> 239.1.1.1 dstmac 01:00:5e:01:01:01 ttl 1
+--- receiver
+joined 239.1.1.1 on 10.9.0.2
+got 'tick 0' from 10.9.0.1
+got 'tick 1' from 10.9.0.1
+got 'tick 2' from 10.9.0.1
+```
+
+### Reading the output
+
+- **Before the join**, v1 already belongs to `224.0.0.1` (all hosts) and to the IPv6 groups ff02::1 and its solicited-node group. Every IPv4 multicast-capable interface joins 224.0.0.1. You cannot leave it.
+- **After the join**, two lines appear: `inet 239.1.1.1` (the IP membership) and `link 01:00:5e:01:01:01` (the MAC filter programmed into the device). That is the 23-bit mapping from earlier.
+- **`/proc/net/igmp`** prints groups in hex, in host byte order on this little-endian machine. `010101EF` read backwards is `EF.01.01.01`, which is 239.1.1.1. `010000E0` is 224.0.0.1. `V3` in the Querier column means the interface is in IGMPv3 mode: no IGMPv2 querier has been heard, so the host uses v3.
+- **The sniffer** saw two identical reports from 10.9.0.2 to 224.0.0.22, destination MAC `01:00:5e:00:00:16` (0x16 = 22). Two copies is the robustness variable. Each carried one record of **type 4, CHANGE_TO_EXCLUDE_MODE, with no sources**: "exclude nobody", which is an any-source join. The report itself has TTL 1. It never leaves the link.
+- **The data** went to MAC `01:00:5e:01:01:01` with TTL 1. A router would decrement that to 0 and drop it. That is the right default for a lab, and the first thing to change when a stream must cross a router.
+
+### Source-specific join and leave
+
+`ssm.py` joins (10.9.0.1, 232.1.1.1) with `IP_ADD_SOURCE_MEMBERSHIP`, waits, then closes the socket. Closing the socket drops the membership. On Linux the `ip_mreq_source` structure is group, interface, then source:
+
+```{.python filename="ssm.py"}
+import socket, struct, sys, time
+grp, src, ifaddr = sys.argv[1], sys.argv[2], sys.argv[3]
+IP_ADD_SOURCE_MEMBERSHIP = getattr(socket, "IP_ADD_SOURCE_MEMBERSHIP", 39)
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.bind((grp, 5001))
+# Linux struct ip_mreq_source: multiaddr, interface, sourceaddr
+mreq = socket.inet_aton(grp) + socket.inet_aton(ifaddr) + socket.inet_aton(src)
+s.setsockopt(socket.IPPROTO_IP, IP_ADD_SOURCE_MEMBERSHIP, mreq)
+print(f"joined ({src}, {grp}) on {ifaddr}", flush=True)
+time.sleep(1.5)
+s.close()
+print("socket closed (leave)", flush=True)
+time.sleep(1.5)
+```
+
+```{.bash filename="lab2.sh"}
+set -e
+cd "$(dirname "$0")"
+ip link set lo up
+unshare -n sleep 20 & RX=$!
+sleep 0.3
+ip link add v0 type veth peer name v1
+ip link set v1 netns $RX
+ip addr add 10.9.0.1/24 dev v0; ip link set v0 up
+nsenter -t $RX -n sh -c 'ip link set lo up; ip addr add 10.9.0.2/24 dev v1; ip link set v1 up'
+sleep 1
+python3 sniff.py v0 5 > sniff2.out &
+SN=$!
+sleep 0.3
+echo '$ python3 ssm.py 232.1.1.1 10.9.0.1 10.9.0.2   # receiver'
+nsenter -t $RX -n python3 ssm.py 232.1.1.1 10.9.0.1 10.9.0.2
+wait $SN
+echo '--- sniff on v0'; cat sniff2.out
+kill $RX 2>/dev/null || true
+```
+
+Captured output of `unshare -rn bash lab2.sh`:
+
+```text
+$ python3 ssm.py 232.1.1.1 10.9.0.1 10.9.0.2   # receiver
+joined (10.9.0.1, 232.1.1.1) on 10.9.0.2
+socket closed (leave)
+--- sniff on v0
+IGMPv3 report 10.9.0.2 -> 224.0.0.22 dstmac 01:00:5e:00:00:16 ttl 1 records [(5, '232.1.1.1', ['10.9.0.1'])]
+IGMPv3 report 10.9.0.2 -> 224.0.0.22 dstmac 01:00:5e:00:00:16 ttl 1 records [(5, '232.1.1.1', ['10.9.0.1'])]
+IGMPv3 report 10.9.0.2 -> 224.0.0.22 dstmac 01:00:5e:00:00:16 ttl 1 records [(6, '232.1.1.1', ['10.9.0.1'])]
+IGMPv3 report 10.9.0.2 -> 224.0.0.22 dstmac 01:00:5e:00:00:16 ttl 1 records [(6, '232.1.1.1', ['10.9.0.1'])]
+```
+
+The join is **type 5, ALLOW_NEW_SOURCES**, with source 10.9.0.1. The leave is **type 6, BLOCK_OLD_SOURCES**, with the same source. Both are sent twice. Compare the any-source join above, which was type 4 with an empty list. That difference is what an SSM-only router looks for: a type 4 record for a group in 232/8 has no meaning, because SSM has no "any source".
+
+### IGMPv2 fallback and a TTL of 0
+
+`lab3.sh` repeats the any-source lab with two changes: the receiver's interface is forced to IGMPv2 through `/proc/sys/net/ipv4/conf/v1/force_igmp_version` (writable inside the namespace, no `sysctl` binary needed), and the sender uses TTL 0.
+
+```{.bash filename="lab3.sh"}
+set -e
+cd "$(dirname "$0")"
+ip link set lo up
+unshare -n sleep 20 & RX=$!
+sleep 0.3
+ip link add v0 type veth peer name v1
+ip link set v1 netns $RX
+ip addr add 10.9.0.1/24 dev v0; ip link set v0 up
+nsenter -t $RX -n sh -c 'ip link set lo up; ip addr add 10.9.0.2/24 dev v1; ip link set v1 up; echo 2 > /proc/sys/net/ipv4/conf/v1/force_igmp_version && echo force2-ok'
+sleep 1
+python3 sniff.py v0 4 > sniff3.out &
+SN=$!
+sleep 0.3
+nsenter -t $RX -n python3 recv.py 239.1.1.1 5000 10.9.0.2 > recv3.out &
+sleep 1
+nsenter -t $RX -n cat /proc/net/igmp
+python3 send.py 239.1.1.1 5000 10.9.0.1 0
+wait $SN; cat sniff3.out; sleep 0.5; cat recv3.out
+kill $RX 2>/dev/null || true
+```
+
+Captured output of `unshare -rn bash lab3.sh`:
+
+```text
+force2-ok
+Idx	Device    : Count Querier	Group    Users Timer	Reporter
+1	lo        :     1      V3
+				010000E0     1 0:00000000		0
+2	v1        :     2      V2
+				010101EF     1 1:00000351		1
+				010000E0     1 0:00000000		0
+sent 3 datagrams to 239.1.1.1:5000 ttl=0
+IGMP type 0x16 10.9.0.2 -> 239.1.1.1 dstmac 01:00:5e:01:01:01
+UDP 10.9.0.1 -> 239.1.1.1 dstmac 01:00:5e:01:01:01 ttl 0
+UDP 10.9.0.1 -> 239.1.1.1 dstmac 01:00:5e:01:01:01 ttl 0
+UDP 10.9.0.1 -> 239.1.1.1 dstmac 01:00:5e:01:01:01 ttl 0
+joined 239.1.1.1 on 10.9.0.2
+got 'tick 0' from 10.9.0.1
+got 'tick 1' from 10.9.0.1
+got 'tick 2' from 10.9.0.1
+```
+
+- `/proc/net/igmp` now shows `V2`, and the group line has a running timer and `Reporter 1`.
+- The report is **IGMP type 0x16, an IGMPv2 membership report, sent to the group address itself** (239.1.1.1, MAC `01:00:5e:01:01:01`), not to 224.0.0.22. There are no records and no sources. A v2 host cannot express SSM.
+- Only one report appeared in the four-second capture. IGMPv2 repeats its unsolicited report after a random delay (the pending timer in `/proc/net/igmp`), not immediately as v3 did here.
+- TTL 0 datagrams still reached a receiver on the same link. The TTL limits forwarding by routers, and nothing forwarded here. Do not use TTL 0 as a "this host only" guarantee; use `IP_MULTICAST_LOOP` and a loopback interface for that.
+
+## Layer 2: snooping and the querier
+
+A switch that knows nothing about multicast floods it like broadcast. **IGMP/MLD snooping** makes the switch listen to reports and queries and forward a group only to ports that asked for it, plus the ports where a multicast router sits (mrouter ports, learned from queries or PIM hellos).
+
+Snooping has a dependency that bites in labs and in flat networks. Memberships only stay alive while hosts answer queries. If there is no querier on the VLAN, nobody asks, hosts stop reporting after their unsolicited reports, and the snooping table ages out. Depending on the implementation the switch then floods again, or stops forwarding the group. Either way the symptom is "multicast works for a few minutes after the receiver starts". The fix is a querier: the router, or a switch with the querier function enabled.
+
+The Linux bridge snoops by default. Here are its multicast settings on a freshly created bridge. `mcast-knobs.py` just prints five keys from `ip -d -j link show` JSON:
+
+```{.python filename="mcast-knobs.py"}
+import json, sys
+d = json.load(sys.stdin)[0]["linkinfo"]["info_data"]
+for k in ("mcast_snooping", "mcast_router", "mcast_querier", "mcast_igmp_version", "mcast_mld_version"):
+    print(k, d[k])
+```
+
+```{.bash filename="bridge.sh"}
+ip link add br0 type bridge
+echo '$ ip -d -j link show br0 | python3 mcast-knobs.py'
+ip -d -j link show br0 | python3 mcast-knobs.py
+echo '$ ip link set br0 type bridge mcast_querier 1 mcast_igmp_version 3'
+ip link set br0 type bridge mcast_querier 1 mcast_igmp_version 3
+ip -d -j link show br0 | python3 mcast-knobs.py
+echo '$ cat /proc/sys/net/ipv4/igmp_max_memberships'
+cat /proc/sys/net/ipv4/igmp_max_memberships
+```
+
+Captured output of `unshare -rn bash bridge.sh`:
+
+```text
+$ ip -d -j link show br0 | python3 mcast-knobs.py
+mcast_snooping 1
+mcast_router 1
+mcast_querier 0
+mcast_igmp_version 2
+mcast_mld_version 1
+$ ip link set br0 type bridge mcast_querier 1 mcast_igmp_version 3
+mcast_snooping 1
+mcast_router 1
+mcast_querier 1
+mcast_igmp_version 3
+mcast_mld_version 1
+$ cat /proc/sys/net/ipv4/igmp_max_memberships
+20
+```
+
+Three defaults to remember:
+
+- `mcast_snooping 1`: the bridge snoops.
+- `mcast_querier 0`: the bridge does not send queries. On an isolated lab bridge with no router, nobody will.
+- `mcast_igmp_version 2` and `mcast_mld_version 1`: if the bridge does become querier, it sends IGMPv2 and MLDv1 queries. Hosts that hear a v2 query drop to v2 compatibility and stop sending source lists. Set version 3 and 2 when you test SSM.
+
+`mcast_router 1` means "learn mrouter ports from queries", which is the normal setting. The snooping table itself is shown by `bridge mdb show` (iproute2's `bridge` tool, not installed on the writing host). On a lab host, add a receiver behind a bridge port and watch its group appear there.
+
+## Layer 3: PIM sparse mode
+
+Hosts talk IGMP to the first router. Routers talk **PIM** to each other. PIM does not have its own topology. It uses the unicast routing table, whatever filled it (OSPF, IS-IS, BGP, statics). That is the "protocol independent" in the name.
+
+### The RPF check
+
+Every multicast forwarding decision starts with a **reverse path forwarding** (RPF) check: a packet from source S is accepted only on the interface the router would use to send unicast traffic **to** S. Anything arriving elsewhere is dropped. This is how multicast avoids loops without a TTL-based flood. It is also why asymmetric unicast routing breaks multicast: the stream arrives on one interface while the unicast route to the source points out another, and every packet fails RPF.
+
+### Sparse mode, step by step (RFC 7761)
+
+Sparse mode assumes nobody wants traffic until they ask. It needs a **rendezvous point** (RP), a router address that every PIM router agrees on, per group range.
+
+1. **Receiver joins.** The receiver sends an IGMP report. Its router (the last-hop router, or designated router on that segment) sends a PIM (*,G) Join hop by hop toward the RP. Each router on the way adds state. That builds the **shared tree**, rooted at the RP.
+2. **Source starts.** The source's first-hop router does not know about any receivers. It encapsulates the first packets in unicast **PIM Register** messages to the RP.
+3. **RP joins the source.** The RP decapsulates and sends the packets down the shared tree. It also sends an (S,G) Join toward the source, so native traffic flows to it, then a **Register-Stop** to the first-hop router.
+4. **Switch to the SPT.** The last-hop router now knows the source address. By default it joins (S,G) directly toward the source, along the unicast shortest path, and prunes that source off the shared tree. The RP drops out of the data path. FRR controls this with `spt-switchover infinity-and-beyond` if you want traffic to stay on the shared tree.
+
+**SSM** skips steps 2 to 4. The receiver already named the source in its IGMPv3 report, so the last-hop router sends an (S,G) Join straight toward S. No RP, no register, no source discovery. Use SSM for anything where receivers can know the source, which is most one-to-many video and data feeds.
+
+**Dense mode** (PIM-DM) floods everywhere first and prunes back. It belongs in a history lesson. **RP placement** in production uses either static configuration, the bootstrap router mechanism (BSR), or anycast RP (RFC 4610), where several routers share one RP address so that the RP is not a single point of failure.
+
+| State | Meaning | Created by |
+|-------|---------|------------|
+| (*,G) | Any source, group G, forward along the shared tree from the RP | IGMP join + PIM join toward RP |
+| (S,G) | Source S, group G, forward along the shortest path from S | SPT switchover, RP joining a source, or SSM |
+| (S,G,rpt) | Prune S from the shared tree after switching to SPT | Last-hop router after switchover |
+
+## Lab: PIM-SM with FRR (not run on the writing host)
+
+This lab runs on the lab host described in the lab host track, with the FRR image already loaded. It was **not run on the writing host**, which has no Docker or Containerlab. All configuration follows the FRR PIM documentation. Predict each `show` before you run it.
+
+```text
+ src (10.1.1.10) --- r1 (RP 10.0.0.1) --- r2 --- rcv (10.2.2.10)
+        10.1.1.0/24          10.12.0.0/30        10.2.2.0/24
+```
+
+```{.yaml filename="mcast.clab.yml"}
+name: mcast
+topology:
+  kinds:
+    frr:
+      image: quay.io/frrouting/frr:containerlab-10.7.1
+    linux:
+      image: alpine:latest
+  nodes:
+    r1:
+      kind: frr
+      startup-config: r1.frr.conf
+      daemons: [ospfd, pimd]
+    r2:
+      kind: frr
+      startup-config: r2.frr.conf
+      daemons: [ospfd, pimd]
+    src:
+      kind: linux
+      exec:
+        - ip addr add 10.1.1.10/24 dev eth1
+        - ip route replace default via 10.1.1.1
+    rcv:
+      kind: linux
+      exec:
+        - ip addr add 10.2.2.10/24 dev eth1
+        - ip route replace default via 10.2.2.1
+  links:
+    - endpoints: ["src:eth1", "r1:eth1"]
+    - endpoints: ["r1:eth2", "r2:eth1"]
+    - endpoints: ["r2:eth2", "rcv:eth1"]
+```
+
+The `daemons` list follows the convention the lab host track uses for FRR nodes. Whatever mechanism your Containerlab version uses, `ospfd` and `pimd` must both be enabled in the node's FRR daemons file. Without `pimd` the `ip pim` lines load but nothing happens.
+
+`r1.frr.conf` (r1 is also the RP):
+
+```{.text filename="r1.frr.conf"}
+frr defaults traditional
+service integrated-vtysh-config
+!
+interface lo
+ ip address 10.0.0.1/32
+ ip pim
+!
+interface eth1
+ ip address 10.1.1.1/24
+ ip pim
+ ip ospf area 0
+!
+interface eth2
+ ip address 10.12.0.1/30
+ ip pim
+ ip ospf area 0
+ ip ospf network point-to-point
+!
+router ospf
+ ospf router-id 10.0.0.1
+ network 10.0.0.1/32 area 0
+!
+router pim
+ rp 10.0.0.1 224.0.0.0/4
+!
+```
+
+`r2.frr.conf`:
+
+```{.text filename="r2.frr.conf"}
+frr defaults traditional
+service integrated-vtysh-config
+!
+interface lo
+ ip address 10.0.0.2/32
+!
+interface eth1
+ ip address 10.12.0.2/30
+ ip pim
+ ip ospf area 0
+ ip ospf network point-to-point
+!
+interface eth2
+ ip address 10.2.2.1/24
+ ip pim
+ ip igmp
+ ip ospf area 0
+!
+router ospf
+ ospf router-id 10.0.0.2
+ network 10.0.0.2/32 area 0
+!
+router pim
+ rp 10.0.0.1 224.0.0.0/4
+!
+```
+
+Every PIM router must agree on the RP. Older FRR releases configured the RP globally as `ip pim rp 10.0.0.1 224.0.0.0/4`. Current releases put it under `router pim`. `ip igmp` is only needed on the receiver-facing interface. `ip pim` goes on every interface that should carry multicast, and on the RP's loopback so it can be the RP.
+
+Bring it up and walk the stages:
+
+```bash
+containerlab deploy -t mcast.clab.yml
+
+# 1. Unicast first. PIM is useless until this works.
+docker exec clab-mcast-r2 vtysh -c 'show ip route 10.1.1.0/24'
+
+# 2. PIM adjacency and RP agreement
+docker exec clab-mcast-r2 vtysh -c 'show ip pim neighbor'
+docker exec clab-mcast-r2 vtysh -c 'show ip pim rp-info'
+
+# 3. Receiver joins. Copy recv.py and send.py from the rootless lab into the hosts first.
+docker cp recv.py clab-mcast-rcv:/recv.py
+docker cp send.py clab-mcast-src:/send.py
+docker exec clab-mcast-rcv apk add --no-cache python3   # needs internet on the lab host
+docker exec -d clab-mcast-rcv python3 /recv.py 239.1.1.1 5000 10.2.2.10
+docker exec clab-mcast-r2 vtysh -c 'show ip igmp groups'
+docker exec clab-mcast-r2 vtysh -c 'show ip pim upstream'
+
+# 4. Source sends with TTL 8 so it can cross two routers
+docker exec clab-mcast-src apk add --no-cache python3
+docker exec clab-mcast-src python3 /send.py 239.1.1.1 5000 10.1.1.10 8
+docker exec clab-mcast-r1 vtysh -c 'show ip mroute'
+docker exec clab-mcast-r2 vtysh -c 'show ip mroute'
+
+containerlab destroy -t mcast.clab.yml --cleanup
+```
+
+What to expect, stage by stage:
+
+- After step 2, r2 lists r1 as a PIM neighbour on eth1, and `rp-info` shows 10.0.0.1 for 224.0.0.0/4 on both routers. If the RP differs between routers, stop and fix that first.
+- After step 3, r2 has 239.1.1.1 on eth2 in `show ip igmp groups`, and a (*,239.1.1.1) upstream entry pointing toward r1.
+- After step 4, the receiver prints three `got 'tick N'` lines. `show ip mroute` on r2 shows an (S,G) entry for (10.1.1.10, 239.1.1.1) with eth1 incoming and eth2 outgoing, because r2 switched to the SPT. With only one path the shared and shortest-path trees coincide, so the switch is invisible in the data path but visible in the state.
+- Repeat step 4 with TTL 1. The receiver gets nothing, and r1 never forwards: the TTL dies at the first hop.
+
+### RPF drill
+
+Remove `ip ospf area 0` from r1's eth1 (or delete the route to 10.1.1.0/24 on r2). The source's subnet disappears from r2's unicast table. Send again. r2 has no RPF interface for 10.1.1.10 and does not build (S,G). The unicast fix is the multicast fix.
+
+## Gotchas
+
+- **TTL 1 by default.** Every Linux multicast socket starts at TTL 1. A stream that works on one segment and dies at the first router is usually this.
+- **RPF failures look like "PIM is broken".** Check `show ip route <source>` on each router before you read any PIM state.
+- **No querier on a snooping segment.** Works for a few minutes, then stops. Make the router the querier or enable the bridge or switch querier.
+- **IGMP version downgrades.** One IGMPv2 querier or a v2-only switch drops hosts to v2, and SSM joins lose their source list. Check the `V3`/`V2` column in `/proc/net/igmp` on a receiver.
+- **The 32:1 MAC overlap.** Two streams in groups that differ only in the top bits share a MAC, so snooping switches and NICs deliver both. Pick groups inside 239.x that differ in the low 23 bits.
+- **Firewalls.** IGMP is IP protocol 2 and PIM is protocol 103. A host firewall that only allows TCP and UDP silently breaks both. PIM hellos go to 224.0.0.13. The router also needs to accept unicast PIM Register messages on the RP.
+- **Container networking.** Docker's default bridge and many cloud networks do not carry multicast between hosts. Inside a single Containerlab topology, point-to-point veth links carry it fine.
+- **VXLAN underlay choice.** A VXLAN underlay can flood BUM traffic with multicast groups (needs PIM in the underlay) or with ingress replication (head-end unicast copies, no PIM). EVPN fabrics usually use ingress replication. Know which one your fabric uses before you debug flooding.
+
+## Boring rule
+
+Prove unicast reachability to the source first, set the TTL explicitly, and make sure every segment has a querier. Most multicast outages are one of those three.
+
+## Try this
+
+1. In the rootless lab, change the sender TTL to 2 and capture again. Expected: the UDP lines show `ttl 2`. Nothing else changes, because there is no router to decrement it.
+2. Join 239.1.1.1 and 239.129.1.1 from two receiver sockets on v1. Expected: both groups appear under `inet` in `ip maddr`, but only one new `link` line, because both map to `01:00:5e:01:01:01`.
+3. Run `ssm.py` with `force_igmp_version` set to 2 on v1. Expected: the `setsockopt` call still succeeds, but the report on the wire is a plain v2 report for 232.1.1.1 with no source. Explain why an SSM router would ignore it.
+4. In the FRR lab, have the receiver stay joined to (10.1.1.10, 232.1.1.1) with a version of `ssm.py` that does not close the socket, and send to 232.1.1.1 from src. Expected: `show ip pim upstream` on r2 shows an (S,G) entry for 232.1.1.1 and no (*,G) entry, because FRR treats 232/8 as SSM by default and never involves the RP.
+5. On your lab host, create a Linux bridge with a receiver namespace behind it and no querier. Join a group and run `bridge mdb show` every minute for six minutes. Expected: the entry ages out. Set `mcast_querier 1` and repeat. Expected: it stays.
+
+## Sources
+
+- RFC 1112, Host Extensions for IP Multicasting: <https://www.rfc-editor.org/rfc/rfc1112>
+- RFC 2236, IGMPv2: <https://www.rfc-editor.org/rfc/rfc2236>
+- RFC 3376, IGMPv3: <https://www.rfc-editor.org/rfc/rfc3376>
+- RFC 2710 and RFC 3810, MLDv1 and MLDv2: <https://www.rfc-editor.org/rfc/rfc3810>
+- RFC 4607, Source-Specific Multicast for IP: <https://www.rfc-editor.org/rfc/rfc4607>
+- RFC 7761, PIM Sparse Mode (revised): <https://www.rfc-editor.org/rfc/rfc7761>
+- RFC 4610, Anycast-RP Using PIM: <https://www.rfc-editor.org/rfc/rfc4610>
+- RFC 2365, Administratively Scoped IP Multicast: <https://www.rfc-editor.org/rfc/rfc2365>
+- RFC 4291, IPv6 Addressing Architecture (multicast scopes): <https://www.rfc-editor.org/rfc/rfc4291>
+- FRR PIM documentation: <https://docs.frrouting.org/en/latest/pim.html>
+- `ip-link(8)` bridge options (`mcast_snooping`, `mcast_querier`, `mcast_igmp_version`): <https://man7.org/linux/man-pages/man8/ip-link.8.html>
+- `bridge(8)` (`bridge mdb`): <https://man7.org/linux/man-pages/man8/bridge.8.html>
+- Linux `ip(7)` multicast socket options: <https://man7.org/linux/man-pages/man7/ip.7.html>
