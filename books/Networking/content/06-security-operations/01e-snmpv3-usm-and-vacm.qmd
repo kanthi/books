@@ -1,0 +1,653 @@
+---
+title: "SNMPv3 Done Properly: USM Keys, Engine IDs, Time Windows and VACM Views"
+author:
+  - name: "K19G"
+  - name: "grok-bot"
+---
+
+# SNMPv3 Done Properly: USM Keys, Engine IDs, Time Windows and VACM Views
+
+Modern network observability leans on streaming telemetry, gNMI, YANG models, flow export, BMP, and active probing such as STAMP. Yet walk into almost any production network and you will still find UDP port 161 answering polls. Optical line systems, out-of-band console servers, PDUs, legacy access switches, and carrier CPE often speak nothing else. Even on modern routers, inventory scrapers and NMS discovery jobs still fall back to `sysDescr.0` and `IF-MIB` counters.
+
+Leaving those devices on SNMPv1 or SNMPv2c means sending the community string—the credential—and every polled OID and value across the wire in clear text. Any tap, SPAN port, or compromised host on the path reads your credentials and your topology. Turning on SNMPv3 without understanding its internals is not much better: operators routinely deploy `authNoPriv` (which still leaks every value), keep MD5 and CBC-DES enabled, clone golden VM images that share a single `snmpEngineID`, or grant `read` views over the entire MIB tree including USM user tables.
+
+SNMPv3 separates message processing, user-based security, and access control into clean, modular RFCs. Once you understand how engine discovery, key localization, timeliness windows, and VACM views fit together, configuring SNMPv3 securely becomes straightforward—and you can see clearly where SNMP reaches its architectural limits and should give way to gNMI.
+
+## Learning goals
+
+By the end of this chapter, you will be able to:
+
+- Read an SNMPv3 packet header and distinguish clear-text USM metadata from the encrypted `ScopedPDU`.
+- Trace SNMPv3 engine discovery and explain why every managed device must have a unique `snmpEngineID`.
+- Derive master keys (`Ku`) and localized keys (`Kul`) from passphrases and verify them against RFC 3414 test vectors.
+- Select appropriate authentication (`usmHMAC192SHA256` or stronger) and privacy (`AES-128-CFB`) algorithms while avoiding weak legacy defaults.
+- Diagnose authentication, time-window, and authorization failures using the six `usmStats` Report counters.
+- Design least-privilege VACM views that expose operational counters while hiding security tables and blocking `SET` access.
+- Decide when to retain SNMPv3 for legacy inventory and when to migrate polling to gNMI and streaming telemetry.
+
+## Architecture and wire layout
+
+SNMPv3 is defined across a suite of STD 62 specifications rather than a single monolithic document:
+
+- **RFC 3411**: Architecture—defines SNMP engines, `snmpEngineID`, contexts, and abstract service interfaces.
+- **RFC 3412**: Message Processing and Dispatching—defines the version 3 message wrapper (`msgID`, `msgMaxSize`, `msgFlags`, `msgSecurityModel`).
+- **RFC 3414**: User-based Security Model (USM)—defines authentication, privacy, key localization, engine discovery, and timeliness.
+- **RFC 3415**: View-based Access Control Model (VACM)—defines how a `securityName` maps to groups, access rules, and OID subtree views.
+- **RFC 3416**: Protocol Operations—defines the PDU types (`GetRequest`, `GetNextRequest`, `GetBulkRequest`, `SetRequest`, `Response`, `SNMPv2-Trap`, `InformRequest`, and `Report`).
+
+An SNMPv3 message is an ASN.1 BER-encoded sequence with four top-level fields: `msgVersion` (integer `3`), `msgGlobalData`, `msgSecurityParameters`, and `msgData` (the `ScopedPDU`).
+
+```text
++-----------------------------------------------------------------------+
+| SNMPv3Message (ASN.1 SEQUENCE)                                        |
+|  +-- msgVersion: 3                                                    |
+|  +-- msgGlobalData (HeaderData)                                       |
+|  |    +-- msgID             (correlation ID, 0..2147483647)           |
+|  |    +-- msgMaxSize        (max response bytes sender accepts)       |
+|  |    +-- msgFlags          (bitmask: auth=0x01 priv=0x02 report=0x04)|
+|  |    +-- msgSecurityModel  (3 = USM)                                 |
+|  +-- msgSecurityParameters (OCTET STRING wrapping UsmSecurityParams)  |
+|  |    +-- msgAuthoritativeEngineID    (clear text)                    |
+|  |    +-- msgAuthoritativeEngineBoots (clear text)                    |
+|  |    +-- msgAuthoritativeEngineTime  (clear text)                    |
+|  |    +-- msgUserName                 (clear text!)                   |
+|  |    +-- msgAuthenticationParameters (HMAC tag, e.g. 12..48 octets)  |
+|  |    +-- msgPrivacyParameters        (64-bit salt / IV seed)         |
+|  +-- msgData (ScopedPDU: plaintext OR encrypted OCTET STRING)         |
+|       +-- contextEngineID                                             |
+|       +-- contextName                                                 |
+|       +-- PDU (GetRequest, GetBulkRequest, Response, Report, ...)     |
++-----------------------------------------------------------------------+
+```
+
+Look closely at where encryption starts and stops. Under `authPriv` (`msgFlags` bits `0x01 | 0x02`, or `0x03`), only the `ScopedPDU` is encrypted. Everything in `msgGlobalData` and `msgSecurityParameters` travels in **clear text**, protected by the HMAC in `msgAuthenticationParameters` but visible to any passive observer on the wire. That includes `msgUserName`, `msgAuthoritativeEngineID`, boots, time, and the privacy salt. An attacker watching UDP 161 cannot read your interface descriptions or `sysDescr.0` under `authPriv`, but they can still enumerate valid usernames and engine IDs.
+
+The `msgFlags` octet controls three independent behaviours:
+
+- `0x01` (`authFlag`): the message carries a valid MAC in `msgAuthenticationParameters`.
+- `0x02` (`privFlag`): the `ScopedPDU` is encrypted (must be paired with `authFlag`; `noAuthPriv` is illegal in USM).
+- `0x04` (`reportableFlag`): the receiver should return a `Report` PDU if an error prevents normal processing. Set for confirmed requests (`Get`, `GetNext`, `GetBulk`, `Set`, `Inform`) and cleared for `Response`, `Trap`, and `Report` PDUs so agents do not trigger Report loops.
+
+| Mode | `msgFlags` | Auth | Encryption | Wire exposure | Use in production |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| SNMPv2c | n/a | Community string | None | Community string, OIDs, values | Legacy read-only behind strict ACLs at most |
+| `noAuthNoPriv` | `0x00` / `0x04` | None | None | Username, engine ID, OIDs, values | Discovery probes only |
+| `authNoPriv` | `0x01` / `0x05` | HMAC | None | Username, engine ID, OIDs, values | Reports and internal lab baselines only |
+| `authPriv` | `0x03` / `0x07` | HMAC | Symmetric cipher | Username, engine ID, boots, time, salt | **Required** for all operational polling |
+
+## Engine IDs and discovery
+
+Every SNMPv3 entity is an engine identified by an `snmpEngineID` (5 to 32 octets, RFC 3411). For any given message exchange, one engine is **authoritative**—meaning its `snmpEngineID`, `snmpEngineBoots`, and `snmpEngineTime` govern key localization and timeliness:
+
+- For `GetRequest`, `GetNextRequest`, `GetBulkRequest`, `SetRequest`, and `InformRequest`, the **receiver** is authoritative. When a manager polls a router, the router is authoritative. When an agent sends an `InformRequest` to a trap receiver, the **manager** is authoritative.
+- For `SNMPv2-Trap`, the **sender** (the agent) is authoritative.
+
+Because keys are localized to the authoritative engine's `snmpEngineID`, and requests must carry the authoritative engine's current `snmpEngineBoots` and `snmpEngineTime`, a manager starting fresh cannot build an authenticated request until it knows those three values. USM solves this with **discovery**.
+
+```text
+Manager                                               Agent (edge-r1)
+  |                                                        |
+  |--- GetRequest (noAuthNoPriv, reportable=0x04) -------->|
+  |    msgAuthoritativeEngineID = "" (empty)               |
+  |    msgUserName = ""                                    |
+  |    varbinds = []                                       |
+  |                                                        |
+  |<-- Report PDU (noAuthNoPriv) --------------------------|
+  |    msgAuthoritativeEngineID = 80001f8804656467652d7231 |
+  |    msgAuthoritativeEngineBoots = 7                     |
+  |    msgAuthoritativeEngineTime  = 1000                  |
+  |    varbind: usmStatsUnknownEngineIDs.0 = 1             |
+  |                                                        |
+  |  [Manager localizes Ku -> Kul for 80001f8804656467652d7231]
+  |                                                        |
+  |--- GetRequest (authPriv, flags=0x07) ----------------->|
+  |    msgAuthoritativeEngineID = 80001f8804656467652d7231 |
+  |    boots = 7, time = 1000, user = "netops"             |
+  |    HMAC + AES-128-CFB(ScopedPDU)                       |
+  |                                                        |
+  |<-- Response (authPriv, flags=0x03) --------------------|
+  |    encrypted varbinds: sysDescr.0, ifDescr.1           |
+```
+
+During discovery, the manager sends an unauthenticated request (`msgFlags = 0x04`, `reportable` set) with an empty `msgAuthoritativeEngineID`. The agent increments `usmStatsUnknownEngineIDs.0` and replies with a `Report` PDU containing that counter plus its `snmpEngineID`, `snmpEngineBoots`, and `snmpEngineTime`. Even if the manager already knows the `snmpEngineID` out of band, it still needs `boots` and `time` unless it caches them from a recent poll.
+
+This is why cloning an `snmpEngineID` across devices is a serious operational bug. If you build a golden router or Linux VM image after `snmpd` has already generated and persisted its `snmpEngineID`, every clone boots with the exact same engine ID. Three things break at once:
+
+1. **Key localization collapses.** Every clone derives the same `Kul` from the same passphrase, erasing the per-device isolation that localization is designed to provide.
+2. **Manager state corrupts.** A collector tracking `(engineID -> boots, time)` sees different boots and uptime values arriving from different IPs under the same `engineID`, triggering continuous `usmStatsNotInTimeWindows` failures.
+3. **Informs and traps collide.** Trap receivers cannot distinguish localized credentials or engine timelines between devices that claim the same ID.
+
+Always generate a fresh `snmpEngineID` per device (typically derived from the enterprise OID prefix `0x8000...` plus a unique MAC address, IPv4/IPv6 address, or device serial/hostname).
+
+## Password-to-key derivation and localization
+
+USM never hashes a raw passphrase directly with the packet payload. Instead, RFC 3414 Appendix A.2 defines a two-stage key derivation using the user's configured hash algorithm `H` (MD5, SHA-1, or a SHA-2 variant from RFC 7860):
+
+```text
+Passphrase P
+   |
+   |  repeat P until 1,048,576 octets (1 MiB), then hash with H
+   v
+Master Key: Ku = H( P_repeated_to_1MiB )
+   |
+   |  concatenate: Ku || snmpEngineID || Ku, then hash with H
+   v
+Localized Key: Kul = H( Ku || snmpEngineID || Ku )
+```
+
+The first stage (`Ku`) stretches the passphrase over 1,048,576 octets of input. By modern standards (such as Argon2 or scrypt), 1 MiB of a fast hash is modest, which is why long, high-entropy passphrases remain essential. The second stage (`Kul`) binds `Ku` to a specific `snmpEngineID`.
+
+You can verify any SNMPv3 implementation against the RFC 3414 Appendix A.3 test vectors using the passphrase `"maplesyrup"` and the 12-octet engine ID `000000000000000000000002`:
+
+| Algorithm | `Ku` (hex) | `Kul` for `000000000000000000000002` (hex) |
+| :--- | :--- | :--- |
+| MD5 (A.3.1) | `9faf3283884e92834ebc9847d8edd963` | `526f5eed9fcce26f8964c2930787d82b` |
+| SHA-1 (A.3.2) | `9fb5cc0381497b3793528939ff788d5d79145211` | `6695febc9288e36282235fc7151f128497b38f3f` |
+
+Localization gives you two practical wins:
+
+- **Blast-radius containment.** An agent stores `Kul` (never the plaintext passphrase and ideally not `Ku`). If an attacker dumps the persistent SNMP state from `edge-r1`, the stolen `Kul` will not authenticate to `edge-r2`, even if both routers were provisioned with the exact same passphrase.
+- **Zero-knowledge-of-password provisioning.** Management platforms can derive `Ku` centrally and push only the device-specific `Kul` to each agent, or provision distinct localized keys per engine.
+
+## Authentication, privacy, and timeliness
+
+### Authentication: retire MD5 and SHA-1, use SHA-2
+
+RFC 3414 originally specified two authentication protocols: `HMAC-MD5-96` and `HMAC-SHA-96`, both truncating the HMAC digest to 12 octets (`96` bits) in `msgAuthenticationParameters`. Both MD5 and SHA-1 are deprecated for new cryptographic deployments.
+
+RFC 7860 adds the SHA-2 family to USM. Each variant uses the corresponding SHA-2 hash both for key derivation (`Ku` and `Kul`, producing 28, 32, 48, or 64 octets) and for HMAC, truncated to the specified MAC length:
+
+| Protocol name | Underlying hash | Key length (octets) | MAC length (octets) | RFC 7860 requirement |
+| :--- | :--- | :--- | :--- | :--- |
+| `usmHMACMD5AuthProtocol` | MD5 | 16 | 12 | Legacy (RFC 3414) — avoid |
+| `usmHMACSHAAuthProtocol` | SHA-1 | 20 | 12 | Legacy (RFC 3414) — avoid |
+| `usmHMAC128SHA224AuthProtocol` | SHA-224 | 28 | 16 | Optional |
+| `usmHMAC192SHA256AuthProtocol` | SHA-256 | 32 | 24 | **MUST implement** |
+| `usmHMAC256SHA384AuthProtocol` | SHA-384 | 48 | 32 | Optional |
+| `usmHMAC384SHA512AuthProtocol` | SHA-512 | 64 | 48 | **SHOULD implement** |
+
+Standardize on `usmHMAC192SHA256` (often configured as `SHA-256`) across your fleet, or `usmHMAC384SHA512` where supported. Keep `HMAC-SHA-96` only for legacy appliances that lack RFC 7860 support, and disable MD5 everywhere.
+
+When computing the HMAC, the sender zeroes out `msgAuthenticationParameters` (12 to 48 zero octets depending on the algorithm), encodes the entire SNMPv3 message (including the encrypted `ScopedPDU` if `priv` is active), computes `HMAC(authKul, message)` over the whole message, and writes the truncated MAC back into `msgAuthenticationParameters`.
+
+### Privacy: AES-128-CFB, never CBC-DES
+
+RFC 3414 defined `CBC-DES` using a 56-bit key. DES is trivially brute-forceable and must not be used. RFC 3826 introduced `usmAesCfb128Protocol` (AES-128 in 128-bit CFB mode).
+
+With AES-128-CFB:
+
+- The encryption key is the **first 128 bits (16 octets)** of the localized privacy key (`privKul`).
+- The 128-bit Initialization Vector (IV) is constructed by concatenating three values in network byte order:
+
+```text
++--------------------+--------------------+----------------------------------+
+| snmpEngineBoots    | snmpEngineTime     | 64-bit local integer ("salt")    |
+| (32 bits)          | (32 bits)          | (sent in msgPrivacyParameters)   |
++--------------------+--------------------+----------------------------------+
+|<------------------------------- 128-bit IV ------------------------------->|
+```
+
+The 64-bit salt is carried in `msgPrivacyParameters` (8 octets). Because CFB mode turns a block cipher into a keystream generator, **never reuse an IV with the same key**: reusing an `(boots, time, salt)` tuple leaks the XOR of the two plaintexts. Senders increment the 64-bit local integer monotonically on every encrypted message.
+
+### Timeliness and the 300-second replay window
+
+RFC 3414 Section 3.2.7 protects against delayed or stale packets using the authoritative engine's `snmpEngineBoots` (number of times the SNMP engine has initialized) and `snmpEngineTime` (seconds since last boot). For an authenticated incoming message, the authoritative engine checks:
+
+1. `msgAuthoritativeEngineBoots` matches the engine's current `snmpEngineBoots`, and `snmpEngineBoots != 2147483647` (a latched overflow state requiring manual re-keying).
+2. `msgAuthoritativeEngineTime` is within **+/-150 seconds** of the engine's current `snmpEngineTime`.
+
+If either check fails, the engine drops the request, increments `usmStatsNotInTimeWindows.0`, and—if `reportable` is set—returns an authenticated (`authNoPriv`, flags `0x01`) `Report` PDU carrying its current `boots` and `time` so a legitimate manager can resynchronize.
+
+Notice what this mechanism **does not** do: USM has **no replay cache** and **no per-packet sequence number check**. Any authenticated `authNoPriv` or `authPriv` packet captured on the wire can be replayed verbatim for up to 150 seconds (effectively a 300-second window around the agent's clock), and the agent will process and answer it again.
+
+Also note a common misconception about NTP: the manager's wall-clock time does **not** need to match the agent's wall-clock time for USM to work. The manager maintains a local `(engineID -> boots, time, lastUpdated)` table driven by the agent's own `Report` and `Response` headers, advancing `time` using its local monotonic clock. NTP is still good hygiene on routers and collectors for log correlation, but USM timeliness is relative to the agent's `snmpEngineTime`.
+
+### Diagnosing failures with `usmStats`
+
+Whenever an agent rejects an SNMPv3 message at the security layer, it increments one of six counters under `1.3.6.1.6.3.15.1.1` (`usmStats`) and, when `reportableFlag` is set, returns the counter in a `Report` PDU:
+
+| OID (`1.3.6.1.6.3.15.1.1.x.0`) | Counter name | Meaning | Operational cause |
+| :--- | :--- | :--- | :--- |
+| `.1.0` | `usmStatsUnsupportedSecLevels` | Requested `auth`/`priv` not supported for user | Manager asked for `authPriv` on an `authNoPriv` user, or cipher mismatch |
+| `.2.0` | `usmStatsNotInTimeWindows` | `boots` mismatch, `boots == 2147483647`, or `time` outside +/-150 s | Agent rebooted, manager clock drifted, or replay of old packet |
+| `.3.0` | `usmStatsUnknownUserNames` | `msgUserName` not configured on this engine | Typo in username, or user not provisioned |
+| `.4.0` | `usmStatsUnknownEngineIDs` | `msgAuthoritativeEngineID` does not match engine | Normal during discovery; if continuous, stale cache or cloned engine ID |
+| `.5.0` | `usmStatsWrongDigests` | HMAC verification failed | Wrong auth passphrase/algorithm, or active tampering/brute-force |
+| `.6.0` | `usmStatsDecryptionErrors` | `ScopedPDU` failed to decrypt or parse as ASN.1 | Wrong privacy passphrase/cipher, or corrupted packet |
+
+## VACM: least-privilege views
+
+USM answers *who* sent the message and whether it was tampered with. **VACM** (RFC 3415) answers *what* that user is allowed to read, write, or receive. Configuring a USM user without a VACM entry leaves the user unable to access any OID.
+
+VACM evaluates access in three steps:
+
+```text
+(securityModel, securityName)
+       |
+       v
+vacmSecurityToGroupTable  --->  groupName
+                                    |
+(groupName, contextName,            |
+ securityModel, securityLevel)      v
+                           vacmAccessTable  --->  readViewName
+                                                  writeViewName
+                                                  notifyViewName
+                                                       |
+                                                       v
+                                          vacmViewTreeFamilyTable
+                                          (OID subtrees + bitmask,
+                                           included / excluded)
+```
+
+1. **Group mapping**: `(securityModel=3, securityName)` maps to a `groupName` (for example, `netops` -> `rw_group`, `monitor` -> `ro_group`).
+2. **Access rule**: `(groupName, contextName, securityModel, securityLevel)` selects the `readView`, `writeView`, and `notifyView`, enforcing a minimum `securityLevel` (always `authPriv` in production).
+3. **View tree**: Each view is a list of OID subtrees marked `included` or `excluded`, optionally with a bitmask for row-level or column-level filtering.
+
+Two VACM behaviours matter operationally:
+
+- **Silent denial per varbind.** If a user queries an OID outside their `readView`, the agent does not return an authorization error for the whole packet; it returns `noSuchObject` for that specific varbind. This prevents an unprivileged user from probing which MIBs or interfaces exist on a box.
+- **Protect the security MIBs.** If you grant a read-only monitoring user a view of the entire ISO tree (`.1`) or `mib-2` plus `snmpV2` (`.1.3.6.1`), you may expose the `usmUser` subtree, including `usmUserTable` (`1.3.6.1.6.3.15.1.2.2`), and `vacmAccessTable` (`1.3.6.1.6.3.16.1.4`). Even though `usmUserTable` does not return raw `Kul` values over the wire, it exposes every configured username, authentication protocol, and privacy protocol. Restrict read-only views to the specific subtrees your NMS actually polls (such as `system` and `interfaces` / `ifMIB`), or explicitly `exclude` the `snmpUsmMIB` and `snmpVacmMIB` subtrees.
+
+## Operations: Net-SNMP, traps vs informs, and when to leave SNMP behind
+
+### Configuring Net-SNMP (from the docs, not run)
+
+On Linux hosts running Net-SNMP's `snmpd`, USM users are created with `createUser` (typically placed in `/var/lib/snmp/snmpd.conf` so `snmpd` replaces the plaintext passphrases with localized `usmUser` entries on startup) and bound to VACM with `view` and `rouser` in `/etc/snmp/snmpd.conf`. The following syntax is from the Net-SNMP `snmpd.conf(5)` manual page (not run here):
+
+```text
+# From the Net-SNMP snmpd.conf(5) docs, not run
+createUser netops SHA-256 "StrongAuthPassphrase!" AES "StrongPrivPassphrase!"
+
+view system_if included 1.3.6.1.2.1.1
+view system_if included 1.3.6.1.2.1.2
+view system_if included 1.3.6.1.2.1.31
+
+rouser netops priv -V system_if
+```
+
+Notice the `priv` keyword on `rouser`: it enforces `authPriv` as the minimum security level, rejecting `noAuthNoPriv` or `authNoPriv` attempts even if the user exists. Never use `rwuser` unless you have a specific, audited requirement for SNMP `SET`—configuration changes belong in NETCONF, RESTCONF, or gNMI, not SNMP.
+
+To query that agent from a collector (not run):
+
+```text
+# Not run
+snmpget -v3 -l authPriv -u netops -a SHA-256 -A 'StrongAuthPassphrase!' \
+  -x AES -X 'StrongPrivPassphrase!' 192.0.2.10 sysDescr.0
+```
+
+### Traps vs Informs
+
+SNMPv3 notifications come in two forms:
+
+- **SNMPv2-Trap**: unacknowledged, `reportableFlag = 0`. The **sender** (the router) is authoritative. The collector needs a USM user entry localized to each router's `snmpEngineID`.
+- **InformRequest**: acknowledged with a `Response` PDU, `reportableFlag = 1`. The **receiver** (the collector) is authoritative. Every router sending informs needs the **collector's** `snmpEngineID` (discovered automatically or configured statically) to localize its keys.
+
+Prefer `InformRequest` when delivery matters (link down, BGP peer state change) and your collector handles discovery cleanly, or avoid SNMP traps altogether in favour of syslog over TLS and streaming telemetry.
+
+### Network hygiene and scaling
+
+- **Management VRF and ACLs**: Bind the SNMP agent to your out-of-band or management VRF only, and filter UDP 161 (and UDP 162 on collectors) to explicit NMS source prefixes.
+- **Monitor `usmStats`**: Poll or alert on `usmStatsWrongDigests.0` (brute-force attempts or misconfigured collector credentials), `usmStatsNotInTimeWindows.0` (reboot loops or replay attempts), and unexpected spikes in `usmStatsUnknownUserNames.0`.
+- **64-bit counters**: RFC 2863 requires 64-bit octet counters on interfaces faster than 20 Mbps, and for good reason: at 10 Gbps a 32-bit octet counter wraps in roughly 3.4 seconds. Poll the 64-bit High Capacity (`HC`) counters in `IF-MIB::ifXTable` (`ifHCInOctets`, `ifHCOutOctets`, RFC 2863).
+- **`GETBULK` sizing**: `GetBulkRequest` amplifies a small request into a large `Response`. Setting `max-repetitions` too high pushes the response past `msgMaxSize` or your path MTU, causing `tooBig` errors or IP fragmentation across management tunnels. Test `max-repetitions` (commonly 10–25 for wide tables) against your actual `msgMaxSize`.
+
+### When to stop using SNMP
+
+SNMPv3 solves wire confidentiality and integrity, but it cannot fix SNMP's underlying operational limits:
+
+- **Polling overhead**: Walking large BGP or ARP tables with `GetNext`/`GetBulk` burns router control-plane CPU.
+- **Flat, untyped OIDs**: Mapping vendor MIBs and table indexes is brittle compared to strongly typed YANG schemas.
+- **No native streaming**: Sub-second interface telemetry requires push-based gRPC/gNMI rather than 60-second UDP polling.
+
+As covered in the YANG/NETCONF/gNMI chapter, move high-frequency counters, routing state, and configuration to gNMI and streaming telemetry wherever your hardware supports it. Keep SNMPv3 strictly for legacy gear, out-of-band power/environmental devices, and low-frequency inventory checks.
+
+## The lab
+
+To see every RFC 3414, 3415, 3826, and 7860 rule in action on real wire bytes, the lab runs a self-contained Python agent and manager (`snmpv3.py`, Python standard library plus the `cryptography` package for AES-128-CFB, talking over loopback UDP). The agent uses `snmpEngineID` `80001f8804` + `"edge-r1"` (`80001f8804656467652d7231`) with `snmpEngineBoots = 7` and `snmpEngineTime = 1000`, and defines two users:
+
+- `netops`: `HMAC-SHA-256-192` + `AES-128-CFB` (`authPriv`), read view `1.3.6.1` (deliberately broad, for contrast with `monitor`).
+- `monitor`: `HMAC-SHA-96` (`authNoPriv`), VACM read view restricted to `1.3.6.1.2.1.1` (`system`) only.
+
+Across seven automated checks, the lab verifies:
+
+1. Exact reproduction of both RFC 3414 Appendix A.3 `"maplesyrup"` test vectors (MD5 and SHA-1 `Ku` and `Kul`).
+2. Key localization isolation: the same passphrase produces different SHA-256 `Kul` keys on `edge-r1` (`1bf9d82e...`) versus `edge-r2` (`71d2f038...`).
+3. Discovery: an empty-engineID probe triggers a `Report` with `usmStatsUnknownEngineIDs=1`, returning `80001f8804656467652d7231`, boots `7`, time `1000`.
+4. `authPriv` vs SNMPv2c on the wire: `netops` polls `sysDescr.0` and `ifDescr.1` (`154 B` request, `185 B` response) returning `'lab-agent Linux 6.12 router'` and `'eth0'` with payloads hidden—though `netops` remains in clear text—compared to a `67 B` SNMPv2c response exposing `"public"` and `sysDescr` in clear text.
+5. All major `usmStats` Reports: wrong password (`usmStatsWrongDigests=1`), unknown user `admin` (`usmStatsUnknownUserNames=1`), `monitor` requesting `authPriv` (`usmStatsUnsupportedSecLevels=1`), stale `engineTime` by 200 s (`usmStatsNotInTimeWindows=1`, sent `authNoPriv` with flags `0x01`), and pre-reboot `boots` (`usmStatsNotInTimeWindows=2`).
+6. VACM scoping: `monitor` reads `sysName.0` (`'edge-r1'`) but receives `noSuchObject` for `ifDescr.1`.
+7. Replay behaviour: a byte-identical replay of the `netops` `authPriv` request 2 seconds later (at `time = 1002`) is accepted and answered again.
+
+```{.python filename="snmpv3.py"}
+#!/usr/bin/env python3
+"""SNMPv3 USM + VACM on loopback UDP, stdlib + cryptography (AES-CFB only).
+Agent and manager are both in this file; every message crosses a real socket."""
+import hashlib, hmac, os, socket, struct, threading, time
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+
+# ---------------- BER ----------------
+def tlv(tag, val):
+    n = len(val)
+    if n < 0x80: ln = bytes([n])
+    else:
+        b = n.to_bytes((n.bit_length() + 7) // 8, "big"); ln = bytes([0x80 | len(b)]) + b
+    return bytes([tag]) + ln + val
+def ber_int(v):
+    b = v.to_bytes(max(1, (v.bit_length() + 8) // 8), "big", signed=True); return tlv(0x02, b)
+def ber_oct(b): return tlv(0x04, b)
+def ber_null(): return b"\x05\x00"
+def ber_oid(s):
+    p = [int(x) for x in s.split(".")]; out = bytes([40 * p[0] + p[1]])
+    for n in p[2:]:
+        enc = [n & 0x7F]; n >>= 7
+        while n: enc.append(0x80 | (n & 0x7F)); n >>= 7
+        out += bytes(reversed(enc))
+    return tlv(0x06, out)
+def seq(*items, tag=0x30): return tlv(tag, b"".join(items))
+
+def parse(buf, i=0):
+    tag = buf[i]; ln = buf[i + 1]; i += 2
+    if ln & 0x80:
+        k = ln & 0x7F; ln = int.from_bytes(buf[i:i + k], "big"); i += k
+    return tag, buf[i:i + ln], i + ln
+def children(buf):
+    out, i = [], 0
+    while i < len(buf):
+        t, v, i = parse(buf, i); out.append((t, v))
+    return out
+def dec_int(v): return int.from_bytes(v, "big", signed=True)
+def dec_oid(v):
+    p = [v[0] // 40, v[0] % 40]; n = 0
+    for b in v[1:]:
+        n = (n << 7) | (b & 0x7F)
+        if not b & 0x80: p.append(n); n = 0
+    return ".".join(map(str, p))
+
+# ---------------- USM crypto ----------------
+def password_to_key(pw: bytes, engine_id: bytes, h):
+    """RFC 3414 A.2 (MD5/SHA-1) and RFC 7860 (SHA-2): 1 MiB of repeated password, then localize."""
+    count, buf = 0, b""
+    d = h()
+    rep = (pw * (64 // len(pw) + 2))
+    while count < 1048576:
+        chunk = rep[count % len(pw):count % len(pw) + 64]; d.update(chunk); count += 64
+    ku = d.digest()
+    return ku, h(ku + engine_id + ku).digest()
+
+AUTH = {"sha1-96": (hashlib.sha1, 12), "sha256-192": (hashlib.sha256, 24)}
+
+def aes_cfb(key16, boots, etime, salt, data, enc=True):
+    iv = struct.pack("!II", boots, etime) + salt
+    c = Cipher(algorithms.AES(key16), modes.CFB(iv))
+    x = c.encryptor() if enc else c.decryptor()
+    return x.update(data) + x.finalize()
+
+# ---------------- message build/parse ----------------
+GET, RESPONSE, REPORT = 0xA0, 0xA2, 0xA8
+STATS = {"1.3.6.1.6.3.15.1.1.1.0": "usmStatsUnsupportedSecLevels", "1.3.6.1.6.3.15.1.1.2.0": "usmStatsNotInTimeWindows",
+         "1.3.6.1.6.3.15.1.1.3.0": "usmStatsUnknownUserNames", "1.3.6.1.6.3.15.1.1.4.0": "usmStatsUnknownEngineIDs",
+         "1.3.6.1.6.3.15.1.1.5.0": "usmStatsWrongDigests", "1.3.6.1.6.3.15.1.1.6.0": "usmStatsDecryptionErrors"}
+
+def pdu(tag, reqid, varbinds, err=0, idx=0):
+    vbs = seq(*[seq(ber_oid(o), v) for o, v in varbinds])
+    return seq(ber_int(reqid), ber_int(err), ber_int(idx), vbs, tag=tag)
+
+def build_v3(msgid, flags, eng, boots, etime, user, scoped, auth=None, priv_key=None, salt=b""):
+    auth_len = AUTH[auth[0]][1] if auth else 0
+    privp = b""
+    body = scoped
+    if priv_key:
+        privp = salt
+        pad = scoped  # CFB needs no padding
+        body = ber_oct(aes_cfb(priv_key[:16], boots, etime, salt, pad))
+    def assemble(authp):
+        usm = seq(ber_oct(eng), ber_int(boots), ber_int(etime), ber_oct(user), ber_oct(authp), ber_oct(privp))
+        hdr = seq(ber_int(msgid), ber_int(65507), ber_oct(bytes([flags])), ber_int(3))
+        return seq(ber_int(3), hdr, ber_oct(usm), body)
+    if not auth: return assemble(b"")
+    blank = assemble(b"\x00" * auth_len)
+    h, n = AUTH[auth[0]]
+    mac = hmac.new(auth[1], blank, h).digest()[:n]
+    return assemble(mac)
+
+def parse_v3(dgram):
+    _, top, _ = parse(dgram); parts = children(top)
+    hdr = children(parts[1][1]); usm = children(parse(parts[2][1])[1])
+    m = dict(msgid=dec_int(hdr[0][1]), flags=hdr[2][1][0], eng=usm[0][1], boots=dec_int(usm[1][1]),
+             etime=dec_int(usm[2][1]), user=usm[3][1], authp=usm[4][1], privp=usm[5][1],
+             data_tag=parts[3][0], data=parts[3][1])
+    return m
+
+def parse_scoped(raw):
+    _, sp, _ = parse(raw); ch = children(sp)
+    tag, body = ch[2]; f = children(body)
+    vbs = [children(v) for _, v in children(f[3][1])]
+    return tag, dec_int(f[0][1]), dec_int(f[1][1]), [(dec_oid(vb[0][1]), vb[1][0], vb[1][1]) for vb in vbs]
+
+# ---------------- agent ----------------
+class Agent:
+    def __init__(self, engine_id):
+        self.eng, self.boots, self.t0 = engine_id, 7, time.monotonic() - 1000
+        self.mib = {"1.3.6.1.2.1.1.1.0": ber_oct(b"lab-agent Linux 6.12 router"),
+                    "1.3.6.1.2.1.1.5.0": ber_oct(b"edge-r1"),
+                    "1.3.6.1.2.1.2.2.1.2.1": ber_oct(b"eth0")}
+        self.users = {}
+        self.stats = {k: 0 for k in STATS}
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); self.sock.bind(("127.0.0.1", 0))
+        self.addr = self.sock.getsockname()
+    def etime(self): return int(time.monotonic() - self.t0)
+    def add_user(self, name, pw, auth, priv_pw=None, view="1.3.6.1"):
+        h = AUTH[auth][0]
+        self.users[name] = dict(auth=auth, ak=password_to_key(pw, self.eng, h)[1],
+                                pk=password_to_key(priv_pw, self.eng, h)[1] if priv_pw else None, view=view)
+    def report(self, m, oid, flags=0):
+        self.stats[oid] += 1
+        sp = seq(ber_oct(self.eng), ber_oct(b""), pdu(REPORT, 0, [(oid, tlv(0x41, self.stats[oid].to_bytes(4, "big")))]))
+        u = self.users.get(m["user"].decode(errors="replace"))
+        auth = (u["auth"], u["ak"]) if (flags & 1 and u) else None
+        return build_v3(m["msgid"], flags, self.eng, self.boots, self.etime(), m["user"], sp, auth=auth)
+    def handle(self, d):
+        m = parse_v3(d)
+        if m["eng"] != self.eng:
+            return self.report(m, "1.3.6.1.6.3.15.1.1.4.0")
+        u = self.users.get(m["user"].decode(errors="replace"))
+        if not u: return self.report(m, "1.3.6.1.6.3.15.1.1.3.0")
+        if m["flags"] & 2 and not u["pk"]: return self.report(m, "1.3.6.1.6.3.15.1.1.1.0")
+        if m["flags"] & 1:
+            h, n = AUTH[u["auth"]]
+            blank = d.replace(m["authp"], b"\x00" * n, 1)
+            if not hmac.compare_digest(hmac.new(u["ak"], blank, h).digest()[:n], m["authp"]):
+                return self.report(m, "1.3.6.1.6.3.15.1.1.5.0")
+            if m["boots"] != self.boots or abs(m["etime"] - self.etime()) > 150:
+                return self.report(m, "1.3.6.1.6.3.15.1.1.2.0", flags=1)
+        raw = m["data"]
+        if m["flags"] & 2:
+            raw = aes_cfb(u["pk"][:16], m["boots"], m["etime"], m["privp"], raw, enc=False)
+        else:
+            raw = seq(raw)  # plaintext ScopedPDU was a SEQUENCE; rewrap value
+        tag, reqid, _, vbs = parse_scoped(raw)
+        out = []
+        for oid, _, _ in vbs:
+            if not (oid + ".").startswith(u["view"] + "."): out.append((oid, b"\x80\x00"))     # noSuchObject (notInView)
+            else: out.append((oid, self.mib.get(oid, b"\x80\x00")))
+        sp = seq(ber_oct(self.eng), ber_oct(b""), pdu(RESPONSE, reqid, out))
+        salt = os.urandom(8) if m["flags"] & 2 else b""
+        return build_v3(m["msgid"], m["flags"] & 3, self.eng, self.boots, self.etime(), m["user"], sp,
+                        auth=(u["auth"], u["ak"]) if m["flags"] & 1 else None,
+                        priv_key=u["pk"] if m["flags"] & 2 else None, salt=salt)
+    def serve(self):
+        while True:
+            d, a = self.sock.recvfrom(65535)
+            if d == b"stop": break
+            self.sock.sendto(self.handle(d), a)
+
+# ---------------- manager helpers ----------------
+def xchg(agent, d):
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.settimeout(2)
+    s.sendto(d, agent.addr); r, _ = s.recvfrom(65535); s.close(); return r
+
+def show(label, r, key=None, h=None):
+    m = parse_v3(r)
+    raw = m["data"]
+    if m["flags"] & 2: raw = aes_cfb(key[:16], m["boots"], m["etime"], m["privp"], raw, enc=False)
+    else: raw = seq(raw)
+    tag, reqid, err, vbs = parse_scoped(raw)
+    kind = {RESPONSE: "Response", REPORT: "Report"}[tag]
+    items = []
+    for oid, t, v in vbs:
+        if oid in STATS: items.append(f"{STATS[oid]}={int.from_bytes(v, 'big')}")
+        elif t == 0x80: items.append(f"{oid}=noSuchObject")
+        else: items.append(f"{oid}={v.decode()!r}")
+    print(f"  {label:44s} -> {kind} flags=0x{m['flags']:02x} boots={m['boots']} time={m['etime']} {'; '.join(items)}")
+    return m
+
+def section(t): print(f"\n=== {t} ===")
+
+def main():
+    section("1. RFC 3414 A.3 password-to-key vectors")
+    e2 = bytes.fromhex("000000000000000000000002")
+    for name, h, want in [("MD5", hashlib.md5, "526f5eed9fcce26f8964c2930787d82b"),
+                          ("SHA-1", hashlib.sha1, "6695febc9288e36282235fc7151f128497b38f3f")]:
+        ku, kul = password_to_key(b"maplesyrup", e2, h)
+        print(f"  {name:5s} Ku={ku.hex()} Kul={kul.hex()} match={kul.hex() == want}")
+
+    section("2. Same password, two engines (key localization)")
+    eA = bytes.fromhex("80001f8804") + b"edge-r1"; eB = bytes.fromhex("80001f8804") + b"edge-r2"
+    for e in (eA, eB):
+        print(f"  engineID {e.hex()} -> SHA-256 Kul {password_to_key(b'correct horse 1', e, hashlib.sha256)[1].hex()[:32]}...")
+
+    ag = Agent(eA)
+    ag.add_user("netops", b"correct horse 1", "sha256-192", priv_pw=b"battery staple 2")
+    ag.add_user("monitor", b"monitor-pass-9", "sha1-96", view="1.3.6.1.2.1.1")
+    th = threading.Thread(target=ag.serve, daemon=True); th.start()
+    _, ak = password_to_key(b"correct horse 1", eA, hashlib.sha256)
+    _, pk = password_to_key(b"battery staple 2", eA, hashlib.sha256)
+    _, mk = password_to_key(b"monitor-pass-9", eA, hashlib.sha1)
+    get = lambda oids, rid=1: seq(ber_oct(eA), ber_oct(b""), pdu(GET, rid, [(o, ber_null()) for o in oids]))
+
+    section("3. Engine discovery (RFC 3414 s4)")
+    probe = build_v3(100, 0x04, b"", 0, 0, b"", seq(ber_oct(b""), ber_oct(b""), pdu(GET, 9, [])))
+    m = show("noAuthNoPriv probe, empty engineID", xchg(ag, probe))
+    print(f"  learned engineID={m['eng'].hex()} boots={m['boots']} time={m['etime']}")
+
+    section("4. authPriv GET as netops (HMAC-SHA-256-192 + AES-128-CFB)")
+    salt = os.urandom(8)
+    req = build_v3(101, 0x07, eA, m["boots"], m["etime"], b"netops", get(["1.3.6.1.2.1.1.1.0", "1.3.6.1.2.1.2.2.1.2.1"]),
+                   auth=("sha256-192", ak), priv_key=pk, salt=salt)
+    r = xchg(ag, req)
+    show("GET sysDescr.0, ifDescr.1", r, key=pk)
+    print(f"  request {len(req)} B, response {len(r)} B; b'lab-agent' visible on the wire: {b'lab-agent' in r}; "
+          f"b'netops' visible: {b'netops' in req}")
+    v2c = seq(ber_int(1), ber_oct(b"public"), pdu(RESPONSE, 1, [("1.3.6.1.2.1.1.1.0", ber_oct(b"lab-agent Linux 6.12 router"))]))
+    print(f"  same answer as SNMPv2c: {len(v2c)} B; b'public' and b'lab-agent' visible: {b'public' in v2c and b'lab-agent' in v2c}")
+
+    section("5. Failures the agent reports")
+    _, bad = password_to_key(b"wrong password", eA, hashlib.sha256)
+    show("netops, wrong auth password", xchg(ag, build_v3(102, 0x05, eA, m["boots"], m["etime"], b"netops", get(["1.3.6.1.2.1.1.1.0"]), auth=("sha256-192", bad))))
+    show("unknown user 'admin'", xchg(ag, build_v3(103, 0x04, eA, m["boots"], m["etime"], b"admin", get(["1.3.6.1.2.1.1.1.0"]))))
+    show("monitor asks for authPriv (no priv key)", xchg(ag, build_v3(104, 0x07, eA, m["boots"], m["etime"], b"monitor", get(["1.3.6.1.2.1.1.1.0"]), auth=("sha1-96", mk), priv_key=mk, salt=os.urandom(8))))
+    show("netops, engineTime 200 s stale", xchg(ag, build_v3(105, 0x05, eA, m["boots"], m["etime"] - 200, b"netops", get(["1.3.6.1.2.1.1.1.0"]), auth=("sha256-192", ak))))
+    show("netops, engineBoots from before a reboot", xchg(ag, build_v3(106, 0x05, eA, m["boots"] - 1, m["etime"], b"netops", get(["1.3.6.1.2.1.1.1.0"]), auth=("sha256-192", ak))))
+
+    section("6. VACM: monitor's view is 1.3.6.1.2.1.1 (system)")
+    show("monitor authNoPriv GET sysName.0, ifDescr.1", xchg(ag, build_v3(107, 0x05, eA, m["boots"], m["etime"], b"monitor", get(["1.3.6.1.2.1.1.5.0", "1.3.6.1.2.1.2.2.1.2.1"]), auth=("sha1-96", mk))))
+
+    section("7. Replay inside the 150 s window")
+    time.sleep(2)
+    show("byte-identical replay of step 4 request", xchg(ag, req), key=pk)
+    print(f"  usm counters: " + ", ".join(f"{STATS[k]}={v}" for k, v in ag.stats.items() if v))
+    socket.socket(socket.AF_INET, socket.SOCK_DGRAM).sendto(b"stop", ag.addr)
+
+if __name__ == "__main__":
+    main()
+```
+
+Run it with `python3 snmpv3.py`. It needs the `cryptography` package for AES (already present on many Linux systems; if not, install it in a virtual environment). No root is needed: agent and manager use an unprivileged loopback port. Output, pasted unedited from a run on 2026-11-16:
+```text
+=== 1. RFC 3414 A.3 password-to-key vectors ===
+  MD5   Ku=9faf3283884e92834ebc9847d8edd963 Kul=526f5eed9fcce26f8964c2930787d82b match=True
+  SHA-1 Ku=9fb5cc0381497b3793528939ff788d5d79145211 Kul=6695febc9288e36282235fc7151f128497b38f3f match=True
+
+=== 2. Same password, two engines (key localization) ===
+  engineID 80001f8804656467652d7231 -> SHA-256 Kul 1bf9d82e1f187a553f6babc310d97c8c...
+  engineID 80001f8804656467652d7232 -> SHA-256 Kul 71d2f038b110a140cc3b3458104f22f5...
+
+=== 3. Engine discovery (RFC 3414 s4) ===
+  noAuthNoPriv probe, empty engineID           -> Report flags=0x00 boots=7 time=1000 usmStatsUnknownEngineIDs=1
+  learned engineID=80001f8804656467652d7231 boots=7 time=1000
+
+=== 4. authPriv GET as netops (HMAC-SHA-256-192 + AES-128-CFB) ===
+  GET sysDescr.0, ifDescr.1                    -> Response flags=0x03 boots=7 time=1000 1.3.6.1.2.1.1.1.0='lab-agent Linux 6.12 router'; 1.3.6.1.2.1.2.2.1.2.1='eth0'
+  request 154 B, response 185 B; b'lab-agent' visible on the wire: False; b'netops' visible: True
+  same answer as SNMPv2c: 67 B; b'public' and b'lab-agent' visible: True
+
+=== 5. Failures the agent reports ===
+  netops, wrong auth password                  -> Report flags=0x00 boots=7 time=1000 usmStatsWrongDigests=1
+  unknown user 'admin'                         -> Report flags=0x00 boots=7 time=1000 usmStatsUnknownUserNames=1
+  monitor asks for authPriv (no priv key)      -> Report flags=0x00 boots=7 time=1000 usmStatsUnsupportedSecLevels=1
+  netops, engineTime 200 s stale               -> Report flags=0x01 boots=7 time=1000 usmStatsNotInTimeWindows=1
+  netops, engineBoots from before a reboot     -> Report flags=0x01 boots=7 time=1000 usmStatsNotInTimeWindows=2
+
+=== 6. VACM: monitor's view is 1.3.6.1.2.1.1 (system) ===
+  monitor authNoPriv GET sysName.0, ifDescr.1  -> Response flags=0x01 boots=7 time=1000 1.3.6.1.2.1.1.5.0='edge-r1'; 1.3.6.1.2.1.2.2.1.2.1=noSuchObject
+
+=== 7. Replay inside the 150 s window ===
+  byte-identical replay of step 4 request      -> Response flags=0x03 boots=7 time=1002 1.3.6.1.2.1.1.1.0='lab-agent Linux 6.12 router'; 1.3.6.1.2.1.2.2.1.2.1='eth0'
+  usm counters: usmStatsUnsupportedSecLevels=1, usmStatsNotInTimeWindows=2, usmStatsUnknownUserNames=1, usmStatsUnknownEngineIDs=1, usmStatsWrongDigests=1
+```
+
+Two lines deserve a second look. In section 4, the request is 154 bytes and the string `netops` is visible in it while `lab-agent` is not: the username rides in clear text and the payload does not. In section 7, the replayed request is answered again at engine time 1002, which is USM working exactly as specified.
+
+## Gotchas
+
+**The trap: `authNoPriv` feels like "SNMPv3 is enabled."**
+Because `authNoPriv` sets `msgFlags = 0x01`, operators sometimes assume traffic is protected. It is authenticated, not encrypted: every OID, interface description, IP address, and counter value travels in clear text. Always require `authPriv` for operational polling.
+
+**The trap: assuming `authPriv` hides usernames.**
+`msgUserName` lives in `msgSecurityParameters`, outside the encrypted `ScopedPDU`. Anyone sniffing management traffic can harvest valid usernames. Combine `authPriv` with management-VRF isolation and strict UDP 161 ACLs.
+
+**The trap: assuming USM stops replay attacks.**
+USM checks only that `boots` matches and `engineTime` is within +/-150 seconds. It has no replay cache. A captured `authPriv` `GetRequest` or `SetRequest` can be replayed for up to 300 seconds—another reason to disable SNMP `SET` entirely.
+
+**The trap: cloning `snmpEngineID` in golden images.**
+Copying `/var/lib/snmp/snmpd.conf` (or a vendor persistent config) into a VM or router template gives every device the same `snmpEngineID`. That breaks key localization isolation and confuses collector time-window caches. Strip persisted engine IDs before sealing images.
+
+**The trap: passphrases shorter than 8 characters.**
+RFC 3414 recommends passphrases of at least 8 octets, and agents such as Net-SNMP commonly refuse shorter passphrases outright. Use long, randomly generated passphrases (16+ characters) stored in your secrets manager.
+
+**The trap: polling 32-bit `IF-MIB` counters on high-speed links.**
+`ifInOctets` and `ifOutOctets` wrap every few seconds on 10G/100G interfaces, producing flat or sawtooth graphs. Always poll the 64-bit `HC` counters in `ifXTable` (RFC 2863).
+
+**The trap: oversized `GETBULK` `max-repetitions`.**
+Requesting 100 repetitions of a wide table can exceed `msgMaxSize` or force IP fragmentation across management GRE/IPsec tunnels, causing silent drops or `tooBig` errors. Tune `max-repetitions` conservatively.
+
+**The trap: VACM views that expose `usmUserTable`.**
+Granting a read-only user access to `.1` or `.1.3.6.1` lets them read `usmUserTable` and `vacmAccessTable`. Scope read-only views to the specific MIB subtrees your NMS needs, and explicitly exclude security tables.
+
+**The trap: leaving CBC-DES in legacy device templates.**
+Some older templates still specify `DES` as a fallback privacy protocol. Audit your fleet and migrate every capable device to `AES-128-CFB` (`AES`) with `SHA-256` (`usmHMAC192SHA256`).
+
+## Exercises
+
+1. **Key localization by hand or script.** Using the RFC 3414 Appendix A.2 algorithm, compute `Ku` and `Kul` for the passphrase `"maplesyrup"` with SHA-1 and engine ID `80001f8804656467652d7231` (`edge-r1`), then repeat for `edge-r2`. Explain why a compromise of `edge-r1`'s localized key does not grant access to `edge-r2`.
+2. **Packet dissection.** Capture (or inspect from the lab) an SNMPv3 discovery probe, its `Report` response, and the subsequent `authPriv` `GetRequest`. Identify the exact byte offsets or fields for `msgFlags`, `msgUserName`, `msgPrivacyParameters`, and the encrypted `ScopedPDU`. Confirm which fields are visible in clear text.
+3. **Timeliness and replay analysis.** An attacker captures a valid `authPriv` `SetRequest` that bounces an interface (`ifAdminStatus.1 = down`) at `snmpEngineTime = 1000`. At what `snmpEngineTime` values will the router accept a byte-identical replay? What happens if the router reboots (`snmpEngineBoots` increments) 30 seconds after the capture?
+4. **Least-privilege VACM design.** Design a Net-SNMP `view` and `rouser` configuration for a capacity-planning collector that needs `system` (`1.3.6.1.2.1.1`) and `ifXTable` (`1.3.6.1.2.1.31.1.1`) only, must use `authPriv`, and must receive `noSuchObject` for `usmUserTable` and `ipRouteTable`.
+5. **Triage with `usmStats`.** Your NMS alerts that polling to `core-r4` stopped after a maintenance window. You query `usmStats` from a working collector and see `usmStatsNotInTimeWindows.0` climbing rapidly while `usmStatsWrongDigests.0` is `0`. What happened, and what are the two most likely root causes?
+6. **Migration decision.** A campus switch stack supports SNMPv3 (`SHA-256` + `AES-128`) and gNMI over TLS. You need 5-second interface drop counters and BGP session state, plus daily hardware serial inventory. Decide which protocol handles which workload and justify your split.
+
+## The boring rule
+
+Use `authPriv` with `SHA-256` and `AES-128`, keep a unique `snmpEngineID` on every device, scope VACM views to read-only operational subtrees, and move high-frequency telemetry to gNMI wherever the platform allows it.
+
+## Sources
+
+- [RFC 3411: An Architecture for Describing Simple Network Management Protocol (SNMP) Management Frameworks](https://datatracker.ietf.org/doc/html/rfc3411)
+- [RFC 3412: Message Processing and Dispatching for the Simple Network Management Protocol (SNMP)](https://datatracker.ietf.org/doc/html/rfc3412)
+- [RFC 3414: User-based Security Model (USM) for version 3 of the Simple Network Management Protocol (SNMPv3)](https://datatracker.ietf.org/doc/html/rfc3414)
+- [RFC 3415: View-based Access Control Model (VACM) for the Simple Network Management Protocol (SNMP)](https://datatracker.ietf.org/doc/html/rfc3415)
+- [RFC 3416: Version 2 of the Protocol Operations for the Simple Network Management Protocol (SNMP)](https://datatracker.ietf.org/doc/html/rfc3416)
+- [RFC 3826: The Advanced Encryption Standard (AES) Cipher Algorithm in the SNMP User-based Security Model](https://datatracker.ietf.org/doc/html/rfc3826)
+- [RFC 7860: HMAC-SHA-2 Authentication Protocols in the User-based Security Model (USM) for SNMPv3](https://datatracker.ietf.org/doc/html/rfc7860)
+- [RFC 2863: The Interfaces Group MIB (IF-MIB)](https://datatracker.ietf.org/doc/html/rfc2863)
+- [Net-SNMP `snmpd.conf(5)` manual page source](https://github.com/net-snmp/net-snmp/blob/master/man/snmpd.conf.5.def)
