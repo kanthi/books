@@ -1,0 +1,727 @@
+---
+title: "IPv6 Extension Headers and Fragmentation: What a Linux Host Accepts, Drops and Reports"
+author:
+  - name: "K19G"
+  - name: "grok-bot"
+---
+
+# IPv6 Extension Headers and Fragmentation: What a Linux Host Accepts, Drops and Reports
+
+Unlike the fixed 20-byte IPv4 header with its variable Options field, IPv6 uses a streamlined 40-byte base header and pushes optional internet-layer functionality into modular Extension Headers (EHs). This design simplifies router processing for the common packet path, moving secondary tasks—such as hop-by-hop signaling, explicit routing, payload fragmentation, and destination-specific processing—into optional headers chained between the IPv6 header and the upper-layer payload.
+
+For network operators, security engineers, and systems programmers, IPv6 extension headers introduce both power and significant operational complexity. Middleboxes and stateful firewalls across the global Internet frequently drop packets containing extension headers due to hardware processing limitations, misconfigured access control lists, or security policies aiming to block evasion techniques. Consequently, an application or protocol design that relies on extension headers may perform perfectly inside a local enterprise environment but suffer silent packet drops when traversing public transit networks.
+
+Understanding how the Linux kernel network stack parses, processes, validates, drops, and reports IPv6 extension headers is essential for debugging connectivity anomalies, hardening edge hosts, and designing resilient IPv6 services. When a Linux host receives a malformed extension header, an unknown option, or an invalid fragment sequence, its reaction is strictly governed by standards-compliant rules and kernel-level sysctl parameters. This chapter dissects the mechanics of IPv6 extension headers and fragmentation, mapping standard RFC requirements directly to Linux kernel counters, ICMPv6 diagnostic messages, and observable host behaviors.
+
+## Learning goals
+
+- Trace the chaining mechanism, alignment constraints, and standardized processing order of IPv6 extension headers.
+- Classify Type-Length-Value (TLV) option behaviors in Hop-by-Hop and Destination Options headers based on high-order bit flags.
+- Analyze IPv6 fragmentation and reassembly rules, including minimum MTU requirements, atomic fragment handling, overlap prevention, and header chain completeness requirements.
+- Distinguish Linux kernel behaviors across different Routing Header types (RH0, Type 2, Type 3, and SRH).
+- Correlate kernel sysctl limits (`max_dst_opts_number`, `max_hbh_opts_number`, `ip6frag_time`) with silently dropped or explicitly rejected IPv6 traffic.
+- Map specific packet anomalies to SNMPv6 MIB counters (`Ip6InHdrErrors`, `Ip6ReasmFails`, `Ip6InUnknownProtos`) and ICMPv6 Parameter Problem or Time Exceeded messages.
+
+## Version note
+
+The lab ran on Linux 6.12 with iproute2 6.15.0 and Python 3.13 (standard library only), unprivileged inside user, network, mount and UTS namespaces. Packets are built by hand and sent with `AF_PACKET`; no Scapy, tcpdump, nftables or ip6tables were available, so the firewall and capture snippets in "In production" are not run.
+
+## Extension header architecture and the header chain
+
+IPv6 organizes protocol fields into a linked list structure known as the header chain. The base IPv6 header contains a 8-bit `Next Header` field that specifies the type of the immediately following header. Each extension header in turn contains its own `Next Header` field, pointing to the subsequent extension header or the ultimate upper-layer protocol (such as TCP, UDP, or ICMPv6).
+
+```text
++-------------------+-------------------+-------------------+-------------------+
+|    IPv6 Header    | Hop-by-Hop Options| Fragment Header   |   UDP Payload     |
+|                   |                   |                   |                   |
+| Next Header = 0  | Next Header = 44  | Next Header = 17  |                   |
++-------------------+-------------------+-------------------+-------------------+
+```
+
+### Next Header assignments and recommended order
+
+The Internet Assigned Numbers Authority (IANA) maintains the assignment of IPv6 Next Header values, which share the same numbering space as IPv4 Protocol numbers. Key Next Header values include:
+
+| Value | Header Type | Description |
+|---|---|---|
+| 0 | Hop-by-Hop Options (`HOPOPT`) | Examined by every hop along the delivery path |
+| 43 | Routing Header (`IPv6-Route`) | Specifies routers to be visited en route |
+| 44 | Fragment Header (`IPv6-Frag`) | Contains fragmentation and reassembly offset information |
+| 50 | Encapsulating Security Payload (`ESP`) | IPSec encryption payload |
+| 51 | Authentication Header (`AH`) | IPSec authentication data |
+| 60 | Destination Options (`IPv6-Opts`) | Examined only by the final destination host |
+| 59 | No Next Header (`IPv6-NoNxt`) | Indicates nothing follows this header |
+| 6 | Transmission Control Protocol (`TCP`) | Upper-layer transport protocol |
+| 17 | User Datagram Protocol (`UDP`) | Upper-layer transport protocol |
+| 58 | ICMP for IPv6 (`IPv6-ICMP`) | Control and diagnostic messaging protocol |
+
+To ensure consistent processing across heterogeneous network nodes, RFC 8200 Section 4.1 recommends a strict ordering when multiple extension headers are present in a single IPv6 datagram:
+
+1. IPv6 base header
+2. Hop-by-Hop Options header (must immediately follow the base IPv6 header if present)
+3. Destination Options header (for options to be processed by the first destination in the IPv6 Header and subsequent destinations in the Routing header)
+4. Routing header
+5. Fragment header
+6. Authentication Header (AH)
+7. Encapsulating Security Payload (ESP) header
+8. Destination Options header (for options to be processed only by the final destination)
+9. Upper-layer header (e.g., TCP, UDP, ICMPv6)
+
+### Uniform format and 8-octet alignment
+
+RFC 6564 specifies a uniform format for IPv6 extension headers to facilitate parsing. With the exception of the Fragment header (which has a fixed 8-octet structure), extension headers consist of a 1-octet `Next Header` field, a 1-octet `Hdr Ext Len` field, and variable option payload data.
+
+```text
+ 0                   1                   2                   3
+ 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|  Next Header  |  Hdr Ext Len  |                               |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+                               +
+|                                                               |
+.                 Option Data / Variable Fields                 .
+.                                                               .
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+```
+
+The `Hdr Ext Len` field represents the length of the extension header in 8-octet units, **not including the first 8 octets**. The total length of the extension header in bytes is calculated as:
+
+```text
+header length in bytes = (Hdr Ext Len + 1) * 8
+```
+
+Because all extension headers are defined to be multiples of 8 octets (64 bits) in length, options inserted into Hop-by-Hop or Destination Options headers must be padded to maintain strict 8-octet alignment.
+
+## TLV options in Hop-by-Hop and Destination Options headers
+
+Both Hop-by-Hop Options (Next Header 0) and Destination Options (Next Header 60) carry variable-length parameters encoded as Type-Length-Value (TLV) triplets.
+
+```text
+ 0                   1                   2                   3
+ 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|  Option Type  | Opt Data Len  |    Option Data (variable)     |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+```
+
+### Option Type bit encoding
+
+The 8-bit `Option Type` field is structured so that its highest-order bits specify node behavior when an unrecognized option type is encountered.
+
+```text
++---+---+---+---+---+---+---+---+
+| Act   |C|      Option Number  |
++---+---+---+---+---+---+---+---+
+ 0   1   2   3   4   5   6   7
+```
+
+The two highest-order bits (bits 0 and 1, labeled `Act`) dictate the action taken by a processing host or router upon encountering an unrecognized option:
+
+- `00`: **Skip** the unrecognized option and continue processing the header.
+- `01`: **Discard** the packet silently without returning an ICMPv6 message.
+- `10`: **Discard** the packet and send an ICMPv6 Parameter Problem (Type 4, Code 2) message to the packet's Source Address, even if the destination address was a multicast address.
+- `11`: **Discard** the packet and send an ICMPv6 Parameter Problem (Type 4, Code 2) message to the Source Address *only if* the destination address was not a multicast address.
+
+Bit 2 (labeled `C`) specifies whether the Option Data may change en route to the destination:
+- `0`: Option Data does not change en route.
+- `1`: Option Data may change en route.
+
+### Alignment padding: Pad1 and PadN
+
+To satisfy alignment requirements for individual options (for instance, ensuring a 4-byte field begins on a 4-byte boundary within the header), two explicit padding options are defined:
+
+1. **Pad1 Option** (Type `0x00`): A single octet consisting of all zero bits. It has no Length or Data fields.
+2. **PadN Option** (Type `0x01`): Used to insert two or more octets of padding. Its format includes an `Opt Data Len` field indicating the number of padding bytes following.
+
+### Hop-by-Hop processing evolution (RFC 8200 vs RFC 9673)
+
+In the initial IPv6 specification (RFC 2460), all intermediate routers were required to parse and process the Hop-by-Hop Options header. In practice, high-speed line-rate ASIC switch fabrics could not process variable extension headers in hardware, forcing such packets to the router CPU slow path. This caused severe performance degradation and made routers vulnerable to Denial-of-Service (DoS) attacks.
+
+RFC 8200 relaxed this requirement: intermediate routers may ignore the Hop-by-Hop Options header unless explicitly configured to process it. RFC 9673 (published in 2024) further formalizes modern Hop-by-Hop procedures, establishing clear operational guidelines for when and how nodes process, forward, or drop packets containing Hop-by-Hop options without breaking end-to-end transport delivery.
+
+## IPv6 fragmentation and reassembly
+
+Unlike IPv4, where intermediate routers perform IP-layer fragmentation when a packet exceeds an outgoing link's Path MTU (PMTU), IPv6 mandates that **only the originating source host may fragment a packet**. Intermediate routers never fragment IPv6 packets; if a packet exceeds a link MTU, the router drops the packet and returns an ICMPv6 Packet Too Big (Type 2, Code 0) message specifying the constrained link MTU.
+
+The absolute minimum IPv6 link MTU is **1280 octets**. Every IPv6 link and path must support receiving datagrams up to this size.
+
+### Fragment header layout
+
+When an originating host sends a packet larger than the PMTU, it splits the payload into unfragmentable and fragmentable parts, inserting a 8-octet Fragment header (Next Header 44) before each fragment.
+
+```text
+ 0                   1                   2                   3
+ 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|  Next Header  |   Reserved    |      Fragment Offset    |Res|M|
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                         Identification                        |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+```
+
+- **Next Header** (8 bits): Identifies the initial header type of the fragmentable part.
+- **Fragment Offset** (13 bits): Indicates the relative position of this fragment's data payload in 8-octet (64-bit) units relative to the start of the original fragmentable part.
+- **M Flag** (1 bit): More Fragments indicator (`1` = more fragments follow; `0` = last fragment).
+- **Identification** (32 bits): Unique value assigned by the source host to identify all fragments originating from the same original IPv6 packet.
+
+### Reassembly rules, timeouts, and edge cases
+
+1. **Reassembly Timeout**: RFC 8200 says to abandon reassembly if all fragments have not arrived within 60 seconds of the first one. Linux uses `net.ipv6.ip6frag_time`, documented with a default of 60 seconds (the lab host reported 1, and the lab sets 2). If the timer expires before all fragments arrive, the host discards all queued fragments. An ICMPv6 Time Exceeded (Type 3, Code 1 - Fragment reassembly time exceeded) message is returned **only if the first fragment (Fragment Offset 0) was received**.
+2. **Overlapping Fragments (RFC 5722)**: Historical evasion techniques manipulated overlapping fragment offsets to bypass network intrusion detection systems (NIDS) or firewalls. RFC 5722 prohibits overlapping fragments entirely. If a receiving host detects an arriving fragment that overlaps with data already received for a reassembly queue, the receiving host **must silently discard the entire packet** (all queued fragments and the new fragment) without sending an ICMPv6 error.
+3. **Atomic Fragments (RFC 6946 & RFC 8021)**: An atomic fragment is a fragment with `Fragment Offset = 0` and `M flag = 0`. RFC 2460 told a host that received a Packet Too Big reporting an MTU below 1280 to keep sending 1280-byte packets but add a Fragment header to every one, so routers could translate them to IPv4; those are atomic fragments, and an attacker who can forge such a Packet Too Big can make a host emit them. RFC 6946 required nodes to process atomic fragments independently without entering normal reassembly queues, isolating them from overlap injection attacks. RFC 8021 deprecated generating them, and RFC 8200 removed the rule.
+4. **Header Chain Splitting (RFC 7112)**: RFC 7112 mandates that the first fragment (`Offset = 0`) must contain the entire IPv6 header chain, including all extension headers and the complete upper-layer protocol header (e.g., TCP header or UDP header). If the first fragment does not contain the complete header chain, the receiving host **must drop the packet and send an ICMPv6 Parameter Problem (Type 4, Code 3)** message to the source.
+
+## Routing headers and unrecognized protocol handling
+
+The Routing Header (Next Header 43) allows a source host to explicitly list one or more intermediate nodes to be visited along the path to the destination.
+
+### Deprecation of Routing Header Type 0 (RH0)
+
+Routing Header Type 0 (RH0) allowed source routing similar to IPv4 Loose/Strict Source Route options. RFC 5095 formally deprecated RH0 because malicious actors could construct packet loops between two intermediate routers containing multiple alternate references to each other in the RH0 address list, resulting in massive bandwidth amplification attacks.
+
+Modern Linux kernels reject packets containing RH0 if `Segments Left > 0` by returning an **ICMPv6 Parameter Problem (Type 4, Code 0)** pointing directly to the Routing Type field. However, if `Segments Left == 0`, the host has reached the final destination without requiring further routing steps, and RFC 5095 dictates that the header is ignored and the payload is delivered normally.
+
+### Linux kernel support for active Routing Header types
+
+The Linux kernel supports specific specialized routing header types:
+- **Type 2**: Mobile IPv6 Home Address option.
+- **Type 3**: RPL (Routing Protocol for Low-Power and Lossy Networks) Source Routing Header.
+- **Type 4**: Segment Routing Header (SRv6). Linux processes Type 4 headers only when explicitly enabled via `net.ipv6.conf.<interface>.seg6_enabled = 1`.
+
+### Unrecognized Next Header values
+
+When a receiving Linux host encounters an unrecognized value in the `Next Header` field of the base IPv6 header or any extension header, it increments the MIB counter `Ip6InUnknownProtos` and generates an **ICMPv6 Parameter Problem (Type 4, Code 1)** message ("unrecognized Next Header type encountered"). The ICMPv6 pointer field is set to the exact byte offset of the unrecognized `Next Header` byte (pointer = 6 if in the IPv6 base header).
+
+## Linux kernel limits and sysctl tunings
+
+Linux bounds option processing and fragment memory with these sysctls (defaults from the kernel's ip-sysctl documentation; the two length limits were read on the lab host as 2147483647):
+
+```text
++------------------------------------+---------------+----------------------------------------------------+
+| Sysctl Parameter                   | Default Value | Functional Impact                                  |
++------------------------------------+---------------+----------------------------------------------------+
+| net.ipv6.max_dst_opts_number       | 8             | Maximum number of options inside Destination Opts  |
+| net.ipv6.max_hbh_opts_number       | 8             | Maximum number of options inside Hop-by-Hop Opts   |
+| net.ipv6.max_dst_opts_length       | INT_MAX       | Maximum length of a Destination Options header     |
+| net.ipv6.max_hbh_length            | INT_MAX       | Maximum length of a Hop-by-Hop Options header      |
+| net.ipv6.ip6frag_high_thresh       | 4194304 (4MB) | Upper memory bound for fragment reassembly queues  |
+| net.ipv6.ip6frag_low_thresh        | 3145728 (3MB) | Lower bound triggered during fragment queue prune  |
+| net.ipv6.ip6frag_time              | 60 (seconds)  | Time fragments are kept before the queue expires   |
++------------------------------------+---------------+----------------------------------------------------+
+```
+
+When an incoming IPv6 packet contains more options in a Destination Options or Hop-by-Hop header than allowed by `max_dst_opts_number` or `max_hbh_opts_number`, the Linux network stack silently drops the packet and increments `Ip6InHdrErrors`.
+
+## Operations, filtering, and security history
+
+### Empirical drop rates across the public Internet
+
+Multiple operational studies (notably RFC 7872 measurements) have documented that packets carrying IPv6 extension headers suffer high drop rates on the public Internet. Drops typically occur in transit Autonomous Systems (ASes) where edge ACLs or stateless firewalls drop non-initial fragments or unrecognized extension headers by default. RFC 9098 provides detailed operational analysis of these drop behaviors and their impact on application stability.
+
+RFC 7045 and RFC 9288 establish modern operational guidelines for transit networks. RFC 7045 advises that intermediate nodes should not drop packets containing extension headers solely because the node does not recognize or process the specific extension header type. RFC 9288 outlines specific recommendation rules for operators configuring border firewalls, balancing network protection against end-to-end transport visibility.
+
+### Security history: Fragment evasion and RA Guard bypass
+
+1. **Fragment-based Firewall Evasion**: In early IPv6 security research, attackers split transport layer headers across multiple fragments (e.g., placing the TCP source/destination ports in the second fragment). Stateless firewalls evaluating only the first fragment could not identify port numbers and allowed the packet through. RFC 7112's rule, that the first fragment must carry the whole header chain, is what lets a stateless filter make a decision on the first fragment.
+2. **RA Guard Evasion (RFC 7113)**: IPv6 Router Advertisement Guard (RA Guard) inspects incoming switch port traffic to block rogue IPv6 routers. Attackers bypassed early hardware RA Guard implementations by prefixing RA messages with benign extension headers (such as Destination Options or Fragmentation headers) to push the ICMPv6 RA payload beyond the switch hardware's fixed inspection depth. RFC 7113 defines modern parsing standards for switches to prevent extension header evasion.
+3. **Predictable Fragment IDs (RFC 7739)**: Early operating systems generated sequential 32-bit IPv6 Fragment Identification numbers. Attackers could perform idle scanning, packet injection, or path MTU spoofing by predicting upcoming Identification field values. RFC 7739 analyses the attacks and recommends unpredictable Identification values; Linux derives them from a keyed hash of the addresses.
+
+## The lab
+
+The following rootless network environment demonstrates host processing of extension headers and fragments using Linux network namespaces (`unshare -urnmu`). Two namespaces, `h1` (fd00::1) and `h2` (fd00::2), share one veth link (`eth0` on both sides, MTU 1500). `h2` runs a UDP sink on port 9000 that logs what its socket actually receives. For every case, `lab.sh` snapshots `h2`'s `/proc/net/snmp6`, `ext6.py` on `h1` writes the hand-built frames with `AF_PACKET` and listens for ICMPv6 errors coming back, and `snmp6.py` prints the counters that changed. `h2` gets `ip6frag_time=2` and an ICMPv6 rate limit of 0, so reassembly timeouts happen inside the test window and no error is suppressed.
+
+```text
+   h1  fd00::1/64  eth0 =========== eth0  fd00::2/64  h2
+   ext6.py: build frames, AF_PACKET send,          sink.py on UDP 9000
+            collect ICMPv6 errors                 snmp6.py counter diff
+```
+
+### Lab files
+
+The packet builder and the fourteen cases:
+
+`ext6.py`:
+
+```python
+#!/usr/bin/env python3
+"""Craft IPv6 extension-header and fragment cases and send them on a link.
+
+  ext6.py CASE PEER_MAC [LISTEN_SECONDS]   (run in h1; h2 = fd00::2, UDP 9000)
+
+Frames are built by hand and written with AF_PACKET, so the kernel on h1
+does not get a say in what goes on the wire.  After sending, we listen for
+ICMPv6 errors coming back (default half a second) and decode them."""
+import socket, struct, sys, time, os
+
+IFACE, SRC, DST = "eth0", "fd00::1", "fd00::2"
+SPORT, DPORT = 5555, 9000
+NH_HBH, NH_TCP, NH_UDP, NH_RH, NH_FRAG, NH_ICMP6, NH_NONE, NH_DST = 0, 6, 17, 43, 44, 58, 59, 60
+
+def csum(data):
+    if len(data) % 2:
+        data += b"\0"
+    s = sum(struct.unpack(f"!{len(data)//2}H", data))
+    while s >> 16:
+        s = (s & 0xffff) + (s >> 16)
+    return ~s & 0xffff
+
+def udp(payload):
+    l = 8 + len(payload)
+    hdr = struct.pack("!HHHH", SPORT, DPORT, l, 0)
+    pseudo = socket.inet_pton(socket.AF_INET6, SRC) + socket.inet_pton(socket.AF_INET6, DST) + struct.pack("!I3xB", l, NH_UDP)
+    c = csum(pseudo + hdr + payload) or 0xffff
+    return struct.pack("!HHHH", SPORT, DPORT, l, c) + payload
+
+def ip6(nh, payload, hlim=64):
+    return struct.pack("!IHBB", 6 << 28, len(payload), nh, hlim) + \
+        socket.inet_pton(socket.AF_INET6, SRC) + socket.inet_pton(socket.AF_INET6, DST) + payload
+
+def frag(nh, offset_bytes, more, ident, data):
+    assert offset_bytes % 8 == 0
+    return struct.pack("!BBHI", nh, 0, (offset_bytes // 8) << 3 | (1 if more else 0), ident) + data
+
+def opts_hdr(nh, options):
+    """Hop-by-Hop / Destination Options header, padded to 8 bytes with PadN."""
+    body = b"".join(options)
+    pad = (8 - (2 + len(body)) % 8) % 8
+    if pad == 1:
+        body += b"\x00"            # Pad1
+    elif pad:
+        body += bytes([1, pad - 2]) + b"\0" * (pad - 2)   # PadN
+    return bytes([nh, (2 + len(body)) // 8 - 1]) + body
+
+def rthdr(nh, rtype, segleft, addrs):
+    body = b"\0" * 4 + b"".join(socket.inet_pton(socket.AF_INET6, a) for a in addrs)
+    return bytes([nh, len(body) // 8, rtype, segleft]) + body
+
+def opt(otype, data=b""):
+    return bytes([otype, len(data)]) + data
+
+def mac(ifname):
+    return bytes.fromhex(open(f"/sys/class/net/{ifname}/address").read().strip().replace(":", ""))
+
+def send_and_listen(packets, peer_mac, wait=0.5):
+    s = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(0x86dd))
+    s.bind((IFACE, 0x86dd))
+    s.settimeout(0.1)
+    eth = peer_mac + mac(IFACE) + b"\x86\xdd"
+    for p in packets:
+        s.send(eth + p)
+    end, seen = time.time() + wait, []
+    while time.time() < end:
+        try:
+            f, addr = s.recvfrom(2000)
+        except socket.timeout:
+            continue
+        if addr[2] == socket.PACKET_OUTGOING:
+            continue
+        pkt = f[14:]
+        if pkt[6] == NH_ICMP6:
+            t, c = pkt[40], pkt[41]
+            ptr = struct.unpack("!I", pkt[44:48])[0]
+            names = {(1, 4): "dest unreachable/port", (4, 0): "parameter problem/erroneous header field",
+                     (4, 1): "parameter problem/unrecognized next header",
+                     (4, 2): "parameter problem/unrecognized IPv6 option",
+                     (4, 3): "parameter problem/first fragment has incomplete header chain",
+                     (3, 1): "time exceeded/fragment reassembly"}
+            if t in (1, 3, 4):
+                extra = f" pointer={ptr}" if t == 4 else ""
+                seen.append(f"ICMPv6 type {t} code {c} ({names.get((t, c), '?')}){extra}")
+    return seen
+
+CASES = {}
+def case(f):
+    CASES[f.__name__] = f
+    return f
+
+PAY = b"A" * 1200
+
+@case
+def plain():
+    return [ip6(NH_UDP, udp(b"plain"))]
+
+@case
+def two_fragments():
+    u = udp(b"two-fragments:" + PAY)
+    return [ip6(NH_FRAG, frag(NH_UDP, 0, True, 0x101, u[:800])),
+            ip6(NH_FRAG, frag(NH_UDP, 800, False, 0x101, u[800:]))]
+
+@case
+def overlapping():
+    u = udp(b"overlapping:" + PAY)
+    # second fragment starts at 792, overlapping the last 8 bytes of the first
+    return [ip6(NH_FRAG, frag(NH_UDP, 0, True, 0x102, u[:800])),
+            ip6(NH_FRAG, frag(NH_UDP, 792, False, 0x102, u[792:]))]
+
+@case
+def atomic_fragment():
+    return [ip6(NH_FRAG, frag(NH_UDP, 0, False, 0x103, udp(b"atomic")))]
+
+@case
+def missing_last():
+    u = udp(b"missing-last:" + PAY)
+    return [ip6(NH_FRAG, frag(NH_UDP, 0, True, 0x104, u[:800]))]
+
+@case
+def chain_split():
+    # first fragment carries a Destination Options header but not the UDP header (RFC 7112)
+    d = opts_hdr(NH_UDP, [opt(0x1e, b"\0" * 4)])
+    rest = d + udp(b"chain-split")
+    return [ip6(NH_FRAG, frag(NH_DST, 0, True, 0x105, rest[:8])),
+            ip6(NH_FRAG, frag(NH_DST, 8, False, 0x105, rest[8:]))]
+
+@case
+def dstopt_skip():      # option type 0x1e: top bits 00 -> skip and continue
+    return [ip6(NH_DST, opts_hdr(NH_UDP, [opt(0x1e, b"\0\0")]) + udp(b"dstopt-skip"))]
+
+@case
+def dstopt_discard():   # 0x5e: top bits 01 -> discard silently
+    return [ip6(NH_DST, opts_hdr(NH_UDP, [opt(0x5e, b"\0\0")]) + udp(b"dstopt-discard"))]
+
+@case
+def dstopt_icmp():      # 0x9e: top bits 10 -> discard and send Parameter Problem code 2
+    return [ip6(NH_DST, opts_hdr(NH_UDP, [opt(0x9e, b"\0\0")]) + udp(b"dstopt-icmp"))]
+
+@case
+def dstopt_nine():      # nine skippable options, above net.ipv6.max_dst_opts_number (8)
+    return [ip6(NH_DST, opts_hdr(NH_UDP, [opt(0x1e, b"")] * 9) + udp(b"dstopt-nine"))]
+
+@case
+def hbh_skip():         # Hop-by-Hop with a skippable unknown option
+    return [ip6(NH_HBH, opts_hdr(NH_UDP, [opt(0x1e, b"\0\0")]) + udp(b"hbh-skip"))]
+
+@case
+def rh0_segleft2():     # Routing Header type 0, deprecated by RFC 5095
+    return [ip6(NH_RH, rthdr(NH_UDP, 0, 2, ["fd00::99", "fd00::98"]) + udp(b"rh0-segleft2"))]
+
+@case
+def rh0_segleft0():
+    return [ip6(NH_RH, rthdr(NH_UDP, 0, 0, ["fd00::99", "fd00::98"]) + udp(b"rh0-segleft0"))]
+
+@case
+def unknown_nh():       # Next Header 253 (RFC 3692 experimental) with nothing behind it
+    return [ip6(253, b"\0" * 8)]
+
+if __name__ == "__main__":
+    peer = bytes.fromhex(sys.argv[2].replace(":", ""))
+    name = sys.argv[1]
+    pk = CASES[name]()
+    sizes = "+".join(str(14 + len(p)) for p in pk)
+    wait = float(sys.argv[3]) if len(sys.argv) > 3 else 0.5
+    errs = send_and_listen(pk, peer, wait)
+    print(f"{name:<16} sent {len(pk)} frame(s) [{sizes} B]; back to sender: {', '.join(errs) or 'nothing'}")
+```
+
+The receiver's UDP sink:
+
+`sink.py`:
+
+```python
+#!/usr/bin/env python3
+"""UDP sink on [::]:9000 that logs the first token of every datagram."""
+import socket, sys
+s = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
+s.bind(("::", 9000))
+with open(sys.argv[1], "a", buffering=1) as log:
+    while True:
+        d, a = s.recvfrom(65535)
+        log.write(f"{d.split(b':')[0].decode()} ({len(d)} B)\n")
+```
+
+The counter diff:
+
+`snmp6.py`:
+
+```python
+#!/usr/bin/env python3
+"""Print counters from /proc/net/snmp6 that changed between two snapshots."""
+import sys, json
+def snap():
+    return {k: int(v) for k, v in (l.split() for l in open("/proc/net/snmp6"))}
+if sys.argv[1] == "save":
+    json.dump(snap(), open(sys.argv[2], "w"))
+else:
+    old, new = json.load(open(sys.argv[2])), snap()
+    keep = ("Ip6InReceives", "Ip6InDelivers", "Ip6InHdrErrors", "Ip6InUnknownProtos", "Ip6InDiscards",
+            "Ip6ReasmReqds", "Ip6ReasmOKs", "Ip6ReasmFails", "Ip6ReasmTimeout", "Icmp6OutParmProblems", "Icmp6OutTimeExcds", "Icmp6OutDestUnreachs",
+            "Udp6InDatagrams", "Udp6NoPorts")
+    ch = [f"{k}+{new[k]-old.get(k,0)}" for k in keep if new.get(k, 0) != old.get(k, 0)]
+    print("    h2 counters: " + (" ".join(ch) or "(none)"))
+```
+
+The driver (run it with `unshare -urnmu sh lab.sh`):
+
+`lab.sh`:
+
+```bash
+#!/bin/sh
+# Run as: unshare -urnmu sh lab.sh   (no root, no installs)
+set -e
+cd "$(dirname "$0")"
+mount -t tmpfs none /run; mkdir -p /run/netns
+for n in h1 h2; do ip netns add $n; ip -n $n link set lo up; done
+ip link add eth0 netns h1 type veth peer name eth0 netns h2
+ip -n h1 addr add fd00::1/64 dev eth0 nodad
+ip -n h2 addr add fd00::2/64 dev eth0 nodad
+ip -n h1 link set eth0 up; ip -n h2 link set eth0 up
+ip netns exec h2 sh -c 'echo 0 > /proc/sys/net/ipv6/icmp/ratelimit; echo 2 > /proc/sys/net/ipv6/ip6frag_time'
+for k in max_dst_opts_number max_hbh_opts_number ip6frag_time; do echo "h2 net.ipv6.$k = $(ip netns exec h2 cat /proc/sys/net/ipv6/$k)"; done
+H2MAC=$(ip -n h2 link show eth0 | awk '/ether/{print $2}')
+: > /tmp/ext6-sink.log
+ip netns exec h2 python3 sink.py /tmp/ext6-sink.log & SINK=$!
+trap 'kill $SINK 2>/dev/null' EXIT
+sleep 1
+echo "== 1. what the kernel itself does with a 3000-byte UDP datagram on a 1500 link"
+ip netns exec h2 python3 snmp6.py save /tmp/s6
+ip netns exec h1 python3 -c "
+import socket;s=socket.socket(socket.AF_INET6,socket.SOCK_DGRAM);s.sendto(b'kernel-frag:'+b'K'*2988,('fd00::2',9000))"
+sleep 0.2; ip netns exec h2 python3 snmp6.py diff /tmp/s6
+ip netns exec h1 cat /proc/net/snmp6 | awk '$1=="Ip6FragCreates"||$1=="Ip6FragOKs"{printf "    h1 %s=%s\n",$1,$2}'
+echo "== 2. hand-built cases"
+for c in plain two_fragments overlapping atomic_fragment missing_last chain_split \
+         dstopt_skip dstopt_discard dstopt_icmp dstopt_nine hbh_skip \
+         rh0_segleft2 rh0_segleft0 unknown_nh; do
+  ip netns exec h2 python3 snmp6.py save /tmp/s6
+  if [ $c = missing_last ] || [ $c = chain_split ]; then W=3; else W=0.5; fi
+  ip netns exec h1 python3 ext6.py $c $H2MAC $W
+  sleep 0.1
+  ip netns exec h2 python3 snmp6.py diff /tmp/s6
+done
+echo "== 3. what the UDP socket on h2 actually received"
+sed 's/^/    /' /tmp/ext6-sink.log
+```
+
+### Execution output
+
+```text
+h2 net.ipv6.max_dst_opts_number = 8
+h2 net.ipv6.max_hbh_opts_number = 8
+h2 net.ipv6.ip6frag_time = 2
+== 1. what the kernel itself does with a 3000-byte UDP datagram on a 1500 link
+    h2 counters: Ip6InReceives+4 Ip6InDelivers+2 Ip6ReasmReqds+3 Ip6ReasmOKs+1 Udp6InDatagrams+1
+    h1 Ip6FragOKs=1
+    h1 Ip6FragCreates=3
+== 2. hand-built cases
+plain            sent 1 frame(s) [67 B]; back to sender: nothing
+    h2 counters: Ip6InReceives+3 Ip6InDelivers+1 Udp6InDatagrams+1
+two_fragments    sent 2 frame(s) [862+484 B]; back to sender: nothing
+    h2 counters: Ip6InReceives+3 Ip6InDelivers+1 Ip6ReasmReqds+2 Ip6ReasmOKs+1 Udp6InDatagrams+1
+overlapping      sent 2 frame(s) [862+490 B]; back to sender: nothing
+    h2 counters: Ip6InReceives+2 Ip6ReasmReqds+2 Ip6ReasmFails+1
+atomic_fragment  sent 1 frame(s) [76 B]; back to sender: nothing
+    h2 counters: Ip6InReceives+1 Ip6InDelivers+1 Ip6ReasmReqds+1 Ip6ReasmOKs+1 Udp6InDatagrams+1
+missing_last     sent 1 frame(s) [862 B]; back to sender: ICMPv6 type 3 code 1 (time exceeded/fragment reassembly)
+    h2 counters: Ip6InReceives+3 Ip6InDelivers+1 Ip6ReasmReqds+1 Ip6ReasmFails+1 Ip6ReasmTimeout+1 Icmp6OutTimeExcds+1
+chain_split      sent 2 frame(s) [70+81 B]; back to sender: ICMPv6 type 4 code 3 (parameter problem/first fragment has incomplete header chain) pointer=0
+    h2 counters: Ip6InReceives+2 Ip6InHdrErrors+1 Ip6ReasmReqds+2 Ip6ReasmFails+1 Ip6ReasmTimeout+1 Icmp6OutParmProblems+1
+dstopt_skip      sent 1 frame(s) [81 B]; back to sender: nothing
+    h2 counters: Ip6InReceives+1 Ip6InDelivers+1 Udp6InDatagrams+1
+dstopt_discard   sent 1 frame(s) [84 B]; back to sender: nothing
+    h2 counters: Ip6InReceives+2 Ip6InDelivers+1 Ip6InHdrErrors+1
+dstopt_icmp      sent 1 frame(s) [81 B]; back to sender: ICMPv6 type 4 code 2 (parameter problem/unrecognized IPv6 option) pointer=42
+    h2 counters: Ip6InReceives+1 Ip6InHdrErrors+1 Icmp6OutParmProblems+1
+dstopt_nine      sent 1 frame(s) [97 B]; back to sender: nothing
+    h2 counters: Ip6InReceives+1 Ip6InHdrErrors+1
+hbh_skip         sent 1 frame(s) [78 B]; back to sender: nothing
+    h2 counters: Ip6InReceives+1 Ip6InDelivers+1 Udp6InDatagrams+1
+rh0_segleft2     sent 1 frame(s) [114 B]; back to sender: ICMPv6 type 4 code 0 (parameter problem/erroneous header field) pointer=42
+    h2 counters: Ip6InReceives+1 Ip6InHdrErrors+1 Icmp6OutParmProblems+1
+rh0_segleft0     sent 1 frame(s) [114 B]; back to sender: nothing
+    h2 counters: Ip6InReceives+2 Ip6InDelivers+1 Udp6InDatagrams+1
+unknown_nh       sent 1 frame(s) [62 B]; back to sender: ICMPv6 type 4 code 1 (parameter problem/unrecognized next header) pointer=6
+    h2 counters: Ip6InReceives+1 Ip6InUnknownProtos+1 Icmp6OutParmProblems+1
+== 3. what the UDP socket on h2 actually received
+    kernel-frag (3000 B)
+    plain (5 B)
+    two-fragments (1214 B)
+    atomic (6 B)
+    dstopt-skip (11 B)
+    hbh-skip (8 B)
+    rh0-segleft0 (12 B)
+```
+
+## Reading the output
+
+The following summary table correlates each experimental test case sent from `h1` with the observed host action at `h2`, returned ICMPv6 diagnostic errors, and governing RFC standards.
+
+| Case | What Was Sent | h2 Action | ICMPv6 Back | Governing RFC |
+|---|---|---|---|---|
+| `kernel-frag` | 3000-byte UDP datagram via OS socket | Reassembled & Delivered | None | RFC 8200 |
+| `plain` | Unfragmented UDP datagram | Delivered | None | RFC 8200 |
+| `two_fragments` | 1214 B UDP payload split across 2 valid fragments | Reassembled & Delivered | None | RFC 8200 |
+| `overlapping` | 2 fragments where second overlaps byte range 792 | Discarded silently | None | RFC 5722 |
+| `atomic_fragment` | Single fragment with Offset=0, M=0 | Delivered | None | RFC 6946 / RFC 8021 |
+| `missing_last` | First fragment sent, second fragment withheld | Discarded on timeout | Type 3 Code 1 | RFC 8200 |
+| `chain_split` | First fragment holds DestOpt only; UDP in 2nd | Discarded immediately | Type 4 Code 3 | RFC 7112 |
+| `dstopt_skip` | Destination Options with unknown option `0x1e` | Delivered | None | RFC 8200 |
+| `dstopt_discard`| Destination Options with unknown option `0x5e` | Discarded silently | None | RFC 8200 |
+| `dstopt_icmp` | Destination Options with unknown option `0x9e` | Discarded | Type 4 Code 2 (ptr=42) | RFC 8200 |
+| `dstopt_nine` | Destination Options header with 9 TLV options | Discarded silently | None | Linux limit (`max_dst_opts_number`) |
+| `hbh_skip` | Hop-by-Hop header with unknown option `0x1e` | Delivered | None | RFC 8200 / RFC 9673 |
+| `rh0_segleft2` | Routing Header Type 0 with Segments Left = 2 | Discarded | Type 4 Code 0 (ptr=42) | RFC 5095 |
+| `rh0_segleft0` | Routing Header Type 0 with Segments Left = 0 | Header ignored & Delivered | None | RFC 5095 |
+| `unknown_nh` | Base IPv6 header with Next Header = 253 | Discarded | Type 4 Code 1 (ptr=6) | RFC 8200 |
+
+### Detailed analysis of experimental results
+
+**Background traffic.** Where a row shows one more `Ip6InReceives` (and sometimes `Ip6InDelivers`) than the test sent, the extra packet is neighbour discovery or MLD on the link, not the test packet. The verdict comes from `Ip6InHdrErrors`, the `Ip6Reasm*` counters, `Udp6InDatagrams` and the ICMPv6 that came back.
+
+#### Kernel Fragmentation
+When `h1` originates a 3000-byte UDP datagram through standard POSIX sockets, the kernel automatically splits the payload into 3 IPv6 fragments (`Ip6FragCreates=3`, `Ip6FragOKs=1`). Upon arrival at `h2`, the stack counts three fragments that needed reassembly (`Ip6ReasmReqds+3`), successfully reassembles the datagram (`Ip6ReasmOKs+1`), and delivers the 3000-byte payload to the UDP sink socket (`Udp6InDatagrams+1`).
+
+#### Plain and Valid Custom Fragments
+The baseline `plain` packet arrives directly without fragmentation. In `two_fragments`, two raw frames arrive containing an 800-byte slice (Offset=0, M=1) and a remaining slice (Offset=100, M=0). `h2` increments `Ip6ReasmReqds+2` and `Ip6ReasmOKs+1`, successfully passing the reconstructed 1214-byte payload to the application socket.
+
+#### Overlapping Fragments (RFC 5722 Compliance)
+In the `overlapping` test case, the second fragment specifies an offset of 99 (792 bytes), overlapping 8 bytes of the preceding fragment. In strict compliance with RFC 5722 to prevent fragment evasion attacks, `h2` immediately purges the entire reassembly queue (`Ip6ReasmFails+1`). No ICMPv6 message is returned, and no data reaches the UDP sink.
+
+#### Atomic Fragments (RFC 6946 / RFC 8021)
+The `atomic_fragment` arrives with `Fragment Offset = 0` and `M flag = 0`. `h2` processes the fragment without error (`Ip6ReasmReqds+1`, `Ip6ReasmOKs+1`), delivering the payload directly to the socket application.
+
+#### Fragmentation Timeout and ICMPv6 Time Exceeded
+In `missing_last`, `h1` sends only the initial fragment (`Offset = 0`, `M = 1`). Because `ip6frag_time` was explicitly configured to 2 seconds for this lab, `h2`'s reassembly timer expires after 2 seconds. Because the initial fragment (`Offset = 0`) was present in the queue, `h2` generates an ICMPv6 Time Exceeded (Type 3, Code 1) message back to `h1` (`Icmp6OutTimeExcds+1`), while updating its internal MIB counters (`Ip6ReasmFails+1`, `Ip6ReasmTimeout+1`).
+
+#### Incomplete Header Chain (RFC 7112 Compliance)
+In `chain_split`, the initial fragment contains only the IPv6 base header and a Destination Options header; the UDP transport header is placed in the second fragment. Because the initial fragment fails to contain the upper-layer header, `h2` rejects the first fragment immediately upon arrival, incrementing `Ip6InHdrErrors+1` and returning an **ICMPv6 Parameter Problem (Type 4, Code 3)** message with `pointer = 0`. The second fragment is queued on its own, waits for a first fragment that never comes, and times out about two seconds later (`Ip6ReasmFails+1`, `Ip6ReasmTimeout+1`) without generating an additional ICMPv6 message (since Offset 0 was never queued).
+
+#### TLV Option Bits in Destination and Hop-by-Hop Options
+- `dstopt_skip` (Option `0x1e` -> bits `00`): Unrecognized option is skipped; packet delivered to socket.
+- `dstopt_discard` (Option `0x5e` -> bits `01`): Packet silently discarded (`Ip6InHdrErrors+1`); no ICMPv6 error returned.
+- `dstopt_icmp` (Option `0x9e` -> bits `10`): Discarded (`Ip6InHdrErrors+1`), returning **ICMPv6 Parameter Problem (Type 4, Code 2)** with `pointer = 42` (40 bytes base header + 2 bytes offset to option type field).
+- `dstopt_nine`: Contains 9 valid TLV options. Because `net.ipv6.max_dst_opts_number` defaults to 8, `h2` rejects the header silently (`Ip6InHdrErrors+1`).
+- `hbh_skip`: Unrecognized Hop-by-Hop option `0x1e` skipped; delivered.
+
+#### Routing Header Type 0 Processing
+- `rh0_segleft2`: Routing Header Type 0 with `Segments Left = 2` is rejected per RFC 5095, incrementing `Ip6InHdrErrors+1` and returning **ICMPv6 Parameter Problem (Type 4, Code 0)** with `pointer = 42` (offset of Routing Type byte).
+- `rh0_segleft0`: Routing Header Type 0 with `Segments Left = 0` is ignored per RFC 5095; payload delivered to application.
+
+#### Unrecognized Next Header
+In `unknown_nh`, the base IPv6 header specifies `Next Header = 253` (RFC 3692 Experimental). `h2` increments `Ip6InUnknownProtos+1` and returns **ICMPv6 Parameter Problem (Type 4, Code 1)** with `pointer = 6` (pointing to the `Next Header` field of the base IPv6 header).
+
+#### UDP Sink Deliveries
+The application UDP sink running on `h2` logged successful datagram receptions for exactly 7 test cases:
+1. `kernel-frag` (3000 bytes)
+2. `plain` (5 bytes)
+3. `two-fragments` (1214 bytes)
+4. `atomic` (6 bytes)
+5. `dstopt-skip` (11 bytes)
+6. `hbh-skip` (8 bytes)
+7. `rh0-segleft0` (12 bytes)
+
+Nothing from the overlapping, missing-last, chain-split, discard, ICMP-option, nine-option, RH0-with-segments or unknown-next-header cases reached the application. Every drop was visible in a counter on `h2`, but only some were visible to the sender: an operator looking only at the sending side would see five ICMPv6 errors for eight drops.
+
+## In production
+
+### Packet inspection with tcpdump
+
+To monitor IPv6 packets containing extension headers or fragment chains in production networks, use explicit header bitmask filters.
+
+```bash
+# not run here
+# Capture IPv6 packets containing a Fragment Header (Next Header = 44)
+tcpdump -ni eth0 "ip6[6] == 44"
+
+# Capture IPv6 packets where the Next Header in the base header is Hop-by-Hop (0)
+tcpdump -ni eth0 "ip6[6] == 0"
+
+# Capture ICMPv6 Parameter Problem messages (Type 4)
+tcpdump -ni eth0 "ip6[40] == 4"
+```
+
+### Stateful firewall filtering with nftables
+
+Modern Linux stateful firewalls use `nftables` expressions to inspect extension headers and manage fragments safely.
+
+```bash
+# not run here
+# Drop packets that carry a Type 0 Routing Header
+nft add rule inet filter input rt type 0 counter drop
+
+# Count fragments that reach the filter (with conntrack loaded, nf_defrag_ipv6
+# reassembles before the filter hooks, so this usually stays at zero)
+nft add rule inet filter input exthdr frag exists counter
+
+# Count packets that carry a Hop-by-Hop Options header
+nft add rule inet filter input exthdr hbh exists counter
+```
+
+### Filtering with legacy ip6tables
+
+```bash
+# not run here
+# Drop Type 0 Routing Headers
+ip6tables -A INPUT -m rt --rt-type 0 -j DROP
+
+# Log packets that contain a Fragment header anywhere in the chain
+ip6tables -A INPUT -m ipv6header --header frag --soft -j LOG --log-prefix "v6frag "
+```
+
+### Kernel sysctl production hardening
+
+An example of tighter limits in `/etc/sysctl.d/99-ipv6-hardening.conf`. Test before deploying: tighter option limits drop legitimate traffic that uses those options.
+
+```bash
+# not run here
+# Reduce reassembly timeout to mitigate fragment buffer memory exhaustion
+net.ipv6.ip6frag_time = 15
+
+# Set conservative memory thresholds for fragment reassembly (bytes)
+net.ipv6.ip6frag_high_thresh = 2097152
+net.ipv6.ip6frag_low_thresh = 1572864
+
+# Enforce strict maximum limits on Hop-by-Hop and Destination options
+net.ipv6.max_hbh_opts_number = 4
+net.ipv6.max_dst_opts_number = 8
+net.ipv6.max_hbh_length = 64
+net.ipv6.max_dst_opts_length = 128
+```
+
+## Gotchas
+
+- **Silent drops in transit**: RFC 7872 measured substantial drop rates for every extension header type it tested on the public Internet, worst for Hop-by-Hop Options. Do not depend on extension headers across networks you do not control, and test with the exact headers you need.
+- **Fragment Offset Units**: The IPv6 Fragment Offset field is expressed in **8-octet (64-bit) units**, not bytes. An offset value of `100` corresponds to byte offset `800`.
+- **ICMPv6 Rate Limiting**: The Linux kernel rate-limits ICMPv6 error responses (`net.ipv6.icmp.ratelimit`). When conducting diagnostic probing, excessive Parameter Problem or Time Exceeded messages will be suppressed.
+- **Atomic Fragment Deprecation**: Do not generate atomic fragments in custom software tools; modern receivers treat them as standalone packets, but intermediate firewalls may drop them under legacy rules.
+- **Reassembly Timeout ICMP Rules**: ICMPv6 Time Exceeded (Type 3, Code 1) is **only** generated if the receiver queued Fragment Offset 0. If Fragment 0 was lost en route, the reassembly queue times out silently.
+- **Pointer Offset Calculations**: ICMPv6 Parameter Problem messages contain a 32-bit `Pointer` field indicating the byte offset where the error occurred within the IPv6 packet. A pointer value of `6` always targets the `Next Header` field of the base header.
+- **Hardware parse depth**: switch and router ASICs parse a limited number of bytes. A long header chain pushes the transport header beyond that depth, so ACLs that match ports cannot see them; some devices drop such packets, some punt them to the CPU.
+- **Conntrack reassembles first**: with connection tracking loaded, Linux's `nf_defrag_ipv6` reassembles fragments before the filter rules run. Rules that match the Fragment header see reassembled packets, and dropping fragments has to happen in a raw-priority chain if you want it at all.
+- **Dropping all fragments breaks DNS**: large UDP DNS answers (DNSSEC, many records) are fragmented when the EDNS buffer size exceeds the path MTU. Filters that drop every fragment are one reason resolvers now advertise 1232 bytes.
+
+## Exercises
+
+1. Modify `ext6.py` to send an IPv6 fragment chain where Fragment 1 carries `Offset = 0` with `M = 1`, and Fragment 2 carries `Offset = 50` (byte 400) with `M = 0`, creating a 400-byte hole in the payload. Run `snmp6.py` and explain the resulting MIB counter changes after `ip6frag_time` expires.
+2. Build a Destination Options header padded with eight consecutive Pad1 bytes instead of a PadN. Predict whether Linux counts padding against `max_dst_opts_number`, then check (hint: the kernel limits runs of padding separately, look at `ip6_parse_tlv()` in `net/ipv6/exthdrs.c`).
+3. Write a Python script using raw sockets to trigger an ICMPv6 Parameter Problem Type 4 Code 2 error by supplying an unrecognized Destination Option with type `0xC2` (binary `11000010`). Verify whether the behavior changes when sending to a unicast vs multicast destination.
+4. Use `sysctl` to set `net.ipv6.conf.all.seg6_enabled = 1` in a test namespace. Send an SRv6 Segment Routing Header (Routing Type 4) frame and verify how Linux parses the routing chain compared to Routing Type 0.
+5. Demonstrate RFC 7112 enforcement by crafting a packet split across two fragments where the first fragment contains 40 bytes base IPv6 header, 8 bytes Hop-by-Hop options, and 8 bytes Destination options, but terminates before the UDP header. Capture the resulting ICMPv6 Parameter Problem code and pointer value.
+
+## Verification
+
+- Ran: `lab.sh` on Linux 6.12.94 with iproute2 6.15.0 and Python 3.13.5, unprivileged (`unshare -urnmu`). The output above is pasted unedited from one run; earlier development runs, before the longer per-case wait was added for the two timeout cases, showed the same drops but attributed the timeout counters and the Time Exceeded message to the following row.
+- The ICMPv6 pointer values (42 and 6) and codes were decoded from the packets `h2` sent back, not inferred.
+- Not run: tcpdump, nftables, ip6tables (not installed; no installs allowed), SRv6 (Routing Type 4) and multicast destinations. Their behaviour is described from RFC 8200 and the kernel documentation.
+- Default sysctl values in the table come from the kernel's ip-sysctl documentation, except the two length limits, which were read on the lab host.
+
+## Sources
+
+- **RFC 8200**: *IPv6 Specification* (Internet Standard). <https://www.rfc-editor.org/rfc/rfc8200.html>
+- **RFC 5095**: *Deprecation of Type 0 Routing Headers in IPv6*. <https://www.rfc-editor.org/rfc/rfc5095.html>
+- **RFC 5722**: *Handling of Overlapping IPv6 Fragments*. <https://www.rfc-editor.org/rfc/rfc5722.html>
+- **RFC 6564**: *A Uniform Format for IPv6 Extension Headers*. <https://www.rfc-editor.org/rfc/rfc6564.html>
+- **RFC 6946**: *Processing of IPv6 "Atomic" Fragments*. <https://www.rfc-editor.org/rfc/rfc6946.html>
+- **RFC 7045**: *Transmission and Processing of IPv6 Extension Headers*. <https://www.rfc-editor.org/rfc/rfc7045.html>
+- **RFC 7112**: *Implications of Oversized IPv6 Header Chains*. <https://www.rfc-editor.org/rfc/rfc7112.html>
+- **RFC 7113**: *Implementation Advice for IPv6 Router Advertisement Guard (RA-Guard)*. <https://www.rfc-editor.org/rfc/rfc7113.html>
+- **RFC 7739**: *Security Implications of Predictable Fragmentation Identifiers in IPv6*. <https://www.rfc-editor.org/rfc/rfc7739.html>
+- **RFC 7872**: *Observations on IPv6 Extension Header Drops in the Public Internet*. <https://www.rfc-editor.org/rfc/rfc7872.html>
+- **RFC 8021**: *Generation of IPv6 Atomic Fragments Considered Harmful*. <https://www.rfc-editor.org/rfc/rfc8021.html>
+- **RFC 9098**: *Operational Implications of IPv6 Extension Headers with Transit Routers*. <https://www.rfc-editor.org/rfc/rfc9098.html>
+- **RFC 9099**: *Operational Security Considerations for IPv6 Networks*. <https://www.rfc-editor.org/rfc/rfc9099.html>
+- **RFC 9288**: *Recommendations on Filtering IPv6 Packets Containing Extension Headers*. <https://www.rfc-editor.org/rfc/rfc9288.html>
+- **RFC 9673**: *Procedures for Processing IPv6 Hop-by-Hop Options Header*. <https://www.rfc-editor.org/rfc/rfc9673.html>
+- **Linux Kernel IPv6 Documentation**: *IPv6 Sysctl Guide*. <https://docs.kernel.org/networking/ip-sysctl.html#ipv6-variables>
+- **Linux Manual Pages**: *ip(7) and ipv6(7) Linux Programmer's Manual*. <https://man7.org/linux/man-pages/man7/ipv6.7.html>
+- **RFC 4443**: *ICMPv6 for IPv6* (Parameter Problem and Time Exceeded codes). <https://www.rfc-editor.org/rfc/rfc4443.html>
+- **RFC 3692**: *Assigning Experimental and Testing Numbers Considered Useful* (Next Header 253 and 254). <https://www.rfc-editor.org/rfc/rfc3692.html>
+- **Linux source**: `net/ipv6/exthdrs.c`, `net/ipv6/reassembly.c`. <https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/net/ipv6>
+- **packet(7)**: <https://man7.org/linux/man-pages/man7/packet.7.html>
