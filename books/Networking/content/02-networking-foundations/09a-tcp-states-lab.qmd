@@ -1,0 +1,475 @@
+---
+title: "TCP States, Reproduced: A Two-Namespace Lab"
+author:
+  - name: "K19G"
+  - name: "grok-bot"
+---
+
+# TCP States, Reproduced: A Two-Namespace Lab
+
+## Learning goals
+
+* Map every state in the RFC 9293 TCP state machine to kernel socket state outputs in Linux `ss`.
+* Interpret the exact operational meaning of `Recv-Q` and `Send-Q` values for both listening and established sockets.
+* Differentiate between network drops, application deadlocks, and connection teardown states using local state inspection.
+* Reproduce specific transitory TCP states (`SYN-SENT`, `SYN-RECV`, `FIN-WAIT-1`, `FIN-WAIT-2`, `CLOSE-WAIT`, `LAST-ACK`, and `TIME-WAIT`) using network namespaces and a veth link you take down and bring back up.
+* Determine whether a stuck TCP state points to an application bug or a network path failure.
+
+## Thesis
+
+TCP connection state transitions are determined entirely by the receipt of protocol control flags (SYN, ACK, FIN, RST) or by internal timers, yet network troubleshooting often relies on external packet captures. You can diagnose connection failures, queue backups, and socket leaks directly from the host by matching socket statistics in `ss` against the TCP state machine without running `tcpdump`.
+
+## Mental model
+
+The formal state machine governing Transmission Control Protocol connections is defined in RFC 9293 (which updates RFC 793). A connection progresses from `CLOSED` through connection establishment (`LISTEN`, `SYN-SENT`, `SYN-RECV`) to `ESTABLISHED`, followed by connection termination through active or passive close sequences.
+
+```text
+                         +---------+
+                         | CLOSED  |
+                         +---------+
+          passive open  /           \  active open
+          (listen)     /             \ send SYN
+                      v               v
+               +---------+         +----------+
+               | LISTEN  |         | SYN-SENT |
+               +---------+         +----------+
+   rcv SYN,         |                    |  rcv SYN,ACK
+   send SYN,ACK     v                    |  send ACK
+               +----------+              |
+               | SYN-RECV |              |
+               +----------+              |
+   rcv ACK          |                    |
+                    v                    v
+                  +------------------------+
+                  |      ESTABLISHED       |
+                  +------------------------+
+     close(), send FIN |              | rcv FIN, send ACK
+     (active close)    v              v (passive close)
+             +------------+       +------------+
+             | FIN-WAIT-1 |       | CLOSE-WAIT |
+             +------------+       +------------+
+  rcv ACK   /          \ rcv FIN       | close(), send FIN
+           v            v send ACK     v
+  +------------+  +---------+     +----------+
+  | FIN-WAIT-2 |  | CLOSING |     | LAST-ACK |
+  +------------+  +---------+     +----------+
+   rcv FIN, |           | rcv ACK      | rcv ACK
+   send ACK v           v              v
+         +---------------+         +---------+
+         |   TIME-WAIT   |-------->| CLOSED  |
+         +---------------+  2*MSL  +---------+
+                           (60 s on Linux)
+```
+
+Eleven states, two paths. The left column is the *active closer* (whoever calls `close()` first), the right column is the *passive closer*. Simultaneous open (`SYN-SENT` receiving a bare SYN) also exists in the RFC but is rare enough to leave out of the picture.
+
+Understanding how kernel socket abstractions project these theoretical states into local socket queues is the key to local troubleshooting.
+
+## Socket Inspection via `ss`
+
+The `ss` (socket statistics) tool extracts socket information directly from kernel netlink structures. 
+
+### Recv-Q and Send-Q Meanings
+
+The values displayed under `Recv-Q` and `Send-Q` depend on whether the socket is in the `LISTEN` state or a data-transfer state:
+
+1. **For sockets in the `LISTEN` state:**
+   * `Recv-Q`: The current number of completed three-way handshake connections waiting in the accept queue to be accepted by the application (`accept(2)`).
+   * `Send-Q`: The maximum backlog limit configured for the listen socket (the second argument passed to `listen(2)`), capped by the system kernel parameter `net.core.somaxconn`.
+
+2. **For sockets in non-`LISTEN` states (`ESTAB`, `SYN-SENT`, `FIN-WAIT-1`, etc.):**
+   * `Recv-Q`: The number of received data bytes queued in the socket receive buffer that have not yet been read by the application (`read(2)` / `recv(2)`). After a FIN arrives and the application has not read the end-of-file yet, Linux shows that FIN as 1 in `Recv-Q`.
+   * `Send-Q`: The number of data bytes queued in the socket send buffer that have been sent but not yet acknowledged by the remote peer, plus queued data waiting to be sent.
+
+### `ss` Command Expressions and Options
+
+To filter sockets effectively during troubleshooting, `ss` supports conditional state syntax and port filtering:
+
+* `ss -tan state all "( sport = :8080 or dport = :8080 )"`: TCP sockets (`-t`), all of them including listeners (`-a`), with numeric addresses and ports (`-n`), where the local port (`sport`) or remote port (`dport`) matches 8080 across all states.
+* `ss -o`: Displays timer information for sockets. This output reveals TCP keepalive timers, retransmission timers (`on`), or `TIME-WAIT` time-to-live countdowns.
+
+## Sidebar: TCP Resets (RST)
+
+A TCP Reset (`RST`) segment abruptly terminates a connection without passing through the graceful four-way teardown sequence. A host generates an `RST` under three main conditions:
+
+1. A segment arrives for a port where no socket is listening (`ECONNREFUSED`).
+2. An application closes a socket with unread data sitting in its receive buffer.
+3. An application sets the `SO_LINGER` socket option with a linger time of 0 before calling `close(2)`, instructing the kernel to abort the connection immediately and discard unsent data.
+
+Unlike `FIN` processing, an `RST` transitions the receiving host's socket directly to `CLOSED` without passing through `TIME-WAIT`.
+
+## The State Troubleshooting Map
+
+When diagnosing connection failures in production, match observed socket states to the responsible component:
+
+| State Observed | Local Socket Context | Probable Cause | Action / Primary Responsible Party |
+| :--- | :--- | :--- | :--- |
+| `SYN-SENT` | Client | Outbound SYN sent, no ACK/RST received back | **Network**: Firewall dropping packets, missing return route, or blackhole. |
+| `SYN-RECV` | Server | SYN received, SYN-ACK sent, no final ACK | **Network / Security**: SYN flood attack, path loss on ACK, or `TCP_DEFER_ACCEPT` waiting for payload. |
+| `ESTAB` (`Recv-Q` high) | Server or Client | Unread data accumulating in buffer | **Application**: Receiver thread blocked, CPU starved, or deadlocked. |
+| `ESTAB` (`Send-Q` high) | Server or Client | Unacknowledged data accumulating | **Network**: Packet loss, severe congestion, or peer stopped receiving (zero window). |
+| `FIN-WAIT-1` | Active Closer | Sent FIN, awaiting ACK | **Network**: Peer unreached, or link dropped before peer could process/acknowledge FIN. |
+| `FIN-WAIT-2` | Active Closer | Peer acknowledged FIN; awaiting peer FIN | **Application (Remote)**: the peer has not closed yet (still sending, or leaked the socket). If the local app already closed, `tcp_fin_timeout` reaps the orphan. |
+| `CLOSE-WAIT` | Passive Closer | Received FIN, sent ACK; awaiting local `close()` | **Application (Local)**: Local process received EOF but failed to invoke `close()`. |
+| `LAST-ACK` | Passive Closer | Local closed socket, sent FIN; awaiting final ACK | **Network**: Final ACK dropped, or remote side unreached during teardown. |
+| `TIME-WAIT` | Active Closer | Connection gracefully closed; 2MSL timer running | **Normal Protocol Execution**: Generic exhaustion issue if accumulated; managed by TIME-WAIT architecture. |
+
+## The Reproduction Lab Setup
+
+The lab uses Linux network namespaces (`ip netns`) to isolate client and server network stacks. Communication between namespaces occurs across a virtual Ethernet (`veth`) link pair.
+
+The lab environment uses two code files: a Python helper script named `hold.py` that executes specific socket API calls, and a shell script named `lab.sh` that sets up namespaces, configures interface states, and captures `ss` outputs.
+
+Place `hold.py` in your working directory. The Python script is written as follows:
+
+```python
+#!/usr/bin/env python3
+"""Tiny TCP actor for the state lab. Usage examples:
+  hold.py listen 10.0.0.2 8080 [defer]      accept (or not) and keep sockets open
+  hold.py connect 10.0.0.2 8080 ACTIONS     ACTIONS: comma list of
+      sleepN | close | shutwr | send
+Each actor writes its progress to stdout and sleeps so ss can look at it.
+"""
+import socket, sys, time
+
+def run_actions(s, actions):
+    for a in actions.split(","):
+        if a.startswith("sleep"):
+            time.sleep(float(a[5:]))
+        elif a == "close":
+            s.close()
+        elif a == "shutwr":
+            s.shutdown(socket.SHUT_WR)
+        elif a == "send":
+            s.send(b"hello\n")
+        print(f"[{sys.argv[1]}] did {a}", flush=True)
+
+mode, host, port = sys.argv[1], sys.argv[2], int(sys.argv[3])
+if mode == "listen":
+    l = socket.socket()
+    l.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    if len(sys.argv) > 4 and sys.argv[4] == "defer":
+        l.setsockopt(socket.IPPROTO_TCP, socket.TCP_DEFER_ACCEPT, 30)
+        l.bind((host, port)); l.listen(8)
+        print("[listen] defer-accept listener up, never calling accept", flush=True)
+        time.sleep(3600)
+    l.bind((host, port)); l.listen(8)
+    print("[listen] up", flush=True)
+    conns = []
+    actions = sys.argv[4] if len(sys.argv) > 4 else "sleep3600"
+    c, _ = l.accept(); print("[listen] accepted", flush=True)
+    run_actions(c, actions)
+    time.sleep(3600)
+else:
+    s = socket.socket()
+    s.setblocking(True)
+    s.settimeout(120)
+    try:
+        s.connect((host, port))
+        print("[connect] connected", flush=True)
+    except Exception as e:
+        print(f"[connect] {e!r}", flush=True)
+        sys.exit(0)
+    run_actions(s, sys.argv[4] if len(sys.argv) > 4 else "sleep3600")
+    time.sleep(3600)
+```
+
+Place `lab.sh` in the same directory. The shell execution script is written as follows:
+
+```sh
+#!/bin/sh
+# Run as: unshare -urnm sh lab.sh
+# Builds client (c) and server (s) namespaces joined by a veth pair, then
+# walks a TCP connection through every state ss can show.
+set -e
+mount -t tmpfs tmpfs /run 2>/dev/null || true
+mkdir -p /run/netns
+ip netns add c; ip netns add s
+ip link add vc type veth peer name vs
+ip link set vc netns c; ip link set vs netns s
+ip -n c addr add 10.0.0.1/24 dev vc; ip -n c link set vc up; ip -n c link set lo up
+ip -n s addr add 10.0.0.2/24 dev vs; ip -n s link set vs up; ip -n s link set lo up
+C="ip netns exec c"; S="ip netns exec s"
+H="python3 $(pwd)/hold.py"
+show() {  # $1 = label; $P = this section's port
+  echo "--- $1"
+  $C ss -tanH state all "( sport = :$P or dport = :$P )" | sed 's/^/  c: /'
+  $S ss -tanH state all "( sport = :$P or dport = :$P )" | sed 's/^/  s: /'
+}
+cleanup() { pkill -f hold.py 2>/dev/null || true; sleep 0.3; }
+
+P=8081
+echo "== 1. LISTEN, SYN-SENT (server link down) =="
+$S $H listen 10.0.0.2 $P >/dev/null & sleep 0.3
+$S ip link set vs down
+$C $H connect 10.0.0.2 $P >/dev/null & sleep 0.5
+show "server listening, server veth down, client connecting"
+cleanup; $S ip link set vs up; sleep 0.3
+
+P=8082
+echo; echo "== 2. SYN-RECV (TCP_DEFER_ACCEPT holds the request) =="
+$S $H listen 10.0.0.2 $P defer >/dev/null & sleep 0.3
+$C $H connect 10.0.0.2 $P sleep60 >/dev/null & sleep 0.5
+show "client thinks it is connected; server keeps a request sock"
+cleanup
+
+P=8083
+echo; echo "== 3. ESTAB -> FIN-WAIT-2 / CLOSE-WAIT (server app never closes) =="
+$S $H listen 10.0.0.2 $P >/dev/null & sleep 0.3
+$C $H connect 10.0.0.2 $P sleep0.5,close >/dev/null & sleep 0.3
+show "both established"
+sleep 0.5
+show "client closed; server application has not"
+
+# section 4 continues the section-3 connection (P stays 8083)
+echo; echo "== 4. LAST-ACK (server closes, client side unreachable) =="
+$C ip link set vc down
+pkill -f 'hold.py listen' ; sleep 0.3
+show "server process exited while the client link is down"
+$C ip link set vc up; sleep 1.5
+show "client link back up, after a FIN retransmit"
+cleanup
+
+P=8085
+echo; echo "== 5. FIN-WAIT-1 (client closes into a dead link) =="
+$S $H listen 10.0.0.2 $P >/dev/null & sleep 0.3
+$C $H connect 10.0.0.2 $P sleep0.6,close >/dev/null & sleep 0.3
+$S ip link set vs down; sleep 0.6
+show "client closed, its FIN cannot be acknowledged"
+$S ip link set vs up
+cleanup
+
+P=8086
+echo; echo "== 6. Simultaneous close: both sides end in TIME-WAIT =="
+$S $H listen 10.0.0.2 $P sleep1,close >/dev/null & sleep 0.3
+$C $H connect 10.0.0.2 $P sleep1,close >/dev/null & sleep 0.5
+$S ip link set vs down; sleep 0.8
+show "both closed while the link was down"
+$S ip link set vs up; sleep 1.5
+show "link up, FINs crossed"
+cleanup
+echo; echo "== kernel =="; uname -r; ss -V
+```
+
+Execute the lab using standard unprivileged namespace isolation:
+
+```sh
+unshare -urnm sh lab.sh
+```
+
+Below is the complete, unedited execution output generated by the test system:
+
+```text
+== 1. LISTEN, SYN-SENT (server link down) ==
+--- server listening, server veth down, client connecting
+  c: SYN-SENT 0      1      10.0.0.1:58098 10.0.0.2:8081
+  s: LISTEN 0      8      10.0.0.2:8081 0.0.0.0:*
+
+== 2. SYN-RECV (TCP_DEFER_ACCEPT holds the request) ==
+--- client thinks it is connected; server keeps a request sock
+  c: ESTAB 0      0      10.0.0.1:43408 10.0.0.2:8082
+  s: LISTEN   0      8      10.0.0.2:8082  0.0.0.0:*    
+  s: SYN-RECV 0      0      10.0.0.2:8082 10.0.0.1:43408
+
+== 3. ESTAB -> FIN-WAIT-2 / CLOSE-WAIT (server app never closes) ==
+--- both established
+  c: ESTAB 0      0      10.0.0.1:34864 10.0.0.2:8083
+  s: LISTEN 0      8      10.0.0.2:8083  0.0.0.0:*    
+  s: ESTAB  0      0      10.0.0.2:8083 10.0.0.1:34864
+--- client closed; server application has not
+  c: FIN-WAIT-2 0      0      10.0.0.1:34864 10.0.0.2:8083
+  s: LISTEN     0      8      10.0.0.2:8083  0.0.0.0:*    
+  s: CLOSE-WAIT 1      0      10.0.0.2:8083 10.0.0.1:34864
+
+== 4. LAST-ACK (server closes, client side unreachable) ==
+--- server process exited while the client link is down
+  c: FIN-WAIT-2 0      0      10.0.0.1:34864 10.0.0.2:8083
+  s: LAST-ACK 1      1      10.0.0.2:8083 10.0.0.1:34864
+--- client link back up, after a FIN retransmit
+  c: TIME-WAIT 0      0      10.0.0.1:34864 10.0.0.2:8083
+
+== 5. FIN-WAIT-1 (client closes into a dead link) ==
+--- client closed, its FIN cannot be acknowledged
+  c: FIN-WAIT-1 0      1      10.0.0.1:53306 10.0.0.2:8085
+  s: LISTEN 0      8      10.0.0.2:8085  0.0.0.0:*    
+  s: ESTAB  0      0      10.0.0.2:8085 10.0.0.1:53306
+
+== 6. Simultaneous close: both sides end in TIME-WAIT ==
+--- both closed while the link was down
+  c: FIN-WAIT-1 0      1      10.0.0.1:56680 10.0.0.2:8086
+  s: LISTEN     0      8      10.0.0.2:8086  0.0.0.0:*    
+  s: FIN-WAIT-1 0      1      10.0.0.2:8086 10.0.0.1:56680
+--- link up, FINs crossed
+  c: TIME-WAIT 0      0      10.0.0.1:56680 10.0.0.2:8086
+  s: LISTEN    0      8      10.0.0.2:8086  0.0.0.0:*    
+  s: TIME-WAIT 0      0      10.0.0.2:8086 10.0.0.1:56680
+
+== kernel ==
+6.12.94+
+ss utility, iproute2-6.15.0
+```
+
+## State-by-State Walkthrough
+
+### 1. SYN-SENT
+
+In Section 1, the server's interface `vs` is set to down. The client initiates a `connect()` call to `10.0.0.2:8081`.
+
+```text
+  c: SYN-SENT 0      1      10.0.0.1:58098 10.0.0.2:8081
+```
+
+* **Delivered packets**: The client transmits an initial `SYN` packet. Because interface `vs` is down on the server end, the packet is silently dropped at the link layer. No response (`SYN-ACK` or `RST`) reaches the client.
+* **Queue Analysis**: The client socket shows `Send-Q` equal to 1. This value represents the `SYN` control packet occupying 1 unit of sequence space waiting for acknowledgment.
+* **Operational Meaning**: A persisting `SYN-SENT` state indicates a network delivery failure, network path blackhole, or an explicit firewall `DROP` rule. It does *not* indicate a closed port. If the destination port were closed and reachable, the remote host kernel would return an `RST` packet, causing `connect()` to fail immediately with `ECONNREFUSED`.
+* **Retransmission Behavior**: According to Linux sysctl documentation (`ip-sysctl`), the duration a socket remains in `SYN-SENT` before returning `ETIMEDOUT` is controlled by `net.ipv4.tcp_syn_retries`. The kernel default is 6 retransmissions. With exponential backoff (starting at 1 second), 6 retries consume approximately 127 seconds before giving up.
+
+### 2. SYN-RECV via TCP_DEFER_ACCEPT
+
+In Section 2, the server listens with `TCP_DEFER_ACCEPT` set to 30 seconds. The client connects without transmitting initial data.
+
+```text
+  c: ESTAB 0      0      10.0.0.1:43408 10.0.0.2:8082
+  s: LISTEN   0      8      10.0.0.2:8082  0.0.0.0:*    
+  s: SYN-RECV 0      0      10.0.0.2:8082 10.0.0.1:43408
+```
+
+* **Delivered packets**: The client sends a `SYN`. The server responds with `SYN-ACK`. The client returns an `ACK`, completing its local three-way handshake and transitioning to `ESTABLISHED`. However, because `TCP_DEFER_ACCEPT` is active on the server, the server kernel defers moving the socket to the accept queue until data arrives.
+* **Queue Analysis**: The server displays a socket in `SYN-RECV` state representing a minified socket structure (a request socket, or `request_sock`). 
+* **Operational Meaning**: In typical operation without `TCP_DEFER_ACCEPT`, a socket seen briefly in `SYN-RECV` indicates an in-flight handshake where the final `ACK` has not arrived (suggesting asymmetric routing or a `SYN` flood attack). Linux explicitly exposes request sockets in `ss` output. When using `TCP_DEFER_ACCEPT`, the socket intentionally remains in `SYN-RECV` at the server while the client considers the connection `ESTABLISHED`.
+
+### 3. FIN-WAIT-2 and CLOSE-WAIT
+
+In Section 3, both sides establish a connection. The client process then calls `close()`, while the server process sleeps without calling `close()`.
+
+```text
+--- client closed; server application has not
+  c: FIN-WAIT-2 0      0      10.0.0.1:34864 10.0.0.2:8083
+  s: LISTEN     0      8      10.0.0.2:8083  0.0.0.0:*    
+  s: CLOSE-WAIT 1      0      10.0.0.2:8083 10.0.0.1:34864
+```
+
+* **Delivered packets**: The client sends a `FIN`. The server kernel receives the `FIN`, immediately generates an `ACK`, and notifies the local server application by returning an EOF (0 bytes read) on the socket. The client receives the `ACK` and moves to `FIN-WAIT-2`.
+* **Queue Analysis**: The server socket transitions to `CLOSE-WAIT`. Notice that `Recv-Q` on the server's `CLOSE-WAIT` socket displays a value of 1. The incoming `FIN` control segment consumes 1 byte in the TCP sequence space, which sits in the receive buffer as an unread EOF indicator.
+* **Operational Meaning**: A socket persisting in `CLOSE-WAIT` is almost always an application bug on the local host. The network has successfully delivered the remote peer's close request (`FIN`) and acknowledged it. The local kernel is waiting for the local process to invoke `close()` or `shutdown()`. An accumulating count of `CLOSE-WAIT` sockets indicates a file descriptor or thread leak in the local server application.
+
+### 4. LAST-ACK
+
+Section 4 continues the connection from Section 3. First, the client link `vc` is brought down to isolate the client. Then the server process is killed (`pkill`).
+
+```text
+--- server process exited while the client link is down
+  c: FIN-WAIT-2 0      0      10.0.0.1:34864 10.0.0.2:8083
+  s: LAST-ACK 1      1      10.0.0.2:8083 10.0.0.1:34864
+```
+
+* **Delivered packets**: When the server process terminates, its kernel closes open file descriptors and attempts to transmit a `FIN`. Because the client network interface is down, the server's `FIN` cannot reach the client.
+* **Queue Analysis**: The server socket transitions to `LAST-ACK`. Its `Send-Q` displays 1 (representing the unacknowledged `FIN` segment). Its `Recv-Q` displays 1 (the original unread `FIN` from the client).
+* **Link Restoration**: When the client link `vc` is restored, the server retransmits its `FIN`. The client receives the `FIN`, returns the final `ACK`, and transitions to `TIME-WAIT`. Upon receiving the final `ACK`, the server socket disappears completely (`CLOSED`).
+
+```text
+--- client link back up, after a FIN retransmit
+  c: TIME-WAIT 0      0      10.0.0.1:34864 10.0.0.2:8083
+```
+
+### 5. FIN-WAIT-1
+
+In Section 5, a connection is established, after which the server interface `vs` is set to down. The client application then calls `close()`.
+
+```text
+--- client closed, its FIN cannot be acknowledged
+  c: FIN-WAIT-1 0      1      10.0.0.1:53306 10.0.0.2:8085
+  s: LISTEN 0      8      10.0.0.2:8085  0.0.0.0:*    
+  s: ESTAB  0      0      10.0.0.2:8085 10.0.0.1:53306
+```
+
+* **Delivered packets**: The client attempts active close by transmitting a `FIN`. Because the server interface is down, the `FIN` never reaches the server.
+* **Queue Analysis**: The client socket enters `FIN-WAIT-1` with `Send-Q` equal to 1 (the unacknowledged `FIN`). The server socket remains in state `ESTABLISHED` with no indication that the client has initiated a close sequence.
+* **Operational Meaning**: Sockets stuck in `FIN-WAIT-1` point to transport path failures or routing drops affecting outgoing frames during connection termination.
+
+### 6. Simultaneous Close
+
+In Section 6, both client and server applications issue a `close()` command simultaneously while the interconnecting veth link is down.
+
+```text
+--- both closed while the link was down
+  c: FIN-WAIT-1 0      1      10.0.0.1:56680 10.0.0.2:8086
+  s: LISTEN     0      8      10.0.0.2:8086  0.0.0.0:*    
+  s: FIN-WAIT-1 0      1      10.0.0.2:8086 10.0.0.1:56680
+```
+
+* **Initial Observation**: Both sides transition independently to `FIN-WAIT-1` with `Send-Q` equal to 1 because neither host can deliver its initial `FIN`.
+* **Link Restoration and Transition**: When interface `vs` is brought back up, both hosts transmit their pending `FIN` segments. Each host receives a `FIN` while sitting in state `FIN-WAIT-1`. According to RFC 9293, receiving a `FIN` prior to receiving an `ACK` for one's own `FIN` causes a connection to transition through state `CLOSING`.
+
+```text
+--- link up, FINs crossed
+  c: TIME-WAIT 0      0      10.0.0.1:56680 10.0.0.2:8086
+  s: LISTEN    0      8      10.0.0.2:8086  0.0.0.0:*    
+  s: TIME-WAIT 0      0      10.0.0.2:8086 10.0.0.1:56680
+```
+
+* **State Observation Note**: Upon processing the incoming `FIN`, each host returns an `ACK` and transitions through `CLOSING` to `TIME-WAIT`. Because the `FIN-ACK` exchange over local virtual interfaces occurs in microseconds, the transitory `CLOSING` state executes too quickly to be sampled by `ss`. Both endpoints settle directly into `TIME-WAIT`.
+
+## Case
+
+This is an illustrative scenario, not a real named incident.
+
+An operator managing an internal RPC gateway service reports that backend application nodes frequently run out of available file descriptors during peak traffic. A quick check of system metrics reveals hundreds of open sockets per node.
+
+The application team blames network instability, suspecting packet loss is stalling connections during teardown. 
+
+To test this, the operator runs `ss -tan state all "( sport = :9000 or dport = :9000 )"` on an affected backend host. The rows below are illustrative, not output from this chapter's lab:
+
+```text
+State       Recv-Q Send-Q  Local Address:Port   Peer Address:Port
+CLOSE-WAIT  1      0       10.0.1.15:9000       10.0.1.100:41232
+CLOSE-WAIT  1      0       10.0.1.15:9000       10.0.1.100:41234
+CLOSE-WAIT  1      0       10.0.1.15:9000       10.0.1.100:41238
+```
+
+Because `Recv-Q` shows 1 and the socket state is `CLOSE-WAIT`, the kernel has already processed the incoming `FIN` from the client RPC gateway and acknowledged it. The network successfully delivered the teardown request. The socket is holding a file descriptor open because the backend server's connection pool code did not invoke `close()` on worker sockets after catching client timeout exceptions.
+
+The operator directs the issue back to the software engineering team to fix missing cleanup handlers in the application codebase.
+
+## Trap
+
+Do not confuse `FIN-WAIT-2` with `CLOSE-WAIT` when identifying who holds responsibility for a hung connection. 
+
+* **`CLOSE-WAIT` is always local**: If `ss` shows a socket in `CLOSE-WAIT`, your local process has failed to close its end of the socket. No network setting or firewall change will clear it; only closing the socket or killing the process will release the descriptor.
+* **`FIN-WAIT-2` is remote**: If `ss` shows a socket in `FIN-WAIT-2`, your local application has called `close()`, but the remote peer has not called `close()`.
+
+## Boring rule
+
+If a socket is stuck in `CLOSE-WAIT`, fix the local application code. If a socket is stuck in `SYN-SENT` or `FIN-WAIT-1`, fix the network path.
+
+## Try this
+
+1. Modify `lab.sh` to trigger an immediate connection reset (`RST`) by setting the `SO_LINGER` socket option to a linger time of 0 before closing the socket. Observe whether the socket ever appears in `TIME-WAIT` or `FIN-WAIT-2` in `ss`.
+2. Replace the link-down trick in section 1 with an address that nobody owns on the link (for example connect to `10.0.0.99`). The client should again sit in `SYN-SENT`; check `ip -n c neigh` to see why (ARP never resolves). If `nft` or `iptables` is available on your machine, repeat with a `drop` rule in namespace `s` and compare.
+3. Use `ss -ti` to inspect internal TCP metrics (such as `rto`, `rtt`, and `ato`) on a socket held in `ESTABLISHED` state while data is being transmitted.
+4. Add a `send` action on the client before the server closes, and make the server call `close()` without reading. The unread data makes the server's kernel send RST instead of FIN. Check with `ss` that neither side ends in `TIME-WAIT`, and that the client's next `recv()` raises `ConnectionResetError`.
+5. Adjust `net.ipv4.tcp_syn_retries` within a network namespace using `sysctl -w net.ipv4.tcp_syn_retries=1` and measure how quickly `connect()` aborts during a `SYN-SENT` scenario.
+
+## Verification
+
+The code listings and command outputs in this chapter were executed and verified under the following conditions:
+
+* **Kernel version**: Linux 6.12.94+ (KVM guest environment)
+* **Python version**: Python 3.13.5
+* **iproute2 version**: 6.15.0
+* **Privilege level**: Unprivileged user execution (no `sudo`, no custom packages installed)
+* **Execution date**: 2026-11-13
+* **Execution command**: `unshare -urnm sh lab.sh` (utilizing user, mount, and network namespaces with two inner netns connected via a `veth` pair)
+
+All command outputs shown in the lab output section are pasted unedited directly from the test run execution. 
+
+Not captured: the `CLOSING` state. Section 6 passed through it, but on a veth it lasts microseconds and the `ss` snapshot missed it. The description of `CLOSING` comes from RFC 9293. Nothing in this lab needed root, `tcpdump`, or a packet filter, and none were used. The `pkill -f hold.py` in `cleanup` matches by command line, so do not run the lab next to other programs called `hold.py`.
+
+## Sources
+
+* RFC 9293 (Transmission Control Protocol), section 3.3.2 state diagram and section 3.6 closing a connection: <https://www.rfc-editor.org/rfc/rfc9293.html>
+* Linux Programmer's Manual - `tcp(7)`: <https://man7.org/linux/man-pages/man7/tcp.7.html>
+* Linux Programmer's Manual - `ss(8)`: <https://man7.org/linux/man-pages/man8/ss.8.html>
+* Linux Kernel IP Sysctl Documentation: <https://docs.kernel.org/networking/ip-sysctl.html>
+* RFC 1122 section 4.2.2.13 and RFC 2525 section 2.17 (RST when data is discarded on close): <https://www.rfc-editor.org/rfc/rfc2525.html>
+* `unshare(1)` and `ip-netns(8)`: <https://man7.org/linux/man-pages/man1/unshare.1.html>, <https://man7.org/linux/man-pages/man8/ip-netns.8.html>
