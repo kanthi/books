@@ -1,0 +1,355 @@
+---
+title: "MPLS Label Switching: Label Stacks, LDP, PHP and SR-MPLS on Linux"
+author:
+  - name: "K19G"
+  - name: "grok-bot"
+---
+
+# MPLS Label Switching: Label Stacks, LDP, PHP and SR-MPLS on Linux
+
+Multiprotocol Label Switching (MPLS) replaces the longest-prefix match at every transit router with an exact match on a short fixed-size label. That sounds like a small optimisation, and on modern hardware the lookup speed no longer matters much. What still matters is the *stack*: because a packet can carry several labels, an ingress router can encode "go to PE2, then deliver into VPN blue" or "go via P1, then over the P1-P2 link, then shortest path to PE2" without any transit router knowing about VPNs or policies. That is why MPLS still carries most service-provider VPN, traffic-engineering and fast-reroute traffic, and why Segment Routing reuses its data plane. This chapter covers the label format, how LDP builds label-switched paths, what penultimate-hop popping does to TTL and QoS, how SR-MPLS turns IGP-advertised indexes into labels, and how the same pieces look on Linux.
+
+## Learning goals
+
+- Encode and decode an MPLS label stack entry by hand, and recognise the reserved labels 0 to 15.
+- Explain push, swap and pop, and the roles of LER, LSR, FEC, ILM and NHLFE.
+- Describe how LDP discovers neighbours, builds sessions and distributes labels.
+- Predict what penultimate-hop popping (PHP) and explicit null do to the forwarding path, the TTL and the traffic class.
+- Derive SR-MPLS labels from an SRGB and prefix-SID indexes, and see why a uniform SRGB matters.
+- Configure the Linux MPLS data plane and FRR's LDP and OSPF segment routing on a lab host.
+
+## Version note
+
+The model in the lab is Python 3.13.5 standard library code run on the book's build box (kernel 6.12.94, iproute2 6.15.0). That kernel has no MPLS support compiled in or loadable, and the lab probe shows the exact errors you get in that case. The Linux and FRR configurations later in the chapter are written from the kernel documentation, `ip-route(8)` and the FRR manual and are **not run here**. Run them on a lab host where `modprobe mpls_router mpls_iptunnel` works, for example four FRR containers joined by Containerlab veth links.
+
+## Labels and the label stack entry
+
+An MPLS packet carries one or more 32-bit label stack entries (LSEs) between the layer-2 header and the payload. On Ethernet the EtherType is `0x8847`. Each entry has four fields (RFC 3032, with the EXP field renamed Traffic Class by RFC 5462):
+
+```text
+ 0                   1                   2                   3
+ 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
++---------------------------------------+-----+-+---------------+
+|                Label (20)             | TC  |S|    TTL (8)    |
++---------------------------------------+-----+-+---------------+
+```
+
+| Field | Bits | Meaning |
+|-------|-----:|---------|
+| Label | 20 | Value looked up by the receiving router (0 to 1,048,575) |
+| TC | 3 | Traffic class, used for QoS marking (often copied from DSCP at ingress) |
+| S | 1 | Bottom of stack: 1 on the last entry only |
+| TTL | 8 | Decremented at every label-switching hop |
+
+There is no field saying what is under the stack. The router that pops the last label knows the payload type from the label it allocated (or from the reserved label it received). Each extra label adds 4 bytes, which is why MPLS cores usually run a larger MTU than the edge.
+
+Labels 0 to 15 are reserved. The ones you meet in practice:
+
+| Label | Name | Use |
+|------:|------|-----|
+| 0 | IPv4 Explicit NULL | "Pop me and route the IPv4 packet"; keeps TC on the last hop |
+| 1 | Router Alert | Punt to the control plane (OAM) |
+| 2 | IPv6 Explicit NULL | Same as 0 for IPv6 |
+| 3 | Implicit NULL | Only ever *advertised*, never sent: "pop before you send to me" |
+| 7 | Entropy Label Indicator | Next label is an entropy label for ECMP hashing (RFC 6790) |
+| 13 | GAL | Generic Associated Channel label (MPLS-TP OAM) |
+| 14 | OAM Alert | Legacy OAM |
+| 15 | Extension | The next label is from an extended reserved space |
+
+## Forwarding: LER, LSR, push, swap, pop
+
+A **label edge router (LER)**, the PE in provider language, classifies an incoming IP packet into a **forwarding equivalence class (FEC)**, usually "destination prefix 192.0.2.4/32", and **pushes** a label. A **label switching router (LSR)**, the P router, looks only at the top label in its **incoming label map (ILM)**, finds a **next-hop label forwarding entry (NHLFE)** and **swaps** the label for the one its downstream neighbour asked for. The last LSR, or the egress LER, **pops** the label and forwards the payload. The ILM plus NHLFEs are what vendors call the LFIB, and what Linux calls the MPLS route table.
+
+The important property: labels are *local* to each router. P1's label for 192.0.2.4/32 means nothing to P2. Each router tells its upstream neighbours which label to use toward a FEC, and the chain of those local choices is the label-switched path (LSP).
+
+## LDP: building LSPs from the IGP
+
+The Label Distribution Protocol (RFC 5036) is the simplest way to get labels for every IGP prefix. It does not compute paths; it follows the IGP's shortest paths.
+
+1. **Discovery.** Each LDP router sends Hello messages to UDP port 646 on the all-routers multicast address of every enabled interface (basic discovery). Targeted hellos can reach non-adjacent peers.
+2. **Session.** The router with the higher transport address opens a TCP connection to port 646 of the other and they exchange Initialization messages. One TCP session per pair of routers, no matter how many links join them.
+3. **Label distribution.** In the common mode, *downstream unsolicited*, every router allocates a local label for each FEC it knows (each IGP prefix, or only loopbacks if you filter) and advertises the mapping to all peers without being asked.
+4. **Retention.** With *liberal retention* a router keeps mappings from all peers, not only from the current IGP next hop. When the IGP reconverges, the label for the new next hop is already there.
+5. **Control.** *Ordered control* means a router only advertises a label for a FEC once it has a label from its own next hop (or is the egress); *independent control* advertises right away. Both exist in implementations.
+
+Because LDP follows the IGP, there is a window after a link comes up when the IGP already uses it but LDP has no session yet, so traffic is sent unlabelled and VPN traffic is dropped. **LDP-IGP synchronisation** (RFC 5443) keeps the IGP cost at maximum on a link until LDP is up on it.
+
+## PHP, explicit null and TTL
+
+The egress PE does not need a label to find 192.0.2.4/32: it owns it. If it receives a labelled packet it would do two lookups, one in the LFIB to pop and one in the FIB to route. **Penultimate-hop popping** avoids that. The egress advertises **implicit null (3)** for its own FECs, which tells the penultimate router "pop instead of swap". The egress then receives a plain IP packet (or, with VPNs, a packet carrying only the inner VPN label).
+
+The price is that the TC bits are gone on the last hop. If the egress must queue on the MPLS TC (for example when the customer's DSCP must not be trusted), it advertises **explicit null (0 or 2)** instead: the penultimate router swaps to label 0, and the egress pops it, reads TC, and routes.
+
+TTL follows one of two models (RFC 3443). In the **uniform** model the ingress copies the IP TTL into the label and the egress copies it back, so every LSR counts as a hop and traceroute shows the core. In the **pipe** model the ingress sets the label TTL to 255 and the IP TTL is decremented only at the edges, so the core is one hop; operators use it (often called "no TTL propagation") to hide the core from customer traceroutes.
+
+## Segment Routing over MPLS
+
+Segment Routing (RFC 8402) removes LDP. The IGP (IS-IS or OSPF) carries the labels itself, and the ingress encodes a path as a list of segments. With the MPLS data plane (RFC 8660) a segment is a label:
+
+- **SRGB.** Each router reserves a Segment Routing Global Block, a label range such as 16000 to 23999.
+- **Prefix SID.** An operator gives each loopback an *index*, unique in the domain. Every router computes the label for that prefix as **its own SRGB base + index**, installs it in its LFIB, and when it forwards toward a neighbour it uses the **neighbour's** SRGB base + index. A node SID is a prefix SID on a router's loopback.
+- **Adjacency SID.** A router allocates a local label for each of its adjacencies, meaning "pop and send out of this link". Adjacency SIDs only mean something at the router that allocated them.
+- **PHP** works as with LDP: a router can ask its neighbours to pop its node SID.
+
+If every router uses the same SRGB, the label for a prefix is the same everywhere, which makes `show` output, packet captures and troubleshooting much easier. RFC 8402 strongly recommends it. Different SRGBs still work, but the label changes at every hop, as the lab shows.
+
+A traffic-engineered path is a stack of SIDs. Hardware limits how many labels it can push (the Maximum SID Depth, advertised per RFC 8491), so controllers compress paths into as few segments as possible.
+
+| | SR-MPLS | SRv6 |
+|---|---|---|
+| Segment | 20-bit label | 128-bit IPv6 address (SID) |
+| Overhead | 4 bytes per segment | 40-byte IPv6 header plus SRH, 16 bytes per segment (less with compressed SIDs) |
+| Core needs | MPLS-capable forwarding | IPv6 forwarding, SRH processing only at segment endpoints |
+| Migration | Coexists with LDP (mapping server, SR/LDP interworking) | Coexists with plain IPv6 |
+
+## VPN and entropy labels in one paragraph each
+
+**L3VPN.** In a BGP/MPLS IP VPN (RFC 4364) the egress PE advertises customer prefixes in MP-BGP with a VPN label. The ingress pushes two labels: the VPN label (bottom) and the transport label toward the egress PE's loopback (top). P routers only see the transport label; with PHP the egress receives the packet with the VPN label on top, which selects the VRF. The core never needs customer routes.
+
+**Entropy label.** LSRs hash on the label stack to spread flows over ECMP paths, and a single LSP to one PE gives them nothing to hash on. With RFC 6790 the ingress inserts the Entropy Label Indicator (7) followed by an entropy label derived from the payload's flow fields, so transit routers can balance without parsing the payload.
+
+## Lab
+
+The lab has two parts. `mpls.py` is a model that encodes and decodes label stacks, walks a packet along PE1, P1, P2, PE2 with LDP-style labels, and computes SR-MPLS labels. `probe.sh` checks what this box's kernel can do.
+
+**`mpls.py`**
+
+```python
+#!/usr/bin/env python3
+"""mpls.py: MPLS label stacks (RFC 3032) and a toy LFIB walk.
+Part 1 encodes and decodes label stack entries. Part 2 forwards one packet
+along PE1-P1-P2-PE2 with LDP-style labels, with and without PHP. Part 3
+builds SR-MPLS labels from prefix-SID indexes (RFC 8660)."""
+import struct
+
+RESERVED = {0: "IPv4 Explicit NULL", 1: "Router Alert", 2: "IPv6 Explicit NULL",
+            3: "Implicit NULL", 7: "Entropy Label Indicator", 13: "GAL", 14: "OAM Alert",
+            15: "Extension"}
+
+def lse(label, tc=0, s=0, ttl=64):
+    assert 0 <= label < 2**20 and 0 <= tc < 8 and s in (0, 1) and 0 <= ttl < 256
+    return struct.pack("!I", (label << 12) | (tc << 9) | (s << 8) | ttl)
+
+def encode(stack):  # stack: list of (label, tc, ttl), top first
+    return b"".join(lse(l, tc, int(i == len(stack) - 1), ttl) for i, (l, tc, ttl) in enumerate(stack))
+
+def decode(buf):
+    out = []
+    for i in range(0, len(buf), 4):
+        w = struct.unpack("!I", buf[i:i + 4])[0]
+        out.append((w >> 12, (w >> 9) & 7, (w >> 8) & 1, w & 0xFF))
+        if w & 0x100:
+            break
+    return out
+
+print("== Part 1: label stack entries")
+stack = [(16004, 0, 64), (24001, 5, 64)]
+raw = encode(stack)
+print("stack", stack, "->", raw.hex(" ", 4))
+for label, tc, s, ttl in decode(raw):
+    note = RESERVED.get(label, "unicast" if label >= 16 else "reserved (unassigned)")
+    print(f"  label={label:<6} tc={tc} s={s} ttl={ttl:<3} {note}")
+print("explicit null on the wire:", lse(0, s=1, ttl=1).hex(), "| largest label:", 2**20 - 1)
+
+print("\n== Part 2: LDP LSP to PE2 loopback 192.0.2.4/32")
+# label each node advertised for 192.0.2.4/32 (downstream unsolicited)
+def adverts(php):
+    return {"P1": 300101, "P2": 300202, "PE2": 3 if php else 0}
+path = ["PE1", "P1", "P2", "PE2"]
+for php in (True, False):
+    adv = adverts(php)
+    print(f"-- PE2 advertises {'implicit null (3), PHP on' if php else 'explicit null (0), PHP off'}")
+    stack, ttl = [], 64          # IP TTL of the customer packet at PE1
+    for i, node in enumerate(path):
+        nxt = path[i + 1] if i + 1 < len(path) else None
+        if node == "PE1":
+            out = adv[nxt]
+            ttl -= 1                                   # IP TTL copied into the label (uniform model)
+            stack = [] if out == 3 else [out]
+            print(f"  {node:4} IP lookup 192.0.2.4 -> push {out if out != 3 else '(nothing)'} ttl={ttl}")
+        elif stack:
+            top = stack[0]
+            ttl -= 1
+            if nxt and adv[nxt] == 3:
+                stack = []
+                print(f"  {node:4} in {top} -> pop (PHP), send plain IP, ip ttl={ttl}")
+            elif nxt:
+                stack = [adv[nxt]]
+                print(f"  {node:4} in {top} -> swap {adv[nxt]} ttl={ttl}")
+            else:
+                print(f"  {node:4} in {top} ({RESERVED.get(top, top)}) -> pop, IP lookup, ip ttl={ttl}, tc preserved to egress")
+                stack = []
+        else:
+            print(f"  {node:4} receives plain IP -> one IP lookup")
+
+print("\n== Part 3: SR-MPLS prefix SIDs (label = SRGB base + index)")
+srgb = {"PE1": 16000, "P1": 16000, "P2": 16000, "PE2": 16000}
+index = {"PE1": 1, "P1": 2, "P2": 3, "PE2": 4}
+print("same SRGB everywhere: label for PE2 =", srgb["P1"] + index["PE2"], "on every node")
+srgb_mixed = dict(srgb, P2=20000)
+print("P2 uses SRGB 20000: P1 must push", srgb_mixed["P2"] + index["PE2"],
+      "toward P2, while P1 itself listens on", srgb_mixed["P1"] + index["PE2"])
+adj = {("P1", "P2"): 24012}
+te = [srgb["P1"] + index["P1"], adj[("P1", "P2")], srgb["P2"] + index["PE2"]]
+print("TE path PE1->P1, then link P1-P2, then shortest path to PE2:", te,
+      "->", encode([(l, 0, 64) for l in te]).hex(" ", 4))
+print("label stack depth", len(te), "=", 4 * len(te), "bytes of overhead")
+wire = te[1:]  # P1 is PE1's direct neighbour and its node SID has PHP, so PE1 never pushes 16002
+print("P1 adjacent with PHP: PE1 actually sends", wire, "=", 4 * len(wire), "bytes")
+```
+
+```bash
+python3 mpls.py
+```
+
+```text
+== Part 1: label stack entries
+stack [(16004, 0, 64), (24001, 5, 64)] -> 03e84040 05dc1b40
+  label=16004  tc=0 s=0 ttl=64  unicast
+  label=24001  tc=5 s=1 ttl=64  unicast
+explicit null on the wire: 00000101 | largest label: 1048575
+
+== Part 2: LDP LSP to PE2 loopback 192.0.2.4/32
+-- PE2 advertises implicit null (3), PHP on
+  PE1  IP lookup 192.0.2.4 -> push 300101 ttl=63
+  P1   in 300101 -> swap 300202 ttl=62
+  P2   in 300202 -> pop (PHP), send plain IP, ip ttl=61
+  PE2  receives plain IP -> one IP lookup
+-- PE2 advertises explicit null (0), PHP off
+  PE1  IP lookup 192.0.2.4 -> push 300101 ttl=63
+  P1   in 300101 -> swap 300202 ttl=62
+  P2   in 300202 -> swap 0 ttl=61
+  PE2  in 0 (IPv4 Explicit NULL) -> pop, IP lookup, ip ttl=60, tc preserved to egress
+
+== Part 3: SR-MPLS prefix SIDs (label = SRGB base + index)
+same SRGB everywhere: label for PE2 = 16004 on every node
+P2 uses SRGB 20000: P1 must push 20004 toward P2, while P1 itself listens on 16004
+TE path PE1->P1, then link P1-P2, then shortest path to PE2: [16002, 24012, 16004] -> 03e82040 05dcc040 03e84140
+label stack depth 3 = 12 bytes of overhead
+P1 adjacent with PHP: PE1 actually sends [24012, 16004] = 8 bytes
+```
+
+**`probe.sh`**
+
+```bash
+# Run as: unshare -urn sh probe.sh   (no sudo)
+ls /proc/sys/net/mpls 2>&1
+ip link add veth0 type veth peer name veth1 && ip link set veth0 up && ip addr add 10.0.0.1/30 dev veth0
+ip -f mpls route add 100 via inet 10.0.0.2 dev veth0 2>&1 || echo "mpls route: exit $?"
+ip route add 192.0.2.4/32 encap mpls 300101 via 10.0.0.2 dev veth0 2>&1 || echo "encap mpls: exit $?"
+```
+
+```text
+ls: cannot access '/proc/sys/net/mpls': No such file or directory
+RTNETLINK answers: Operation not supported
+mpls route: exit 2
+Error: lwt encapsulation type not supported.
+encap mpls: exit 2
+```
+
+## Reading the output
+
+**Part 1.** The stack `[(16004, 0, 64), (24001, 5, 64)]` becomes `03e84040 05dc1b40`. Take the first word: `0x03e84040 >> 12` is `0x3e84` = 16004; the next three bits are 0 (TC); then S = 0, because another entry follows; the last byte `0x40` is TTL 64. In the second word, `0x05dc1b40 >> 12` is 24001 and the low 12 bits are `0xb40`: TC 5, S 1, TTL 64. Explicit null with S = 1 and TTL 1 is `00000101`, which is what a packet capture of a last hop with explicit null looks like.
+
+**Part 2, PHP on.** PE2 advertises implicit null, so P2 never sends a label to PE2: it pops 300202 and hands over a plain IP packet. PE2 does one IP lookup. The TTL drops by one at each of PE1, P1 and P2 (63, 62, 61), so the uniform model makes three hops visible.
+
+**Part 2, PHP off.** With explicit null, P2 swaps 300202 for 0 and PE2 pops it. PE2 does the extra pop, but it still has the TC bits when it classifies the packet, and the TTL reaches 60 because PE2 also counts as an MPLS hop.
+
+**Part 3.** With one SRGB (16000) everywhere, PE2's index 4 gives label 16004 on every node. When P2 uses SRGB 20000, P1 still listens on 16004 for PE2 but must push 20004 when it sends toward P2: the label now changes hop by hop like an LDP label. The TE path PE1 to P1, over the P1-P2 link, then shortest path to PE2 is `[16002, 24012, 16004]`, 12 bytes. Because P1 is adjacent to PE1 and asks for PHP on its node SID, PE1 does not push 16002 at all and sends `[24012, 16004]`, 8 bytes. Controllers make this optimisation to fit within the Maximum SID Depth.
+
+**Probe.** `/proc/sys/net/mpls` does not exist, adding an MPLS route returns `Operation not supported`, and an `encap mpls` IP route fails with `lwt encapsulation type not supported`. Those are the three symptoms of missing `mpls_router` and `mpls_iptunnel` modules. veth pairs and namespaces work fine, so the topology itself could be built rootless; only the MPLS data plane is missing.
+
+## Linux and FRR configuration (not run here)
+
+On a lab host with the modules available, the kernel side looks like this. `platform_labels` sets the size of the label table (labels at or above it are rejected) and `input` must be enabled per interface before labelled packets are accepted.
+
+```bash
+# not run here: requires mpls_router and mpls_iptunnel
+modprobe mpls_router
+modprobe mpls_iptunnel
+sysctl -w net.mpls.platform_labels=1048575
+sysctl -w net.mpls.conf.eth1.input=1
+sysctl -w net.mpls.conf.eth2.input=1
+
+# ingress (PE1): push label 300101 for PE2's loopback
+ip route add 192.0.2.4/32 encap mpls 300101 via inet 10.0.12.2 dev eth1
+
+# transit (P1): swap 300101 -> 300202 toward P2
+ip -f mpls route add 300101 as 300202 via inet 10.0.23.2 dev eth2
+
+# penultimate (P2) with PHP: pop 300202 and forward the IP packet
+ip -f mpls route add 300202 via inet 10.0.34.2 dev eth2
+
+ip -f mpls route show
+```
+
+Static labels are good for understanding the data plane. In practice FRR programs them. A minimal LDP configuration on P1:
+
+```text
+! frr.conf on P1 (not run here)
+mpls ldp
+ router-id 192.0.2.2
+ address-family ipv4
+  discovery transport-address 192.0.2.2
+  interface eth1
+  interface eth2
+ exit-address-family
+!
+```
+
+And the SR-MPLS equivalent with OSPF, using the same SRGB on every node and index 2 for P1's loopback:
+
+```text
+! frr.conf on P1 (not run here)
+router ospf
+ ospf router-id 192.0.2.2
+ capability opaque
+ segment-routing on
+ segment-routing global-block 16000 23999
+ segment-routing node-msd 8
+ segment-routing prefix 192.0.2.2/32 index 2
+!
+```
+
+Check the result with `show mpls ldp binding`, `show mpls table` and `ip -f mpls route` on each node. A four-node Containerlab topology of FRR containers on a Linux host with the modules loaded is the easiest place to try both; enable the sysctls inside each container's network namespace.
+
+## Gotchas
+
+1. **The kernel modules are not optional.** Without `mpls_router` (LFIB) and `mpls_iptunnel` (the `encap mpls` route type) you get exactly the errors in the probe. Containers share the host kernel, so the host must load them.
+2. **`net.mpls.platform_labels` defaults to 0.** Until you raise it, every MPLS route fails even with the module loaded.
+3. **Per-interface `input` is off by default.** Labelled packets arriving on an interface without `net.mpls.conf.<dev>.input=1` are dropped silently.
+4. **MTU grows with the stack.** Every label is 4 bytes. A two-label VPN packet of 1500 bytes is 1508 bytes on the wire; plan core MTU for the deepest stack you will push, plus entropy labels.
+5. **PHP removes the TC bits.** If the egress queues on MPLS TC, advertise explicit null, or carry the marking in DSCP as well.
+6. **LDP without IGP sync drops VPN traffic.** After a link comes up, the IGP may use it before the LDP session is up. Enable LDP-IGP synchronisation.
+7. **Mixed SRGBs work but confuse humans.** Labels change at every hop, so captures and `show` output stop matching the index plan. Use one SRGB domain-wide.
+8. **Label stack depth is a hardware limit.** A TE path that needs more labels than the ingress can push will not be installed; check the advertised MSD.
+
+## Exercises
+
+1. Decode `05dc1b40` by hand: write the 32 bits, split them into fields, and confirm label 24001, TC 5, S 1, TTL 64.
+2. Change `mpls.py` so that PE1 uses the pipe model (label TTL 255, IP TTL untouched in the core). What IP TTL does PE2 see in each PHP mode?
+3. Add a VPN label (say 30001) at the bottom of the stack in Part 2. Which router pops which label with PHP on, and what does PE2 see?
+4. Give P1 an SRGB of 18000 as well as P2 using 20000. List the label PE1 pushes for PE2 and every swap along the path.
+5. On a lab host with the modules loaded, build the three-router static LSP from the Linux section in namespaces, run `tcpdump -e -i <link> mpls` on each link, and confirm the labels match the model's PHP trace.
+
+## Verification
+
+- Ran on the build box as an unprivileged user (no sudo, no installs): `python3 mpls.py` (Python 3.13.5 standard library) and `unshare -urn sh probe.sh` (kernel 6.12.94, iproute2 6.15.0). The listings are the files that ran and the outputs are pasted verbatim.
+- Not run here: everything in "Linux and FRR configuration", the Containerlab topology and exercise 5. The box kernel has no MPLS support, as the probe shows.
+
+## Sources
+
+- RFC 3031, Multiprotocol Label Switching Architecture
+- RFC 3032, MPLS Label Stack Encoding
+- RFC 5462, renaming the EXP field to Traffic Class
+- RFC 3443, TTL processing in MPLS networks
+- RFC 5036, LDP Specification
+- RFC 5443, LDP IGP Synchronization
+- RFC 6790, The Use of Entropy Labels in MPLS Forwarding
+- RFC 4364, BGP/MPLS IP Virtual Private Networks
+- RFC 8402, Segment Routing Architecture
+- RFC 8660, Segment Routing with the MPLS Data Plane
+- RFC 8491, Signaling Maximum SID Depth (MSD) Using IS-IS
+- Linux kernel documentation, `Documentation/networking/mpls-sysctl.rst`
+- `ip-route(8)` (MPLS routes and `encap mpls`)
+- FRR documentation: LDP and OSPF Segment Routing (https://docs.frrouting.org/)
