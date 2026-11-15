@@ -1,0 +1,895 @@
+---
+title: "BMP: Streaming What Your BGP Routers Actually Received"
+author:
+  - name: "K19G"
+  - name: "grok-bot"
+---
+
+# BMP: Streaming What Your BGP Routers Actually Received
+
+The usual ways of looking at BGP on a router show you the result, not the input. `show bgp` and SNMP give you the best paths after policy. A route-reflector or looking-glass feed gives you what the router chose to advertise. If a peer sends you a bogon, a /25, or a path with a strange community, and your inbound policy throws it away, none of those views show it. You only find out what a peer really sent by turning on soft-reconfiguration and scraping the CLI, router by router.
+
+The BGP Monitoring Protocol (BMP, RFC 7854) fixes this with a separate TCP stream from the router to a monitoring station. For every monitored peer the router can send the routes **as received**, before inbound policy (pre-policy Adj-RIB-In), and the routes **as accepted**, after policy (post-policy Adj-RIB-In), plus session up/down events with the full OPEN and NOTIFICATION messages and periodic counters. The station never talks BGP to the router and never changes its state. Compare the two streams and you can see what each peer sent, what your policy did to it, and when.
+
+This chapter takes the protocol apart, builds a small codec and station in standard-library Python, streams a simulated router's session through real TCP, and shows the mistakes stations make: framing by `read()`, missing the implicit withdraw on Peer Down, and trusting post-policy data alone.
+
+## Learning goals
+
+- Understand the architectural differences between CLI/SNMP/BGP looking-glass monitoring and BMP telemetry.
+- Master the BMP message format, including the 6-byte common header, the 42-byte per-peer header, and flags like V, L, A, and O.
+- Trace the lifecycle of a BMP session through Initiation, Peer Up, Route Monitoring, Statistics Report, Peer Down, and Termination message flows.
+- Recognize how End-of-RIB (EOR) markers delimit initial state dumps from incremental real-time telemetry.
+- Decode Peer Down notification codes, RFC 9003 shutdown communication strings, and statistics counters.
+- Differentiate between pre-policy Adj-RIB-In, post-policy Adj-RIB-In, RFC 8671 Adj-RIB-Out, and RFC 9069 Loc-RIB streaming capabilities.
+- Build framing logic in TCP stream collectors to correctly handle arbitrary socket chunking without corrupting BMP frame boundaries.
+
+## Version note
+
+The lab ran on the book's build box: Linux 6.12.94 and Python 3.13.5, standard library only, unprivileged, over loopback TCP. No packages were installed and no real router was involved: `routersim.py` generates the BMP stream a router would send (its `sysDescr` string says "lab sim"). Timestamps in the simulated stream are fixed, so the output is reproducible. Message formats follow RFC 7854 (BMP v3), RFC 8671 (Adj-RIB-Out), RFC 9069 (Loc-RIB) and RFC 9003 (shutdown communication). The FRR configuration comes from the current FRR BMP documentation, fetched on 2026-11-14, and is **not run here**.
+
+## BMP Architecture and Transport Mechanics
+
+BMP operates on a simple client-server model where the router acts as the BMP client (monitored device) and the monitoring server acts as the BMP station (collector). The transport mechanism is plain, unencrypted TCP. Connection establishment can be configured as active (where the router initiates a TCP connection to a configured station IP and port) or passive (where the router listens on a designated TCP port for connections from authorized stations).
+
+```text
++-------------------------------------------------------------+
+|                        BGP Router                           |
+|                                                             |
+|  +------------+   Pre-Policy   +-------------------------+  |
+|  |  eBGP Peer |--------------->|  Adj-RIB-In (Pre)       |--+----+
+|  +------------+                +-------------------------+  |    |
+|                                             |               |    |
+|                                    [ Inbound Policy ]       |    |
+|                                             |               |    |
+|                                             v               |    |
+|                                +-------------------------+  |    |
+|                                |  Adj-RIB-In (Post)      |--+--+ |
+|                                +-------------------------+  |  | |
+|                                             |               |  | |
+|                                    [ Best Path Select ]     |  | |
+|                                             |               |  | |
+|                                             v               |  | |
+|                                +-------------------------+  |  | |
+|                                |        Loc-RIB          |  |  | |
+|                                +-------------------------+  |  | |
++-------------------------------------------------------------+  | |
+                                                                 | |
+                                        BMP Telemetry Stream     | |
+                                        (One-way TCP connection) | |
+                                                                 v v
+                                                   +-------------------+
+                                                   |    BMP Station    |
+                                                   |    (Collector)    |
+                                                   +-------------------+
+```
+
+A core architectural invariant of BMP under RFC 7854 is that the protocol is strictly one-way. The router streams BMP telemetry messages to the station, but the station never sends BMP protocol messages back to the router over the session. The station does not transmit ACKs at the application layer, nor does it issue queries or commands. If the TCP connection to the station fails, the router tries to reconnect (FRR uses exponential backoff between `min-retry` and `max-retry`), and on reconnect it starts again with an Initiation message and a fresh dump. The BGP sessions themselves do not depend on the BMP session.
+
+## Packet Headers and Message Framing
+
+Every BMP message sent over the TCP stream begins with a standard 6-byte Common Header, immediately followed by message-specific payloads or a Per-Peer Header depending on the message type.
+
+### Common Header Structure
+
+The Common Header layout consists of 6 contiguous bytes:
+
+- **Version** (1 byte): Must be set to `0x03` (BMP Version 3).
+- **Message Length** (4 bytes): Unsigned 32-bit integer indicating the total length of the BMP message in bytes, including the 6-byte common header.
+- **Message Type** (1 byte): Identifies the payload format that follows.
+
+RFC 7854 and subsequent extensions define seven standard message types:
+
+| Type Code | Message Name | Description |
+|---|---|---|
+| `0` | Route Monitoring | Encapsulates BGP UPDATE messages for prefix additions and withdrawals. |
+| `1` | Statistics Report | Carries diagnostic counters and gauges (e.g., policy drops, RIB sizes). |
+| `2` | Peer Down | Signals that a monitored BGP session has terminated, including reason codes. |
+| `3` | Peer Up | Signals that a monitored BGP session has been established, carrying OPEN frames. |
+| `4` | Initiation | Transmits station-facing metadata (sysName, sysDescr) upon connection setup. |
+| `5` | Termination | Signals that the router is closing the BMP session. |
+| `6` | Route Mirroring | Sends raw, unparsed BGP PDUs for debugging or security analysis. |
+
+### Per-Peer Header Structure
+
+Message types `0` (Route Monitoring), `1` (Statistics Report), `2` (Peer Down), `3` (Peer Up) and `6` (Route Mirroring) contain a 42-byte Per-Peer Header immediately following the Common Header. This header contextualizes which BGP neighbor produced the event:
+
+```text
+ 0                   1                   2                   3
+ 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|   Peer Type   |  Peer Flags   |                               |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+                               |
+|                     Peer Distinguisher (8 bytes)              |
+|                                                               |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                                                               |
+|                  Peer IP Address (16 bytes)                   |
+|                                                               |
+|                                                               |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|          Peer AS              |        Peer BGP ID            |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                    Timestamp (Seconds)                        |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                  Timestamp (Microseconds)                     |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+```
+
+The fields of the 42-byte Per-Peer Header operate as follows:
+
+1. **Peer Type** (1 byte):
+   - `0`: Global Instance Peer (standard default routing table).
+   - `1`: RD Instance Peer (L3VPN / VRF instance with a Route Distinguisher).
+   - `2`: Local Instance Peer.
+   - `3`: Loc-RIB Instance (RFC 9069, representing the router's consolidated Loc-RIB).
+
+2. **Peer Flags** (1 byte):
+   - `V` bit (`0x80`): `0` indicates an IPv4 peer address; `1` indicates an IPv6 peer address.
+   - `L` bit (`0x40`): `0` indicates pre-policy monitoring; `1` indicates post-policy monitoring.
+   - `A` bit (`0x20`): `1` means the encapsulated BGP messages use the legacy 2-byte AS_PATH format; `0` means the 4-byte AS_PATH format. It describes the AS_PATH inside the carried UPDATE, not the Peer AS field.
+   - `O` bit (`0x10`): `1` indicates Adj-RIB-Out monitoring (RFC 8671).
+
+3. **Peer Distinguisher** (8 bytes): Route Distinguisher value if Peer Type is set to `1`; otherwise set to all zeros.
+
+4. **Peer Address** (16 bytes): Remote IP address of the BGP peer. For IPv6 peers (`V=1`), the full 16-byte IPv6 address is encoded. For IPv4 peers (`V=0`), the IPv4 address is stored in the **last 4 bytes** (bytes 12 through 15), with the leading 12 bytes filled with zeros.
+
+5. **Peer AS** (4 bytes): Autonomous System number of the peer (32-bit integer).
+
+6. **Peer BGP ID** (4 bytes): BGP Identifier (IPv4 router ID format) of the remote peer.
+
+7. **Timestamp** (8 bytes): Split into two 32-bit unsigned fields—seconds since Unix epoch followed by microseconds elapsed within that second.
+
+## Message Types and Telemetry Operations
+
+### Initiation and Termination Messages
+
+When a BMP TCP session connects, the router sends an Initiation message (Type 4) containing informational Information TLVs (Type-Length-Value tuples):
+- **TLV Type 0**: Free-form string (e.g., administrative notes).
+- **TLV Type 1**: `sysDescr` (system description string).
+- **TLV Type 2**: `sysName` (fully qualified domain name or hostname).
+
+When shutting down a session, the router sends a Termination message (Type 5) containing a reason TLV (Type 1), where Reason Code `0` indicates an administrative closure.
+
+### Peer Up and Peer Down Messages
+
+When a monitored BGP neighbor transitions to the `Established` state, the router emits a Peer Up message (Type 3). The Peer Up message includes the Per-Peer Header, local IP address, local port, remote port, and the raw BGP OPEN frames sent and received during session setup. This allows the station to inspect negotiated capabilities (such as Multiprotocol BGP extensions or 4-byte ASN support) and calculate the operational hold time. The negotiated hold time is governed by RFC 4271 rules as the minimum of the local and remote hold times in the OPEN frames.
+
+When a BGP neighbor drops out of the `Established` state, a Peer Down message (Type 2) is transmitted. The Peer Down payload provides a Reason code:
+- `1`: Local system closed the session with a BGP NOTIFICATION message.
+- `2`: Local system closed the session without a NOTIFICATION; a 2-byte FSM event code follows.
+- `3`: Remote peer closed the session, sending a BGP NOTIFICATION message.
+- `4`: Remote peer closed the session without sending a NOTIFICATION message.
+- `5`: Peer was de-configured from monitoring.
+- `6`: Local system closed, TLV data follows (added by RFC 9069 and used for Loc-RIB instance peers, with a VRF/table name TLV).
+
+If Reason `1` or `3` is indicated, the raw BGP NOTIFICATION payload follows inside the Peer Down frame. When a BGP NOTIFICATION contains code 6/2 (Cease / Administrative Shutdown), it may carry an RFC 9003 Shutdown Communication string containing human-readable text explaining the maintenance event.
+
+**Peer Down is an implicit withdraw.** Receiving a Peer Down message for a given peer implicitly withdraws **all** active paths previously announced by that peer in both pre-policy and post-policy tables. A BMP station must remove all Adj-RIB-In state tied to that peer when it processes Peer Down; no individual withdrawals will follow.
+
+### Route Monitoring and End-of-RIB (EOR)
+
+Route Monitoring messages (Type 0) wrap standard BGP UPDATE frames. When a router first connects to a BMP station or when a BGP session comes up, the router executes an initial dump of all routes present in the table. 
+
+To signal that the initial dump has completed for a given table, the router transmits an End-of-RIB (EOR) marker (RFC 4724). For IPv4 unicast the marker is an UPDATE with no withdrawn routes, no path attributes and no NLRI; for other address families it is an UPDATE carrying an empty MP_UNREACH_NLRI for that AFI/SAFI. Once an EOR marker is received for a peer, all subsequent Route Monitoring messages over that BMP channel represent real-time incremental updates (additions, withdrawals, or path attribute changes).
+
+### Statistics Reports
+
+Statistics Report messages (Type 1) deliver operational metrics at configured intervals without sending full table dumps. Common statistic types (RFC 7854, plus RFC 8671 for Adj-RIB-Out) include:
+- **Type 0**: Prefixes rejected by inbound policy (32-bit counter).
+- **Type 7**: Current route count in Adj-RIB-In (64-bit gauge).
+- **Type 8**: Current route count in Loc-RIB (64-bit gauge).
+- **Type 14/15**: Pre-policy and post-policy route counts in Adj-RIB-Out (RFC 8671).
+
+## Extended BMP Monitoring (RFC 8671 & RFC 9069)
+
+Standard RFC 7854 BMP focuses on Adj-RIB-In. Two key standards extend BMP to cover the remaining internal BGP state machines:
+
+1. **RFC 8671 (Adj-RIB-Out)**: Adds monitoring for routes sent *to* peers. By setting the `O` flag (`0x10`) in the Per-Peer Header, routers stream updates reflecting what they transmitted to eBGP/iBGP neighbors both pre-policy (before outbound route-maps) and post-policy (after outbound attribute modifications and filtering).
+2. **RFC 9069 (Loc-RIB)**: Adds monitoring for the central Loc-RIB table—the consolidated routing table resulting from best-path selection across all peers and local origins. Loc-RIB monitoring uses Peer Type `3` in the Per-Peer Header and allows observing which paths won best-path selection across the entire device.
+
+## The lab
+
+The lab environment demonstrates a complete Python-based BMP pipeline executing unprivileged over loopback TCP (`127.0.0.1`). It consists of four modular source components:
+
+1. `bmp/bmp.py`: A pure-Python codec defining binary pack/unpack logic for BMP v3 Common Headers, Per-Peer Headers, Initiation, Peer Up, Peer Down, Route Monitoring, and Statistics frames, along with a minimal BGP UPDATE/OPEN parser.
+2. `bmp/routersim.py`: A simulated router (AS 64500) that manages two eBGP peers (`isp-a` IPv4, `isp-b` IPv6), enforces an inbound security policy filtering bogons (`100.64.0.0/10`, `198.18.0.0/15`, `/25` prefixes), sets `LOCAL_PREF`, and streams structured BMP frames.
+3. `bmp/station.py`: A stream-framing BMP collector that accumulates bytes from socket buffers, parses complete BMP frames using length headers, and maintains per-peer pre-policy and post-policy state tables.
+4. `bmp/lab.py`: The test harness that executes five distinct analytical scenarios: chunked TCP transport, inbound policy drop evaluation, raw Per-Peer Header inspection, framing failure demonstration, and post-policy visibility limitations.
+
+**A simplification to know about.** In `routersim.py`, for implementation brevity without introducing third-party dependencies, `isp-b` is defined with an IPv6 peer address (`2001:db8:b::1`), but NLRI entries are emitted with standard IPv4 prefixes and unicast NEXT_HOP attributes. Production implementations carrying IPv6 routes utilize MP_REACH_NLRI (RFC 4760).
+
+```{.python filename="bmp.py"}
+"""Minimal BMP v3 (RFC 7854, 8671, 9069) and BGP-4 (RFC 4271) codec. Standard library only."""
+import ipaddress, struct
+
+# ---------- BGP-4 messages (just enough for BMP) ----------
+MARKER = b"\xff" * 16
+OPEN, UPDATE, NOTIFICATION = 1, 2, 3
+
+def bgp(msg_type, body):
+    return MARKER + struct.pack("!HB", 19 + len(body), msg_type) + body
+
+def bgp_open(asn, hold, router_id, afi_safis=((1, 1),)):
+    caps = b""
+    for afi, safi in afi_safis:                      # capability 1: multiprotocol (RFC 4760)
+        caps += struct.pack("!BBHBB", 1, 4, afi, 0, safi)
+    caps += struct.pack("!BBI", 65, 4, asn)          # capability 65: 4-octet AS (RFC 6793)
+    params = struct.pack("!BB", 2, len(caps)) + caps # optional parameter 2: capabilities
+    my_as = asn if asn < 65536 else 23456            # AS_TRANS for 4-byte ASNs
+    body = struct.pack("!BHH4sB", 4, my_as, hold, ipaddress.IPv4Address(router_id).packed, len(params))
+    return bgp(OPEN, body + params)
+
+def _prefixes(pfxs):
+    out = b""
+    for p in pfxs:
+        n = ipaddress.IPv4Network(p)
+        out += bytes([n.prefixlen]) + n.network_address.packed[: (n.prefixlen + 7) // 8]
+    return out
+
+def bgp_update(nlri=(), withdrawn=(), as_path=(), next_hop=None, med=None, local_pref=None, communities=()):
+    attrs = b""
+    if nlri:
+        attrs += struct.pack("!BBBB", 0x40, 1, 1, 0)                        # ORIGIN IGP
+        seg = struct.pack("!BB", 2, len(as_path)) + b"".join(struct.pack("!I", a) for a in as_path)
+        attrs += struct.pack("!BBB", 0x40, 2, len(seg)) + seg               # AS_PATH, 4-byte ASNs
+        attrs += struct.pack("!BBB4s", 0x40, 3, 4, ipaddress.IPv4Address(next_hop).packed)
+        if med is not None:
+            attrs += struct.pack("!BBBI", 0x80, 4, 4, med)
+        if local_pref is not None:
+            attrs += struct.pack("!BBBI", 0x40, 5, 4, local_pref)
+        if communities:
+            val = b"".join(struct.pack("!HH", *map(int, c.split(":"))) for c in communities)
+            attrs += struct.pack("!BBB", 0xC0, 8, len(val)) + val
+    w = _prefixes(withdrawn)
+    return bgp(UPDATE, struct.pack("!H", len(w)) + w + struct.pack("!H", len(attrs)) + attrs + _prefixes(nlri))
+
+def bgp_notification(code, subcode, data=b""):
+    return bgp(NOTIFICATION, bytes([code, subcode]) + data)
+
+def admin_shutdown(text):
+    """Cease / Administrative Shutdown with a shutdown communication (RFC 9003)."""
+    raw = text.encode()
+    return bgp_notification(6, 2, bytes([len(raw)]) + raw)
+
+def parse_bgp(pdu):
+    length, mtype = struct.unpack("!HB", pdu[16:19])
+    body = pdu[19:length]
+    if mtype == OPEN:
+        ver, my_as, hold, rid, plen = struct.unpack("!BHH4sB", body[:10])
+        caps, p, asn4 = [], body[10:10 + plen], None
+        while p:
+            ptype, l = p[0], p[1]
+            c = p[2:2 + l]
+            while ptype == 2 and c:
+                code, cl = c[0], c[1]
+                v = c[2:2 + cl]
+                if code == 1:
+                    afi, _, safi = struct.unpack("!HBB", v)
+                    caps.append(f"MP afi={afi} safi={safi}")
+                elif code == 65:
+                    asn4 = struct.unpack("!I", v)[0]
+                    caps.append(f"AS4 {asn4}")
+                else:
+                    caps.append(f"cap {code}")
+                c = c[2 + cl:]
+            p = p[2 + l:]
+        return {"type": "OPEN", "as": asn4 or my_as, "hold": hold,
+                "id": str(ipaddress.IPv4Address(rid)), "caps": caps}
+    if mtype == UPDATE:
+        wl = struct.unpack("!H", body[:2])[0]
+        withdrawn = _parse_prefixes(body[2:2 + wl])
+        al = struct.unpack("!H", body[2 + wl:4 + wl])[0]
+        attrs = _parse_attrs(body[4 + wl:4 + wl + al])
+        nlri = _parse_prefixes(body[4 + wl + al:])
+        return {"type": "UPDATE", "withdrawn": withdrawn, "attrs": attrs, "nlri": nlri,
+                "eor": not withdrawn and not nlri and not attrs}
+    if mtype == NOTIFICATION:
+        code, sub = body[0], body[1]
+        out = {"type": "NOTIFICATION", "code": code, "subcode": sub}
+        if code == 6 and sub in (2, 4) and len(body) > 2:   # RFC 9003 shutdown communication
+            n = body[2]
+            out["communication"] = body[3:3 + n].decode()
+        return out
+    return {"type": mtype}
+
+def _parse_prefixes(b):
+    out = []
+    while b:
+        plen = b[0]
+        nb = (plen + 7) // 8
+        addr = b[1:1 + nb] + b"\x00" * (4 - nb)
+        out.append(f"{ipaddress.IPv4Address(addr)}/{plen}")
+        b = b[1 + nb:]
+    return out
+
+def _parse_attrs(b):
+    attrs = {}
+    while b:
+        flags, code = b[0], b[1]
+        if flags & 0x10:
+            l, off = struct.unpack("!H", b[2:4])[0], 4
+        else:
+            l, off = b[2], 3
+        v = b[off:off + l]
+        if code == 1:
+            attrs["origin"] = ["igp", "egp", "incomplete"][v[0]]
+        elif code == 2:
+            path = []
+            while v:
+                n = v[1]
+                path += [struct.unpack("!I", v[2 + 4 * i:6 + 4 * i])[0] for i in range(n)]
+                v = v[2 + 4 * n:]
+            attrs["as_path"] = path
+        elif code == 3:
+            attrs["next_hop"] = str(ipaddress.IPv4Address(v))
+        elif code == 4:
+            attrs["med"] = struct.unpack("!I", v)[0]
+        elif code == 5:
+            attrs["local_pref"] = struct.unpack("!I", v)[0]
+        elif code == 8:
+            attrs["communities"] = [f"{v[i]<<8|v[i+1]}:{v[i+2]<<8|v[i+3]}" for i in range(0, len(v), 4)]
+        b = b[off + l:]
+    return attrs
+
+# ---------- BMP ----------
+ROUTE_MONITORING, STATS, PEER_DOWN, PEER_UP, INITIATION, TERMINATION, ROUTE_MIRRORING = range(7)
+TYPE_NAMES = ["RouteMonitoring", "Stats", "PeerDown", "PeerUp", "Initiation", "Termination", "RouteMirroring"]
+FLAG_V, FLAG_L, FLAG_A, FLAG_O = 0x80, 0x40, 0x20, 0x10   # RFC 7854 V/L/A, RFC 8671 O
+GLOBAL, RD_INSTANCE, LOCAL_INSTANCE, LOC_RIB = 0, 1, 2, 3  # peer types (3 from RFC 9069)
+STAT_NAMES = {0: "rejected-by-inbound-policy", 1: "dup-prefix-adverts", 2: "dup-withdraws",
+              3: "cluster-list-loop", 4: "as-path-loop", 5: "originator-id-loop", 6: "confed-loop",
+              7: "adj-rib-in-routes", 8: "loc-rib-routes", 11: "treat-as-withdraw-updates",
+              12: "treat-as-withdraw-prefixes", 13: "dup-updates",
+              14: "adj-rib-out-pre-routes", 15: "adj-rib-out-post-routes"}
+DOWN_REASONS = {1: "local close, NOTIFICATION follows", 2: "local close, FSM event follows",
+                3: "remote close, NOTIFICATION follows", 4: "remote close, no NOTIFICATION",
+                5: "peer de-configured from monitoring", 6: "local close, TLV data follows (RFC 9069)"}
+
+def common(mtype, body):
+    return struct.pack("!BIB", 3, 6 + len(body), mtype) + body
+
+def per_peer(addr, asn, bgp_id, ts, flags=0, ptype=GLOBAL, pd=0):
+    a = ipaddress.ip_address(addr)
+    if a.version == 6:
+        flags |= FLAG_V
+        packed = a.packed
+    else:
+        packed = b"\x00" * 12 + a.packed       # IPv4 goes in the LAST 4 bytes
+    sec, usec = int(ts), int(round((ts - int(ts)) * 1e6))
+    return struct.pack("!BBQ16sI4sII", ptype, flags, pd, packed, asn,
+                       ipaddress.IPv4Address(bgp_id).packed, sec, usec)
+
+def info_tlvs(items):
+    return b"".join(struct.pack("!HH", t, len(v)) + v for t, v in items)
+
+def initiation(sys_descr, sys_name, strings=()):
+    items = [(0, s.encode()) for s in strings] + [(1, sys_descr.encode()), (2, sys_name.encode())]
+    return common(INITIATION, info_tlvs(items))
+
+def peer_up(peer, local_addr, local_port, remote_port, sent_open, recv_open):
+    la = ipaddress.ip_address(local_addr)
+    lp = la.packed if la.version == 6 else b"\x00" * 12 + la.packed
+    return common(PEER_UP, peer + lp + struct.pack("!HH", local_port, remote_port) + sent_open + recv_open)
+
+def route_monitoring(peer, update):
+    return common(ROUTE_MONITORING, peer + update)
+
+def stats_report(peer, counters):
+    body = struct.pack("!I", len(counters))
+    for stype, value in counters:
+        if stype in (7, 8, 14, 15):
+            body += struct.pack("!HHQ", stype, 8, value)   # 64-bit gauge
+        else:
+            body += struct.pack("!HHI", stype, 4, value)   # 32-bit counter
+    return common(STATS, peer + body)
+
+def peer_down(peer, reason, data=b""):
+    return common(PEER_DOWN, peer + bytes([reason]) + data)
+
+def termination(reason, text=None):
+    items = ([(0, text.encode())] if text else []) + [(1, struct.pack("!H", reason))]
+    return common(TERMINATION, info_tlvs(items))
+
+def parse_per_peer(b):
+    ptype, flags, pd, addr, asn, bid, sec, usec = struct.unpack("!BBQ16sI4sII", b[:42])
+    ip = ipaddress.IPv6Address(addr) if flags & FLAG_V else ipaddress.IPv4Address(addr[12:])
+    return {"peer_type": ptype, "flags": flags, "pd": pd, "addr": str(ip), "as": asn,
+            "bgp_id": str(ipaddress.IPv4Address(bid)), "ts": sec + usec / 1e6,
+            "post_policy": bool(flags & FLAG_L), "adj_rib_out": bool(flags & FLAG_O)}
+
+def _take_pdu(b):
+    l = struct.unpack("!H", b[16:18])[0]
+    return b[:l], b[l:]
+
+def parse_bmp(msg):
+    ver, length, mtype = struct.unpack("!BIB", msg[:6])
+    if ver != 3:
+        raise ValueError(f"BMP version {ver}")
+    body = msg[6:length]
+    out = {"type": TYPE_NAMES[mtype] if mtype < len(TYPE_NAMES) else mtype}
+    if mtype in (INITIATION, TERMINATION):
+        tl = []
+        while body:
+            t, l = struct.unpack("!HH", body[:4])
+            tl.append((t, body[4:4 + l]))
+            body = body[4 + l:]
+        out["tlvs"] = tl
+        return out
+    out["peer"] = parse_per_peer(body)
+    rest = body[42:]
+    if mtype == ROUTE_MONITORING:
+        out["bgp"] = parse_bgp(rest)
+    elif mtype == PEER_UP:
+        v6 = out["peer"]["flags"] & FLAG_V
+        la = ipaddress.IPv6Address(rest[:16]) if v6 else ipaddress.IPv4Address(rest[12:16])
+        lport, rport = struct.unpack("!HH", rest[16:20])
+        sent, p = _take_pdu(rest[20:])
+        recv, info = _take_pdu(p)
+        out.update(local=f"[{la}]:{lport}" if v6 else f"{la}:{lport}", remote_port=rport,
+                   sent_open=parse_bgp(sent), recv_open=parse_bgp(recv), info=info)
+    elif mtype == STATS:
+        n = struct.unpack("!I", rest[:4])[0]
+        p, stats = rest[4:], {}
+        for _ in range(n):
+            t, l = struct.unpack("!HH", p[:4])
+            v = p[4:4 + l]
+            stats[STAT_NAMES.get(t, f"stat-{t}")] = int.from_bytes(v, "big")
+            p = p[4 + l:]
+        out["stats"] = stats
+    elif mtype == PEER_DOWN:
+        reason = rest[0]
+        out["reason"] = reason
+        out["reason_text"] = DOWN_REASONS.get(reason, "unknown")
+        if reason in (1, 3):
+            out["notification"] = parse_bgp(rest[1:])
+        elif reason == 2:
+            out["fsm_event"] = struct.unpack("!H", rest[1:3])[0]
+    return out
+
+class Framer:
+    """BMP is a byte stream over TCP. Reassemble whole messages from arbitrary chunks."""
+    def __init__(self):
+        self.buf = b""
+    def feed(self, chunk):
+        self.buf += chunk
+        msgs = []
+        while len(self.buf) >= 6:
+            length = struct.unpack("!I", self.buf[1:5])[0]
+            if len(self.buf) < length:
+                break
+            msgs.append(self.buf[:length])
+            self.buf = self.buf[length:]
+        return msgs
+```
+
+```{.python filename="routersim.py"}
+"""A pretend router (AS 64500) that streams BMP for two eBGP peers. Deterministic timestamps."""
+import bmp
+
+T0 = 1794614400.0          # 2026-11-14 00:00:00 UTC, so the output is reproducible
+R1 = dict(asn=64500, rid="10.0.0.1")
+PEERS = {
+    "isp-a": dict(addr="192.0.2.1", asn=64501, rid="192.0.2.1", local="192.0.2.2", lport=179, rport=50412),
+    "isp-b": dict(addr="2001:db8:b::1", asn=4200000002, rid="198.51.100.1", local="2001:db8:b::2",
+                  lport=41820, rport=179),
+}
+# What each peer sends us (pre-policy), as (prefix, as_path, extra attributes)
+RECEIVED = {
+    "isp-a": [("203.0.113.0/24", [64501, 64510], {}),
+              ("198.18.0.0/15", [64501], {}),                    # benchmarking range: bogon
+              ("100.64.0.0/10", [64501, 64666], {}),             # shared address space: bogon
+              ("203.0.113.128/25", [64501, 64510], {}),          # longer than /24: filtered
+              ("192.0.2.0/24", [64501], {"communities": ["64501:100"]})],
+    "isp-b": [("203.0.113.0/24", [4200000002, 64520, 64510], {}),
+              ("198.51.100.0/24", [4200000002], {"med": 50})],
+}
+BOGONS = ("198.18.0.0/15", "100.64.0.0/10", "10.0.0.0/8", "192.168.0.0/16")
+
+def inbound_policy(peer, prefix, as_path, attrs):
+    """Return post-policy attributes, or None if rejected."""
+    import ipaddress
+    net = ipaddress.ip_network(prefix)
+    if any(net.subnet_of(ipaddress.ip_network(b)) for b in BOGONS) or net.prefixlen > 24:
+        return None
+    out = dict(attrs)
+    out["local_pref"] = 200 if peer == "isp-a" else 100     # prefer ISP A
+    out.pop("communities", None)                              # scrub their communities
+    return out
+
+def hdr(name, ts, post=False):
+    p = PEERS[name]
+    return bmp.per_peer(p["addr"], p["asn"], p["rid"], ts, flags=bmp.FLAG_L if post else 0)
+
+def opens(name):
+    p = PEERS[name]
+    sent = bmp.bgp_open(R1["asn"], 90, R1["rid"])
+    recv = bmp.bgp_open(p["asn"], 180 if name == "isp-a" else 30, p["rid"])
+    return sent, recv
+
+def update_for(name, prefix, path, attrs):
+    nh = "192.0.2.1" if name == "isp-a" else "198.51.100.1"   # IPv4 NLRI; v6 next hop would need MP_REACH
+    return bmp.bgp_update(nlri=[prefix], as_path=path, next_hop=nh, **attrs)
+
+def session(monitor=("pre", "post")):
+    msgs = [bmp.initiation("FRRouting 10.5.1 (lab sim)", "r1.lab", ["edge router, rack 3"])]
+    ts = T0
+    for name in PEERS:
+        p = PEERS[name]
+        sent, recv = opens(name)
+        msgs.append(bmp.peer_up(hdr(name, ts), p["local"], p["lport"], p["rport"], sent, recv))
+    rejected = {n: 0 for n in PEERS}
+    for name, routes in RECEIVED.items():
+        for prefix, path, attrs in routes:
+            ts += 0.25
+            if "pre" in monitor:
+                msgs.append(bmp.route_monitoring(hdr(name, ts), update_for(name, prefix, path, attrs)))
+            post = inbound_policy(name, prefix, path, attrs)
+            if post is None:
+                rejected[name] += 1
+            elif "post" in monitor:
+                msgs.append(bmp.route_monitoring(hdr(name, ts, post=True), update_for(name, prefix, path, post)))
+        for post in (False, True):                                   # End-of-RIB = empty UPDATE
+            if ("post" if post else "pre") in monitor:
+                msgs.append(bmp.route_monitoring(hdr(name, ts, post), bmp.bgp_update()))
+    # incremental changes after the initial dump
+    ts += 30
+    wd = bmp.bgp_update(withdrawn=["192.0.2.0/24"])
+    path = [64501, 64501, 64501, 64510]                               # ISP A starts prepending
+    for post in (False, True):
+        if ("post" if post else "pre") in monitor:
+            msgs.append(bmp.route_monitoring(hdr("isp-a", ts, post), wd))
+    ts += 1
+    for post in (False, True):
+        if ("post" if post else "pre") in monitor:
+            msgs.append(bmp.route_monitoring(hdr("isp-a", ts, post), update_for(
+                "isp-a", "203.0.113.0/24", path, {"local_pref": 200} if post else {})))
+    ts += 10
+    for name in PEERS:
+        pre = len(RECEIVED[name]) - (1 if name == "isp-a" else 0)
+        msgs.append(bmp.stats_report(hdr(name, ts), [(0, rejected[name]), (7, pre)]))
+    ts += 60
+    msgs.append(bmp.peer_down(hdr("isp-b", ts), 3,
+                bmp.admin_shutdown("maintenance CHG-4711, back 02:00 UTC")))
+    ts += 5
+    msgs.append(bmp.peer_down(hdr("isp-a", ts), 4))                  # TCP reset, no NOTIFICATION
+    msgs.append(bmp.termination(0, "bmp targets reconfigured"))
+    return msgs
+```
+
+```{.python filename="station.py"}
+"""A small BMP monitoring station: frames the TCP stream, keeps pre/post Adj-RIB-In per peer."""
+import asyncio, datetime, bmp
+
+class Station:
+    def __init__(self, quiet=False):
+        self.rib = {}          # (peer addr, "pre"|"post") -> {prefix: attrs}
+        self.peers = {}
+        self.log = []
+        self.quiet = quiet
+
+    def say(self, line):
+        self.log.append(line)
+        if not self.quiet:
+            print(line)
+
+    def handle(self, raw):
+        m = bmp.parse_bmp(raw)
+        t = m["type"]
+        if t == "Initiation":
+            kv = {0: "string", 1: "sysDescr", 2: "sysName"}
+            self.say("INIT   " + ", ".join(f"{kv[k]}={v.decode()!r}" for k, v in m["tlvs"]))
+            return
+        if t == "Termination":
+            reason = [int.from_bytes(v, "big") for k, v in m["tlvs"] if k == 1][0]
+            self.say(f"TERM   reason={reason} " + " ".join(v.decode() for k, v in m["tlvs"] if k == 0))
+            return
+        p = m["peer"]
+        when = datetime.datetime.fromtimestamp(p["ts"], datetime.UTC).strftime("%H:%M:%S.%f")[:-3]
+        who = f"{p['addr']} AS{p['as']}"
+        if t == "PeerUp":
+            s, r = m["sent_open"], m["recv_open"]
+            hold = min(s["hold"], r["hold"])
+            self.peers[p["addr"]] = who
+            self.say(f"UP     {when} {who} local={m['local']} rport={m['remote_port']} "
+                     f"hold={hold}s (we {s['hold']}, they {r['hold']}) caps={r['caps']}")
+        elif t == "RouteMonitoring":
+            kind = "post" if p["post_policy"] else "pre"
+            rib = self.rib.setdefault((p["addr"], kind), {})
+            u = m["bgp"]
+            if u["eor"]:
+                self.say(f"EOR    {when} {who} {kind}-policy: {len(rib)} routes")
+                return
+            for w in u["withdrawn"]:
+                rib.pop(w, None)
+                self.say(f"WDRAW  {when} {who} {kind:4} {w}")
+            for n in u["nlri"]:
+                change = "UPDATE" if n in rib else "ADD   "
+                rib[n] = u["attrs"]
+                a = u["attrs"]
+                extra = " ".join(f"{k}={a[k]}" for k in ("local_pref", "med", "communities") if k in a)
+                self.say(f"{change} {when} {who} {kind:4} {n:18} path={a['as_path']} {extra}".rstrip())
+        elif t == "Stats":
+            self.say(f"STATS  {when} {who} {m['stats']}")
+        elif t == "PeerDown":
+            gone = sum(len(self.rib.pop((p['addr'], k), {})) for k in ("pre", "post"))
+            detail = ""
+            if "notification" in m:
+                n = m["notification"]
+                detail = f" NOTIFICATION {n['code']}/{n['subcode']}"
+                if "communication" in n:
+                    detail += f" {n['communication']!r}"
+            self.say(f"DOWN   {when} {who} reason={m['reason']} ({m['reason_text']}){detail}; "
+                     f"implicitly withdrew {gone} pre+post entries")
+
+    def policy_diff(self):
+        out = []
+        for (addr, kind), rib in sorted(self.rib.items()):
+            if kind == "pre":
+                post = self.rib.get((addr, "post"), {})
+                out.append((addr, sorted(set(rib) - set(post))))
+        return out
+
+async def serve(station, host, port, done):
+    async def on_conn(reader, writer):
+        framer = bmp.Framer()
+        chunks = 0
+        while data := await reader.read(65536):
+            chunks += 1
+            for msg in framer.feed(data):
+                station.handle(msg)
+        station.say(f"(connection closed after {chunks} reads, {len(framer.buf)} bytes left over)")
+        writer.close()
+        done.set()
+    return await asyncio.start_server(on_conn, host, port)
+```
+
+```{.python filename="lab.py"}
+"""Run the BMP lab: a simulated router streams to a real TCP station on 127.0.0.1."""
+import asyncio, random, sys, bmp, routersim
+from station import Station, serve
+
+def section(title):
+    print(f"\n=== {title} ===")
+
+async def router_connect(port, msgs, chunk_max, seed=7):
+    """Active router side: connect, write the BMP stream in random-sized TCP writes."""
+    _, w = await asyncio.open_connection("127.0.0.1", port)
+    stream = b"".join(msgs)
+    rnd, i = random.Random(seed), 0
+    while i < len(stream):
+        n = rnd.randint(1, chunk_max)
+        w.write(stream[i:i + n])
+        await w.drain()
+        await asyncio.sleep(0)            # let the station read between writes
+        i += n
+    w.close()
+    await w.wait_closed()
+    return len(stream)
+
+async def run_station(msgs, chunk_max, quiet=False):
+    st, done = Station(quiet=quiet), asyncio.Event()
+    srv = await serve(st, "127.0.0.1", 0, done)
+    port = srv.sockets[0].getsockname()[1]
+    nbytes = await router_connect(port, msgs, chunk_max)
+    await done.wait()
+    srv.close()
+    return st, nbytes
+
+async def naive(msgs, chunk_max):
+    """Wrong: assumes one read() == one BMP message."""
+    ok = bad = 0      # ok counts messages decoded; anything after the first in a read is lost
+    done = asyncio.Event()
+    async def on_conn(r, w):
+        nonlocal ok, bad
+        while data := await r.read(65536):
+            try:
+                bmp.parse_bmp(data)
+                ok += 1
+            except Exception:
+                bad += 1
+        done.set()
+    srv = await asyncio.start_server(on_conn, "127.0.0.1", 0)
+    await router_connect(srv.sockets[0].getsockname()[1], msgs, chunk_max)
+    await done.wait()
+    srv.close()
+    return ok, bad
+
+async def main():
+    msgs = routersim.session()
+    section("1. One BMP session, written in random 1-40 byte TCP chunks")
+    st, nbytes = await run_station(msgs, 40)
+    print(f"{len(msgs)} BMP messages, {nbytes} bytes")
+
+    section("2. What did inbound policy drop? (pre-policy minus post-policy, before Peer Down)")
+    st2, _ = await run_station(msgs[:-3], 1500, quiet=True)   # stop before the two Peer Downs
+    for addr, dropped in st2.policy_diff():
+        print(f"{addr:16} dropped by policy: {dropped if dropped else 'nothing'}")
+
+    section("3. Per-peer header bytes (IPv4 sits in the last 4 of 16 address bytes)")
+    for name in ("isp-a", "isp-b"):
+        h = routersim.hdr(name, routersim.T0)
+        print(f"{name}: type={h[0]} flags=0x{h[1]:02x} PD={h[2:10].hex()}")
+        print(f"       addr={h[10:26].hex()} AS={int.from_bytes(h[26:30],'big')} id={h[30:34].hex()}")
+
+    section("4. Same stream, naive station that treats every read() as one message")
+    for cmax in (1500, 40):
+        ok, bad = await naive(msgs, cmax)
+        print(f"writes up to {cmax:4} bytes: decoded {ok:2} of {len(msgs)} messages, "
+              f"{bad:3} reads raised errors")
+
+    section("5. Post-policy only: can you still see the bogons?")
+    post_only = routersim.session(monitor=("post",))
+    st5, _ = await run_station(post_only[:-3], 1500, quiet=True)
+    for (addr, kind), rib in sorted(st5.rib.items()):
+        print(f"{addr:16} {kind}: {sorted(rib)}")
+    print("pre-policy RIBs seen:", [k for k in st5.rib if k[1] == "pre"])
+
+asyncio.run(main())
+```
+
+## Reading the results
+
+Run it with `python3 lab.py` from the folder holding the four files. The output (identical on every run, because the simulated timestamps and the chunking seed are fixed):
+
+```text
+$ python3 lab.py
+
+=== 1. One BMP session, written in random 1-40 byte TCP chunks ===
+INIT   string='edge router, rack 3', sysDescr='FRRouting 10.5.1 (lab sim)', sysName='r1.lab'
+UP     00:00:00.000 192.0.2.1 AS64501 local=192.0.2.2:179 rport=50412 hold=90s (we 90, they 180) caps=['MP afi=1 safi=1', 'AS4 64501']
+UP     00:00:00.000 2001:db8:b::1 AS4200000002 local=[2001:db8:b::2]:41820 rport=179 hold=30s (we 90, they 30) caps=['MP afi=1 safi=1', 'AS4 4200000002']
+ADD    00:00:00.250 192.0.2.1 AS64501 pre  203.0.113.0/24     path=[64501, 64510]
+ADD    00:00:00.250 192.0.2.1 AS64501 post 203.0.113.0/24     path=[64501, 64510] local_pref=200
+ADD    00:00:00.500 192.0.2.1 AS64501 pre  198.18.0.0/15      path=[64501]
+ADD    00:00:00.750 192.0.2.1 AS64501 pre  100.64.0.0/10      path=[64501, 64666]
+ADD    00:00:01.000 192.0.2.1 AS64501 pre  203.0.113.128/25   path=[64501, 64510]
+ADD    00:00:01.250 192.0.2.1 AS64501 pre  192.0.2.0/24       path=[64501] communities=['64501:100']
+ADD    00:00:01.250 192.0.2.1 AS64501 post 192.0.2.0/24       path=[64501] local_pref=200
+EOR    00:00:01.250 192.0.2.1 AS64501 pre-policy: 5 routes
+EOR    00:00:01.250 192.0.2.1 AS64501 post-policy: 2 routes
+ADD    00:00:01.500 2001:db8:b::1 AS4200000002 pre  203.0.113.0/24     path=[4200000002, 64520, 64510]
+ADD    00:00:01.500 2001:db8:b::1 AS4200000002 post 203.0.113.0/24     path=[4200000002, 64520, 64510] local_pref=100
+ADD    00:00:01.750 2001:db8:b::1 AS4200000002 pre  198.51.100.0/24    path=[4200000002] med=50
+ADD    00:00:01.750 2001:db8:b::1 AS4200000002 post 198.51.100.0/24    path=[4200000002] local_pref=100 med=50
+EOR    00:00:01.750 2001:db8:b::1 AS4200000002 pre-policy: 2 routes
+EOR    00:00:01.750 2001:db8:b::1 AS4200000002 post-policy: 2 routes
+WDRAW  00:00:31.750 192.0.2.1 AS64501 pre  192.0.2.0/24
+WDRAW  00:00:31.750 192.0.2.1 AS64501 post 192.0.2.0/24
+UPDATE 00:00:32.750 192.0.2.1 AS64501 pre  203.0.113.0/24     path=[64501, 64501, 64501, 64510]
+UPDATE 00:00:32.750 192.0.2.1 AS64501 post 203.0.113.0/24     path=[64501, 64501, 64501, 64510] local_pref=200
+STATS  00:00:42.750 192.0.2.1 AS64501 {'rejected-by-inbound-policy': 3, 'adj-rib-in-routes': 4}
+STATS  00:00:42.750 2001:db8:b::1 AS4200000002 {'rejected-by-inbound-policy': 0, 'adj-rib-in-routes': 2}
+DOWN   00:01:42.750 2001:db8:b::1 AS4200000002 reason=3 (remote close, NOTIFICATION follows) NOTIFICATION 6/2 'maintenance CHG-4711, back 02:00 UTC'; implicitly withdrew 4 pre+post entries
+DOWN   00:01:47.750 192.0.2.1 AS64501 reason=4 (remote close, no NOTIFICATION); implicitly withdrew 5 pre+post entries
+TERM   reason=0 bmp targets reconfigured
+(connection closed after 59 reads, 0 bytes left over)
+27 BMP messages, 2497 bytes
+
+=== 2. What did inbound policy drop? (pre-policy minus post-policy, before Peer Down) ===
+192.0.2.1        dropped by policy: ['100.64.0.0/10', '198.18.0.0/15', '203.0.113.128/25']
+2001:db8:b::1    dropped by policy: nothing
+
+=== 3. Per-peer header bytes (IPv4 sits in the last 4 of 16 address bytes) ===
+isp-a: type=0 flags=0x00 PD=0000000000000000
+       addr=000000000000000000000000c0000201 AS=64501 id=c0000201
+isp-b: type=0 flags=0x80 PD=0000000000000000
+       addr=20010db8000b00000000000000000001 AS=4200000002 id=c6336401
+
+=== 4. Same stream, naive station that treats every read() as one message ===
+writes up to 1500 bytes: decoded  1 of 27 messages,   1 reads raised errors
+writes up to   40 bytes: decoded  0 of 27 messages,  59 reads raised errors
+
+=== 5. Post-policy only: can you still see the bogons? ===
+192.0.2.1        post: ['203.0.113.0/24']
+2001:db8:b::1    post: ['198.51.100.0/24', '203.0.113.0/24']
+pre-policy RIBs seen: []
+```
+
+### Analyzing the Output Scenarios
+
+1. **Section 1 (Stream Framing and Lifecycle)**:
+   - The lab transmitted a complete BMP telemetry session delivering **27 BMP messages** spanning **2497 total bytes**.
+   - `lab.py` wrote the stream in random 1-to-40-byte TCP writes. The station needed **59 reads** to receive it, reassembled every message from its length field, and had **0 bytes left over**.
+   - Session setup began with an Initiation message detailing host identity (`edge router, rack 3`, `FRRouting 10.5.1 (lab sim)`, `r1.lab`).
+   - Two Peer Up messages established session attributes:
+     - `isp-a` (192.0.2.1, AS64501): Local hold time of 90s, remote hold time of 180s. Negotiated hold time resolves to **90s** (min of both).
+     - `isp-b` (2001:db8:b::1, AS4200000002): Local hold time of 90s, remote hold time of 30s. Negotiated hold time resolves to **30s**.
+   - Initial route dumps produced End-of-RIB markers:
+     - `isp-a`: Emitted 5 pre-policy routes and 2 post-policy routes.
+     - `isp-b`: Emitted 2 pre-policy routes and 2 post-policy routes.
+   - Lifecycle events included explicit withdrawals (`192.0.2.0/24`), AS-path prepending updates (`path=[64501, 64501, 64501, 64510]`), and periodic Statistics Reports.
+   - Neighbor teardowns occurred under two distinct conditions:
+     - `isp-b` terminated via Peer Down Reason `3` (remote close with NOTIFICATION), delivering BGP NOTIFICATION code `6/2` with RFC 9003 shutdown communication string `'maintenance CHG-4711, back 02:00 UTC'`. This event automatically triggered an implicit withdrawal of 4 RIB entries.
+     - `isp-a` terminated via Peer Down Reason `4` (remote close without NOTIFICATION), implicitly withdrawing 5 RIB entries.
+
+2. **Section 2 (Policy Drop Evaluation)**:
+   - By subtracting post-policy Adj-RIB-In state from pre-policy state, the station computed exact inbound policy drop sets.
+   - Peer `192.0.2.1` (`isp-a`) had three prefixes dropped: `100.64.0.0/10` (CGNAT bogon), `198.18.0.0/15` (benchmark bogon), and `203.0.113.128/25` (length exceeding `/24`).
+   - Peer `2001:db8:b::1` (`isp-b`) experienced zero policy drops.
+
+3. **Section 3 (Per-Peer Header Verification)**:
+   - Header byte dumps verify byte alignment rules for IPv4 and IPv6 peers.
+   - `isp-a`: Peer Type `0`, Flags `0x00` (`V=0` IPv4, `L=0` pre-policy). Peer Address displays 12 leading zero bytes followed by IPv4 address hex `c0000201` (`192.0.2.1`).
+   - `isp-b`: Peer Type `0`, Flags `0x80` (`V=1` IPv6, `L=0` pre-policy). Peer Address displays full 16-byte IPv6 representation `20010db8000b00000000000000000001` (`2001:db8:b::1`).
+
+4. **Section 4 (Stream Framing Failure Demonstration)**:
+   - Demonstrates the failure mode of naive socket collectors that assume 1 socket read equals 1 BMP frame.
+   - When written in chunks up to 1500 bytes, a naive station successfully decoded only **1 of 27 messages**, throwing parsing errors on the remaining truncated bytes.
+   - When written in chunks up to 40 bytes, a naive station decoded **0 of 27 messages**, failing across all 59 socket reads.
+
+5. **Section 5 (Post-Policy Blindspot)**:
+   - When configured for post-policy monitoring only, pre-policy state remains empty (`pre-policy RIBs seen: []`).
+   - The station observed only accepted prefixes (`203.0.113.0/24` and `198.51.100.0/24`). The bogon updates sent by `isp-a` were completely hidden from view.
+
+## Production configuration (not run here)
+
+In production environments running FRRouting (FRR), the `bgpd` daemon must be launched with the `-M bmp` flag to load the dynamic BMP module. All BMP daemon settings are configured inside the `router bgp ASN` configuration block.
+
+```text
+router bgp 64500
+ bmp targets collectors
+  bmp connect 192.0.2.50 port 5000 min-retry 1000 max-retry 30000
+  bmp monitor ipv4 unicast pre-policy
+  bmp monitor ipv4 unicast post-policy
+  bmp monitor ipv6 unicast loc-rib
+  bmp stats interval 60000
+  ip access-list bmp-stations
+ exit
+```
+
+The `ip access-list bmp-stations` statement references an access list used to restrict BMP session establishment. Note that the access-list definition must exist in the global configuration.
+
+### Configuration Mechanics and Operational Notes
+
+- **Active vs. Passive Connections**: The `bmp connect <addr> port <port>` directive instructs FRR to initiate an active TCP connection to a collector station. For passive monitoring where FRR listens for incoming station connections, the command syntax changes to `bmp listener <addr> port <port>`.
+- **Route Mirroring**: FRR supports BGP Route Mirroring via `bmp mirror`. To prevent socket backup under heavy update bursts, buffer caps are set at the instance level using `bmp mirror buffer-limit`.
+- **Inbound Soft-Reconfiguration Unnecessary**: FRR documentation notes that pre-policy monitoring is sourced directly from the Adj-RIB-In maintained internally for covered peers. Explicitly configuring `neighbor soft-reconfiguration inbound` is **not required** to feed BMP pre-policy tables.
+- **Dynamic Activation and Route Refresh**: Enabling BMP pre-policy monitoring dynamically at runtime triggers an automated BGP Route Refresh request toward active peers. Peers without the route refresh capability (RFC 2918) are reset instead, so enable pre-policy monitoring in a maintenance window or before the sessions come up.
+- **Add-Path Interaction**: FRR documentation says monitoring peers with ADD-PATH gives "somewhat unpredictable" results: the path ID is never included in Route Monitoring, an arbitrary one of the received paths is sent, and the choice can differ between the pre- and post-policy streams.
+- **Supported Statistics Counters**: FRR implements a subset of RFC 7854 statistic types: `0` (rejected prefixes), `2` (duplicate withdrawals), `3` (CLUSTER_LIST loop), `4` (AS_PATH loop), `5` (ORIGINATOR_ID loop), `7` (Adj-RIB-In routes), `8` (Loc-RIB routes), and `11` (updates handled as "treat as withdraw", RFC 7607), plus an experimental 65531 for prefixes rejected because of an invalid next hop. FRR counts 3, 4 and 5 per prefix, not per update.
+
+### Popular Open-Source BMP Collectors
+
+Open-source software on the station side and for testing:
+- **pmacct (pmbmpd / nfacctd)**: A versatile telemetry daemon capable of ingesting BMP streams, parsing pre/post policy updates, and exporting structured routing events to Kafka, Elasticsearch, or SQL backends.
+- **OpenBMP**: A dedicated collector architecture designed specifically for large-scale BMP ingestion, providing real-time enrichment and streaming integration with message queues.
+- **GoBGP**: speaks BMP as the *monitored* side (it can stream its own RIBs to a station), which makes it a handy traffic source when you test a collector.
+
+**Security.** RFC 7854 BMP defines a cleartext TCP transport mechanism with no built-in encryption or authentication mechanisms. BMP streams convey sensitive internal topology and policy information. Put BMP traffic within an isolated Out-of-Band (OOB) Management Network or dedicated VRF, enforced with strict IP access control lists and firewall filters.
+
+## Gotchas
+
+1. **Memory Overhead of Pre-Policy Adj-RIB-In**: Storing pre-policy Adj-RIB-In tables for multiple full-table transit peers drastically increases memory consumption on edge routers. Routers must track every rejected prefix and un-scrubbed attribute alongside active routing tables.
+2. **Reconnection Telemetry Storms**: When a BMP TCP connection breaks and reconnects, the router re-transmits a complete initial table dump for all monitored peers. On routers holding millions of paths, reconnecting BMP sessions can generate massive bandwidth spikes and CPU load on collector stations.
+3. **Stream Framing Requirements**: TCP is a stream-oriented transport with no message boundary guarantees. Collectors must continuously buffer bytes and parse the 32-bit `Message Length` field in the Common Header. Assuming that a single socket `read()` or `recv()` maps to one complete BMP message will result in stream corruption.
+4. **IPv4 Addressing Encoding in Per-Peer Header**: IPv4 peer addresses occupy the **last 4 bytes** of the 16-byte address field in the Per-Peer Header. Decoders that inspect the first 4 bytes of the field will read all zeros (`0.0.0.0`) instead of the actual peer IP.
+5. **The A flag**: if the `A` flag (`0x20`) is set, the AS_PATH inside the carried UPDATEs uses 2-byte AS numbers. A station that always decodes 4-byte AS_PATHs will produce garbage paths for such peers.
+6. **ADD-PATH**: when a peer session negotiated ADD-PATH, the UPDATEs carry path identifiers and the station has to learn that from the OPEN messages in Peer Up. Implementations differ (FRR drops the path ID and sends one arbitrary path), so a station that keys its RIB by prefix alone can silently merge distinct paths.
+7. **Implicit Withdrawals on Peer Down**: When a station receives a Peer Down message, it must immediately flush all pre-policy and post-policy entries associated with that peer. Collectors that fail to execute implicit withdrawals will retain ghost routes indefinitely.
+8. **Router Clock Synchronization**: BMP Per-Peer Headers rely on router-generated timestamps (seconds and microseconds). If the router's system clock drifts due to unconfigured NTP, telemetry correlation across distributed collectors becomes inaccurate.
+9. **Post-Policy Telemetry Blindspot**: Relying exclusively on post-policy BMP streaming hides all inbound filtering activity. Bogons, malicious announcements, and peer misconfigurations dropped by ingress policies are completely unobservable without pre-policy monitoring.
+10. **Route Mirroring vs. Route Monitoring**: Route Monitoring (Type 0) carries parsed BGP UPDATE messages representing state changes. Route Mirroring (Type 6) streams verbatim, unparsed BGP wire PDUs. Mirroring carries the PDUs inside TLVs (type 0 holds a BGP message, type 1 carries information codes such as "messages lost"); it is for debugging and forensics, while Monitoring is what you build RIB views from.
+
+## Exercises
+
+1. **Implement Loc-RIB Monitoring**: Extend `bmp.py` and `routersim.py` to emit Peer Type `3` (Loc-RIB) frames. Include a Peer Down message using Reason Code `6` (Local System Closed) and verify state clearing on the station.
+2. **Add IPv6 MP_REACH_NLRI Support**: Modify `routersim.py` to transmit true IPv6 prefixes using Multiprotocol Extensions (Attribute Type Code 14) over `isp-b`, and update `station.py` to decode `MP_REACH_NLRI` attributes.
+3. **Build an Automated Policy Drop Alarm**: Write a threshold script monitoring `station.py` statistics events that triggers an alert whenever the `rejected-by-inbound-policy` counter increments by more than 5 prefixes in a 60-second window.
+4. **Export Station State to JSON**: Extend `station.py` to serialize active pre-policy and post-policy Adj-RIB-In tables to a structured JSON file upon receiving an End-of-RIB (EOR) marker.
+5. **Handle BGP Add-Path Identifiers**: Update the BGP codec in `bmp.py` to parse 4-byte Path Identifiers preceding NLRI prefixes on Add-Path enabled sessions, maintaining distinct paths per prefix in the station storage engine.
+6. **Measure Telemetry Stream Volume**: Write a benchmark script that generates simulated BGP tables containing N prefixes (N = 10 000, 100 000 and 1 000 000) and measures total byte output for initial dumps across pre-policy and post-policy modes.
+
+## Verification
+
+All code examples, packet codecs, framing simulation routines, and state calculations presented in **The lab** section were executed and verified directly on Linux 6.12.94 using Python 3.13.5 standard library components. The output block is pasted from that run; the listings are byte-identical to the files that ran, and because the simulated timestamps are fixed a second run produced identical output. Production configuration snippets for FRRouting (FRR) and collector references reflect standard official documentation guidelines and were not executed natively in this lab environment.
+
+## Sources
+
+- **RFC 7854**: *BGP Monitoring Protocol (BMP)*. IETF Proposed Standard, June 2016. https://datatracker.ietf.org/doc/html/rfc7854
+- **RFC 8671**: *Support for Adj-RIB-Out in the BGP Monitoring Protocol (BMP)*. IETF Proposed Standard, November 2019. https://datatracker.ietf.org/doc/html/rfc8671
+- **RFC 9069**: *Support for Local RIB in the BGP Monitoring Protocol (BMP)*. IETF Proposed Standard, February 2021. https://datatracker.ietf.org/doc/html/rfc9069
+- **RFC 9003**: *BGP Administrative Shutdown Communication*. IETF Proposed Standard, January 2021. https://datatracker.ietf.org/doc/html/rfc9003
+- **RFC 4271**: *A Border Gateway Protocol 4 (BGP-4)*. IETF Draft Standard, January 2006. https://datatracker.ietf.org/doc/html/rfc4271
+- **RFC 4724**: *Graceful Restart Mechanism for BGP (End-of-RIB marker)*. IETF Proposed Standard, January 2007. https://datatracker.ietf.org/doc/html/rfc4724
+- **FRRouting Documentation**: *BGP Monitoring Protocol (BMP)*. https://docs.frrouting.org/en/latest/bmp.html
+- **IANA Registry**: *BGP Monitoring Protocol (BMP) Parameters*. https://www.iana.org/assignments/bmp-parameters/
