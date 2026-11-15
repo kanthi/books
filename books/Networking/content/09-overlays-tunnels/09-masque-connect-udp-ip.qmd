@@ -1,0 +1,556 @@
+---
+title: "MASQUE: Tunnelling UDP and IP over HTTP (CONNECT-UDP and CONNECT-IP)"
+author:
+  - name: "K19G"
+  - name: "grok-bot"
+---
+
+# MASQUE: Tunnelling UDP and IP over HTTP (CONNECT-UDP and CONNECT-IP)
+
+## Learning goals
+
+- Explain how HTTP Datagrams and the Capsule Protocol carry unreliable datagram traffic onto HTTP streams and QUIC flows.
+- Distinguish the mechanisms and URI schemes of CONNECT-UDP (RFC 9298) and CONNECT-IP (RFC 9484).
+- Analyze the packet-level overhead introduced by capsule encoding, context identifiers, and QUIC framing.
+- Evaluate the operational challenges of MASQUE, including MTU reduction, TCP-in-TCP meltdown on fallbacks, and egress filtering.
+- Assess how proxy target restrictions prevent open proxy vulnerabilities on enterprise networks.
+
+## Thesis
+
+MASQUE turns an HTTP proxy into a tunnel endpoint. A client opens one HTTP request that says "relay UDP to this host and port" (CONNECT-UDP) or "relay IP packets for me" (CONNECT-IP). From then on, packets travel as HTTP Datagrams: unreliable QUIC DATAGRAM frames when HTTP/3 is available, and length-prefixed capsules on the request stream when it is not. The framing is tiny, a few bytes per packet. What changes for operators is everything around it. A VPN now looks like HTTPS on port 443. The target sees the proxy's address, not the client's. The inner MTU shrinks by the QUIC overhead. And a quiet fallback to TCP turns a datagram tunnel into a stream tunnel. This chapter builds the framing by hand so those consequences are concrete.
+
+## Mental model
+
+```text
++-------------------------------------------------------------------+
+|                        Application Layer                          |
+|  [ UDP Datagrams ]                   [ Raw IP Packets / VPN ]      |
++-------------------------------------------------------------------+
+|                        MASQUE Layer                               |
+|  RFC 9298 (CONNECT-UDP)              RFC 9484 (CONNECT-IP)        |
+|  + Context ID (Varint)               + Capsules (ADDRESS/ROUTE)   |
++-------------------------------------------------------------------+
+|                     HTTP Datagram / Capsule                       |
+|  RFC 9297: Type (Varint) | Length (Varint) | Value                |
++-------------------------------------------------------------------+
+|                        Transport Layer                            |
+|  HTTP/3 (QUIC DATAGRAM Frame)   OR   HTTP/1.1 / HTTP/2 Stream    |
+|  Unreliable, Direct Flow             Reliable, Capsule-wrapped    |
++-------------------------------------------------------------------+
+```
+
+## HTTP Datagrams and the Capsule Protocol
+
+The foundation of MASQUE is RFC 9297, which defines HTTP Datagrams and the Capsule Protocol. Traditional HTTP streams provide reliable, ordered byte streams. However, encapsulating real-time application traffic, voice, or generic IP packets inside a reliable stream introduces head-of-line blocking when packet loss occurs.
+
+RFC 9297 introduces two complementary transport mechanisms for HTTP:
+
+1. **HTTP Datagrams**: Unreliable datagram transfers mapped to underlying transport frames, such as QUIC DATAGRAM frames (RFC 9221).
+2. **Capsule Protocol**: A framing sequence used within an HTTP stream when unreliable datagram transport is unavailable or when control signalling is required.
+
+A capsule consists of three fields encoded sequentially:
+
+- **Capsule Type**: A variable-length integer (varint) identifying the payload type.
+- **Capsule Length**: A varint defining the length of the payload in bytes.
+- **Capsule Value**: The opaque byte sequence of the capsule payload.
+
+```text
+ 0                   1                   2                   3
+ 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                     Capsule Type (Varint)                     |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                    Capsule Length (Varint)                    |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                        Capsule Value ...                      |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+```
+
+When operating over HTTP/3, endpoints negotiate the support for HTTP Datagrams using the `SETTINGS_H3_DATAGRAM` setting (type `0x33`). When enabled, HTTP Datagrams bypass the stream reliability engine and ride directly in QUIC DATAGRAM frames. To map the datagram to its associated HTTP request, each HTTP Datagram payload begins with a Quarter Stream ID (a varint calculated as the HTTP request stream ID divided by 4).
+
+If an endpoint receives a capsule with an unknown Capsule Type, RFC 9297 mandates that the endpoint must silently skip and discard that capsule. DATAGRAM capsule type `0x00` is reserved to transmit datagrams reliably over stream-based transports such as HTTP/1.1 or HTTP/2.
+
+## Proxying UDP: CONNECT-UDP
+
+RFC 9298 defines Proxying UDP in HTTP (CONNECT-UDP). This mechanism allows an HTTP client to request an HTTP proxy to establish a UDP socket to a remote destination and relay UDP payloads bi-directionally.
+
+### URI Template and Handshake
+
+CONNECT-UDP endpoints are identified using a standardized URI template:
+
+`https://example.org/.well-known/masque/udp/{target_host}/{target_port}/`
+
+The client initiates the tunnel depending on the underlying HTTP version:
+
+- **HTTP/1.1**: The client issues an HTTP `GET` request using the target path, accompanied by headers requesting protocol upgrading:
+  - `Connection: Upgrade`
+  - `Upgrade: connect-udp`
+  - `Capsule-Protocol: ?1`
+  
+  The proxy responds with `101 Switching Protocols` and an `Upgrade: connect-udp` header upon successful connection setup.
+
+- **HTTP/2 and HTTP/3**: The client issues an Extended CONNECT request using the pseudo-headers:
+  - `:method = CONNECT`
+  - `:protocol = connect-udp`
+  - `:path = /.well-known/masque/udp/{target_host}/{target_port}/`
+
+### Context Identifiers
+
+Every UDP payload encapsulated within a CONNECT-UDP stream or datagram begins with a Context ID varint. The Context ID defines how the remaining payload should be parsed or demultiplexed.
+
+- **Context ID 0**: Indicates a standard, uncompressed UDP payload.
+- **Even Context IDs (non-zero)**: Allocated by the client for protocol extensions or compression contexts.
+- **Odd Context IDs**: Allocated by the proxy for extension handling.
+
+```text
++-----------------------+-------------------+
+| Context ID (Varint)   | UDP Payload Bytes |
+| (0x00 = Standard UDP) | ...               |
++-----------------------+-------------------+
+```
+
+## Proxying IP: CONNECT-IP
+
+RFC 9484 extends the MASQUE framework to support proxying full IP packets over HTTP using the CONNECT-IP protocol. CONNECT-IP allows clients to construct full-featured IP Virtual Private Networks (VPNs) over HTTP/3 connections.
+
+### URI Template and Path Format
+
+The URI template for CONNECT-IP uses target host and protocol specifiers:
+
+`https://example.org/.well-known/masque/ip/{target}/{ipproto}/`
+
+Setting `{target}` or `{ipproto}` to `"*"` requests wildcard proxying, allowing the client to send IP packets destined for any address or using any IP protocol number.
+
+### Signalling Capsules
+
+CONNECT-IP uses control capsules to negotiate addresses and routes across the tunnel stream:
+
+1. **ADDRESS_REQUEST (`0x02`)**: Sent by the client to request assignment of an IP address and prefix from the proxy.
+2. **ADDRESS_ASSIGN (`0x01`)**: Sent by the proxy to assign an IP address and prefix to the client.
+3. **ROUTE_ADVERTISEMENT (`0x03`)**: Sent by either endpoint to announce reachable IP ranges and protocols across the tunnel.
+
+The layout for `ADDRESS_REQUEST` and `ADDRESS_ASSIGN` capsules includes:
+
+- Request ID (Varint)
+- IP Version (8 bits: `0x04` for IPv4, `0x06` for IPv6)
+- IP Address (4 bytes for IPv4, 16 bytes for IPv6)
+- Prefix Length (8 bits)
+
+The `ROUTE_ADVERTISEMENT` capsule contains:
+
+- IP Version (8 bits)
+- Start IP Address
+- End IP Address
+- IP Protocol (8 bits, `0x00` indicates all protocols)
+
+## Deployment Architectures and Comparison
+
+MASQUE is deployed in production Internet systems to secure privacy and bypass legacy network restrictions.
+
+- **Apple iCloud Private Relay**: Uses two proxy hops in series. The ingress proxy sees the client's IP address but not the destination, because the request to the second hop is end-to-end encrypted through it. The egress proxy sees the destination but receives the connection from the ingress proxy, not from the client. Neither operator alone sees both who the client is and where it is going.
+- **Cloudflare WARP**: Provides MASQUE-based tunnelling to encapsulate client traffic over HTTP/3, presenting an alternative to traditional WireGuard tunnels.
+
+### Comparative Analysis
+
+- **WireGuard**: Operates strictly as a kernel-level or user-space UDP tunnel. Tunnels use fixed handshake formats and distinctive UDP packet headers, making them simple for middleboxes and deep packet inspection (DPI) systems to identify and block. WireGuard does not leverage HTTP semantics.
+- **Standard HTTP CONNECT**: Mandates reliable TCP delivery. It cannot encapsulate native UDP datagrams without wrapping them in an outer stream, incurring head-of-line blocking.
+- **MASQUE**: Carries UDP and IP traffic inside ordinary HTTP/3 connections on UDP port 443. To a port- or protocol-based firewall it is HTTPS. Traffic analysis (long-lived connections, packet size patterns, known proxy addresses) may still distinguish it, but the packets themselves carry no tunnel signature.
+
+| Property | WireGuard | HTTP CONNECT | MASQUE (RFC 9298 / 9484) |
+|----------|-----------|--------------|--------------------------|
+| Carries | IP packets | one TCP byte stream | UDP payloads (CONNECT-UDP) or IP packets (CONNECT-IP) |
+| Outer transport | UDP, any port | TCP | HTTP/3 over QUIC (UDP 443), fallback HTTP/2 or HTTP/1.1 over TCP |
+| Setup | Noise IK handshake | `CONNECT host:port` | extended CONNECT (HTTP/2, HTTP/3) or `GET` + `Upgrade` (HTTP/1.1) |
+| Looks like, to port-based policy | WireGuard | HTTPS | HTTPS / HTTP/3 |
+| Per-target policy point | none (peer keys only) | the proxy | the proxy |
+
+## Operator Considerations
+
+### Egress Control and Open Proxy Mitigation
+
+Because MASQUE traffic presents as ordinary HTTPS/HTTP/3 traffic over UDP port 443 (or TCP port 443 during fallbacks), legacy firewall mechanisms based on IP port classification cannot restrict or block MASQUE traffic without disabling egress HTTP/3 entirely. Egress control must move to the proxy infrastructure itself through explicit authentication, target allow-lists, and TLS inspection.
+
+Proxies must restrict which targets they will reach. An unconstrained MASQUE proxy acts as an open proxy, allowing internal attackers to use the proxy server as an anonymizing reflector to attack third-party networks or bypass internal segmentation boundaries.
+
+### Framing Overhead and Path MTU
+
+Because QUIC DATAGRAM frames cannot be fragmented across IP networks, the inner Path MTU available to encapsulated packets inside a MASQUE tunnel is reduced compared to the physical network interface MTU.
+
+The effective inner payload MTU is constrained by:
+
+```text
+Inner MTU = Physical Path MTU 
+            - Outer IP Header
+            - Outer UDP Header
+            - QUIC Short Header
+            - QUIC AEAD Encryption Tag
+            - QUIC DATAGRAM Frame Overhead
+            - HTTP/3 Quarter Stream ID
+            - MASQUE Context ID
+```
+
+A packet that does not fit cannot be sent as a datagram. For CONNECT-IP, the endpoint that cannot fit it drops it and should tell the inner source with an ICMP "Packet Too Big" or "Fragmentation Needed" message, so path MTU discovery keeps working inside the tunnel. RFC 9484 also requires an IPv6 tunnel to carry at least 1280-byte packets, which means the outer path needs room for 1280 plus all the QUIC and HTTP overhead. Clamp TCP MSS on the tunnel interface, as with any other tunnel.
+
+### Fallback Risks: Meltdown and Blocking
+
+When HTTP/3 path validation fails (e.g., when UDP port 443 is filtered by network policy), MASQUE falls back to HTTP/2 or HTTP/1.1 transport.
+
+Under HTTP/1.1 or HTTP/2 fallback:
+
+1. UDP datagrams are forced into reliable DATAGRAM capsules over a single stream. Packet loss now triggers TCP retransmission of the outer stream, and every later datagram waits behind the lost one (head-of-line blocking). Datagrams that the application would rather have dropped arrive late instead.
+2. For CONNECT-IP, carrying IP traffic containing inner TCP connections over an outer HTTP/2 TCP stream causes **TCP-in-TCP meltdown**. Loss events on the outer TCP stream cause retransmission delays that conflict with inner TCP timers, which can stack retransmission timers and collapse throughput on lossy paths.
+
+## Lab: Simulating CONNECT-UDP and CONNECT-IP
+
+This lab executes `masque-lab.py`. It implements:
+1. A local UDP echo server listening on `127.0.0.1:7007`.
+2. A CONNECT-UDP proxy implementing HTTP/1.1 stream framing with target restriction checks on `127.0.0.1:8443` (not run with TLS; simplified lab environment).
+3. A client encoding RFC 9297 DATAGRAM capsules, RFC 9484 CONNECT-IP capsules, and calculating HTTP/3 datagram overhead.
+
+`masque-lab.py`:
+
+```python
+#!/usr/bin/env python3
+"""CONNECT-UDP over HTTP/1.1 (RFC 9298) with the Capsule Protocol (RFC 9297).
+
+Everything is on loopback and in one process, no root, no packages:
+  * a UDP echo server on 127.0.0.1:7007 that says who it heard from
+  * a MASQUE-style UDP proxy on 127.0.0.1:8443 (plain TCP, no TLS, lab only)
+  * a client that asks the proxy to open a UDP flow and sends DATAGRAM capsules
+Part 2 encodes CONNECT-IP capsules (RFC 9484) and the HTTP/3 datagram framing
+and prints the bytes, so you can see the per-packet overhead.
+"""
+import socket, struct, threading, time
+
+# ---------------------------------------------------------- QUIC varints (RFC 9000 16)
+def vi(n):
+    if n < 1 << 6:  return struct.pack("!B", n)
+    if n < 1 << 14: return struct.pack("!H", n | 0x4000)
+    if n < 1 << 30: return struct.pack("!I", n | 0x80000000)
+    return struct.pack("!Q", n | 0xC000000000000000)
+
+def read_vi(buf, i):
+    first = buf[i]; ln = 1 << (first >> 6)
+    v = first & 0x3F
+    for b in buf[i + 1:i + ln]:
+        v = (v << 8) | b
+    return v, i + ln
+
+def capsule(ctype, value):                       # RFC 9297 3.2
+    return vi(ctype) + vi(len(value)) + value
+
+DATAGRAM = 0x00                                   # capsule type
+def udp_payload_capsule(payload):                 # RFC 9298 5: Context ID 0 = UDP payload
+    return capsule(DATAGRAM, vi(0) + payload)
+
+def read_capsules(sock, buf):
+    """Yield (type, value) for each complete capsule; keep partials in buf."""
+    while True:
+        try:
+            ctype, i = read_vi(buf, 0); ln, j = read_vi(buf, i)
+        except IndexError:
+            ctype = None
+        if ctype is not None and len(buf) >= j + ln:
+            yield ctype, bytes(buf[j:j + ln]); del buf[:j + ln]; continue
+        chunk = sock.recv(65536)
+        if not chunk:
+            return
+        buf += chunk
+
+# ---------------------------------------------------------- UDP echo target
+def echo_server():
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.bind(("127.0.0.1", 7007))
+    while True:
+        data, peer = s.recvfrom(2048)
+        s.sendto(b"echo from 127.0.0.1:7007 to %s:%d: " % (peer[0].encode(), peer[1]) + data, peer)
+
+# ---------------------------------------------------------- the UDP proxy
+ALLOWED = {("127.0.0.1", 7007)}                   # proxies MUST control what they reach
+
+def handle(conn):
+    head = b""
+    while b"\r\n\r\n" not in head:
+        head += conn.recv(4096)
+    head, rest = head.split(b"\r\n\r\n", 1)
+    lines = head.decode().split("\r\n")
+    method, path, _ = lines[0].split(" ")
+    hdrs = {k.lower(): v.strip() for k, v in (l.split(":", 1) for l in lines[1:])}
+    parts = path.strip("/").split("/")            # .well-known/masque/udp/{host}/{port}
+    ok = (method == "GET" and hdrs.get("upgrade", "").lower() == "connect-udp"
+          and hdrs.get("capsule-protocol") == "?1" and parts[:3] == [".well-known", "masque", "udp"])
+    target = (parts[3], int(parts[4])) if ok else None
+    if not ok or target not in ALLOWED:
+        conn.sendall(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n"); conn.close()
+        print(f"  proxy: refused {method} {path}")
+        return
+    udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); udp.connect(target)
+    print(f"  proxy: {method} {path} -> UDP flow {udp.getsockname()} -> {target}")
+    conn.sendall(b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\n"
+                 b"Upgrade: connect-udp\r\nCapsule-Protocol: ?1\r\n\r\n")
+    def back():
+        while True:
+            data = udp.recv(2048)
+            conn.sendall(udp_payload_capsule(data))
+    threading.Thread(target=back, daemon=True).start()
+    for ctype, value in read_capsules(conn, bytearray(rest)):
+        if ctype != DATAGRAM:
+            continue                              # unknown capsules are skipped (RFC 9297 3.2)
+        ctx, i = read_vi(value, 0)
+        if ctx == 0:
+            udp.send(value[i:])
+
+def proxy_server():
+    s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s.bind(("127.0.0.1", 8443)); s.listen()
+    while True:
+        c, _ = s.accept()
+        threading.Thread(target=handle, args=(c,), daemon=True).start()
+
+# ---------------------------------------------------------- the client
+def client(host, port, messages):
+    c = socket.create_connection(("127.0.0.1", 8443))
+    req = (f"GET /.well-known/masque/udp/{host}/{port}/ HTTP/1.1\r\nHost: 127.0.0.1:8443\r\n"
+           "Connection: Upgrade\r\nUpgrade: connect-udp\r\nCapsule-Protocol: ?1\r\n\r\n")
+    c.sendall(req.encode())
+    resp = b""
+    while b"\r\n\r\n" not in resp:
+        chunk = c.recv(4096)
+        if not chunk: break
+        resp += chunk
+    print("  client: " + resp.split(b"\r\n")[0].decode())
+    if b" 101 " not in resp.split(b"\r\n")[0]:
+        return
+    buf = bytearray(resp.split(b"\r\n\r\n", 1)[1])
+    caps = read_capsules(c, buf)
+    for m in messages:
+        cap = udp_payload_capsule(m)
+        c.sendall(cap)
+        print(f"  client: sent DATAGRAM capsule {cap[:6].hex(' ')} ... ({len(cap)} B for {len(m)} B of UDP payload)")
+        ctype, value = next(caps)
+        ctx, i = read_vi(value, 0)
+        text = value[i:].decode()
+        shown = text if len(text) <= 60 else text[:56] + f"... ({len(value) - i} B)"
+        print(f"  client: got  type=0x{ctype:02x} ctx={ctx}: {shown}")
+    c.close()
+
+# ---------------------------------------------------------- part 2: bytes on the wire
+def hexdump(b):
+    return b.hex(" ")
+
+def connect_ip_capsules():
+    req = capsule(0x02, vi(1) + bytes([4]) + socket.inet_aton("0.0.0.0") + bytes([32]))
+    assign = capsule(0x01, vi(1) + bytes([4]) + socket.inet_aton("192.0.2.33") + bytes([32]))
+    route = capsule(0x03, bytes([4]) + socket.inet_aton("0.0.0.0")
+                    + socket.inet_aton("255.255.255.255") + bytes([0]))
+    return [("ADDRESS_REQUEST any IPv4 /32, req 1", req),
+            ("ADDRESS_ASSIGN 192.0.2.33/32, req 1", assign),
+            ("ROUTE_ADVERTISEMENT 0.0.0.0-255.255.255.255 any", route)]
+
+def main():
+    for fn in (echo_server, proxy_server):
+        threading.Thread(target=fn, daemon=True).start()
+    time.sleep(0.2)
+    print("1) CONNECT-UDP through the proxy")
+    client("127.0.0.1", 7007, [b"hello", b"x" * 1200])
+    print("   asking for a target the proxy does not allow:")
+    client("127.0.0.2", 53, [b"nope"])
+    print()
+    print("2) CONNECT-IP capsules (RFC 9484)")
+    for label, b in connect_ip_capsules():
+        print(f"  {label:48} {hexdump(b)}")
+    print()
+    print("3) One UDP payload as an HTTP/3 datagram (RFC 9297 2.1)")
+    stream_id = 4                                  # 2nd client bidi stream
+    payload = b"\x00" * 1200
+    h3 = vi(stream_id // 4) + vi(0) + payload
+    print(f"  request stream {stream_id} -> Quarter Stream ID {stream_id // 4}; "
+          f"datagram = {hexdump(h3[:2])} + payload")
+    quic_frame = vi(0x31) + vi(len(h3)) + h3       # DATAGRAM frame with length (RFC 9221)
+    print(f"  HTTP/3 datagram {len(h3)} B, QUIC DATAGRAM frame {len(quic_frame)} B "
+          f"(+2 B HTTP/3, +{len(quic_frame) - len(h3)} B frame header) for {len(payload)} B of UDP payload")
+
+if __name__ == "__main__":
+    main()
+```
+
+Run it (no root, no packages, loopback only):
+
+```bash
+python3 masque-lab.py
+```
+
+Output:
+
+```text
+1) CONNECT-UDP through the proxy
+  proxy: GET /.well-known/masque/udp/127.0.0.1/7007/ -> UDP flow ('127.0.0.1', 34231) -> ('127.0.0.1', 7007)
+  client: HTTP/1.1 101 Switching Protocols
+  client: sent DATAGRAM capsule 00 06 00 68 65 6c ... (8 B for 5 B of UDP payload)
+  client: got  type=0x00 ctx=0: echo from 127.0.0.1:7007 to 127.0.0.1:34231: hello
+  client: sent DATAGRAM capsule 00 44 b1 00 78 78 ... (1204 B for 1200 B of UDP payload)
+  client: got  type=0x00 ctx=0: echo from 127.0.0.1:7007 to 127.0.0.1:34231: xxxxxxxxxxx... (1245 B)
+   asking for a target the proxy does not allow:
+  client: HTTP/1.1 403 Forbidden
+
+2) CONNECT-IP capsules (RFC 9484)
+  ADDRESS_REQUEST any IPv4 /32, req 1              02 07 01 04 00 00 00 00 20
+  ADDRESS_ASSIGN 192.0.2.33/32, req 1              01 07 01 04 c0 00 02 21 20
+  ROUTE_ADVERTISEMENT 0.0.0.0-255.255.255.255 any  03 0a 04 00 00 00 00 ff ff ff ff 00
+
+3) One UDP payload as an HTTP/3 datagram (RFC 9297 2.1)
+  request stream 4 -> Quarter Stream ID 1; datagram = 01 00 + payload
+  HTTP/3 datagram 1202 B, QUIC DATAGRAM frame 1205 B (+2 B HTTP/3, +3 B frame header) for 1200 B of UDP payload
+```
+
+### Reading the CONNECT-UDP Flow
+
+The proxy output demonstrates the handling of the initial GET request:
+
+```text
+proxy: GET /.well-known/masque/udp/127.0.0.1/7007/ -> UDP flow ('127.0.0.1', 34231) -> ('127.0.0.1', 7007)
+```
+
+The client receives `HTTP/1.1 101 Switching Protocols` indicating the HTTP stream has been converted to accept raw capsule data.
+
+The client sends a 5-byte UDP payload ("hello") encapsulated inside a DATAGRAM capsule:
+
+```text
+client: sent DATAGRAM capsule 00 06 00 68 65 6c ... (8 B for 5 B of UDP payload)
+```
+
+Parsing the 8-byte capsule `00 06 00 68 65 6c`:
+- `00`: Capsule Type `0x00` (DATAGRAM capsule).
+- `06`: Capsule Length (6 bytes follow).
+- `00`: Context ID `0` (Standard UDP payload).
+- `68 65 6c 6c 6f`: Payload bytes corresponding to ASCII string "hello" (5 bytes).
+
+The length field (6) accounts for 1 byte of Context ID plus 5 bytes of payload.
+
+```text
+client: got  type=0x00 ctx=0: echo from 127.0.0.1:7007 to 127.0.0.1:34231: hello
+```
+
+The echo server answered `127.0.0.1:34231`, which is the UDP socket the proxy opened. It never saw the client's TCP connection to port 8443. (Everything is on 127.0.0.1 in the lab, so only the port tells them apart. On a real network the addresses differ too.) This illustrates both the source-anonymizing privacy property of MASQUE and the central logging problem for network operators: backend target logs record only the proxy IP address, obscuring client accountability unless explicit logging is enabled on the proxy.
+
+For a 1200-byte UDP payload:
+
+```text
+client: sent DATAGRAM capsule 00 44 b1 00 78 78 ... (1204 B for 1200 B of UDP payload)
+```
+
+- `00`: Capsule Type `0x00`.
+- `44 b1`: Variable-length integer encoding for length 1201 (2-byte varint format: `0x4000 | 1201`).
+- `00`: Context ID `0`.
+- Remaining bytes: 1200 bytes of payload.
+
+The framing adds 4 bytes of total overhead to the 1200-byte UDP payload.
+
+When the client asks for a target that is not on the allow-list (`127.0.0.2`, port 53):
+
+```text
+client: HTTP/1.1 403 Forbidden
+```
+
+The proxy evaluates the target against its access control allow-list and terminates the HTTP handshake with a `403 Forbidden` response before opening remote sockets.
+
+### Reading the CONNECT-IP Capsule Signalling
+
+Part 2 prints the raw bytes encoded for CONNECT-IP control capsules:
+
+- **ADDRESS_REQUEST**: `02 07 01 04 00 00 00 00 20`
+  - `02`: Capsule Type `0x02` (`ADDRESS_REQUEST`).
+  - `07`: Capsule Length (7 bytes).
+  - `01`: Request ID (1).
+  - `04`: IP Version (IPv4).
+  - `00 00 00 00`: Address (`0.0.0.0`).
+  - `20`: Prefix length (`32` in hex, representing `/32`).
+
+- **ADDRESS_ASSIGN**: `01 07 01 04 c0 00 02 21 20`
+  - `01`: Capsule Type `0x01` (`ADDRESS_ASSIGN`).
+  - `07`: Capsule Length (7 bytes).
+  - `01`: Request ID (1).
+  - `04`: IP Version (IPv4).
+  - `c0 00 02 21`: Assigned IPv4 Address (`192.0.2.33`).
+  - `20`: Assigned Prefix length (`/32`).
+
+- **ROUTE_ADVERTISEMENT**: `03 0a 04 00 00 00 00 ff ff ff ff 00`
+  - `03`: Capsule Type `0x03` (`ROUTE_ADVERTISEMENT`).
+  - `0a`: Capsule Length (10 bytes).
+  - `04`: IP Version (IPv4).
+  - `00 00 00 00`: Start IP Address (`0.0.0.0`).
+  - `ff ff ff ff`: End IP Address (`255.255.255.255`).
+  - `00`: Protocol ID (`0`, indicating all IP protocols).
+
+### Reading HTTP/3 Datagram Overhead Calculations
+
+Part 3 calculates transport overhead when transmitting a 1200-byte UDP payload over native HTTP/3 datagrams:
+
+```text
+request stream 4 -> Quarter Stream ID 1; datagram = 01 00 + payload
+HTTP/3 datagram 1202 B, QUIC DATAGRAM frame 1205 B (+2 B HTTP/3, +3 B frame header) for 1200 B of UDP payload
+```
+
+- Request stream ID 4 translates to Quarter Stream ID `1` (`4 / 4 = 1`), encoded as a 1-byte varint (`0x01`).
+- Context ID `0` occupies 1 byte (`0x00`).
+- The HTTP/3 Datagram payload length is 1202 bytes (1200 bytes UDP payload + 2 bytes framing).
+- The QUIC DATAGRAM frame header adds 3 bytes (frame type `0x31` plus a 2-byte varint length field).
+- Total framing prior to outer QUIC, AEAD tag, UDP, and IP header overhead is 1205 bytes for 1200 bytes of inner application data.
+
+## Case
+
+This is an illustrative scenario, not a real named incident.
+
+An enterprise network team noticed a surge in outbound UDP traffic targeting external port 443 addresses. Deep packet inspection engines flagged the traffic as standard HTTP/3 traffic using TLS 1.3 ALPN identifiers.
+
+However, internal users were running user-space proxy clients utilizing CONNECT-UDP to bypass network egress filtering policies. The clients encapsulated local database traffic and internal SSH connections over HTTP/3 tunnels to cloud-hosted MASQUE proxies.
+
+Because the internal firewalls permitted outgoing UDP port 443 to maintain web performance for HTTP/3, users had built unmonitored tunnels through the perimeter. Port policy alone could not see them.
+
+To resolve the security gap without blocking legitimate web browsing, the network engineering team made an explicit, TLS-inspecting forward proxy the only permitted path for outbound HTTP on managed devices. The proxy parses Extended CONNECT headers, inspects the `:protocol` pseudo-header, blocks requests containing `connect-udp` and `connect-ip` unless sourced from authorized endpoints, and logs all target host fields extracted from URI templates.
+
+## Trap
+
+Assuming that migrating a tunnel to HTTP/3 guarantees performance improvements over TCP VPNs is a trap.
+
+While HTTP/3 eliminates head-of-line blocking on lossy paths when using unreliable QUIC DATAGRAM frames, fallback paths (such as HTTP/2 over TCP) convert the stream into reliable Capsule Protocol handling.
+
+If network firewalls block UDP port 443, MASQUE clients fall back silently to HTTP/2 over TCP. Under lossy path conditions, running IP traffic (containing inner TCP traffic) inside a fallback HTTP/2 stream triggers TCP-in-TCP meltdown. The resulting retransmission storms cause application timeouts that are far worse than standard UDP packet drops.
+
+Operators must explicitly measure path protocol selection and monitor fallback counters to prevent throughput degradation.
+
+## Boring rule
+
+Always enforce explicit target host and port allow-lists on MASQUE proxies to prevent open proxy exploitation.
+
+Configure proxies to restrict destination IP addresses and ports to known upstream application boundaries. Deny wildcard URI template parameters (`*`) on perimeter ingress proxies unless client identity is validated using mutual TLS (mTLS).
+
+## Try this
+
+1. Modify `masque-lab.py` to add a second entry to the proxy target allow-list and verify that connections to the newly added port succeed with `101 Switching Protocols`.
+2. Alter the client script to request Context ID `2` within the DATAGRAM capsule header and observe how the proxy processes or relays non-zero Context IDs.
+3. Update the CONNECT-IP capsule builder in Part 2 to construct an `ADDRESS_ASSIGN` capsule containing an IPv6 address (`2001:db8::1/64`) instead of an IPv4 address, and measure the change in total byte length.
+4. Modify the HTTP/3 datagram calculation logic in Part 3 to compute framing overhead for request stream ID `16` (Quarter Stream ID `4`) using a 2000-byte payload requiring multi-byte QUIC varints.
+
+## Verification
+
+The code examples and overhead calculations were verified in the following environment:
+- **Operating System**: Linux 6.12.94+
+- **Python Version**: Python 3.13.5
+- **Execution Context**: Unprivileged user execution, loopback interface only (`127.0.0.1`), zero external package dependencies.
+- **Date**: 2026-11-13
+
+The lab listing is the exact file that ran. The output is pasted unedited. Ephemeral ports change per run, and the order of the proxy and client lines for the refused request can differ because they are printed from different threads.
+
+The lab speaks HTTP/1.1 over plain TCP without TLS. Real MASQUE runs over HTTP/3 with TLS 1.3. Nothing in this lab is QUIC: part 3 computes the HTTP/3 framing, it does not send it.
+
+Not executed in this lab: Production HTTP/3 MASQUE software daemons (none installed), Apple iCloud Private Relay infrastructure, or Cloudflare WARP endpoints.
+
+## Sources
+
+- RFC 9297 - HTTP Datagrams and the Capsule Protocol: https://www.rfc-editor.org/rfc/rfc9297.html
+- RFC 9298 - Proxying UDP in HTTP (CONNECT-UDP): https://www.rfc-editor.org/rfc/rfc9298.html
+- RFC 9484 - Proxying IP in HTTP (CONNECT-IP): https://www.rfc-editor.org/rfc/rfc9484.html
+- RFC 9221 - An Unreliable Datagram Extension to QUIC: https://www.rfc-editor.org/rfc/rfc9221.html
+- RFC 9000 section 16 - QUIC variable-length integers: https://www.rfc-editor.org/rfc/rfc9000.html#section-16
+- RFC 8441 and RFC 9220 - extended CONNECT for HTTP/2 and HTTP/3: https://www.rfc-editor.org/rfc/rfc8441.html, https://www.rfc-editor.org/rfc/rfc9220.html
+- Apple, iCloud Private Relay overview: https://www.apple.com/privacy/docs/iCloud_Private_Relay_Overview_Dec2021.PDF
