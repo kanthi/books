@@ -1,0 +1,537 @@
+---
+title: "Link-Local Service Discovery: mDNS, DNS-SD and Why the Printer Vanishes Across VLANs"
+author:
+  - name: "K19G"
+  - name: "grok-bot"
+---
+
+# Link-Local Service Discovery: mDNS, DNS-SD and Why the Printer Vanishes Across VLANs
+
+Every network engineer eventually gets the ticket: "the printer worked yesterday, and today nobody can see it". Nothing is down. The printer answers pings. What changed is that someone moved the printer, or the laptops, into a different VLAN, and the thing that made the printer *appear* in the print dialog only ever worked on one link.
+
+That thing is Multicast DNS (mDNS, RFC 6762) carrying DNS-Based Service Discovery (DNS-SD, RFC 6763). Printers, AirPlay and Chromecast receivers, SSH and SMB servers on Linux and macOS, Home Assistant, Thread border routers and countless IoT devices announce themselves this way. It is DNS, with the same message format you already know, but sent to a link-local multicast group with no server at all. Understanding exactly where its boundaries are, and the four standard ways to stretch them, turns the printer ticket into a five-minute fix and an architecture decision instead of an afternoon of guessing.
+
+This chapter builds a minimal responder, a querier and a reflector in Python, runs them across three Linux network namespaces, and shows each rule of the protocol in a captured exchange.
+
+## Learning goals
+
+- Describe how mDNS reuses the DNS message format: group 224.0.0.251 / ff02::fb, UDP 5353, the `.local` domain, query id 0, the QU bit and the cache-flush bit.
+- Walk a DNS-SD lookup from service type to usable address: PTR browse, SRV and TXT resolution, A/AAAA lookup, and the `_services._dns-sd._udp` meta-query.
+- Explain the three ways a responder answers (multicast, unicast for QU and direct queries, legacy unicast) and the source-address and TTL rules that keep mDNS on one link.
+- Show why discovery fails across a routed boundary even with forwarding and multicast routing enabled.
+- Compare the fixes: reflectors (Avahi), the Discovery Proxy (RFC 8766), the Service Registration Protocol (RFC 9665) and plain unicast DNS-SD records in an ordinary zone, with their security trade-offs.
+
+## Version note
+
+Ran on this box as an unprivileged user: Linux **6.12.94**, iproute2 **6.15.0**, Python **3.13.5** standard library only. The topology lives inside `unshare -urnm` with three named network namespaces joined by veth pairs; there is no switch and no bridge (this kernel cannot create bridges in an unprivileged namespace), so each "VLAN" is one point-to-point link. The responder, querier and reflector are small programs written for this chapter that implement the RFC rules being demonstrated; they are not Avahi or Apple's mDNSResponder. Outputs are pasted unedited.
+
+Not run here: Avahi, systemd-resolved, nss-mdns, `avahi-browse`, `resolvectl`, and switch features such as IGMP snooping. Their configuration is shown from their documentation and marked.
+
+## mDNS is DNS without a server
+
+An mDNS message is a normal DNS message (RFC 1035 header, questions, answers, authority, additional records, name compression). What changes is the transport and a handful of reinterpreted bits:
+
+| Item | Unicast DNS | mDNS (RFC 6762) |
+|---|---|---|
+| Destination | a configured resolver | 224.0.0.251 or ff02::fb, every host on the link |
+| Port | 53 | 5353, source and destination |
+| Names | any zone | `.local.` (and link-local reverse zones) |
+| Query ID | random, matched in reply | 0 in multicast queries (section 18.1) |
+| Top bit of question class | part of class | **QU**: "unicast response preferred" (section 5.4) |
+| Top bit of record class | part of class | **cache-flush**: "this is the complete set; replace what you cached" (section 10.2) |
+| Authority | a server | every host answers for its own names; conflicts resolved by probing |
+
+224.0.0.251 sits inside 224.0.0.0/24, the IPv4 *local network control block*. Packets to that block are never forwarded by routers, with or without multicast routing, and ff02::fb has link-local scope by definition. That single fact explains most cross-VLAN failures: no amount of PIM configuration makes mDNS cross a router.
+
+Two kinds of records exist in mDNS. **Unique** records (a host's A/AAAA, an instance's SRV and TXT) belong to one responder, which probes for conflicts before using a name and sets the cache-flush bit when it announces them. **Shared** records (the PTR that lists instances of a service type) can have many owners, one per instance, so they must never carry the cache-flush bit: a responder that set it would wipe every other printer from everyone's cache.
+
+TTLs follow section 10: records whose name or data is a host name (A, AAAA, SRV) default to **120 seconds**; everything else (PTR, TXT) to **75 minutes** (4500 s). Queriers refresh records at 80 percent of their lifetime, and a responder that leaves sends a "goodbye" with TTL 0.
+
+## DNS-SD: from a service type to a socket address
+
+DNS-SD (RFC 6763) is a naming convention layered on top, and it works over unicast DNS as well as mDNS. Discovering a printer takes three steps:
+
+```text
+  1. browse    PTR  _ipp._tcp.local                    -> "Office Printer._ipp._tcp.local"
+  2. resolve   SRV  Office Printer._ipp._tcp.local     -> priority 0, weight 0, port 631, target officeprinter.local
+               TXT  Office Printer._ipp._tcp.local     -> txtvers=1  rp=ipp/print  ty=Lab Printer
+  3. address   A    officeprinter.local                -> 10.0.10.5
+```
+
+The instance name is human-readable UTF-8 (spaces allowed); the service type is `_<service>._<tcp|udp>`, registered with IANA; the TXT record carries key=value pairs the application defines (here the IPP resource path and a display name). A PTR query for `_services._dns-sd._udp.<domain>` lists every service type present. Real responders save round trips by putting the SRV, TXT and address records in the *additional* section of the PTR answer (RFC 6763 section 12); the minimal responder in this lab does not, so the client asks three times and you can see each step.
+
+## Three ways to answer, and the rules that keep mDNS local
+
+A responder decides how to reply from the query it receives:
+
+1. **Multicast** (the default): the response goes to 224.0.0.251:5353 so every cache on the link learns from it.
+2. **Unicast to port 5353**: when the question has the QU bit set (section 5.4), typically the first query after a host joins the network, or when the query was sent *directly* to the responder's unicast address (section 5.5).
+3. **Legacy unicast** (section 6.7): when the query came from a source port other than 5353, the querier is a simple resolver that does not speak full mDNS. The responder must reply by unicast to that address and port, echo the query ID and the question, clear the cache-flush bit, and should cap record TTLs at 10 seconds, because a simple resolver will not see goodbyes or cache-flush announcements.
+
+Three rules then keep the protocol on its link:
+
+- **Responses to link-local queries must come from the link.** A querier that sent to 224.0.0.251 must accept answers only from the local link (section 11). Responses addressed to the multicast group are on-link by definition; unicast responses are checked against the interface's subnets.
+- **Direct unicast queries from off-link are ignored.** A responder that receives a query at its own address from a source outside its subnets should silently drop it (section 5.5).
+- **Send everything with IP TTL 255.** All responses, multicast and unicast, should use IP TTL 255 (section 11), for compatibility with old queriers that drop anything else. Multicast TTL is set with `IP_MULTICAST_TTL`, unicast TTL with `IP_TTL`; a responder that forgets the second one sends unicast replies with the system default (127 on this box, 64 on most Linux systems).
+
+## The lab
+
+Three namespaces model a printer VLAN and a staff VLAN joined by a router:
+
+```text
+   printer VLAN 10.0.10.0/24                       staff VLAN 10.0.20.0/24
+   p: officeprinter  10.0.10.5  p0 ---- ra 10.0.10.1  r  10.0.20.1 rb ---- c0 10.0.20.7  c: laptop
+                                                (ip_forward=1)
+```
+
+"Same link" queries run from the router itself on its printer-VLAN address, since a veth link has exactly two ends. `mdns.py` is a small shared library: the DNS wire format (names, questions, records, parsing including compression pointers) and a helper that opens a multicast socket with the options the RFC asks for.
+
+```{.python filename="mdns.py"}
+"""mdns.py: just enough DNS wire format for mDNS / DNS-SD (RFC 1035, 6762, 6763). Stdlib only."""
+import socket, struct
+
+MDNS_ADDR, MDNS_PORT = "224.0.0.251", 5353
+IP_RECVTTL = getattr(socket, "IP_RECVTTL", 12)   # Linux value; Python does not export it
+TYPES = {1: "A", 12: "PTR", 16: "TXT", 33: "SRV", 255: "ANY"}
+CODES = {v: k for k, v in TYPES.items()}
+
+def enc_name(name):
+    out = b""
+    for label in name.rstrip(".").split("."):
+        out += bytes([len(label.encode())]) + label.encode()
+    return out + b"\x00"
+
+def dec_name(msg, i):
+    labels, jumped, end = [], False, None
+    while True:
+        n = msg[i]
+        if n & 0xC0 == 0xC0:                       # compression pointer
+            if not jumped:
+                end = i + 2
+            i, jumped = ((n & 0x3F) << 8) | msg[i + 1], True
+            continue
+        if n == 0:
+            return ".".join(labels), (end if jumped else i + 1)
+        labels.append(msg[i + 1:i + 1 + n].decode()); i += 1 + n
+
+def query(qid, questions, unicast_response=False):
+    """questions: [(name, type)]. QU bit = top bit of QCLASS (RFC 6762 section 5.4)."""
+    out = struct.pack("!HHHHHH", qid, 0, len(questions), 0, 0, 0)
+    for name, qtype in questions:
+        out += enc_name(name) + struct.pack("!HH", CODES[qtype], 0x8001 if unicast_response else 1)
+    return out
+
+def rr(name, rtype, ttl, rdata, cache_flush):
+    cls = 0x8001 if cache_flush else 1             # cache-flush bit (RFC 6762 section 10.2)
+    return enc_name(name) + struct.pack("!HHIH", CODES[rtype], cls, ttl, len(rdata)) + rdata
+
+def response(qid, answers, questions=()):
+    out = struct.pack("!HHHHHH", qid, 0x8400, len(questions), len(answers), 0, 0)  # QR=1, AA=1
+    for name, qtype in questions:
+        out += enc_name(name) + struct.pack("!HH", CODES[qtype], 1)
+    return out + b"".join(answers)
+
+def parse(msg):
+    qid, flags, qd, an, ns, ar = struct.unpack("!HHHHHH", msg[:12])
+    i, qs, rrs = 12, [], []
+    for _ in range(qd):
+        name, i = dec_name(msg, i)
+        qtype, qclass = struct.unpack("!HH", msg[i:i + 4]); i += 4
+        qs.append((name, TYPES.get(qtype, qtype), bool(qclass & 0x8000)))
+    for _ in range(an + ns + ar):
+        name, i = dec_name(msg, i)
+        rtype, rclass, ttl, rdlen = struct.unpack("!HHIH", msg[i:i + 10]); i += 10
+        rd = msg[i:i + rdlen]
+        t = TYPES.get(rtype, rtype)
+        if t == "A":
+            val = socket.inet_ntoa(rd)
+        elif t == "PTR":
+            val = dec_name(msg, i)[0]
+        elif t == "SRV":
+            pri, w, port = struct.unpack("!HHH", rd[:6]); val = f"{pri} {w} {port} {dec_name(msg, i + 6)[0]}"
+        elif t == "TXT":
+            parts, j = [], 0
+            while j < len(rd):
+                parts.append(rd[j + 1:j + 1 + rd[j]].decode()); j += 1 + rd[j]
+            val = " ".join(parts)
+        else:
+            val = rd.hex()
+        rrs.append((name, t, ttl, bool(rclass & 0x8000), val)); i += rdlen
+    return qid, flags, qs, rrs
+
+def mcast_socket(iface_addrs, bind_port=MDNS_PORT):
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s.bind(("0.0.0.0", bind_port))
+    for a in iface_addrs:
+        s.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP,
+                     socket.inet_aton(MDNS_ADDR) + socket.inet_aton(a))
+    s.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 255)   # RFC 6762 section 11:
+    s.setsockopt(socket.IPPROTO_IP, socket.IP_TTL, 255)             # TTL 255 for unicast too
+    s.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_LOOP, 0)
+    s.setsockopt(socket.IPPROTO_IP, IP_RECVTTL, 1)
+    s.setsockopt(socket.IPPROTO_IP, socket.IP_PKTINFO, 1)
+    return s
+```
+
+`responder.py` answers for one IPP printer. It follows the rules above: off-link direct queries are ignored, legacy queries get a legacy unicast answer with TTLs capped at 10 seconds and no cache-flush bit, QU and direct queries get a unicast answer, and everything else gets a multicast answer. The TTLs are the RFC 6762 defaults.
+
+```{.python filename="responder.py"}
+#!/usr/bin/env python3
+"""responder.py IFACE_ADDR PREFIXLEN: answer mDNS / DNS-SD queries for one IPP printer."""
+import ipaddress, socket, struct, sys, time
+from mdns import *
+
+addr, plen = sys.argv[1], int(sys.argv[2])
+link = ipaddress.ip_network(f"{addr}/{plen}", strict=False)
+HOST, SVC = "officeprinter.local", "_ipp._tcp.local"
+INST = f"Office Printer.{SVC}"
+txt = b"".join(bytes([len(x)]) + x for x in (b"txtvers=1", b"rp=ipp/print", b"ty=Lab Printer"))
+RECORDS = {   # name -> [(type, ttl, rdata, cache_flush)]; TTLs are RFC 6762 section 10 defaults
+    SVC: [("PTR", 4500, enc_name(INST), False)],                       # shared record
+    INST: [("SRV", 120, struct.pack("!HHH", 0, 0, 631) + enc_name(HOST), True),
+           ("TXT", 4500, txt, True)],
+    HOST: [("A", 120, socket.inet_aton(addr), True)],
+    "_services._dns-sd._udp.local": [("PTR", 4500, enc_name(SVC), False)],
+}
+s = mcast_socket([addr])
+s.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF, socket.inet_aton(addr))
+while True:
+    msg, anc, _, (src, sport) = s.recvmsg(9000, 256)
+    qid, flags, qs, _ = parse(msg)
+    if flags & 0x8000:
+        continue                                                      # a response, not a query
+    dst = next(socket.inet_ntoa(c[2][8:12]) for c in anc if c[1] == socket.IP_PKTINFO)
+    direct = dst != MDNS_ADDR                                         # sent to our unicast address
+    if direct and ipaddress.ip_address(src) not in link:              # RFC 6762 section 5.5
+        print(f"   responder: ignored direct unicast query from off-link {src}:{sport}", flush=True)
+        continue
+    legacy = sport != MDNS_PORT                                       # RFC 6762 section 6.7
+    answers = []
+    for name, qtype, qu in qs:
+        for rtype, ttl, rdata, flush in RECORDS.get(name, []):
+            if qtype in (rtype, "ANY"):
+                answers.append(rr(name, rtype, min(ttl, 10) if legacy else ttl, rdata,
+                                  flush and not legacy))
+    if not answers:
+        continue
+    if legacy:
+        s.sendto(response(qid, answers, [(n, t) for n, t, _ in qs]), (src, sport))
+        print(f"   responder: legacy unicast answer to {src}:{sport} (id {qid})", flush=True)
+    elif direct or any(qu for _, _, qu in qs):
+        s.sendto(response(0, answers), (src, sport))
+        print(f"   responder: {'direct' if direct else 'QU'} query, unicast answer to {src}:{sport}", flush=True)
+    else:
+        s.sendto(response(0, answers), (MDNS_ADDR, MDNS_PORT))
+        print(f"   responder: multicast answer to {MDNS_ADDR} for {src}", flush=True)
+```
+
+`browse.py` sends one question and prints every response that arrives within a second, including the IP TTL of the packet (read with `IP_RECVTTL`) and the query ID.
+
+```{.python filename="browse.py"}
+#!/usr/bin/env python3
+"""browse.py IFACE_ADDR [--legacy] [--qu] [--to ADDR] NAME TYPE: one mDNS question, print what comes back."""
+import socket, sys, time
+from mdns import *
+
+args = sys.argv[1:]
+iface = args.pop(0)
+legacy, qu, to = "--legacy" in args, "--qu" in args, MDNS_ADDR
+if "--to" in args:
+    to = args[args.index("--to") + 1]; del args[args.index("--to"):args.index("--to") + 2]
+args = [a for a in args if not a.startswith("--")]
+name, qtype = args
+if legacy:                                            # ephemeral port, plain socket
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.bind((iface, 0)); s.setsockopt(socket.IPPROTO_IP, IP_RECVTTL, 1)
+    s.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF, socket.inet_aton(iface))
+else:
+    s = mcast_socket([iface])
+    s.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF, socket.inet_aton(iface))
+qid = 4242 if legacy else 0                           # mDNS queries use id 0 (section 18.1)
+s.sendto(query(qid, [(name, qtype)], unicast_response=qu), (to, MDNS_PORT))
+s.settimeout(1.0); got = 0
+try:
+    while True:
+        msg, anc, _, (src, sport) = s.recvmsg(9000, 256)
+        ttl = next((c[2][0] for c in anc if c[1] == socket.IP_TTL), None)
+        rid, flags, _, rrs = parse(msg)
+        if not flags & 0x8000:
+            continue
+        got += 1
+        print(f"   from {src}:{sport}  IP TTL {ttl}  id {rid}")
+        for n, t, rttl, flush, val in rrs:
+            print(f"      {n:<32} {t:<4} ttl={rttl:<5}{' cache-flush' if flush else ''}  {val}")
+except socket.timeout:
+    pass
+if not got:
+    print("   no answer within 1 s")
+```
+
+`reflector.py` does what Avahi's `enable-reflector` does: it listens on both links and re-sends every mDNS packet it hears on one link onto the other, from its own address.
+
+```{.python filename="reflector.py"}
+#!/usr/bin/env python3
+"""reflector.py ADDR_A ADDR_B: repeat mDNS packets between two links (what avahi's enable-reflector does)."""
+import socket, sys
+from mdns import *
+
+a, b = sys.argv[1], sys.argv[2]
+rx = mcast_socket([a, b])
+tx = {}
+for mine in (a, b):
+    t = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    t.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    t.bind((mine, MDNS_PORT))
+    t.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF, socket.inet_aton(mine))
+    t.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 255)
+    t.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_LOOP, 0)
+    tx[mine] = t
+while True:
+    msg, anc, _, (src, sport) = rx.recvmsg(9000, 256)
+    if src in (a, b) or sport != MDNS_PORT:
+        continue                                      # our own echo, or a legacy query we cannot relay
+    ifaddr = next(socket.inet_ntoa(c[2][4:8]) for c in anc if c[1] == socket.IP_PKTINFO)
+    out = b if ifaddr == a else a                     # in_pktinfo.ipi_spec_dst = address on ingress link
+    tx[out].sendto(msg, (MDNS_ADDR, MDNS_PORT))
+    print(f"   reflector: {src} on {ifaddr} -> re-sent from {out}", flush=True)
+```
+
+The driver script:
+
+```{.bash filename="lab.sh"}
+#!/bin/sh
+# Run as: unshare -urnm sh lab.sh   (user + net + mount namespaces, no sudo)
+H=$(pwd); cd $H
+mount -t tmpfs tmpfs /run; mkdir -p /run/netns
+for ns in p r c; do ip netns add $ns; ip -n $ns link set lo up; done
+ip link add p0 type veth peer name ra; ip link set p0 netns p; ip link set ra netns r
+ip link add rb type veth peer name c0; ip link set rb netns r; ip link set c0 netns c
+ip -n p addr add 10.0.10.5/24 dev p0; ip -n r addr add 10.0.10.1/24 dev ra    # printer VLAN
+ip -n r addr add 10.0.20.1/24 dev rb; ip -n c addr add 10.0.20.7/24 dev c0    # staff VLAN
+for d in p:p0 r:ra r:rb c:c0; do ip -n ${d%:*} link set ${d#*:} up; done
+ip netns exec r sh -c 'echo 1 > /proc/sys/net/ipv4/ip_forward'
+ip -n p route add default via 10.0.10.1; ip -n c route add default via 10.0.20.1
+sleep 1
+ip netns exec p python3 responder.py 10.0.10.5 24 & RP=$!; sleep 0.5
+
+echo "== 1. same link: browse for IPP printers (PTR), then resolve the instance (SRV/TXT) and host (A)"
+ip netns exec r python3 browse.py 10.0.10.1 _ipp._tcp.local PTR
+ip netns exec r python3 browse.py 10.0.10.1 "Office Printer._ipp._tcp.local" ANY
+ip netns exec r python3 browse.py 10.0.10.1 officeprinter.local A
+
+echo "== 2. same link, legacy one-shot query from an ephemeral port (what a plain DNS stub does)"
+ip netns exec r python3 browse.py 10.0.10.1 --legacy officeprinter.local A
+
+echo "== 3. same link, QU (unicast-response) question"
+ip netns exec r python3 browse.py 10.0.10.1 --qu officeprinter.local A
+
+echo "== 4. other VLAN: multicast query from the staff VLAN, router forwarding on"
+ip netns exec c python3 browse.py 10.0.20.7 officeprinter.local A
+ip -n r -s mroute show 2>&1 | head -3 | sed 's/^/   r mroute: /'
+
+echo "== 5. other VLAN: unicast the query straight at the printer (routed, so it arrives)"
+ip netns exec c python3 browse.py 10.0.20.7 --to 10.0.10.5 officeprinter.local A
+
+echo "== 6. reflector on the router, then the staff VLAN browses again"
+ip netns exec r python3 reflector.py 10.0.10.1 10.0.20.1 & RF=$!; sleep 0.5
+ip netns exec c python3 browse.py 10.0.20.7 _ipp._tcp.local PTR
+sleep 0.3
+kill $RF $RP
+```
+
+```bash
+unshare -urnm sh lab.sh
+```
+
+### 1. Same link: browse, resolve, address
+
+```text
+== 1. same link: browse for IPP printers (PTR), then resolve the instance (SRV/TXT) and host (A)
+   responder: multicast answer to 224.0.0.251 for 10.0.10.1
+   from 10.0.10.5:5353  IP TTL 255  id 0
+      _ipp._tcp.local                  PTR  ttl=4500   Office Printer._ipp._tcp.local
+   responder: multicast answer to 224.0.0.251 for 10.0.10.1
+   from 10.0.10.5:5353  IP TTL 255  id 0
+      Office Printer._ipp._tcp.local   SRV  ttl=120   cache-flush  0 0 631 officeprinter.local
+      Office Printer._ipp._tcp.local   TXT  ttl=4500  cache-flush  txtvers=1 rp=ipp/print ty=Lab Printer
+   responder: multicast answer to 224.0.0.251 for 10.0.10.1
+   from 10.0.10.5:5353  IP TTL 255  id 0
+      officeprinter.local              A    ttl=120   cache-flush  10.0.10.5
+```
+
+Three questions, three multicast answers, each from 10.0.10.5:5353 with IP TTL 255 and query ID 0. The PTR record (shared) has TTL 4500 and no cache-flush bit. The SRV and A records (host-name records) have TTL 120 and the cache-flush bit; the TXT record has the long TTL and the cache-flush bit, because it is unique to this instance. The SRV data `0 0 631 officeprinter.local` is priority, weight, port, target: everything an IPP client needs, plus the TXT path `rp=ipp/print`.
+
+### 2. A plain DNS client asks
+
+```text
+== 2. same link, legacy one-shot query from an ephemeral port (what a plain DNS stub does)
+   responder: legacy unicast answer to 10.0.10.1:40467 (id 4242)
+   from 10.0.10.5:5353  IP TTL 255  id 4242
+      officeprinter.local              A    ttl=10     10.0.10.5
+```
+
+This query came from an ephemeral port, as a stub resolver pointed at 224.0.0.251:5353 would send it. The responder recognised a legacy query and answered exactly as section 6.7 requires: unicast to 10.0.10.1 on the querier's port, the query ID 4242 echoed, TTL cut from 120 to 10 seconds, and no cache-flush bit. The IP TTL is still 255 because the responder sets `IP_TTL` as well as `IP_MULTICAST_TTL`.
+
+### 3. A QU question
+
+```text
+== 3. same link, QU (unicast-response) question
+   responder: QU query, unicast answer to 10.0.10.1:5353
+   from 10.0.10.5:5353  IP TTL 255  id 0
+      officeprinter.local              A    ttl=120   cache-flush  10.0.10.5
+```
+
+With the QU bit set, the reply comes by unicast to port 5353. The records are ordinary mDNS records (full TTL, cache-flush set), because the querier is a full mDNS implementation that just asked not to wake up the whole link. Hosts typically set QU on the first query after joining a network, then switch to normal multicast queries so that other caches benefit.
+
+### 4. The staff VLAN asks by multicast
+
+```text
+== 4. other VLAN: multicast query from the staff VLAN, router forwarding on
+   no answer within 1 s
+```
+
+The laptop on 10.0.20.0/24 sends the same query to 224.0.0.251. The router has forwarding enabled, but it does not forward packets addressed to 224.0.0.0/24, and it has no multicast routing state (`ip mroute` printed nothing). The query never reaches the printer VLAN. This is the printer ticket.
+
+### 5. The staff VLAN asks by unicast
+
+```text
+== 5. other VLAN: unicast the query straight at the printer (routed, so it arrives)
+   responder: ignored direct unicast query from off-link 10.0.20.7:5353
+   no answer within 1 s
+```
+
+A workaround people try is to send the mDNS query straight to the printer's address. Routing delivers it, so the packet arrives, and the responder drops it on purpose: a direct unicast query from a source outside its subnet must be ignored (section 5.5). Many real devices behave this way, and those that do not are the ones that end up answering mDNS queries from the whole Internet when exposed (an amplification and information-leak vector that has been abused).
+
+### 6. A reflector on the router
+
+```text
+== 6. reflector on the router, then the staff VLAN browses again
+   reflector: 10.0.20.7 on 10.0.20.1 -> re-sent from 10.0.10.1
+   responder: multicast answer to 224.0.0.251 for 10.0.10.1
+   reflector: 10.0.10.5 on 10.0.10.1 -> re-sent from 10.0.20.1
+   from 10.0.20.1:5353  IP TTL 255  id 0
+      _ipp._tcp.local                  PTR  ttl=4500   Office Printer._ipp._tcp.local
+```
+
+With the reflector running, the laptop's query is heard on 10.0.20.1 and re-sent from 10.0.10.1 into the printer VLAN. The printer sees an on-link source and answers by multicast; the reflector hears the answer and re-sends it from 10.0.20.1 into the staff VLAN. The laptop accepts it, because a response to the multicast group is on-link by definition, even though its source is the router rather than the printer. The SRV and A records still name the printer and 10.0.10.5, so the actual print job is ordinary routed unicast traffic.
+
+## Reading the results
+
+The six runs together show the whole boundary:
+
+- mDNS discovery is confined to one link by design: multicast to 224.0.0.0/24 is never routed (run 4) and off-link unicast queries are ignored (run 5).
+- Once discovery has produced a host name and a port, the service itself is plain unicast and crosses routers normally. Only the *finding* is local.
+- A reflector extends discovery by making the router a participant on both links (run 6). It works because it rewrites the problem, not the rules: every packet it sends is on-link from the receiver's point of view.
+
+## Fixing cross-VLAN discovery
+
+There are four standard approaches. They differ in where the state lives and how much of the link they expose.
+
+| Approach | How it works | Strengths | Costs and risks |
+|---|---|---|---|
+| Reflector / repeater (Avahi `enable-reflector`, many Wi-Fi controllers' "mDNS gateway") | re-sends mDNS packets between chosen links | zero client change, works with every device | multicast load on every reflected link grows with all of them; breaks the isolation the VLANs were for (guest and IoT devices see staff services and vice versa); two reflectors can loop; no policy unless filtered |
+| Discovery Proxy (RFC 8766) | a proxy on each link answers *unicast* DNS queries for a per-link subdomain by doing mDNS on that link | clients use ordinary DNS-SD over unicast; queries are answered on demand, not flooded | needs clients configured with browse domains (via DNS `b._dns-sd._udp` / `lb._dns-sd._udp` records or DHCP) and a proxy implementation |
+| Service Registration Protocol (RFC 9665) | devices register their services with a unicast DNS server using authenticated DNS updates | no multicast at all; used by Thread and Matter; scales to large networks | devices must support SRP; needs an SRP server (often on a border router) |
+| Static unicast DNS-SD records | publish PTR/SRV/TXT records for the printers in a normal zone, plus browse-domain records | simple, auditable, works across any routed network | manual or tooling-driven maintenance; clients must have the domain in their search/browse configuration |
+
+For enterprise printers, static unicast DNS-SD records in the site's normal zone are often the cleanest fix: printers rarely move, the records are reviewable, and nothing floods. For homes and small offices with many consumer devices, a filtered reflector is the pragmatic choice. For IoT, SRP is where the industry is going.
+
+## Configuration you would use (not run here)
+
+**Avahi reflector with a filter** (not run here: written from `avahi-daemon.conf(5)`). Reflect only between the named interfaces and only the listed service types:
+
+```text
+# /etc/avahi/avahi-daemon.conf (excerpt)
+[server]
+allow-interfaces=vlan10,vlan20
+
+[reflector]
+enable-reflector=yes
+reflect-ipv=no
+reflect-filters=_ipp._tcp.local,_printer._tcp.local
+```
+
+`reflect-filters` lists the service names (or host names) allowed through; by default everything is reflected. Avahi must be the only mDNS responder bound to port 5353 on those interfaces.
+
+**systemd-resolved as an mDNS resolver and responder** (not run here):
+
+```text
+# /etc/systemd/resolved.conf
+[Resolve]
+MulticastDNS=yes
+```
+
+```bash
+# per link, if the network manager does not set it (not run here)
+resolvectl mdns eth0 yes
+resolvectl query officeprinter.local
+```
+
+**nss-mdns for `.local` lookups in glibc programs** (not run here): the `hosts:` line in `/etc/nsswitch.conf` gains `mdns4_minimal [NOTFOUND=return]` before `dns`, so `.local` names are resolved by mDNS and never leak to the unicast resolver.
+
+**Inspecting what is on the link** (not run here):
+
+```bash
+avahi-browse -art                    # every service type and instance, resolved
+avahi-resolve -n officeprinter.local
+tcpdump -ni eth0 udp port 5353       # watch queries and answers
+```
+
+**Unicast DNS-SD records in a normal zone** (not run here; zone file excerpt):
+
+```text
+b._dns-sd._udp.example.net.          PTR  example.net.
+lb._dns-sd._udp.example.net.         PTR  example.net.
+_ipp._tcp.example.net.               PTR  Office\032Printer._ipp._tcp.example.net.
+Office\032Printer._ipp._tcp.example.net. SRV 0 0 631 officeprinter.example.net.
+Office\032Printer._ipp._tcp.example.net. TXT "txtvers=1" "rp=ipp/print"
+officeprinter.example.net.           A    10.0.10.5
+```
+
+**Firewalls.** Allow UDP 5353 to and from 224.0.0.251 (and ff02::fb) on the links where discovery should work, and block it at the edge: mDNS has no business on a WAN interface.
+
+## LLMNR, the cousin
+
+Windows also uses Link-Local Multicast Name Resolution (LLMNR, RFC 4795, UDP 5355, 224.0.0.252 and ff02::1:3) for single-label names. It resolves names only, with no service discovery, and it is a favourite of credential-relay attacks on Windows networks, because any host on the link can answer a mistyped name. Microsoft now recommends mDNS over LLMNR, and many hardening guides disable LLMNR outright. If you see UDP 5355 in a capture, that is what it is.
+
+## Gotchas
+
+1. **224.0.0.0/24 is never routed.** No PIM, IGMP or `ip mroute` setting makes mDNS cross a router. The fix is always a proxy, a reflector or unicast DNS-SD.
+2. **IGMP snooping without a querier.** Switches that snoop IGMP but have no querier on the VLAN can age out group memberships and stop delivering multicast, including 224.0.0.251 on some platforms. If mDNS works for a few minutes after a device boots and then fades, check snooping and the querier.
+3. **Reflectors erase VLAN boundaries.** The guest VLAN can now see and print to staff printers, and IoT devices can see laptops. Use `reflect-filters` or a controller policy, and never reflect into untrusted segments by default.
+4. **Two reflectors make a loop.** Packets re-sent by one reflector are heard and re-sent by the other. Run exactly one per set of links, or use a product with loop detection.
+5. **Unicast replies need IP TTL 255 too.** `IP_MULTICAST_TTL` does not affect unicast; set `IP_TTL` as well, or old queriers will drop QU and legacy responses.
+6. **Exposed responders answer the Internet.** A device that answers direct unicast queries from any source leaks its names and services and can be used for amplification. Filter UDP 5353 at the edge.
+7. **`.local` in unicast DNS breaks things.** Organisations that use `.local` as an internal unicast domain (an old Active Directory habit) collide with mDNS: hosts with nss-mdns stop at mDNS and never ask the DNS server. Use a domain you own, or a subdomain of one.
+8. **Wi-Fi turns multicast into a tax.** On Wi-Fi, multicast is sent at a low basic rate to all stations, so chatty mDNS (and especially a reflector feeding many VLANs into one SSID) costs airtime for everyone. Controllers' mDNS gateways exist mainly for this reason.
+
+## Exercises
+
+1. **Additional records.** Change `responder.py` so a PTR answer also carries the instance's SRV and TXT and the host's A record in the additional section, then change `browse.py` to print the additional section. How many queries does a full lookup take now?
+2. **Goodbye.** Add a `--goodbye` mode to the responder that, on exit, multicasts its records with TTL 0. Extend `browse.py` to keep listening for 5 seconds and print the goodbye.
+3. **Strict querier.** Make `browse.py` reject unicast responses whose source address is not in the querying interface's subnet (section 11). Which of the six scenarios change, and why does scenario 6 still work?
+4. **A filtered reflector.** Add a filter to `reflector.py` that relays only questions and answers whose names end in `_ipp._tcp.local` or match the printer's host name. Test it with a query for `_ssh._tcp.local` from the staff VLAN.
+5. **Count the multicast cost.** With the reflector running, generate 100 queries from the staff VLAN and use `ip -s link` on both router interfaces to count packets in and out. Predict the numbers for three, then ten reflected VLANs.
+6. **Design exercise.** A school has 40 classroom VLANs and wants teachers' laptops to cast to the classroom display only in their own room. Compare a reflector, a Discovery Proxy and static unicast DNS-SD records for this, and pick one.
+
+## Verification
+
+- Ran on this box, unprivileged: `unshare -urnm sh lab.sh` with `mdns.py`, `responder.py`, `browse.py` and `reflector.py`. All six scenario outputs are pasted verbatim.
+- RFC 6762 behaviours (query ID 0, QU bit, cache-flush rules, legacy unicast with TTL at most 10 s, direct unicast source check, IP TTL 255, 120 s and 75 min TTLs) were checked against the RFC text; DNS-SD naming and browse domains against RFC 6763; the Avahi `reflect-filters` option against the `avahi-daemon.conf(5)` source.
+- Not run here: Avahi, systemd-resolved, nss-mdns, `avahi-browse`, `resolvectl`, `tcpdump`, the zone excerpt, switch IGMP snooping behaviour, and IPv6 (ff02::fb) discovery.
+
+## Sources
+
+- RFC 6762, Multicast DNS. <https://www.rfc-editor.org/rfc/rfc6762>
+- RFC 6763, DNS-Based Service Discovery. <https://www.rfc-editor.org/rfc/rfc6763>
+- RFC 8766, Discovery Proxy for Multicast DNS-Based Service Discovery. <https://www.rfc-editor.org/rfc/rfc8766>
+- RFC 9665, Service Registration Protocol for DNS-Based Service Discovery. <https://www.rfc-editor.org/rfc/rfc9665>
+- RFC 4795, Link-Local Multicast Name Resolution (LLMNR). <https://www.rfc-editor.org/rfc/rfc4795>
+- RFC 5771, IANA Guidelines for IPv4 Multicast Address Assignments (224.0.0.0/24 local network control block). <https://www.rfc-editor.org/rfc/rfc5771>
+- RFC 1035, Domain Names: Implementation and Specification. <https://www.rfc-editor.org/rfc/rfc1035>
+- IANA Service Name and Transport Protocol Port Number Registry. <https://www.iana.org/assignments/service-names-port-numbers/>
+- `avahi-daemon.conf(5)`. <https://github.com/avahi/avahi/blob/master/man/avahi-daemon.conf.5.xml.in>
+- `resolved.conf(5)` and `resolvectl(1)`, systemd. <https://www.freedesktop.org/software/systemd/man/latest/resolved.conf.html>
+- nss-mdns README. <https://github.com/avahi/nss-mdns>
+- `ip(7)` socket options (`IP_TTL`, `IP_MULTICAST_TTL`, `IP_RECVTTL`, `IP_PKTINFO`). <https://man7.org/linux/man-pages/man7/ip.7.html>
