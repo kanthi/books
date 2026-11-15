@@ -1,0 +1,596 @@
+---
+title: "DNS Rebinding: How a Web Page Reaches Your LAN, and the Three Places to Stop It"
+author:
+  - name: "K19G"
+  - name: "grok-bot"
+---
+
+# DNS Rebinding: How a Web Page Reaches Your LAN, and the Three Places to Stop It
+
+Web browsers enforce the Same-Origin Policy to isolate web applications from one another. Under the Same-Origin Policy, a script loaded from one origin can only read responses from another resource if both share the exact same scheme, host name, and port. The Same-Origin Policy evaluates the host name string rather than the underlying IP address to which that host name resolves. If an attacker controls the authoritative DNS server for a domain name such as `rebind.test`, they can manipulate the IP addresses returned over time. A victim visiting `http://rebind.test:8080` loads an HTML page with JavaScript. When the DNS record's Time To Live (TTL) expires, the attacker's DNS server changes the record to point to a private LAN or loopback IP address. The victim browser's subsequent request to `http://rebind.test:8080/api/config` maintains the same scheme, host name, and port, rendering it same-origin in the eyes of the browser. The browser allows the script to read the HTTP response body containing sensitive local data.
+
+Because the request carries `Host: rebind.test:8080` and carries no cookies for the target service, DNS rebinding bypasses standard boundary defenses. It targets services that trust requests simply because they originate from the internal network or loopback interface rather than enforcing explicit authentication. Common targets include router administration interfaces, Network Attached Storage (NAS) devices, printers, IoT appliances, local development servers, local AI model servers listening on localhost, and internal container management dashboards such as Kubernetes or Docker endpoints.
+
+Understanding and defending against DNS rebinding requires analyzing how DNS resolution interacts with browser origin checks and socket connections across the three locations where mitigation can be implemented: the DNS resolver, the HTTP service, and the web browser itself. For foundational DNS query structures and authoritative resolution mechanics, see [DNS Authoritative and Recursive](05-dns-authoritative-and-recursive.qmd).
+
+## Learning goals
+
+- Explain why the Same-Origin Policy's reliance on host names instead of IP addresses enables DNS rebinding attacks.
+- Differentiate between time-varying DNS answers and multiple A record fallback strategies for exploiting client socket behavior.
+- Configure local recursive DNS resolvers (dnsmasq and Unbound) to filter public domain responses that resolve to private, loopback, link-local, or unspecified address ranges.
+- Implement HTTP Host header validation and explicit binding controls on local web services to reject misdirected requests.
+- Identify browser-level defense mechanisms, including Chrome's Local Network Access rules and the security implications of the `0.0.0.0` IP address on Unix-like operating systems.
+- Identify IPv6-specific DNS rebinding vectors, including Unique Local Addresses (ULA), link-local scopes, and IPv4-mapped IPv6 addresses.
+
+## Version note
+
+The concepts and lab demonstrations in this chapter run on Linux 6.12 with iproute2 version 6.15.0 and Python 3.13 standard library. The network environment is executed unprivileged inside Linux user, network, and mount namespaces (`unshare -urnm`). Real-daemon configuration snippets for dnsmasq and Unbound illustrate production syntax; these binaries are not installed in the execution environment.
+
+## Rebinding strategies and mechanics
+
+DNS rebinding attacks generally rely on one of two methods to redirect a client's HTTP connection from an attacker-controlled public server to an internal private target.
+
+### Time-varying answers
+
+In a time-varying DNS rebinding attack, the authoritative DNS server responds to an initial query with a short TTL (typically 1 second) pointing to the attacker's public IP address. The victim's browser resolves the name, connects to the public IP address, and downloads the malicious payload. Once the TTL expires, the script running in the browser makes a secondary request (`fetch('/api/config')`). The browser issues a new DNS query to the resolver. The authoritative server returns the internal IP address of the target LAN device.
+
+```text
+browser (10.0.0.2)      resolver (10.0.0.1)      attacker DNS / web       LAN service (10.0.0.5)
+      |  1. A? rebind.test   |                          |                          |
+      |--------------------->|  2. A? rebind.test       |                          |
+      |                      |------------------------->|                          |
+      |                      |  3. A 203.0.113.80 TTL 1 |                          |
+      |  4. A 203.0.113.80   |<-------------------------|                          |
+      |<---------------------|                          |                          |
+      |  5. GET /  Host: rebind.test:8080               |                          |
+      |------------------------------------------------>| (203.0.113.80)           |
+      |  6. 200 OK, page with script                    |                          |
+      |<------------------------------------------------|                          |
+      |        ... TTL runs out ...                     |                          |
+      |  7. A? rebind.test   |  8. A? rebind.test       |                          |
+      |--------------------->|------------------------->|                          |
+      |                      |  9. A 10.0.0.5 TTL 1     |                          |
+      |  10. A 10.0.0.5      |<-------------------------|                          |
+      |<---------------------|                          |                          |
+      |  11. GET /api/config  Host: rebind.test:8080                               |
+      |--------------------------------------------------------------------------->|
+      |  12. 200 OK, secret JSON (same origin, so the script can read it)          |
+      |<---------------------------------------------------------------------------|
+```
+
+Real browsers keep their own host cache and often hold an answer for about a minute even when the record says TTL 1. Attack tools get around this by waiting the cache out or by flooding it with lookups for other names. The lab's client re-resolves on every request, which is a simplification that makes the flip happen in two seconds. Known security tools such as NCC Group's Singularity of Origin implement these automated strategies.
+
+### Multiple A records and socket fallback
+
+The second technique provides both the public IP address and the internal target IP address in a single DNS response containing multiple A records. When the browser receives the answer containing both `203.0.113.80` and `10.0.0.5`, it attempts to establish a TCP connection to the first address (`203.0.113.80`) to load the initial web page.
+
+After the page has loaded, the attacker stops the web server at `203.0.113.80` or drops incoming connections via firewall rules. When the malicious script subsequently triggers a secondary fetch request, the browser attempts to connect to `203.0.113.80`. Because the connection fails or times out, the browser's networking stack automatically falls back to the second IP address in the cached A record list (`10.0.0.5`). The fetch request succeeds against the internal LAN service under the original `rebind.test` origin context.
+
+## Three places to defend
+
+Defending against DNS rebinding requires intervention at one or more layers of the network architecture.
+
+| Layer | Defense Mechanism | Primary Action | Limitations |
+| :--- | :--- | :--- | :--- |
+| **1. Resolver** | Response Filtering | Drops or rewrites DNS answers mapping public domains to private/loopback IP spaces. | Bypassed if client uses DNS-over-HTTPS (DoH) to external resolvers; does not protect internal services assigned public IP addresses. |
+| **2. Service** | Host Header Validation & Auth | Validates incoming `Host` headers against explicit allowlists; requires TLS and authentication. | Requires administrative access and code or configuration updates across all internal services. |
+| **3. Browser** | Local Network Access (LNA) | Prompts user or blocks requests originating from public contexts targeting private/loopback IPs. | Controlled entirely by user-agent updates and specific browser vendor implementations. |
+
+### Defense 1: Recursive DNS resolver filtering
+
+A recursive DNS resolver situated at the network perimeter or on a local gateway can inspect incoming DNS answers from upstream authoritative servers. If a query for an external domain returns an IP address belonging to RFC 1918 private space, loopback ranges, or link-local allocations, the resolver discards or alters the response.
+
+```
+                  Public Authoritative DNS
+                             |
+                             | Response: A 10.0.0.5
+                             v
+                  +----------------------+
+                  |  Recursive Resolver  |
+                  |  (dnsmasq / Unbound) |
+                  +----------------------+
+                             |
+         Is name on local exception list? (e.g. *.home.arpa)
+                       /           \
+                 YES  /             \ NO
+                     v               v
+            Allow Response       Drop / Refuse / NXDOMAIN
+                                 Log: "possible DNS-rebind..."
+```
+
+Standard DNS implementations provide native configuration directives for rebind protection:
+
+- **dnsmasq**: The `--stop-dns-rebind` option rejects and logs responses from upstream servers that resolve to private IPv4 or IPv6 ranges. The `--rebind-localhost-ok` flag permits `127.0.0.0/8` and `::1` responses (commonly required for local blocklists), while `--rebind-domain-ok=/home.arpa/` explicitly exempts trusted local domains.
+- **Unbound**: The `private-address:` directive defines IP networks that must not appear in public DNS answers. Unbound strips matching `A`, `AAAA`, `SVCB`, and `HTTPS` records, as well as `ipv4hint` and `ipv6hint` attributes. Explicit exceptions are declared using `private-domain:`. Unbound does not enable private address filtering by default. The `unbound.conf` man page notes that administrators must explicitly add `::ffff:0:0/96` to prevent IPv4-mapped IPv6 bypasses.
+
+### Defense 2: Service-level Host header validation and TLS
+
+Internal web applications must not implicitly trust requests based on network interface binding or IP origin. Applications should enforce strict checks on the HTTP `Host` header, comparing the incoming value against an explicit allowlist of expected hostnames and IP addresses. 
+
+If a request contains an unrecognized `Host` header (such as `rebind.test:8080`), the application must reject it immediately with HTTP status code `421 Misdirected Request` (defined in RFC 9110 Section 15.5.20) or HTTP `403 Forbidden`.
+
+Furthermore, implementing HTTPS with TLS mitigates rebinding attacks. When a browser initiates an HTTPS connection to `https://rebind.test:8080`, it verifies the server's TLS certificate. Even if DNS points `rebind.test` to internal IP `10.0.0.5`, the target service will present a certificate for its own local identity (e.g., `admin.home.arpa` or a self-signed certificate). The browser aborts the TLS handshake due to a domain name mismatch before any HTTP payload is transmitted.
+
+Binding a local service exclusively to `127.0.0.1` or `::1` does not prevent DNS rebinding. If an attacker rebinds a domain to `127.0.0.1`, requests from the victim's local browser still terminate on `127.0.0.1`, making loopback services fully reachable if Host header validation is absent.
+
+### Defense 3: Browser-level Local Network Access (LNA)
+
+Modern web browsers implement structural restrictions on network requests initiated across network boundaries. Chrome introduced Local Network Access (LNA), shipped in Chrome 142 (stable October 28, 2025), replacing the earlier Private Network Access (PNA) CORS-preflight specifications. 
+
+LNA categorizes network spaces into distinct security contexts: public, local (RFC 1918 / private IP space), and loopback (`127.0.0.0/8`, `::1`). When a page executing in a public context attempts to fetch a resource from a local or loopback address, the browser intercepts the connection and prompts the user for explicit permission. In Chrome 145, this policy split granular permissions into separate `local-network` and `loopback-network` categories.
+
+LNA checks are performed against the actual target IP address resolved for the socket connection rather than the origin string alone. Consequently, a DNS rebinding attempt that resolves a public domain to a private IP triggers the LNA prompt or block regardless of the Same-Origin Policy status of the origin string.
+
+### The 0.0.0.0 address vector
+
+On Linux and macOS, a socket connection to `0.0.0.0` reaches services listening on `127.0.0.1`. Windows refuses it. In August 2024, Oligo Security disclosed this behavior as "0.0.0.0 Day," demonstrating that public web applications could interact with local loopback services by specifying `0.0.0.0` as a target host.
+
+Because traditional DNS rebind filtering rules frequently focused exclusively on `127.0.0.0/8` and RFC 1918 blocks, queries returning `0.0.0.0` bypassed filtering. Comprehensive DNS rebind filters must explicitly include `0.0.0.0/8` alongside Carrier-Grade NAT (`100.64.0.0/10`), IPv6 loopback (`::1`), IPv6 link-local (`fe80::/10`), and IPv6 Unique Local Addresses (`fc00::/7`). After the disclosure the Fetch specification was changed to forbid `0.0.0.0` as a target, Safari (WebKit) blocks it, and Chrome rolled out a block between Chromium 128 and 133.
+
+### IPv6 rebind vectors
+
+DNS rebinding functions identically over IPv6 using `AAAA` resource records. Rebind filters that only inspect `A` records leave networks exposed to IPv6-based rebinding. Complete protection requires filtering the following IPv6 address ranges:
+
+- **Loopback**: `::1/128`
+- **Unique Local Addresses (ULA)**: `fc00::/7`
+- **Link-Local Addresses**: `fe80::/10`
+- **IPv4-Mapped IPv6 Addresses**: `::ffff:0:0/96` (e.g., `::ffff:127.0.0.1` or `::ffff:10.0.0.5`)
+
+## The lab
+
+The lab environment constructs four distinct network namespaces using Linux veth pairs and a bridge:
+
+- `home`: Victim namespace containing the client Python browser script (`10.0.0.2`).
+- `nas`: Target namespace hosting an unauthenticated admin API service (`10.0.0.5`).
+- `rtr`: Gateway router namespace operating a forwarding resolver on `10.0.0.1:53` and bridging the LAN.
+- `evil`: Attacker namespace hosting an authoritative DNS server on `203.0.113.53` and an HTTP web server on `203.0.113.80`.
+
+Three simplifications to keep in mind. There is no JavaScript engine: `browser.py` does what a browser's network stack does (resolve, connect, try the next address, send `Host`), and the `<script>` in the attacker's page is a placeholder. `browser.py` keeps no host cache, so it re-resolves on every request. And when `resolver.py --filter` refuses an answer it returns NXDOMAIN; that is the lab's choice, while dnsmasq logs `possible DNS-rebind attack detected` and refuses the answer, and Unbound removes the matching records. All addresses are documentation ranges, so the attacker's own public answer `203.0.113.80` passes the filter.
+
+```
++-----------------------------------------------------------------------------------+
+| Linux User/Net/Mount Namespaces (unshare -urnm)                                   |
+|                                                                                   |
+|  +--------------------+                    +-----------------------------------+  |
+|  |   home (ns)        |                    |   nas (ns)                        |  |
+|  |   10.0.0.2/24      |                    |   10.0.0.5/24                     |  |
+|  |   (browser.py)     |                    |   (admin.py :8080)                |  |
+|  +---------+----------+                    +-----------------+-----------------+  |
+|            | e0                                              | e0                 |
+|            |                                                 |                    |
+|            |               +------------------+              |                    |
+|            +---------------+   rtr (ns)       +--------------+                    |
+|                            |   br0: 10.0.0.1  |                                   |
+|                            |  (resolver.py)   |                                   |
+|                            +--------+---------+                                   |
+|                                     | up0 (198.51.100.1/24)                       |
+|                                     |                                             |
+|                                     | e0 (198.51.100.2/24)                        |
+|                            +--------+---------+                                   |
+|                            |   evil (ns)      |                                   |
+|                            |   203.0.113.53   | (evildns.py)                      |
+|                            |   203.0.113.80   | (evilweb.py)                      |
+|                            +------------------+                                   |
++-----------------------------------------------------------------------------------+
+```
+
+### Lab files
+
+```{.python filename="dnsmini.py"}
+"""Minimal DNS wire helpers: parse a query, build A answers (stdlib only)."""
+import struct
+
+def parse_query(data):
+    tid, flags, qd = struct.unpack("!HHH", data[:6])
+    i, labels = 12, []
+    while data[i]:
+        n = data[i]
+        labels.append(data[i + 1:i + 1 + n].decode())
+        i += n + 1
+    qtype, qclass = struct.unpack("!HH", data[i + 1:i + 5])
+    return tid, ".".join(labels).lower(), qtype, data[12:i + 5]
+
+def answer(tid, question, addrs, ttl, rcode=0):
+    hdr = struct.pack("!HHHHHH", tid, 0x8400 | rcode, 1, len(addrs), 0, 0)
+    body = question
+    for a in addrs:
+        body += struct.pack("!HHHIH", 0xC00C, 1, 1, ttl, 4)
+        body += bytes(int(x) for x in a.split("."))
+    return hdr + body
+
+def query(name, tid=0x1234):
+    q = b"".join(bytes([len(p)]) + p.encode() for p in name.split(".")) + b"\0"
+    return struct.pack("!HHHHHH", tid, 0x0100, 1, 0, 0, 0) + q + struct.pack("!HH", 1, 1)
+
+def parse_answer(data):
+    tid, flags, qd, an = struct.unpack("!HHHH", data[:8])
+    i = 12
+    while data[i]:
+        i += data[i] + 1
+    i += 5
+    out = []
+    for _ in range(an):
+        _, typ, _, ttl, rdlen = struct.unpack("!HHHIH", data[i:i + 12])
+        rd = data[i + 12:i + 12 + rdlen]
+        if typ == 1:
+            out.append((".".join(str(b) for b in rd), ttl))
+        i += 12 + rdlen
+    return flags & 0xF, out
+```
+
+```{.python filename="evildns.py"}
+"""Attacker's authoritative server for rebind.test.
+mode=flip : first query -> attacker IP, later queries -> target IP (TTL 1)
+mode=multi: every query -> [attacker IP, target IP]"""
+import socket, sys
+from dnsmini import parse_query, answer
+
+mode, attacker, target = sys.argv[1], sys.argv[2], sys.argv[3]
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.bind(("203.0.113.53", 53))
+seen = 0
+while True:
+    data, peer = s.recvfrom(512)
+    tid, name, qtype, q = parse_query(data)
+    if mode == "flip":
+        addrs = [attacker] if seen == 0 else [target]
+    else:
+        addrs = [attacker, target]
+    seen += 1
+    print(f"evildns: query #{seen} {name} -> {','.join(addrs)} ttl=1", flush=True)
+    s.sendto(answer(tid, q, addrs, 1), peer)
+```
+
+```{.python filename="resolver.py"}
+"""Home-router style forwarding resolver on 10.0.0.1:53.
+--filter drops answers that put a public name on a private/loopback/unspecified
+address, like dnsmasq --stop-dns-rebind or unbound private-address."""
+import ipaddress, socket, sys
+from dnsmini import parse_query, parse_answer, answer
+
+FILTER = "--filter" in sys.argv
+BLOCK = [ipaddress.ip_network(n) for n in
+         ("0.0.0.0/8", "10.0.0.0/8", "127.0.0.0/8", "169.254.0.0/16",
+          "172.16.0.0/12", "192.168.0.0/16", "100.64.0.0/10")]
+LOCAL_OK = ("home.arpa",)   # names allowed to be private (dnsmasq --rebind-domain-ok)
+
+up = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.bind(("10.0.0.1", 53))
+while True:
+    data, peer = s.recvfrom(512)
+    tid, name, qtype, q = parse_query(data)
+    up.sendto(data, ("203.0.113.53", 53))
+    reply, _ = up.recvfrom(512)
+    rcode, rrs = parse_answer(reply)
+    bad = [a for a, _ in rrs if any(ipaddress.ip_address(a) in n for n in BLOCK)]
+    if FILTER and bad and not name.endswith(LOCAL_OK):
+        print(f"resolver: possible DNS-rebind attack detected: {name} -> {','.join(bad)}", flush=True)
+        reply = answer(tid, q, [], 0, rcode=3)   # NXDOMAIN, as dnsmasq returns
+    s.sendto(reply, peer)
+```
+
+```{.python filename="admin.py"}
+"""An unauthenticated 'admin API' on the LAN, e.g. a router, NAS or dev server.
+--check-host only answers when Host names this service."""
+import sys
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+CHECK = "--check-host" in sys.argv
+ALLOWED = {"10.0.0.5:8080", "admin.home.arpa:8080", "localhost:8080"}
+
+class H(BaseHTTPRequestHandler):
+    def do_GET(self):
+        host = self.headers.get("Host", "")
+        if CHECK and host not in ALLOWED:
+            self.send_response(421)
+            body = b"misdirected request\n"
+        else:
+            self.send_response(200)
+            body = b'{"wifi_psk": "correct-horse-battery", "admin": true}\n'
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+        print(f"admin: GET {self.path} Host={host} -> {'421' if CHECK and host not in ALLOWED else '200'}", flush=True)
+    def log_message(self, *a):
+        pass
+
+ThreadingHTTPServer((sys.argv[1], 8080), H).serve_forever()
+```
+
+```{.python filename="evilweb.py"}
+"""Attacker's web server: serves the page that will run in the victim's browser."""
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+class H(BaseHTTPRequestHandler):
+    def do_GET(self):
+        body = b"<script>/* wait for TTL, then fetch('/api/config') */</script>\n"
+        self.send_response(200)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+        print(f"evilweb: GET {self.path} Host={self.headers.get('Host')}", flush=True)
+    def log_message(self, *a):
+        pass
+
+ThreadingHTTPServer(("203.0.113.80", 8080), H).serve_forever()
+```
+
+```{.python filename="browser.py"}
+"""What the browser does, minus the browser: resolve, load the page,
+wait out the TTL, then fetch a same-origin URL. The origin is
+http://rebind.test:8080 both times; only the address behind it changed."""
+import socket, sys, time
+from dnsmini import query, parse_answer
+
+RESOLVER = ("10.0.0.1", 53)
+
+def resolve(name):
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.settimeout(2)
+    s.sendto(query(name), RESOLVER)
+    rcode, rrs = parse_answer(s.recv(512))
+    return rcode, [a for a, _ in rrs]
+
+def get(name, path):
+    rcode, addrs = resolve(name)
+    if rcode:
+        return f"resolve {name}: rcode={rcode} (NXDOMAIN)" if rcode == 3 else f"rcode={rcode}"
+    for a in addrs:                       # browsers fall back across A records
+        try:
+            c = socket.create_connection((a, 8080), timeout=2)
+        except OSError as e:
+            print(f"browser:   {a}:8080 {e.strerror}, trying next address")
+            continue
+        c.sendall(f"GET {path} HTTP/1.1\r\nHost: {name}:8080\r\nConnection: close\r\n\r\n".encode())
+        data = b""
+        while chunk := c.recv(4096):
+            data += chunk
+        status = data.split(b"\r\n", 1)[0].decode()
+        return f"{a} {status} {data.split(b'\r\n\r\n', 1)[1].decode().strip()}"
+    return "no address answered"
+
+name = "rebind.test"
+print("browser: load  ", get(name, "/"))
+time.sleep(float(sys.argv[1]) if len(sys.argv) > 1 else 2)
+print("browser: fetch ", get(name, "/api/config"))
+```
+
+```{.python filename="zero.py"}
+"""The '0.0.0.0 day': on Linux and macOS, connecting to 0.0.0.0 reaches
+services bound to 127.0.0.1. Blocklists that only cover 127/8 and RFC 1918 miss it."""
+import socket, threading
+srv = socket.create_server(("127.0.0.1", 8081))
+threading.Thread(target=lambda: srv.accept()[0].sendall(b"hello from 127.0.0.1:8081\n"), daemon=True).start()
+c = socket.create_connection(("0.0.0.0", 8081), timeout=2)
+print("connect 0.0.0.0:8081 ->", c.getpeername(), c.recv(64).decode().strip())
+```
+
+```{.bash filename="lab.sh"}
+#!/bin/sh
+# Run as: unshare -urnm sh lab.sh   (no root, no installs)
+set -e
+mount -t tmpfs none /run && mkdir -p /run/netns
+for n in home nas rtr evil; do ip netns add $n; ip -n $n link set lo up; done
+ip -n rtr link add br0 type bridge && ip -n rtr link set br0 up
+ip -n rtr addr add 10.0.0.1/24 dev br0
+for h in home nas; do
+  ip -n rtr link add p$h type veth peer name e0 netns $h
+  ip -n rtr link set p$h master br0 up
+  ip -n $h link set e0 up
+done
+ip -n home addr add 10.0.0.2/24 dev e0 && ip -n home route add default via 10.0.0.1
+ip -n nas  addr add 10.0.0.5/24 dev e0 && ip -n nas  route add default via 10.0.0.1
+ip -n rtr link add up0 type veth peer name e0 netns evil
+ip -n rtr addr add 198.51.100.1/24 dev up0 && ip -n rtr link set up0 up
+ip -n evil addr add 198.51.100.2/24 dev e0 && ip -n evil link set e0 up
+ip -n evil addr add 203.0.113.53/32 dev lo && ip -n evil addr add 203.0.113.80/32 dev lo
+ip -n evil route add default via 198.51.100.1
+ip -n rtr route add 203.0.113.0/24 via 198.51.100.2
+ip netns exec rtr sh -c "echo 1 > /proc/sys/net/ipv4/ip_forward"
+
+P=""
+bg() { "$@" & P="$P $!"; }
+stop() { kill $P 2>/dev/null; wait $P 2>/dev/null || true; P=""; }
+X="ip netns exec"
+run() {   # $1 title, $2 dns mode, $3 resolver flag, $4 admin flag, $5 evilweb on|off
+  echo; echo "=== $1 ==="
+  bg $X evil python3 -u evildns.py $2 203.0.113.80 10.0.0.5
+  [ "$5" = on ] && bg $X evil python3 -u evilweb.py
+  bg $X rtr python3 -u resolver.py $3
+  bg $X nas python3 -u admin.py 10.0.0.5 $4
+  sleep 0.7
+  $X home python3 -u browser.py 2
+  sleep 0.3; stop
+}
+run "1. classic rebind (TTL 1, answer flips)"        flip ""         ""            on
+run "2. same attack, resolver filter on"             flip --filter   ""            on
+run "3. same attack, service checks Host"            flip ""         --check-host  on
+# 4: both addresses in one answer; the attacker stops listening after the page loads
+echo; echo "=== 4. multiple A records, attacker closes port after load ==="
+bg $X evil python3 -u evildns.py multi 203.0.113.80 10.0.0.5
+$X evil python3 -u evilweb.py & W=$!
+bg $X rtr python3 -u resolver.py
+bg $X nas python3 -u admin.py 10.0.0.5
+sleep 0.7
+$X home python3 -u browser.py 2 & B=$!
+sleep 1; kill $W; wait $W 2>/dev/null || true; echo "lab: evilweb stopped"
+wait $B; sleep 0.3; stop
+echo; echo "=== 5. 0.0.0.0 reaches loopback ==="
+$X nas python3 zero.py
+```
+
+### Execution output
+
+```text
+=== 1. classic rebind (TTL 1, answer flips) ===
+evildns: query #1 rebind.test -> 203.0.113.80 ttl=1
+evilweb: GET / Host=rebind.test:8080
+browser: load   203.0.113.80 HTTP/1.0 200 OK <script>/* wait for TTL, then fetch('/api/config') */</script>
+evildns: query #2 rebind.test -> 10.0.0.5 ttl=1
+admin: GET /api/config Host=rebind.test:8080 -> 200
+browser: fetch  10.0.0.5 HTTP/1.0 200 OK {"wifi_psk": "correct-horse-battery", "admin": true}
+
+=== 2. same attack, resolver filter on ===
+evildns: query #1 rebind.test -> 203.0.113.80 ttl=1
+evilweb: GET / Host=rebind.test:8080
+browser: load   203.0.113.80 HTTP/1.0 200 OK <script>/* wait for TTL, then fetch('/api/config') */</script>
+evildns: query #2 rebind.test -> 10.0.0.5 ttl=1
+resolver: possible DNS-rebind attack detected: rebind.test -> 10.0.0.5
+browser: fetch  resolve rebind.test: rcode=3 (NXDOMAIN)
+
+=== 3. same attack, service checks Host ===
+evildns: query #1 rebind.test -> 203.0.113.80 ttl=1
+evilweb: GET / Host=rebind.test:8080
+browser: load   203.0.113.80 HTTP/1.0 200 OK <script>/* wait for TTL, then fetch('/api/config') */</script>
+evildns: query #2 rebind.test -> 10.0.0.5 ttl=1
+admin: GET /api/config Host=rebind.test:8080 -> 421
+browser: fetch  10.0.0.5 HTTP/1.0 421 Misdirected Request misdirected request
+
+=== 4. multiple A records, attacker closes port after load ===
+evildns: query #1 rebind.test -> 203.0.113.80,10.0.0.5 ttl=1
+evilweb: GET / Host=rebind.test:8080
+browser: load   203.0.113.80 HTTP/1.0 200 OK <script>/* wait for TTL, then fetch('/api/config') */</script>
+lab: evilweb stopped
+evildns: query #2 rebind.test -> 203.0.113.80,10.0.0.5 ttl=1
+browser:   203.0.113.80:8080 Connection refused, trying next address
+admin: GET /api/config Host=rebind.test:8080 -> 200
+browser: fetch  10.0.0.5 HTTP/1.0 200 OK {"wifi_psk": "correct-horse-battery", "admin": true}
+
+=== 5. 0.0.0.0 reaches loopback ===
+connect 0.0.0.0:8081 -> ('127.0.0.1', 8081) hello from 127.0.0.1:8081
+```
+
+## Reading the output
+
+### Section 1: Classic rebind (TTL 1, answer flips)
+
+The browser initiates query #1 for `rebind.test`. `evildns.py` returns public IP `203.0.113.80` with TTL=1. `browser.py` connects to `203.0.113.80:8080` and loads the initial payload from `evilweb.py`. 
+
+After sleeping for 2 seconds (exceeding the 1-second TTL), `browser.py` performs a second resolution for `rebind.test`. `evildns.py` returns `10.0.0.5` for query #2. The browser connects to `10.0.0.5:8080` while transmitting `Host: rebind.test:8080`. Because `admin.py` runs without `--check-host`, it accepts the request and exposes `{"wifi_psk": "correct-horse-battery", "admin": true}` to the client.
+
+### Section 2: Same attack, resolver filter on
+
+The initial page load succeeds identically to Section 1. On query #2, `resolver.py` executes with the `--filter` flag. The resolver parses the response from `evildns.py` (`10.0.0.5`), matches `10.0.0.5` against the `BLOCK` array (`10.0.0.0/8`), and identifies the rebind attempt. 
+
+The resolver logs `resolver: possible DNS-rebind attack detected: rebind.test -> 10.0.0.5` and returns `rcode=3` (NXDOMAIN) with zero answers. `browser.py` receives the NXDOMAIN error and fails the fetch operation without establishing a TCP connection to the internal service.
+
+### Section 3: Same attack, service checks Host
+
+Filtering is disabled on the resolver, allowing query #2 to return `10.0.0.5`. `browser.py` connects to `10.0.0.5:8080` and sends `GET /api/config HTTP/1.1` with `Host: rebind.test:8080`. 
+
+`admin.py` executes with `--check-host`. It evaluates `rebind.test:8080` against `ALLOWED` (`{"10.0.0.5:8080", "admin.home.arpa:8080", "localhost:8080"}`). Because `rebind.test:8080` is absent from the allowlist, `admin.py` rejects the request, returning HTTP status code `421 Misdirected Request`. The attacker page fails to read sensitive API data.
+
+### Section 4: Multiple A records, attacker closes port after load
+
+`evildns.py` operates in `multi` mode, responding to query #1 with both `203.0.113.80` and `10.0.0.5`. `browser.py` iterates over the returned IP array, connecting to `203.0.113.80:8080` to retrieve the web payload. 
+
+One second after the browser starts, `lab.sh` stops `evilweb.py` (the `lab: evilweb stopped` line), well after the page has loaded. When `browser.py` attempts its secondary request, it first tries `203.0.113.80:8080`. The TCP handshake is rejected (`Connection refused`). `browser.py` falls back to the second address in its A record list (`10.0.0.5`), successfully connecting to `admin.py` and reading the API response.
+
+### Section 5: 0.0.0.0 reaches loopback
+
+`zero.py` starts a TCP server bound to `127.0.0.1:8081`. The client script initiates a TCP socket connection directly to `0.0.0.0:8081`. 
+
+Linux treats a connect to `0.0.0.0` as a connect to the local host, establishing a socket connection to `127.0.0.1:8081`. The client receives `hello from 127.0.0.1:8081`, demonstrating why DNS rebind filters must cover `0.0.0.0/8` in addition to loopback and private blocks.
+
+## Production deployment configurations
+
+Production implementations of resolver filtering and HTTP Host validation utilize dedicated daemon configurations.
+
+### Production dnsmasq setup (not run here)
+
+```text
+# /etc/dnsmasq.conf
+# Reject upstream answers in private IP ranges
+stop-dns-rebind
+
+# Allow loopback addresses in answers (for local ad-block lists)
+rebind-localhost-ok
+
+# Allow private IP answers for explicit local domain names
+rebind-domain-ok=/home.arpa/
+```
+
+### Production Unbound setup (not run here)
+
+```text
+# /etc/unbound/unbound.conf
+server:
+    # Deny public domain answers pointing to private/loopback IPv4/IPv6 spaces
+    private-address: 10.0.0.0/8
+    private-address: 172.16.0.0/12
+    private-address: 192.168.0.0/16
+    private-address: 169.254.0.0/16
+    private-address: fd00::/8
+    private-address: fe80::/10
+    private-address: ::ffff:0:0/96
+
+    # Allow private IP answers for local infrastructure domains
+    private-domain: "home.arpa"
+```
+
+### Production NGINX host validation setup (not run here)
+
+```nginx
+# /etc/nginx/sites-available/default
+# Catch-all server block to drop requests with missing or untrusted Host headers
+server {
+    listen 80 default_server;
+    listen [::]:80 default_server;
+    server_name _;
+    return 444;
+}
+
+# Explicit server block for authorized internal hostnames
+server {
+    listen 80;
+    server_name admin.home.arpa 10.0.0.5;
+
+    location / {
+        proxy_pass http://127.0.0.1:8080;
+    }
+}
+```
+
+## Gotchas
+
+1. **DNS-over-HTTPS (DoH) browser bypass**: Operating system or gateway DNS resolvers cannot inspect or filter queries if modern browsers bypass system DNS using encrypted DoH directly to public providers (such as Cloudflare or Google).
+2. **Exempting local names incorrectly**: Wildcard rebind exemptions (such as `rebind-domain-ok=/example.com/`) allow attackers to use subdomains under that domain to execute rebind attacks against private networks.
+3. **Public IP local services**: Resolver filtering only drops private, loopback, and link-local IP addresses. If an organization hosts internal services on publicly routable IP addresses protected solely by perimeter firewalls, resolver rebind filters will not block responses resolving to those public IPs.
+4. **Omission of IPv4-mapped IPv6 ranges**: Resolvers configured to block standard IPv4 address blocks (`10.0.0.0/8`, `127.0.0.0/8`) remain vulnerable if an attacker returns IPv4-mapped IPv6 records (e.g., `::ffff:10.0.0.5` or `::ffff:127.0.0.1`) and the filter lacks `::ffff:0:0/96`.
+5. **Relying solely on binding to 127.0.0.1**: Binding a local web service to `127.0.0.1` prevents external network packets from reaching the port directly, but does not prevent a local browser from reaching `127.0.0.1` via a rebound hostname.
+6. **Internal web services omitting port numbers in allowlists**: If an HTTP Host header validation library strips or ignores port numbers (evaluating `Host: rebind.test:8080` as merely `rebind.test`), subtle allowlist parsing errors can lead to bypasses.
+7. **Ignoring the 0.0.0.0/8 block**: Network filters that block RFC 1918 and `127.0.0.0/8` while leaving `0.0.0.0/8` unblocked remain vulnerable to 0.0.0.0 Day exploitation on Unix-like client operating systems.
+8. **A TTL of 1 does not mean re-resolution after one second**: browser host caches (and resolvers configured with a minimum cache TTL) hold answers longer. That slows a real attack down. It does not stop it, so do not count it as a defense.
+
+## Exercises
+
+1. **IPv6 filtering.** Add AAAA support (type 28, 16-byte RDATA) to `dnsmini.py`, make `evildns.py` answer `::ffff:10.0.0.5` to AAAA queries, and add `::1/128`, `fe80::/10`, `fc00::/7` and `::ffff:0:0/96` to `BLOCK` in `resolver.py`. Confirm the mapped address is refused, then remove `::ffff:0:0/96` and watch it pass.
+2. **Multiple A records against the filter.** Run scenario 4 with `resolver.py --filter`. The answer contains one public and one private address. Check that the whole answer is refused, and decide whether stripping only the private record (what Unbound does) would be enough.
+3. **Browser host cache.** Give `browser.py` a cache that keeps every answer for at least 30 seconds, whatever the TTL. Show that scenario 1 now fails with `sleep 2`, then raise the sleep to 31 and show the attack succeeds again.
+4. **Host checks done wrong.** Change `admin.py` so that `--check-host` compares only the part of `Host` before the colon, against a set that contains `localhost`. Rebind `rebind.test` to `127.0.0.1` with a service on loopback, and confirm it is still refused. Then explain why a page script cannot simply send `Host: localhost:8080` itself (look up "forbidden request header" in the Fetch standard).
+5. **0.0.0.0 through DNS.** Run `evildns.py flip 203.0.113.80 0.0.0.0` with the `admin.py` service bound to `127.0.0.1` inside `home`, once without and once with `--filter`. Which entry of `BLOCK` stops it?
+
+## Verification
+
+The code examples and output presented in this chapter were verified in the following environment:
+
+- **Operating System**: Linux 6.12.94 kernel
+- **Networking Stack**: iproute2 6.15.0
+- **Runtime Environment**: Python 3.13 standard library (no third-party modules installed)
+- **Isolation Container**: Unprivileged Linux namespaces (`unshare -urnm`) using temporary `tmpfs` mounts for `/run/netns`
+- **Execution Script**: `lab.sh` executing `dnsmini.py`, `evildns.py`, `resolver.py`, `admin.py`, `evilweb.py`, `browser.py`, and `zero.py`
+
+Production software suites (`dnsmasq`, `Unbound`, `NGINX`) were not executed during the generation of the lab trace; configuration blocks for those applications are labeled `(not run here)` and serve as production reference implementations.
+
+## Sources
+
+- RFC 9110, HTTP Semantics, section 15.5.20 "421 Misdirected Request": <https://www.rfc-editor.org/rfc/rfc9110.html#section-15.5.20>
+- RFC 8375, Special-Use Domain 'home.arpa.': <https://www.rfc-editor.org/rfc/rfc8375.html>
+- dnsmasq man page (`--stop-dns-rebind`, `--rebind-localhost-ok`, `--rebind-domain-ok`): <https://thekelleys.org.uk/dnsmasq/docs/dnsmasq-man.html>
+- unbound.conf man page (`private-address`, `private-domain`): <https://unbound.docs.nlnetlabs.nl/en/latest/manpages/unbound.conf.html>
+- Chrome, "New permission prompt for Local Network Access": <https://developer.chrome.com/blog/local-network-access>
+- Chrome 142 release notes, "Local network access restrictions": <https://developer.chrome.com/release-notes/142>
+- Local Network Access specification: <https://wicg.github.io/local-network-access/>
+- NCC Group, Singularity of Origin: <https://github.com/nccgroup/singularity>
+- Oligo Security, "0.0.0.0 Day: Exploiting Localhost APIs From the Browser" (7 Aug 2024): <https://www.oligo.security/blog/0-0-0-0-day-exploiting-localhost-apis-from-the-browser>
