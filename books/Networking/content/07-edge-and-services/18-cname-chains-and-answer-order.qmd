@@ -1,0 +1,284 @@
+---
+title: "CNAME Chains and Answer Order: What the RFCs Say and What glibc Does"
+author:
+  - name: "K19G"
+  - name: "grok-bot"
+---
+
+# CNAME Chains and Answer Order: What the RFCs Say and What glibc Does
+
+## Learning goals
+
+- State the CNAME rules that *are* precise in the RFCs: one CNAME per owner name, no other data at that name, and chains followed by the resolver
+- Explain the difference between the order of records inside an RRset, which never matters, and the order of RRsets in the answer section, which the RFCs leave unclear
+- Reproduce, without root, the glibc `getaddrinfo()` failure that hit users of a large public resolver on 2026-01-08, and show the same bytes parsed correctly by an order-independent algorithm
+- Write CNAME-heavy zones and DNS-serving code that do not depend on this ambiguity
+- Know which "illegal" CNAME data glibc silently tolerates, so you are not fooled when a broken zone still works on Linux
+
+## Thesis
+
+A CNAME says "this name is an alias; ask about that other name instead". When a recursive resolver answers for an alias, it puts the whole chain in the answer section: each CNAME, then the final records. Every DNS client has to follow that chain. There are two ways to do it. You can index the whole section and then walk from the question name. Or you can read records top to bottom, updating the name you are looking for each time you pass a CNAME. The second way is shorter and works as long as the server sends the chain in order. RFC 1034 describes answers as "possibly preface[d] by one or more CNAME RRs", which nearly every server follows, but no RFC makes it a requirement. In January 2026, a resolver change put the CNAMEs after the address records for some cached answers. Every sequential parser, including glibc's, started returning "no such name". This chapter rebuilds that failure on a laptop in a few milliseconds and draws two rules from it: servers should send chains in order, and clients should not need them to.
+
+## Mental model
+
+```text
+  question:  www.example.test  A
+
+  answer section as sent (in order):         answer section as sent (reordered):
+    www.example.test   CNAME cdn.example.test    edge.cdn.test      A     192.0.2.80
+    cdn.example.test   CNAME edge.cdn.test       www.example.test   CNAME cdn.example.test
+    edge.cdn.test      A     192.0.2.80          cdn.example.test   CNAME edge.cdn.test
+
+  sequential parser, "expected name" = www.example.test
+    in order : match CNAME -> expect cdn...      reordered: A for edge.cdn.test != www -> skip
+               match CNAME -> expect edge...                CNAME www -> expect cdn...
+               match A     -> 192.0.2.80                     CNAME cdn -> expect edge...
+                                                             end of section -> NO ADDRESS
+  indexed parser: build {owner -> CNAME} and {owner -> A} first, then walk from the
+                  question name. Same result for both orders.
+```
+
+## What the RFCs are clear about
+
+Three CNAME rules are precise, and you should treat them as hard constraints in any zone you run.
+
+**One CNAME per name, and nothing else there.** RFC 1034 section 3.6.2 says that if a CNAME RR is present at a node, no other data should be present. RFC 2181 section 10.1 tightens this: an alias name can have only one CNAME record. (DNSSEC's RRSIG and NSEC records at the alias are the standard exceptions.) This is why you cannot put a CNAME at a zone apex, which must have SOA and NS records. "CNAME flattening" and ALIAS/ANAME records exist to work around that, by having the server resolve the target and answer with A/AAAA records instead.
+
+**RRset order never matters.** RFC 1034 section 3.6 defines an RRset as all records with the same owner, type and class, and says "the order of RRs in a set is not significant, and need not be preserved by name servers, resolvers, or other parts of the DNS". That is why round-robin works and why no client may rely on getting a particular address first.
+
+**Resolvers restart at the target.** RFC 1034 section 5.2.2: "In most cases a resolver simply restarts the query at the new name when it encounters a CNAME." A full recursive resolver does exactly that and then assembles the chain in its answer.
+
+## What the RFCs leave open
+
+The ambiguity sits between those rules. Each CNAME in a chain is its own RRset, because each has a different owner name. The final A records are another RRset. The "order is not significant" rule is about records *within* one RRset. It says nothing about the order of *different* RRsets in a section. RFC 1034 section 4.3.1 says a recursive response will be "the answer to the query, possibly preface by one or more CNAME RRs that specify aliases encountered on the way to an answer". It is a description, written ten years before RFC 2119 gave the IETF its MUST and SHOULD keywords, so it is not a requirement either.
+
+So a server that sends the A record first, or sends the chain links out of order, has not clearly broken any rule. A client that only works when the chain comes first and in order has not clearly broken one either. Both readings were deployed for decades. They only collided when one large server changed its behaviour.
+
+## The 2026-01-08 incident, briefly
+
+Cloudflare's post-incident write-up describes the cause. A memory optimisation in the 1.1.1.1 cache changed how a partially cached CNAME chain was merged with the final records. The old code built a new list with the CNAMEs first, then the answer. The new code appended the CNAMEs to the existing answer list, so for some responses the CNAMEs came *after* the A or AAAA records. The global release started late on 2026-01-07 (UTC) and reached 90% of servers on 2026-01-08. glibc's `getaddrinfo()` started failing for affected names, and some Cisco switches that used 1.1.1.1 went into reboot loops. The incident was declared at 18:19 UTC, the revert started at 18:27 and impact ended at 19:55 UTC the same day. Cloudflare says it will keep CNAMEs first and in order, and it has proposed an Internet-Draft (draft-jabley-dnsop-ordered-answer-section) to make that ordering explicit.
+
+The interesting part for an operator is not the bug. It is that the "obviously fine" response broke clients on millions of Linux machines, and that you can reproduce it in a few milliseconds.
+
+## Lab: serve one chain in six orders, ask glibc each time
+
+The lab runs a tiny DNS server on 127.0.0.1:53 and calls `socket.getaddrinfo()`, which is the real glibc stub resolver, the same code path `curl`, `ssh` and most Linux programs use. To avoid touching the host, it runs inside a private user, mount and network namespace (`unshare -rmn`). Inside, you are root, so the script can bind port 53 and bind-mount a private `/etc/resolv.conf` that says `nameserver 127.0.0.1`. That mount exists only inside the namespace. When the script exits, the namespace and the mount are gone.
+
+For each case the server returns the same records in a different order. The script prints what glibc returned and, for comparison, what an order-independent `follow()` function makes of the same records.
+
+`cname-order.py`:
+
+```python
+#!/usr/bin/env python3
+"""Serve one CNAME chain in two orders and ask glibc to resolve it.
+
+Run inside a private user+mount+net namespace (no root needed):
+    unshare -rmn python3 cname-order.py
+The script points /etc/resolv.conf at 127.0.0.1 with a bind mount that only
+exists inside the namespace, starts a tiny DNS server on 127.0.0.1:53, and
+calls socket.getaddrinfo(), which is glibc's stub resolver.
+"""
+import os, socket, struct, subprocess, threading, sys
+
+def name(n):
+    out = b""
+    for label in n.rstrip(".").split("."):
+        out += bytes([len(label)]) + label.encode()
+    return out + b"\x00"
+
+def rr(owner, rtype, ttl, rdata):
+    return name(owner) + struct.pack("!HHIH", rtype, 1, ttl, len(rdata)) + rdata
+
+A, CNAME = 1, 5
+CHAIN = [
+    ("www.example.test", CNAME, 3600, name("cdn.example.test")),
+    ("cdn.example.test", CNAME, 300, name("edge.cdn.test")),
+    ("edge.cdn.test", A, 60, socket.inet_aton("192.0.2.80")),
+    ("unrelated.test", A, 60, socket.inet_aton("192.0.2.99")),         # 3
+    ("www.example.test", A, 60, socket.inet_aton("192.0.2.66")),       # 4: illegal sibling
+    ("www.example.test", CNAME, 3600, name("other.cdn.test")),         # 5: second CNAME
+    ("other.cdn.test", A, 60, socket.inet_aton("192.0.2.77")),         # 6
+]
+ORDERS = {
+    "cname-first": [0, 1, 2],
+    "cname-last": [2, 0, 1],
+    "chain-reversed": [1, 0, 2],
+    "unrelated-first": [3, 0, 1, 2],
+    "cname-plus-a": [0, 4, 1, 2],
+    "two-cnames": [0, 5, 1, 2, 6],
+}
+mode = {"order": "cname-first"}
+
+def parse_question(msg):
+    i = 12
+    labels = []
+    while msg[i]:
+        labels.append(msg[i + 1:i + 1 + msg[i]].decode())
+        i += msg[i] + 1
+    qtype, qclass = struct.unpack("!HH", msg[i + 1:i + 5])
+    return ".".join(labels), qtype, msg[12:i + 5]
+
+def answer(query):
+    qid, = struct.unpack("!H", query[:2])
+    qname, qtype, qsec = parse_question(query)
+    rrs = b""
+    count = 0
+    if qname == "www.example.test" and qtype == A:
+        for idx in ORDERS[mode["order"]]:
+            rrs += rr(*CHAIN[idx])
+            count += 1
+    flags = 0x8180  # QR, RD, RA, NOERROR
+    return struct.pack("!HHHHHH", qid, flags, 1, count, 0, 0) + qsec + rrs
+
+def follow(records, qname, max_hops=8):
+    """Order-independent: index the whole answer section, then walk the chain."""
+    cname = {}
+    addrs = {}
+    for owner, rtype, _, rdata in records:
+        if rtype == CNAME:
+            cname.setdefault(owner, rdata)        # first CNAME per owner, like glibc
+        elif rtype == A:
+            addrs.setdefault(owner, []).append(socket.inet_ntoa(rdata))
+    name_, hops = qname, 0
+    while name_ in cname and hops < max_hops:
+        raw, labels, i = cname[name_], [], 0
+        while raw[i]:
+            labels.append(raw[i + 1:i + 1 + raw[i]].decode()); i += raw[i] + 1
+        name_, hops = ".".join(labels), hops + 1
+    return name_, addrs.get(name_, [])
+
+def serve(sock):
+    while True:
+        q, peer = sock.recvfrom(4096)
+        sock.sendto(answer(q), peer)
+
+def main():
+    subprocess.run(["ip", "link", "set", "lo", "up"], check=True)
+    with open("/tmp/cname-order-resolv.conf", "w") as f:
+        f.write("nameserver 127.0.0.1\noptions attempts:1 timeout:1\n")
+    subprocess.run(["mount", "--bind", "/tmp/cname-order-resolv.conf",
+                    "/etc/resolv.conf"], check=True)
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.bind(("127.0.0.1", 53))
+    threading.Thread(target=serve, args=(s,), daemon=True).start()
+    for order in ORDERS:
+        mode["order"] = order
+        seq = " | ".join(f"{CHAIN[i][0]} {'CNAME' if CHAIN[i][1]==CNAME else 'A'}"
+                         for i in ORDERS[order])
+        try:
+            res = socket.getaddrinfo("www.example.test", 80, socket.AF_INET,
+                                     socket.SOCK_STREAM, 0, socket.AI_CANONNAME)
+            addrs = ",".join(sorted({r[4][0] for r in res}))
+            out = f"OK  {addrs}  canonname={res[0][3]}"
+        except socket.gaierror as e:
+            out = f"FAIL  gaierror {e.errno}: {e.strerror}"
+        target, robust = follow([CHAIN[i] for i in ORDERS[order]], "www.example.test")
+        print(f"{order:15} [{seq}]\n{'':15} glibc  -> {out}"
+              f"\n{'':15} follow -> {','.join(robust) or 'NODATA'}  canonname={target}")
+
+if __name__ == "__main__":
+    main()
+```
+
+Run it:
+
+```bash
+unshare -rmn python3 cname-order.py
+```
+
+Output:
+
+```text
+cname-first     [www.example.test CNAME | cdn.example.test CNAME | edge.cdn.test A]
+                glibc  -> OK  192.0.2.80  canonname=edge.cdn.test
+                follow -> 192.0.2.80  canonname=edge.cdn.test
+cname-last      [edge.cdn.test A | www.example.test CNAME | cdn.example.test CNAME]
+                glibc  -> FAIL  gaierror -2: Name or service not known
+                follow -> 192.0.2.80  canonname=edge.cdn.test
+chain-reversed  [cdn.example.test CNAME | www.example.test CNAME | edge.cdn.test A]
+                glibc  -> FAIL  gaierror -2: Name or service not known
+                follow -> 192.0.2.80  canonname=edge.cdn.test
+unrelated-first [unrelated.test A | www.example.test CNAME | cdn.example.test CNAME | edge.cdn.test A]
+                glibc  -> OK  192.0.2.80  canonname=edge.cdn.test
+                follow -> 192.0.2.80  canonname=edge.cdn.test
+cname-plus-a    [www.example.test CNAME | www.example.test A | cdn.example.test CNAME | edge.cdn.test A]
+                glibc  -> OK  192.0.2.80  canonname=edge.cdn.test
+                follow -> 192.0.2.80  canonname=edge.cdn.test
+two-cnames      [www.example.test CNAME | www.example.test CNAME | cdn.example.test CNAME | edge.cdn.test A | other.cdn.test A]
+                glibc  -> OK  192.0.2.80  canonname=edge.cdn.test
+                follow -> 192.0.2.80  canonname=edge.cdn.test
+```
+
+### Reading the first three cases: order is the whole difference
+
+`cname-first` is the conventional order and works. `cname-last` is the shape of the January incident: the A record first, then the chain. glibc returns `EAI_NONAME`, "Name or service not known", the same error as a name that does not exist. `chain-reversed` keeps the A record last but swaps the two CNAMEs. It fails as well. That case matters because "CNAMEs before other records" is not enough: a sequential parser also needs the *links* of the chain in order, starting from the question name.
+
+`follow()` gets `192.0.2.80` and the canonical name `edge.cdn.test` in all three cases, from identical bytes. The data was never wrong. Only the parsing strategy differs.
+
+### Reading `unrelated-first`: glibc skips, it does not stop
+
+An unrelated A record at the top does not break glibc. Its parser skips records whose owner is not the name it is currently expecting, then carries on. That explains exactly why `cname-last` fails: the A record for `edge.cdn.test` is skipped as "unrelated" because, when glibc reaches it, it is still looking for `www.example.test`. By the time the CNAMEs have moved the expected name to `edge.cdn.test`, the A record is behind it.
+
+### Reading `cname-plus-a` and `two-cnames`: broken zones that still "work"
+
+These two answers break the hard rules: `www.example.test` has a CNAME *and* an A record, and in the last case two different CNAMEs. A correct zone loader would refuse both. glibc returns an address anyway. With a CNAME and an A record at the alias, it followed the CNAME and ignored `192.0.2.66`. With two CNAMEs, it followed the first one and ignored `other.cdn.test`. So did `follow()`, because it was written to keep the first CNAME too.
+
+That is the trap. If you test a broken zone only from a Linux host, it looks fine. A different resolver may pick the other CNAME, or return the sibling A record, or SERVFAIL. RFC 2181 section 10.1 allows none of these zones, and the only safe behaviour is not to publish them. Validate zones with your server's checker (for example `named-checkzone` or `kzonecheck`; not run here, neither is installed), not by resolving names from one client.
+
+## How to be robust on both sides
+
+**If you serve DNS** (an authoritative server, a resolver, a load balancer that answers DNS, a test fake like the one in the lab):
+
+- Send the chain first, in order from the question name, then the final RRset. That is what the RFC 1034 text describes and what deployed clients expect.
+- Keep that order on every code path, including cache merges and partially cached chains. Write a test that asserts it. The incident came from an optimisation in code that had no such test.
+- Keep chains short. Each CNAME hop costs the resolver at least one more lookup when it is not cached, and some resolvers cap the chain length.
+
+**If you parse DNS** (a stub resolver, a monitoring probe, an embedded client):
+
+- Index the whole answer section, then walk from the question name, as `follow()` does. It is a dozen lines and handles every order.
+- Put a hop limit on the walk (the lab uses 8) so a CNAME loop in a broken answer cannot spin forever.
+- Treat a CNAME and other data at the same owner, or two CNAMEs, as a broken answer. Do not quietly pick one.
+
+**If you run Linux hosts**, you cannot fix glibc's parser from configuration. You can choose what sits in front of it. A local caching resolver (for example `systemd-resolved`, `unbound` or `dnsmasq` on 127.0.0.x) parses upstream answers with its own code and re-serialises them for glibc. Cloudflare's write-up notes that `systemd-resolved` was not affected because it parses answers into a set before following the chain.
+
+## Case
+
+This is an illustrative scenario, not a real named incident.
+
+A team ran an internal DNS-based service discovery layer: a small Go service answering for `*.svc.internal`, with aliases such as `api.svc.internal CNAME api-blue.svc.internal`. During a refactor, someone changed the answer builder to append the alias records after looking up the final A records, because that made the code simpler. Unit tests compared answers as sets and passed. Staging used a resolver library that parsed answers as a set, and it passed too. In production, every service that called `getaddrinfo()` through glibc began failing to resolve aliased names with "Name or service not known". Services that resolved non-aliased names were fine, which made the problem look like a data issue. A packet capture showed the answer section in the new order. The fix was one line. The lasting fix was a test that compared the answer section *as a list*: CNAMEs first, in chain order.
+
+## Trap
+
+Testing DNS answers as sets. Sets are the right model for RRset contents and the wrong model for what clients actually parse. If you write or proxy DNS, assert the order of the answer section in tests. And do not take "it resolves on my Linux box" as proof a zone is valid: glibc forgives some illegal zones, as the last two cases showed.
+
+## Boring rule
+
+Serve CNAME chains first and in order. Parse them without depending on order. Never publish a CNAME with sibling data or a second CNAME, and check zones with a zone checker, not a client.
+
+## Try this
+
+1. Add a case where the chain is complete but the final A record is missing (a "dangling" CNAME). What does glibc return? What does `follow()` return, and how would you make it say NODATA explicitly?
+2. Add a CNAME loop: `www -> cdn -> www`. Does glibc return, and how fast? Does `follow()` stop at its hop limit?
+3. Change `getaddrinfo()` to use `socket.AF_UNSPEC` and teach the server to answer `AAAA` with the same chain plus `2001:db8::80`. Reorder only the AAAA answer. What do you get back now?
+4. Make `follow()` reject answers with two CNAMEs for one owner or a CNAME plus other data, instead of picking the first. Which of the six cases does it reject?
+5. Write the server-side test the Case describes: given an answer section, assert that the CNAMEs come first and that each CNAME's owner is the previous one's target, starting from the question name.
+
+## Verification
+
+- `unshare -rmn python3 cname-order.py` ran on Linux 6.12.94+ (a KVM guest) with Python 3.13.5 and glibc 2.41 (Debian `2.41-12+deb13u4`), as an unprivileged user with no `sudo` and no extra packages, on 2026-11-13. `/etc/nsswitch.conf` on this host has `hosts: files dns`.
+- The private `/etc/resolv.conf` existed only inside the namespace. No real resolver was contacted. All names are under `.test`, and addresses come from 192.0.2.0/24 (RFC 5737 documentation space).
+- The listing is the exact file that ran. The output is pasted unedited.
+- glibc behaviour is shown for this glibc version only. Other stub resolvers (musl, BSD libc, systemd-resolved, embedded stacks) were not tested here.
+- Not run: `named-checkzone` and `kzonecheck` (not installed), public resolvers.
+
+## Sources
+
+- RFC 1034, *Domain Names: Concepts and Facilities* (sections 3.6, 3.6.2, 4.3.1, 5.2.2): <https://www.rfc-editor.org/rfc/rfc1034>
+- RFC 1035, *Domain Names: Implementation and Specification*: <https://www.rfc-editor.org/rfc/rfc1035>
+- RFC 2181, *Clarifications to the DNS Specification* (section 10.1, CNAME): <https://www.rfc-editor.org/rfc/rfc2181>
+- RFC 5737, *IPv4 Address Blocks Reserved for Documentation*: <https://www.rfc-editor.org/rfc/rfc5737>
+- Cloudflare, *What came first: the CNAME or the A record?* (post-incident write-up, January 2026): <https://blog.cloudflare.com/cname-a-record-order-dns-standards/>
+- Cloudflare status, *Global Issues with 1.1.1.1 public resolver* (2026-01-08): <https://www.cloudflarestatus.com/incidents/rk3dgkmy89kc>
+- draft-jabley-dnsop-ordered-answer-section: <https://datatracker.ietf.org/doc/draft-jabley-dnsop-ordered-answer-section/>
+- glibc `resolv/nss_dns/dns-host.c` (`getanswer_r`): <https://sourceware.org/git/?p=glibc.git;a=blob;f=resolv/nss_dns/dns-host.c>
+- `resolv.conf(5)`: <https://man7.org/linux/man-pages/man5/resolv.conf.5.html>
