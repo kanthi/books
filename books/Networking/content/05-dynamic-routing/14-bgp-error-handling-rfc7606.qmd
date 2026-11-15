@@ -1,0 +1,578 @@
+---
+title: "BGP Error Handling: RFC 7606, Treat-as-Withdraw and Session-Killing UPDATEs"
+author:
+  - name: "K19G"
+  - name: "grok-bot"
+---
+
+# BGP Error Handling: RFC 7606, Treat-as-Withdraw and Session-Killing UPDATEs
+
+For most of BGP's history, a single malformed `UPDATE` message was a kill switch. Under RFC 4271, if a speaker received an `UPDATE` with a corrupted attribute length, an unknown `ORIGIN` value, or a stray flag bit, it had one prescribed response: send a `NOTIFICATION` with Error Code 3 ("UPDATE Message Error") and tear down the TCP session. On an eBGP peering carrying a full internet routing table, one bad prefix from one customer three hops away could drop hundreds of thousands of unrelated routes, trigger a global churn wave, and—because the neighbor immediately re-advertised the same bad `UPDATE` upon reconnecting—lock the session into a permanent reset loop.
+
+RFC 7606, published in August 2015, rewrote that contract. Instead of treating every syntax or attribute error as fatal to the entire session, it introduced a graded hierarchy of responses centered on **treat-as-withdraw** and **attribute discard**. The goal is blast-radius containment: if you can still reliably parse which prefixes an `UPDATE` is talking about, you withdraw only those prefixes from `Adj-RIB-In` and keep the session—and every other route on it—alive.
+
+Containment, however, introduces its own operational traps. A session that stays `Established` while silently withdrawing prefixes looks healthy on naive up/down dashboards. Worse, because optional transitive attributes pass untouched through routers that do not understand them, a malformed attribute can travel across multiple autonomous systems before hitting a parser that chokes on it—either resetting a distant session or exposing implementation bugs like the ones disclosed across major BGP stacks in 2023.
+
+## Learning goals
+
+By the end of this chapter, you will be able to:
+
+- Decode a BGP `NOTIFICATION` message on the wire and distinguish fatal `UPDATE` parsing errors (Error Code 3) from administrative or policy-driven `Cease` teardowns (Error Code 6).
+- Apply the four RFC 7606 error-handling approaches—session reset, AFI/SAFI disable, treat-as-withdraw, and attribute discard—and determine which one wins when multiple errors appear in a single `UPDATE`.
+- Explain why NLRI boundary parsing is the hard gate for treat-as-withdraw, and identify the exact conditions (such as length overruns, missing NLRIs, or malformed prefix lengths) that still force a session reset.
+- Trace how optional transitive attributes propagate across non-supporting routers to create multi-AS "worm-like" resets, and map that mechanism to real-world incidents and CVEs.
+- Instrument BGP error handling in production using BMP treat-as-withdraw counters, packet logging, and ingress filtering without masking iBGP routing inconsistencies.
+
+## Why RFC 4271 killed sessions on sight
+
+The original BGP-4 specification in RFC 4271 treated protocol correctness as binary. A BGP session is a stateful TCP stream carrying incremental routing deltas; if a speaker cannot trust a peer's encoding, RFC 4271 Section 6.3 assumes the safest move is to abort the session, flush `Adj-RIB-In`, and start over.
+
+In Section 6.3, RFC 4271 defines Error Code 3 (`UPDATE Message Error`) with eleven subcodes covering everything from a broken attribute list to an invalid prefix length:
+
+| Subcode | Name | Typical trigger |
+| :--- | :--- | :--- |
+| 1 | Malformed Attribute List | Duplicate attributes, attribute length overrun, or `Total Path Attribute Length` mismatch |
+| 2 | Unrecognized Well-known Attribute | Well-known flag set on an attribute type the receiver does not recognize |
+| 3 | Missing Well-known Attribute | Missing `ORIGIN`, `AS_PATH`, or `NEXT_HOP` (for IPv4 unicast) |
+| 4 | Attribute Flags Error | Conflicting Optional, Transitive, or Extended Length flags on a known attribute |
+| 5 | Attribute Length Error | Attribute length violates the fixed or bounded size for that type |
+| 6 | Invalid `ORIGIN` Attribute | `ORIGIN` value is not `0` (IGP), `1` (EGP), or `2` (INCOMPLETE) |
+| 7 | *(Deprecated)* | Formerly "AS Routing Loop"; no longer used |
+| 8 | Invalid `NEXT_HOP` Attribute | Syntactically invalid IP address or semantically invalid next hop |
+| 9 | Optional Attribute Error | Malformed optional attribute (such as `COMMUNITY` or `MULTI_EXIT_DISC`) |
+| 10 | Invalid Network Field | NLRI prefix length exceeds address family maximum (e.g., `> 32` for IPv4) or overruns field |
+| 11 | Malformed `AS_PATH` | Unknown segment type, segment length zero, or `AS_PATH` overrun/underrun |
+
+One notable exception already existed in RFC 4271 Section 5.1.5: if an external (eBGP) peer sends a `LOCAL_PREF` attribute, the receiver is supposed to ignore it rather than reset the session. Everything else in Section 6.3 went straight to `NOTIFICATION`.
+
+On the wire, a `NOTIFICATION` message is minimal. Every BGP message starts with a 19-octet header: a 16-octet Marker (all `0xff` bytes), a 2-octet Length, and a 1-octet Type (`3` for `NOTIFICATION`). The payload adds a 1-octet Error Code, a 1-octet Error Subcode, and optional variable-length Data (often the offending attribute or header bytes):
+
+```text
+ 0                   1                   2                   3
+ 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                                                               |
++                                                               +
+|                                                               |
++                   Marker (16 octets of 0xff)                  +
+|                                                               |
++                                                               +
+|                                                               |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|          Length (2)           |    Type = 3   |  Error Code   |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+| Error Subcode |            Data (0 or more octets)            |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+```
+
+When a speaker sends a bare `NOTIFICATION` with no diagnostic Data, the total message length is 21 octets (`0x0015`). Right after the 16-octet `0xff` marker, you see `00 15 03` followed by the code and subcode:
+
+- `00 15 03 03 05`: Error Code 3 (`UPDATE Message Error`), Subcode 5 (`Attribute Length Error`).
+- `00 15 03 03 0a`: Error Code 3 (`UPDATE Message Error`), Subcode 10 (`Invalid Network Field`).
+
+### Distinguishing parse errors from Cease notifications
+
+When you triage a session flap, the first question is whether the `NOTIFICATION` was a deliberate administrative/policy teardown or a protocol parse failure. Error Code 3 means one side sent bytes the other side refused to parse. Error Code 6 (`Cease`), defined in RFC 4486, means the session was closed intentionally for operational reasons:
+
+| Cease Subcode (RFC 4486) | Name | Operational meaning |
+| :--- | :--- | :--- |
+| 1 | Maximum Number of Prefixes Reached | Peer exceeded configured `max-prefix` limit |
+| 2 | Administrative Shutdown | Operator shut down the neighbor or BGP process |
+| 3 | Peer De-configured | Neighbor statement removed from configuration |
+| 4 | Administrative Reset | Operator issued a hard clear (`clear bgp`) |
+| 5 | Connection Rejected | Incoming TCP connection refused (e.g., wrong state or ACL) |
+| 6 | Other Configuration Change | Incompatible config change such as AS number or capability change |
+| 7 | Connection Collision Resolution | Duplicate TCP connection closed in favor of the winning connection |
+| 8 | Out of Resources | Memory or buffer exhaustion prevented continuing the session |
+
+Under RFC 9003, Cease subcodes 2 (`Administrative Shutdown`) and 4 (`Administrative Reset`) can also carry a short UTF-8 shutdown communication (up to 255 octets) in the Data field, letting an operator tell the peer why the session went down ("emergency fiber splice, back in 15m"). Seeing `06 02` or `06 04` with a maintenance ticket string is healthy operations. Seeing `03 01`, `03 05`, or `03 0a` means a malformed `UPDATE` is loose on the wire.
+
+## The RFC 7606 hierarchy: four levels of damage
+
+RFC 7606 ("Revised Error Handling for BGP UPDATE Messages") replaces the single hammer of session reset with four graduated approaches, ordered from **strongest** (most disruptive) to **weakest** (least disruptive):
+
+1. **Session reset**: Send `NOTIFICATION` (Error Code 3) and close the TCP connection, exactly as in RFC 4271. Reserved for cases where the receiver cannot reliably locate or parse the NLRI boundaries, or where `MP_REACH_NLRI`/`MP_UNREACH_NLRI` itself is structurally broken.
+2. **AFI/SAFI disable** (RFC 4760 Section 7): Instead of tearing down the entire multi-protocol BGP session, disable only the specific Address Family Identifier / Subsequent Address Family Identifier (for example, `IPv6 Unicast` or `EVPN`) affected by the malformed `MP_REACH_NLRI` or `MP_UNREACH_NLRI`, flush its routes, and leave other AFI/SAFIs running.
+3. **Treat-as-withdraw**: Remove every route carried in the malformed `UPDATE` from `Adj-RIB-In` as if the peer had sent an explicit withdrawal for those prefixes, and run the decision process to fall back to alternate paths (or remove the routes entirely if none exist). The session remains `Established`.
+4. **Attribute discard**: Drop the offending attribute from the `UPDATE` and continue processing the remaining attributes and routes normally. This is allowed **only** for attributes whose absence cannot corrupt route selection or forwarding installation (such as `ATOMIC_AGGREGATE` or `AGGREGATOR`).
+
+When a single `UPDATE` contains multiple errors, **the strongest applicable approach wins**. If one attribute triggers attribute discard and another triggers treat-as-withdraw, the entire `UPDATE` is treated as a withdrawal. If the NLRI field itself cannot be parsed, treat-as-withdraw is impossible, so the speaker escalates to AFI/SAFI disable or session reset.
+
+```text
+                    Malformed UPDATE arrives
+                               |
+                               v
+            +-------------------------------------+
+            | Can NLRI / MP_REACH / MP_UNREACH    |
+            | boundaries be parsed with certainty?|
+            +-------------------------------------+
+                 |                           |
+                No                          Yes
+                 |                           |
+                 v                           v
+      +--------------------+      +-------------------------+
+      | Specific AFI/SAFI  |      | Evaluate every path     |
+      | known & isolatable?|      | attribute error         |
+      +--------------------+      +-------------------------+
+         |            |              |         |         |
+        No           Yes        Attr Discard  T-a-W   Reset Error
+         |            |              |         |         |
+         v            v              v         v         v
+   Session Reset  Disable AFI/SAFI   +----+----+---------+
+   (NOTIFICATION) (RFC 4760 s7)           |
+                                          v
+                              Strongest error wins
+```
+
+### Treat-as-withdraw is not "ignore the UPDATE"
+
+A common misconception is that RFC 7606 tells a router to "drop" or "ignore" a bad `UPDATE`. Dropping an `UPDATE` silently would be catastrophic: if the peer previously advertised a valid path for `192.0.2.0/24` and then sent a malformed `UPDATE` updating that prefix's attributes, ignoring the second message would leave the **stale** route in `Adj-RIB-In` indefinitely.
+
+Treat-as-withdraw explicitly forces the receiver to act as though the peer withdrew every prefix in that `UPDATE`. If the prefix was previously installed from that peer, it is removed from `Adj-RIB-In` and `Loc-RIB`, and a withdrawal is propagated downstream if no backup path exists. If the prefix was not previously present, removing it is a no-op—either way, the router never retains stale state from a peer that just sent garbage.
+
+## Framing, attribute length, and the NLRI boundary
+
+Treat-as-withdraw rests on a single prerequisite: **you must know which prefixes the `UPDATE` applies to**. In a classic IPv4 unicast `UPDATE`, the wire layout places the `Withdrawn Routes` first, then the `Total Path Attribute Length` and `Path Attributes`, and finally the `NLRI` at the tail of the message:
+
+```text
++-------------------------------------------------------+
+| Withdrawn Routes Length (2 octets)                    |
++-------------------------------------------------------+
+| Withdrawn Routes (variable)                           |
++-------------------------------------------------------+
+| Total Path Attribute Length (2 octets)                |
++-------------------------------------------------------+
+| Path Attributes (variable: Flags | Type | Len | Val)  |
++-------------------------------------------------------+
+| Network Layer Reachability Information (NLRI, var)    |
++-------------------------------------------------------+
+```
+
+If an error inside `Path Attributes` corrupts your ability to find the start of the `NLRI` field—or if the `NLRI` field itself is syntactically invalid—you cannot know which routes to withdraw. RFC 7606 Sections 4 and 5 close every ambiguity around this boundary.
+
+### Section 4: Attribute length overruns and zero-length rules
+
+Each path attribute begins with 1 octet of Attribute Flags, 1 octet of Attribute Type Code, and either a 1-octet Length or (when the Extended Length bit `0x10` is set) a 2-octet Length.
+
+- **Overrun or truncated header**: If fewer than 3 octets remain in the `Path Attributes` field (or fewer than 4 octets when the Extended Length bit is set), or if an attribute's declared length extends past `Total Path Attribute Length`, the speaker MUST apply **treat-as-withdraw**—not session reset. Why? Because `Total Path Attribute Length` is a separate 2-octet field at the top of the attribute block. As long as `Total Path Attribute Length` itself fits inside the BGP message, the receiver can jump directly to `offset + Total Path Attribute Length` to locate the `NLRI` field without trusting the individual attribute lengths inside it.
+- **Zero-length attributes**: Only two attributes in base BGP-4 are permitted to have a length of zero: `AS_PATH` (which is empty when originating a route into iBGP) and `ATOMIC_AGGREGATE` (which is a flag-like marker with no value). Any other attribute arriving with length zero is an error.
+
+### Section 5.1: MP_REACH_NLRI ordering and single-purpose UPDATEs
+
+For multiprotocol BGP (RFC 4760), prefixes live inside `MP_REACH_NLRI` (Type 14) and `MP_UNREACH_NLRI` (Type 15) rather than in the trailing IPv4 `NLRI` field. RFC 7606 Section 5.1 tightens how senders must encode these:
+
+1. If `MP_REACH_NLRI` or `MP_UNREACH_NLRI` is present, it **SHALL be the very first attribute** in the `Path Attributes` list. Placing it first ensures that if a later attribute overruns or fails to parse, the receiver has already extracted the AFI/SAFI and the prefixes.
+2. An `UPDATE` **MUST NOT** carry more than one of the following four elements: non-empty `Withdrawn Routes`, non-empty IPv4 `NLRI`, `MP_REACH_NLRI`, or `MP_UNREACH_NLRI`. Receivers must still accept older encodings that combine them, because legacy speakers exist, but modern senders must separate them.
+
+### Section 5.2: The empty-NLRI trap
+
+Consider an `UPDATE` that carries path attributes (other than `MP_UNREACH_NLRI`) but has **no reachable NLRI**—neither in the IPv4 `NLRI` field nor in `MP_REACH_NLRI`. Normally, an `UPDATE` with `Total Path Attribute Length = 0` and no `NLRI` (or an empty `MP_UNREACH_NLRI` for a multiprotocol family) is the legitimate **End-of-RIB** marker used by Graceful Restart (RFC 4724).
+
+However, if an `UPDATE` has path attributes other than `MP_UNREACH_NLRI`, **no reachable NLRI**, and **any error that is not attribute discard**, RFC 7606 Section 5.2 mandates a **session reset**. When an attribute is malformed and no NLRI were parsed, the speaker cannot be sure whether the sender omitted the NLRI intentionally or whether a framing bug caused the NLRI to disappear into a corrupt attribute.
+
+### Sections 5.3 and 5.4: NLRI syntax and typed NLRI
+
+Even when the receiver reaches the `NLRI` or `Withdrawn Routes` field cleanly, it must validate the prefix encodings:
+
+- **Withdrawn Routes must be checked**: RFC 7606 requires the `Withdrawn Routes` field to undergo the exact same syntactic validation as `NLRI`.
+- **IPv4 prefix bounds**: An IPv4 `NLRI` (or `Withdrawn Routes`) field is syntactically incorrect if any prefix length is greater than `32`, or if the last prefix's encoded octets overrun the end of the field. Both force a **session reset** (Subcode 10, `Invalid Network Field`).
+- **MP_REACH / MP_UNREACH minimum lengths**: `MP_REACH_NLRI` must be at least 5 octets long (2-octet AFI + 1-octet SAFI + 1-octet Next Hop Length + 1-octet Reserved), and `MP_UNREACH_NLRI` must be at least 3 octets long (2-octet AFI + 1-octet SAFI). Shorter values cannot even identify the AFI/SAFI reliably, forcing a **session reset**.
+- **Typed NLRI (Section 5.4)**: Address families such as EVPN or MCAST-VPN encode NLRIs as `(Route Type, Length, Value)` tuples. If a speaker encounters an unknown route type inside an otherwise syntactically valid typed NLRI field, it discards only those unknown routes rather than resetting the session or the AFI/SAFI.
+
+## Per-attribute error handling
+
+RFC 7606 Section 7 specifies the exact error-handling action for every standard BGP path attribute. The table below summarizes the rules you need when reading packet captures or debugging BGP logs:
+
+| Attribute / Condition | Malformed condition | RFC 4271 action | RFC 7606 action |
+| :--- | :--- | :--- | :--- |
+| Attribute Flags | Optional/Transitive flags conflict with known definition | Reset (Subcode 4) | **Treat-as-withdraw** |
+| Missing Well-known Mandatory | Missing `ORIGIN`, `AS_PATH`, or `NEXT_HOP` (IPv4 unicast; `NEXT_HOP` is discretionary in MP-BGP per RFC 4760) | Reset (Subcode 3) | **Treat-as-withdraw** |
+| `MP_REACH_NLRI` / `MP_UNREACH_NLRI` duplicate | Appears more than once in the same `UPDATE` | Reset (Subcode 1) | **Session reset** (Malformed Attribute List) |
+| Any other duplicate attribute | Same attribute type appears more than once | Reset (Subcode 1) | **Keep first, discard rest** |
+| `ORIGIN` (Type 1) | Length `!= 1` or value not in `{0, 1, 2}` | Reset (Subcode 5 or 6) | **Treat-as-withdraw** |
+| `AS_PATH` (Type 2) | Unknown segment type, overrun/underrun, segment length `0`, or leftmost-AS check failure (SHOULD) | Reset (Subcode 11) | **Treat-as-withdraw** |
+| `NEXT_HOP` (Type 3) | Length `!= 4` (or semantically invalid) | Reset (Subcode 5 or 8) | **Treat-as-withdraw** |
+| `MULTI_EXIT_DISC` (Type 4) | Length `!= 4` | Reset (Subcode 5 or 9) | **Treat-as-withdraw** |
+| `LOCAL_PREF` (Type 5) | Received from eBGP peer | Ignored (s5.1.5) | **Attribute discard** |
+| `LOCAL_PREF` (Type 5) | Received from iBGP peer with length `!= 4` | Reset (Subcode 5) | **Treat-as-withdraw** |
+| `ATOMIC_AGGREGATE` (Type 6) | Length `!= 0` | Reset (Subcode 5) | **Attribute discard** |
+| `AGGREGATOR` (Type 7) | Length `!= 6` (2-octet AS) or `!= 8` (4-octet AS) | Reset (Subcode 5) | **Attribute discard** |
+| `COMMUNITY` (Type 8) | Length is `0` or not a multiple of `4` | Reset (Subcode 5 or 9) | **Treat-as-withdraw** |
+| `ORIGINATOR_ID` (Type 9) | Received from eBGP peer | Not covered by RFC 4271 (RFC 4456 attribute) | **Attribute discard** |
+| `ORIGINATOR_ID` (Type 9) | Received from iBGP peer, malformed (length `!= 4`) | Not covered by RFC 4271; implementations reset | **Treat-as-withdraw** |
+| `CLUSTER_LIST` (Type 10) | Received from eBGP peer | Not covered by RFC 4271 (RFC 4456 attribute) | **Attribute discard** |
+| `CLUSTER_LIST` (Type 10) | Received from iBGP peer, malformed (length `0` or not multiple of `4`) | Not covered by RFC 4271; implementations reset | **Treat-as-withdraw** |
+
+Notice the design logic behind **attribute discard**. You can safely discard `ATOMIC_AGGREGATE` and `AGGREGATOR` because neither attribute participates in the BGP best-path selection algorithm or the forwarding next-hop calculation; they are informational metadata. Similarly, `LOCAL_PREF`, `ORIGINATOR_ID`, and `CLUSTER_LIST` have no business crossing an eBGP boundary, so discarding them on eBGP protects the session without affecting external route selection. By contrast, `ORIGIN`, `AS_PATH`, `NEXT_HOP`, `MED`, and `COMMUNITY` directly drive best-path selection, loop prevention, or policy—so if they are corrupt, the route itself cannot be trusted and must be withdrawn.
+
+For future-proofing, RFC 7606 Section 8 requires that any **new path attribute** standardized after RFC 7606 must explicitly define its own error-handling behavior rather than leaving implementers to guess between treat-as-withdraw, attribute discard, and session reset.
+
+## Why optional transitive attributes become worms
+
+On paper, RFC 7606 looks like a complete solution. In practice, BGP's extensibility mechanism—**optional transitive attributes**—creates a propagation hazard that turns a localized parser bug into a wide-area outage.
+
+Under BGP's attribute model, if a router receives an **optional** (`0x80`) **transitive** (`0x40`) attribute whose type code it does not recognize, it is required to set the **Partial** bit (`0x20`) and **forward the attribute unchanged** to its peers. It does not validate the attribute's payload, because it does not know the attribute's syntax.
+
+```text
+  Origin AS              Transit AS A             Transit AS B             Target AS C
++------------+          +------------+           +------------+           +------------+
+| Announces  |  Attr X  | Unknown    |  Attr X   | Unknown    |  Attr X   | Parses     |
+| prefix +   | -------> | optional   | --------> | optional   | --------> | Attr X ->  |
+| bad Attr X |          | transitive | (Partial) | transitive | (Partial) | Error /    |
++------------+          +------------+           +------------+           | Reset!     |
+                             (OK)                     (OK)                +------------+
+                                                                                ^
+                                                      Session restarts ->       |
+                                                      Transit AS B resends -----+
+                                                      the same bad UPDATE!
+```
+
+On 2 June 2023, this exact mechanism played out on the global internet. As documented by Ben Cartwright-Cox in *"Grave flaws in BGP Error handling"* (29 August 2023), a small Brazilian network (re)announced a route carrying an optional transitive attribute for a feature that had not finished standardisation. Routers along the path that did not understand the attribute passed it on unchanged. Juniper routers running reasonably modern software *did* understand it, judged it malformed and, in their default configuration, shut down the whole BGP session, hurting networks thousands of miles from the origin; the post names COLT as heavily impacted. (The post later adds a reader's correction: the attribute may not have been corrupted at all, just implemented against an unfinished specification. For the receiver, the effect is the same.)
+
+Think through what happens next. The upstream peer still holds the route, so when the reset session comes back up it re-sends its table, including the same `UPDATE`, and the session can go down again. Until someone filters the route or the origin withdraws it, the session flaps on a loop that nobody on either end caused.
+
+### The August–September 2023 BGP CVEs
+
+Cartwright-Cox's subsequent fuzzing campaign uncovered multiple implementation flaws across major BGP stacks, resulting in a cluster of CVEs disclosed at the end of August and start of September 2023:
+
+- **CVE-2023-4481** (NVD published 2023-09-01, Juniper JSA72510): In Juniper Junos OS and Junos OS Evolved (`rpd`), a crafted BGP `UPDATE` can tear down a BGP session with an `UPDATE` message error or propagate the malformed attribute further.
+- **CVE-2023-38802** (2023-08-29): In FRRouting (FRR) versions 7.5.1 through 9.0 and Pica8 PICOS 4.3.3.2, a crafted `UPDATE` containing a corrupted attribute 23 (`Tunnel Encapsulation`) triggers a denial of service.
+- **CVE-2023-41358** (2023-08-29): In FRRouting through 9.0, `bgpd/bgp_packet.c` processes NLRIs when the attribute length is zero, mishandling the boundary conditions that RFC 7606 relies on.
+- **CVE-2023-38283** (2023-08-29): In OpenBGPD before 8.1 (fixed in OpenBSD 7.3 errata 006), incorrect handling of path-attribute length can reset a BGP session—tied in the post to the then-new Only-to-Customer (`OTC`) attribute code.
+
+The post also notes that Nokia advised operators to enable `error-handling update-fault-tolerance` on SR OS and SR Linux BGP groups (from the docs/report, not run), underscoring that even when RFC 7606 exists in a standard, fault-tolerant parsing is sometimes an explicit configuration knob or subject to per-attribute parser bugs.
+
+## Operating RFC 7606 in production
+
+Deploying RFC 7606-compliant software is necessary, but it is not "set and forget." Operating treat-as-withdraw safely requires changes to how you monitor, log, and filter BGP.
+
+### The iBGP consistency problem (RFC 7606 Section 6)
+
+Treat-as-withdraw is safest on eBGP sessions, where withdrawing a bad route simply falls back to another transit or peering path. Inside your own AS, however, **treat-as-withdraw on an iBGP session can create routing loops and black holes**.
+
+Suppose ingress router `R1` accepts a route from an eBGP peer (perhaps because `R1` runs a looser parser or does not parse an optional transitive attribute) and reflects it to `R2` and `R3`. `R2` understands the attribute, finds it malformed, and applies treat-as-withdraw—removing the route. `R3` does not understand the attribute and keeps the route. Now `R3` and `R2` disagree on reachability for the same destination, which can send traffic bouncing between them or straight into a black hole.
+
+RFC 7606 Section 6 gives the operational rule: when you see treat-as-withdraw firing on an iBGP session, **trace the route back to the ingress eBGP router and filter or fix it at the edge**.
+
+### Observability: BMP, alerts, and packet logging
+
+Because RFC 7606 keeps the TCP session `Established`, traditional up/down SNMP traps and BGP state-change alerts will stay silent while prefixes disappear. You need three layers of visibility:
+
+1. **Separate NOTIFICATION alerts**: Alert on `NOTIFICATION` Error Code 3 (`UPDATE Message Error`) at high severity, separately from `Cease` (Code 6). A Code 3 alert means either a peer is sending unparseable framing or your own router hit a session-reset condition.
+2. **Watch BMP treat-as-withdraw counters**: As covered in the BMP chapter, RFC 7854 defines BMP Statistics Report types specifically for RFC 7606 events: **Type 11** counts `UPDATE` messages subjected to treat-as-withdraw, and **Type 12** counts prefixes subjected to treat-as-withdraw. Graph these counters per peer; any non-zero spike means you are silently dropping routes.
+3. **Log the NLRI and the full malformed UPDATE**: RFC 7606 Section 6 says a speaker must provide debugging facilities that, at a minimum, log an error listing the NLRI involved and containing the entire malformed `UPDATE` message. Make sure yours is turned on and the logs are kept (a hex dump or MRT file is ideal). Without the raw bytes, you cannot tell whether a peer has a buggy stack, whether a transitive attribute is leaking from three ASes away, or which ingress router needs a filter.
+
+### Edge hygiene
+
+- **Audit and patch**: Verify that every BGP implementation you operate—including route reflectors, BMP collectors, and anycast hosts—claims RFC 7606 support and is patched against the 2023 CVEs (`CVE-2023-4481`, `CVE-2023-38802`, `CVE-2023-41358`, `CVE-2023-38283`).
+- **Filter unknown or deprecated optional transitive attributes at the edge**: Where your platform supports attribute-scrubbing or path-attribute filtering in route policy, drop unknown or deprecated optional transitive attributes on eBGP ingress from untrusted peers so they cannot enter your iBGP mesh or transit your AS to break a downstream customer.
+
+## The lab
+
+To see the exact difference between RFC 4271 and RFC 7606 on the wire, `bgp7606.py` runs two minimal BGP-4 speakers over loopback (`127.0.0.1`) implementing `OPEN`, `KEEPALIVE`, `UPDATE`, and `NOTIFICATION`. For each test case, the sender transmits three messages in order: a valid `UPDATE` for `198.51.100.0/24`, one malformed `UPDATE` for `192.0.2.0/24`, and a final valid `UPDATE` for `203.0.113.0/24`. The receiver runs each test twice—once in `rfc4271` mode and once in `rfc7606` mode—and reports the session state, any `NOTIFICATION` bytes, and the resulting `Adj-RIB-In`.
+
+```{.python filename="bgp7606.py"}
+#!/usr/bin/env python3
+"""Two minimal BGP-4 speakers over loopback TCP. The sender pushes one good
+UPDATE, then a malformed one, then another good one. The receiver runs either
+classic RFC 4271 handling (NOTIFICATION + session reset) or RFC 7606 revised
+error handling (treat-as-withdraw / attribute discard / session reset)."""
+import socket, struct, threading, ipaddress, sys
+
+MARKER = b"\xff" * 16
+OPEN, UPDATE, NOTIFICATION, KEEPALIVE = 1, 2, 3, 4
+ORIGIN, AS_PATH, NEXT_HOP, MED, LOCAL_PREF, ATOMIC_AGG, AGGREGATOR, COMMUNITY = 1, 2, 3, 4, 5, 6, 7, 8
+MP_REACH, MP_UNREACH = 14, 15
+NAMES = {1: "ORIGIN", 2: "AS_PATH", 3: "NEXT_HOP", 4: "MED", 5: "LOCAL_PREF", 6: "ATOMIC_AGGREGATE",
+         7: "AGGREGATOR", 8: "COMMUNITY", 14: "MP_REACH_NLRI", 15: "MP_UNREACH_NLRI", 23: "TUNNEL_ENCAP"}
+WELL_KNOWN = {ORIGIN, AS_PATH, NEXT_HOP, LOCAL_PREF, ATOMIC_AGG}
+
+def msg(t, body=b""): return MARKER + struct.pack("!HB", 19 + len(body), t) + body
+def attr(flags, code, val):
+    if len(val) > 255: return struct.pack("!BBH", flags | 0x10, code, len(val)) + val
+    return struct.pack("!BBB", flags, code, len(val)) + val
+def nlri(prefixes):
+    out = b""
+    for p in prefixes:
+        n = ipaddress.ip_network(p); plen = n.prefixlen
+        out += bytes([plen]) + n.network_address.packed[:(plen + 7) // 8]
+    return out
+def update(attrs, prefixes=(), withdrawn=b""):
+    pa = b"".join(attrs)
+    return msg(UPDATE, struct.pack("!H", len(withdrawn)) + withdrawn + struct.pack("!H", len(pa)) + pa + nlri(prefixes))
+
+def good_attrs(nh="192.0.2.1"):
+    return [attr(0x40, ORIGIN, b"\x00"),
+            attr(0x40, AS_PATH, b"\x02\x01" + struct.pack("!H", 65001)),   # AS_SEQUENCE [65001], 2-octet ASNs
+            attr(0x40, NEXT_HOP, ipaddress.ip_address(nh).packed)]
+
+def recv_exact(s, n):
+    b = b""
+    while len(b) < n:
+        c = s.recv(n - len(b))
+        if not c: raise ConnectionError("peer closed")
+        b += c
+    return b
+def read_msg(s):
+    h = recv_exact(s, 19); ln, t = struct.unpack("!HB", h[16:19])
+    return t, recv_exact(s, ln - 19)
+
+# ---------------- receiver-side parsing ----------------
+STRONG = {"attribute discard": 0, "treat-as-withdraw": 1, "AFI/SAFI disable": 2, "session reset": 3}
+
+def parse_nlri(buf, field):
+    out, i = [], 0
+    while i < len(buf):
+        plen = buf[i]
+        if plen > 32: raise ValueError(f"{field}: prefix length {plen} > 32")
+        nb = (plen + 7) // 8
+        if i + 1 + nb > len(buf): raise ValueError(f"{field}: last prefix overruns field")
+        out.append(f"{ipaddress.IPv4Address(buf[i+1:i+1+nb] + bytes(4 - nb))}/{plen}"); i += 1 + nb
+    return out
+
+def check_attrs(pa, ebgp=True):
+    """Return (errors[(approach, reason, subcode)], parsed attrs dict)."""
+    errs, seen, i = [], {}, 0
+    while i < len(pa):
+        if len(pa) - i < 3:
+            errs.append(("treat-as-withdraw", "fewer than 3 octets left for an attribute (RFC 7606 s4)", 1)); break
+        flags, code = pa[i], pa[i + 1]
+        if flags & 0x10:
+            if len(pa) - i < 4: errs.append(("treat-as-withdraw", "short extended-length header", 1)); break
+            alen = struct.unpack("!H", pa[i+2:i+4])[0]; hdr = 4
+        else:
+            alen = pa[i + 2]; hdr = 3
+        if i + hdr + alen > len(pa):
+            errs.append(("treat-as-withdraw", f"{NAMES.get(code, code)} length {alen} overruns Total Path Attribute Length (RFC 7606 s4)", 5)); break
+        val = pa[i + hdr:i + hdr + alen]; i += hdr + alen
+        name = NAMES.get(code, f"type {code}")
+        if code in seen:
+            if code in (MP_REACH, MP_UNREACH): errs.append(("session reset", f"{name} appears twice", 1))
+            else: errs.append(("attribute discard", f"duplicate {name}: later copy dropped (RFC 7606 s3g)", 1))
+            continue
+        seen[code] = val
+        opt, trans = bool(flags & 0x80), bool(flags & 0x40)
+        if code in WELL_KNOWN and (opt or not trans):
+            errs.append(("treat-as-withdraw", f"{name} flags O={int(opt)} T={int(trans)} conflict (RFC 7606 s3c)", 4)); continue
+        if code == ORIGIN and (alen != 1 or val[0] > 2):
+            errs.append(("treat-as-withdraw", f"ORIGIN malformed (len {alen}, value {val[:1].hex()}) (s7.1)", 6))
+        elif code == AS_PATH:
+            j = 0
+            while j < alen:
+                if alen - j < 2: errs.append(("treat-as-withdraw", "AS_PATH underrun (s7.2)", 11)); break
+                st, sl = val[j], val[j + 1]
+                if st not in (1, 2, 3, 4) or sl == 0 or j + 2 + 2 * sl > alen:
+                    errs.append(("treat-as-withdraw", f"AS_PATH segment type {st} len {sl} malformed (s7.2)", 11)); break
+                j += 2 + 2 * sl
+        elif code == NEXT_HOP and alen != 4:
+            errs.append(("treat-as-withdraw", f"NEXT_HOP length {alen} != 4 (s7.3)", 8))
+        elif code == MED and alen != 4:
+            errs.append(("treat-as-withdraw", f"MED length {alen} != 4 (s7.4)", 5))
+        elif code == LOCAL_PREF and ebgp:
+            errs.append(("attribute discard", "LOCAL_PREF from an external peer is discarded (s7.5)", 0))
+        elif code == ATOMIC_AGG and alen != 0:
+            errs.append(("attribute discard", f"ATOMIC_AGGREGATE length {alen} != 0 (s7.6)", 5))
+        elif code == AGGREGATOR and alen != 6:
+            errs.append(("attribute discard", f"AGGREGATOR length {alen} != 6 without 4-octet AS (s7.7)", 5))
+        elif code == COMMUNITY and (alen == 0 or alen % 4):
+            errs.append(("treat-as-withdraw", f"COMMUNITY length {alen} not a non-zero multiple of 4 (s7.8)", 5))
+    for wk in (ORIGIN, AS_PATH, NEXT_HOP):
+        if wk not in seen:
+            errs.append(("treat-as-withdraw", f"missing well-known {NAMES[wk]} (s3d)", 3))
+    return errs, seen
+
+class Receiver:
+    def __init__(self, mode):
+        self.mode, self.rib, self.log, self.notified = mode, {}, [], None
+    def handle_update(self, body):
+        wl = struct.unpack("!H", body[:2])[0]; wd = body[2:2 + wl]
+        tl = struct.unpack("!H", body[2 + wl:4 + wl])[0]; pa = body[4 + wl:4 + wl + tl]
+        if 4 + wl + tl > len(body):
+            return ("session reset", "Withdrawn + Total Attribute Length exceed message (s3b)", 1)
+        try:
+            withdrawn = parse_nlri(wd, "Withdrawn Routes"); prefixes = parse_nlri(body[4 + wl + tl:], "NLRI")
+        except ValueError as e:
+            return ("session reset", f"{e} (s3j, s5.3)", 10)
+        errs, seen = check_attrs(pa)
+        for w in withdrawn: self.rib.pop(w, None)
+        if not errs:
+            for p in prefixes: self.rib[p] = ipaddress.IPv4Address(seen[NEXT_HOP]).exploded
+            return None
+        worst = max(errs, key=lambda e: STRONG[e[0]])
+        if self.mode == "rfc4271":
+            # RFC 4271 5.1.5 already says LOCAL_PREF from an external peer is ignored
+            errs = [e for e in errs if "LOCAL_PREF from an external" not in e[1]]
+            if errs:
+                sub = next((e[2] for e in errs if e[2]), 1)
+                return ("session reset", errs[0][1], sub)
+            for p in prefixes: self.rib[p] = ipaddress.IPv4Address(seen[NEXT_HOP]).exploded
+            return None
+        if not prefixes and not withdrawn and worst[0] != "attribute discard":
+            return ("session reset", "attribute error in an UPDATE with no NLRI (s5.2)", worst[2] or 1)
+        for e in errs: self.log.append(f"{e[0]}: {e[1]}")
+        if worst[0] == "treat-as-withdraw":
+            for p in prefixes: self.rib.pop(p, None)
+            self.log.append(f"  -> {prefixes} treated as withdrawn")
+        elif worst[0] == "attribute discard":
+            for p in prefixes: self.rib[p] = ipaddress.IPv4Address(seen[NEXT_HOP]).exploded
+        elif worst[0] == "session reset":
+            return worst
+        return None
+
+def run_case(mode, bad):
+    srv = socket.socket(); srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(("127.0.0.1", 0)); srv.listen(1); port = srv.getsockname()[1]
+    rcv = Receiver(mode); done = threading.Event()
+    def server():
+        c, _ = srv.accept()
+        try:
+            read_msg(c)                                                  # OPEN
+            c.sendall(msg(OPEN, struct.pack("!BHH4sB", 4, 65000, 90, socket.inet_aton("10.0.0.2"), 0)))
+            c.sendall(msg(KEEPALIVE)); read_msg(c)                       # KEEPALIVE
+            while True:
+                t, body = read_msg(c)
+                if t != UPDATE: continue
+                r = rcv.handle_update(body)
+                if r:
+                    approach, reason, sub = r
+                    note = msg(NOTIFICATION, bytes([3, sub]))
+                    c.sendall(note); rcv.notified = (reason, note[16:].hex(" ")); break
+        except ConnectionError:
+            pass
+        finally:
+            c.close(); done.set()
+    th = threading.Thread(target=server); th.start()
+    s = socket.create_connection(("127.0.0.1", port))
+    s.sendall(msg(OPEN, struct.pack("!BHH4sB", 4, 65001, 90, socket.inet_aton("10.0.0.1"), 0)))
+    read_msg(s); read_msg(s); s.sendall(msg(KEEPALIVE))
+    s.sendall(update(good_attrs(), ["198.51.100.0/24"]))
+    s.sendall(bad)
+    s.sendall(update(good_attrs("192.0.2.9"), ["203.0.113.0/24"]))
+    try:
+        s.settimeout(0.5); t, body = read_msg(s); got = f"NOTIFICATION code {body[0]} subcode {body[1]}"
+    except (socket.timeout, ConnectionError):
+        got = None
+    s.close(); done.wait(2); th.join(2); srv.close()
+    return rcv, got
+
+CASES = [
+    ("COMMUNITY length 6", update(good_attrs() + [attr(0xC0, COMMUNITY, b"\xfd\xe8\x00\x01\x00\x02")], ["192.0.2.0/24"])),
+    ("ORIGIN value 7", update([attr(0x40, ORIGIN, b"\x07")] + good_attrs()[1:], ["192.0.2.0/24"])),
+    ("AS_PATH segment length 0", update([good_attrs()[0], attr(0x40, AS_PATH, b"\x02\x00"), good_attrs()[2]], ["192.0.2.0/24"])),
+    ("ATOMIC_AGGREGATE length 2", update(good_attrs() + [attr(0x40, ATOMIC_AGG, b"\x00\x00")], ["192.0.2.0/24"])),
+    ("LOCAL_PREF over eBGP", update(good_attrs() + [attr(0x40, LOCAL_PREF, struct.pack("!I", 500))], ["192.0.2.0/24"])),
+    ("NEXT_HOP flags optional", update(good_attrs()[:2] + [attr(0xC0, NEXT_HOP, socket.inet_aton("192.0.2.1"))], ["192.0.2.0/24"])),
+    ("duplicate MED", update(good_attrs() + [attr(0x80, MED, b"\x00\x00\x00\x0a"), attr(0x80, MED, b"\x00\x00\x00\x14")], ["192.0.2.0/24"])),
+    ("missing NEXT_HOP", update(good_attrs()[:2], ["192.0.2.0/24"])),
+    ("bad COMMUNITY, no NLRI", update(good_attrs() + [attr(0xC0, COMMUNITY, b"\x00\x01\x02")])),
+    ("NLRI prefix length 33", msg(UPDATE, b"\x00\x00" + struct.pack("!H", len(b"".join(good_attrs()))) + b"".join(good_attrs()) + b"\x21\xc0\x00\x02\x00\x00")),
+]
+
+def main():
+    print(f"{'case':28s} {'mode':8s} {'session':42s} Adj-RIB-In after the next good UPDATE")
+    for name, bad in CASES:
+        for mode in ("rfc4271", "rfc7606"):
+            rcv, got = run_case(mode, bad)
+            sess = "UP" if not rcv.notified else f"RESET ({got})"
+            print(f"{name:28s} {mode:8s} {sess:42s} {sorted(rcv.rib)}")
+            if mode == "rfc7606":
+                for l in rcv.log: print(f"{'':37s}| {l}")
+                if rcv.notified: print(f"{'':37s}| reason: {rcv.notified[0]}; bytes after marker: {rcv.notified[1]}")
+
+if __name__ == "__main__":
+    main()
+```
+
+Run it with `python3 bgp7606.py`. It needs no root: both speakers listen on unprivileged loopback ports. Output, pasted unedited from a run on 2026-11-16:
+```text
+case                         mode     session                                    Adj-RIB-In after the next good UPDATE
+COMMUNITY length 6           rfc4271  RESET (NOTIFICATION code 3 subcode 5)      ['198.51.100.0/24']
+COMMUNITY length 6           rfc7606  UP                                         ['198.51.100.0/24', '203.0.113.0/24']
+                                     | treat-as-withdraw: COMMUNITY length 6 not a non-zero multiple of 4 (s7.8)
+                                     |   -> ['192.0.2.0/24'] treated as withdrawn
+ORIGIN value 7               rfc4271  RESET (NOTIFICATION code 3 subcode 6)      ['198.51.100.0/24']
+ORIGIN value 7               rfc7606  UP                                         ['198.51.100.0/24', '203.0.113.0/24']
+                                     | treat-as-withdraw: ORIGIN malformed (len 1, value 07) (s7.1)
+                                     |   -> ['192.0.2.0/24'] treated as withdrawn
+AS_PATH segment length 0     rfc4271  RESET (NOTIFICATION code 3 subcode 11)     ['198.51.100.0/24']
+AS_PATH segment length 0     rfc7606  UP                                         ['198.51.100.0/24', '203.0.113.0/24']
+                                     | treat-as-withdraw: AS_PATH segment type 2 len 0 malformed (s7.2)
+                                     |   -> ['192.0.2.0/24'] treated as withdrawn
+ATOMIC_AGGREGATE length 2    rfc4271  RESET (NOTIFICATION code 3 subcode 5)      ['198.51.100.0/24']
+ATOMIC_AGGREGATE length 2    rfc7606  UP                                         ['192.0.2.0/24', '198.51.100.0/24', '203.0.113.0/24']
+                                     | attribute discard: ATOMIC_AGGREGATE length 2 != 0 (s7.6)
+LOCAL_PREF over eBGP         rfc4271  UP                                         ['192.0.2.0/24', '198.51.100.0/24', '203.0.113.0/24']
+LOCAL_PREF over eBGP         rfc7606  UP                                         ['192.0.2.0/24', '198.51.100.0/24', '203.0.113.0/24']
+                                     | attribute discard: LOCAL_PREF from an external peer is discarded (s7.5)
+NEXT_HOP flags optional      rfc4271  RESET (NOTIFICATION code 3 subcode 4)      ['198.51.100.0/24']
+NEXT_HOP flags optional      rfc7606  UP                                         ['198.51.100.0/24', '203.0.113.0/24']
+                                     | treat-as-withdraw: NEXT_HOP flags O=1 T=1 conflict (RFC 7606 s3c)
+                                     |   -> ['192.0.2.0/24'] treated as withdrawn
+duplicate MED                rfc4271  RESET (NOTIFICATION code 3 subcode 1)      ['198.51.100.0/24']
+duplicate MED                rfc7606  UP                                         ['192.0.2.0/24', '198.51.100.0/24', '203.0.113.0/24']
+                                     | attribute discard: duplicate MED: later copy dropped (RFC 7606 s3g)
+missing NEXT_HOP             rfc4271  RESET (NOTIFICATION code 3 subcode 3)      ['198.51.100.0/24']
+missing NEXT_HOP             rfc7606  UP                                         ['198.51.100.0/24', '203.0.113.0/24']
+                                     | treat-as-withdraw: missing well-known NEXT_HOP (s3d)
+                                     |   -> ['192.0.2.0/24'] treated as withdrawn
+bad COMMUNITY, no NLRI       rfc4271  RESET (NOTIFICATION code 3 subcode 5)      ['198.51.100.0/24']
+bad COMMUNITY, no NLRI       rfc7606  RESET (NOTIFICATION code 3 subcode 5)      ['198.51.100.0/24']
+                                     | reason: attribute error in an UPDATE with no NLRI (s5.2); bytes after marker: 00 15 03 03 05
+NLRI prefix length 33        rfc4271  RESET (NOTIFICATION code 3 subcode 10)     ['198.51.100.0/24']
+NLRI prefix length 33        rfc7606  RESET (NOTIFICATION code 3 subcode 10)     ['198.51.100.0/24']
+                                     | reason: NLRI: prefix length 33 > 32 (s3j, s5.3); bytes after marker: 00 15 03 03 0a
+```
+
+The table below summarizes all ten cases from the lab run:
+
+| Test case | `rfc4271` mode | `rfc7606` mode | Final `rfc7606` RIB |
+| :--- | :--- | :--- | :--- |
+| `COMMUNITY` length 6 | Reset (Code 3, Subcode 5); RIB has only `198.51.100.0/24` | Session UP; treat-as-withdraw | `198.51.100.0/24`, `203.0.113.0/24` |
+| `ORIGIN` value 7 | Reset (Code 3, Subcode 6) | Session UP; treat-as-withdraw | `198.51.100.0/24`, `203.0.113.0/24` |
+| `AS_PATH` segment length 0 | Reset (Code 3, Subcode 11) | Session UP; treat-as-withdraw | `198.51.100.0/24`, `203.0.113.0/24` |
+| `ATOMIC_AGGREGATE` length 2 | Reset (Code 3, Subcode 5) | Session UP; attribute discard | All three prefixes (including `192.0.2.0/24`) |
+| `LOCAL_PREF` over eBGP | Session UP (ignored per s5.1.5) | Session UP; logs attribute discard | All three prefixes |
+| `NEXT_HOP` flags optional+transitive | Reset (Code 3, Subcode 4) | Session UP; treat-as-withdraw | `198.51.100.0/24`, `203.0.113.0/24` |
+| Duplicate `MED` | Reset (Code 3, Subcode 1) | Session UP; later copy discarded | All three prefixes |
+| Missing `NEXT_HOP` | Reset (Code 3, Subcode 3) | Session UP; treat-as-withdraw | `198.51.100.0/24`, `203.0.113.0/24` |
+| Bad `COMMUNITY` with no NLRI | Reset (Code 3, Subcode 5): `00 15 03 03 05` | Reset (Code 3, Subcode 5, per s5.2): `00 15 03 03 05` | Session down |
+| `NLRI` prefix length 33 | Reset (Code 3, Subcode 10): `00 15 03 03 0a` | Reset (Code 3, Subcode 10): `00 15 03 03 0a` | Session down |
+
+The lesson across these ten cases is stark. Under RFC 4271, nine of the ten faults kill the entire session immediately (only the eBGP `LOCAL_PREF` case survives, because Section 5.1.5 already said to ignore it); `203.0.113.0/24` is never even received, even though there is nothing wrong with it. Under RFC 7606, those same eight faults are absorbed cleanly: informational attributes (`ATOMIC_AGGREGATE`, duplicate `MED`, eBGP `LOCAL_PREF`) are discarded so `192.0.2.0/24` survives, while route-critical errors (`COMMUNITY`, `ORIGIN`, `AS_PATH`, `NEXT_HOP`) withdraw `192.0.2.0/24` and let `203.0.113.0/24` install normally. Only the two cases where NLRI parsing itself cannot be trusted—the empty-NLRI malformed `UPDATE` (Section 5.2) and the `/33` IPv4 prefix (Section 5.3)—still force a session reset.
+
+## Gotchas
+
+- **The trap: Silent reachability loss.** Under RFC 7606, your BGP session stays `Established` with zero flaps while treat-as-withdraw quietly purges prefixes from `Adj-RIB-In`. If you only alert on peer state transitions, you will find out from customers that prefixes are missing. Always pair RFC 7606 with BMP stats (types 11 and 12) and syslog alerts for malformed `UPDATE`s.
+- **The trap: Attribute discard changes policy outcomes.** When a speaker discards a malformed `ATOMIC_AGGREGATE` or `AGGREGATOR` (or strips an unexpected `LOCAL_PREF` on eBGP), the route survives—which means any route-map or policy statement matching on that discarded attribute will now evaluate differently. RFC 7606 Section 6 makes the same warning and notes that such policies are safe in general only when applied to eBGP sessions.
+- **The trap: A strict RFC 4271 speaker behind a tolerant RFC 7606 speaker.** If your edge router implements RFC 7606 and uses attribute discard or passes an unknown optional transitive attribute along, an older or unpatched iBGP peer (or downstream customer) behind it may still reset its session on that exact `UPDATE`.
+- **The trap: Transitive attributes travel far.** You do not have to peer directly with the misbehaving network to be hit by a malformed optional transitive attribute. As the June 2023 incident showed, intermediate ASes that do not parse the attribute will happily forward it across the globe to the first router that does.
+- **The trap: Zero-length attributes.** Only `AS_PATH` and `ATOMIC_AGGREGATE` are allowed to have length zero. A zero-length `COMMUNITY` or `CLUSTER_LIST` is malformed and triggers treat-as-withdraw—and as `CVE-2023-41358` demonstrated, zero-length edge cases in attribute parsing are a prime source of real-world bugs.
+- **The trap: `MP_REACH_NLRI` not placed first.** RFC 7606 Section 5.1 requires `MP_REACH_NLRI` and `MP_UNREACH_NLRI` to be the very first attribute in the `UPDATE`. If a buggy sender places a malformed optional attribute *before* `MP_REACH_NLRI`, the receiver may not be able to isolate the AFI/SAFI cleanly.
+- **The trap: Fuzzing production instead of a lab.** Testing malformed `UPDATE`s against a live peering or route reflector—even with RFC 7606 enabled—can trigger parser bugs, memory corruption, or unintended transitive propagation across your peers. Always fuzz in an isolated lab (not run against production).
+
+## Exercises
+
+1. **Decode the wire:** You capture a 21-octet BGP `NOTIFICATION` whose bytes after the 16-octet `0xff` marker are `00 15 03 03 0b`. Identify the message type, total length, Error Code, and Error Subcode. What attribute caused this error under RFC 4271, and how does RFC 7606 handle the same fault if the IPv4 `NLRI` field is intact?
+2. **Resolve competing errors:** A single IPv4 unicast `UPDATE` for `198.51.100.0/24` arrives over an eBGP session carrying: (a) `ATOMIC_AGGREGATE` with length `2`, (b) `LOCAL_PREF` with value `200`, and (c) `COMMUNITY` with length `6`. List the RFC 7606 action for each individual error, state the winning action for the `UPDATE` as a whole, and describe the final state of `198.51.100.0/24` in `Adj-RIB-In`.
+3. **Explain the boundary rule:** Why does RFC 7606 Section 4 allow treat-as-withdraw when an attribute's length overruns `Total Path Attribute Length`, whereas Section 5.2 forces a session reset when a malformed `UPDATE` has path attributes (other than `MP_UNREACH_NLRI`) and no reachable NLRI?
+4. **Trace an iBGP black hole:** Router `RR1` receives an IPv4 route for `203.0.113.0/24` from an eBGP peer with an unknown optional transitive attribute `Attr-X`. `RR1` does not implement `Attr-X` and reflects the route to `PE1` and `PE2`. `PE1` implements `Attr-X`, finds its length invalid, and applies RFC 7606 treat-as-withdraw; `PE2` does not implement `Attr-X`. Describe what happens to traffic toward `203.0.113.0/24` inside the AS and state the operational fix recommended by RFC 7606 Section 6.
+5. **Triage a session flap:** During a maintenance window, one eBGP session drops with `00 1c 03 06 02` followed by ASCII text, while another drops with `00 15 03 03 0a`. Using RFC 4486, RFC 9003, and RFC 4271/7606, explain what each `NOTIFICATION` means and which one requires immediate packet-level investigation.
+6. **Design edge protection:** Using the lab cases and the 2023 CVE wave as your reference, write a short operational checklist (four to five concrete controls) for an AS operator running mixed-vendor routers at an Internet Exchange Point to prevent both local session resets and transitive-attribute propagation to downstream customers.
+
+## The boring rule
+
+Log the full malformed `UPDATE`, watch BMP treat-as-withdraw counters, and scrub unknown optional transitive attributes at the edge—because a BGP session that stays up while silently dropping routes is only half a victory.
+
+## Sources
+
+- [RFC 4271: A Border Gateway Protocol 4 (BGP-4)](https://datatracker.ietf.org/doc/html/rfc4271)
+- [RFC 7606: Revised Error Handling for BGP UPDATE Messages](https://datatracker.ietf.org/doc/html/rfc7606)
+- [RFC 4760: Multiprotocol Extensions for BGP-4](https://datatracker.ietf.org/doc/html/rfc4760)
+- [RFC 4486: Subcodes for BGP Cease Notification Message](https://datatracker.ietf.org/doc/html/rfc4486)
+- [RFC 9003: Extended BGP Administrative Shutdown Communication](https://datatracker.ietf.org/doc/html/rfc9003)
+- [RFC 7854: BGP Monitoring Protocol (BMP)](https://datatracker.ietf.org/doc/html/rfc7854)
+- [Ben Cartwright-Cox, "Grave flaws in BGP Error handling" (29 August 2023)](https://blog.benjojo.co.uk/post/bgp-path-attributes-grave-error-handling)
+- [NVD: CVE-2023-4481 (Juniper Junos OS / Junos OS Evolved rpd)](https://nvd.nist.gov/vuln/detail/CVE-2023-4481)
+- [NVD: CVE-2023-38802 (FRRouting / Pica8 PICOS attribute 23)](https://nvd.nist.gov/vuln/detail/CVE-2023-38802)
+- [NVD: CVE-2023-41358 (FRRouting bgpd/bgp_packet.c zero attribute length)](https://nvd.nist.gov/vuln/detail/CVE-2023-41358)
+- [NVD: CVE-2023-38283 (OpenBGPD path-attribute length handling)](https://nvd.nist.gov/vuln/detail/CVE-2023-38283)
