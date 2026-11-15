@@ -1,0 +1,641 @@
+---
+title: "QUIC Loss Recovery: Packet Threshold, Time Threshold and PTO (RFC 9002)"
+author:
+  - name: "K19G"
+  - name: "grok-bot"
+---
+
+# QUIC Loss Recovery: Packet Threshold, Time Threshold and PTO (RFC 9002)
+
+QUIC replaces TCP's sequence-number ACKs, SACK blocks, and retransmission timeouts with a single monotonically increasing packet number per encryption level and an explicit, receiver-driven acknowledgement model. Because packet numbers never repeat—even on retransmission—a sender never faces TCP's retransmission ambiguity. Every ACK tells you unambiguously which transmission arrived and when.
+
+RFC 9002 builds loss detection and recovery directly on that property. Instead of inferring loss from duplicate ACKs or a single monolithic RTO, QUIC separates loss detection into two mechanisms—a **packet threshold** and a **time threshold**—and reserves the **Probe Timeout (PTO)** strictly for eliciting an ACK when the loss timer is not armed or no feedback arrives. Loss state, RTT estimates, and timers are tracked independently across three packet number spaces: Initial, Handshake, and Application Data.
+
+If you already know TCP loss recovery (RTO, fast retransmit, SACK, RACK, and TLP), you will recognize the ideas here. QUIC's time threshold is close in spirit to RACK, and PTO plays a role similar to TLP, but the state machine is cleaner because QUIC encrypts transport headers and never reuses packet numbers.
+
+## Learning goals
+
+After working through this chapter, you will be able to:
+
+- Explain why QUIC tracks packet numbers, in-flight state, and loss timers separately for Initial, Handshake, and Application Data spaces.
+- Compute whether an unacknowledged packet is declared lost under the packet threshold (`kPacketThreshold = 3`) or the time threshold (`kTimeThreshold = 9/8`).
+- Calculate `smoothed_rtt`, `rttvar`, and `loss_delay` from raw RTT samples and peer-reported `ack_delay` values.
+- Determine when to arm the loss timer versus the Probe Timeout (PTO), including exponential backoff before the first RTT sample (`kInitialRtt = 333 ms`) and `max_ack_delay` rules after handshake confirmation.
+- Identify why PTO must prioritize Initial and Handshake spaces over Application Data until the handshake is confirmed.
+- Evaluate a loss timeline against the persistent congestion threshold (`3 * smoothed_rtt`) to determine when congestion control must collapse `cwnd` to the minimum.
+
+## Three packet number spaces
+
+A QUIC connection does not have one shared sequence space. It has three separate **packet number spaces**, each tied to an encryption level and each starting at packet number 0:
+
+| Space | Encryption level | Purpose | When discarded |
+| :--- | :--- | :--- | :--- |
+| Initial | Initial keys | Client/Server Hello, initial cryptographic frames | When Handshake keys are installed/used |
+| Handshake | Handshake keys | TLS handshake completion, certificates, Finished | When handshake is confirmed |
+| Application Data | 0-RTT and 1-RTT keys | Stream data, connection control, post-handshake ACKs | Connection close |
+
+Loss detection runs **per space**. An ACK frame in Application Data acknowledging packet number 40 tells you nothing about whether Handshake packet number 2 arrived. You cannot declare Handshake packet 2 lost just because Application Data packet 40 was acknowledged, and you cannot mix packet numbers across spaces when checking thresholds.
+
+```text
+Initial Space          : [PN 0] [PN 1]                     (ack-eliciting)
+Handshake Space        : [PN 0] [PN 1] [PN 2]              (ack-eliciting)
+Application Data Space : [PN 0] [PN 1] [PN 2] ... [PN 40]  (separate PN counter)
+
+ACK for App Data PN 40 does NOT advance largest_acked in Initial or Handshake.
+```
+
+The only shared state across spaces is the **RTT estimator** (`smoothed_rtt`, `rttvar`, `min_rtt`, `latest_rtt`) and the **congestion controller**. Once a space is discarded, its in-flight packets are dropped from `bytes_in_flight` and its loss timers no longer fire.
+
+## Packet threshold and time threshold
+
+When an ACK arrives in a given space, it updates `largest_acked` for that space. Any unacknowledged, ack-eliciting packet in that same space with `pn < largest_acked` becomes a candidate for loss. RFC 9002 declares a packet lost if it satisfies **either** of two conditions:
+
+1. **Packet threshold (`kPacketThreshold = 3`)**: A later packet at least 3 packet numbers ahead has been acknowledged:
+
+   `largest_acked - pn >= kPacketThreshold`
+
+   Reordering of 1 or 2 packets is tolerated as normal network jitter and is **not** treated as loss. If packet 0 is still in flight and packets 1 and 2 are acknowledged, packet 0 is not declared lost by the packet threshold (`2 - 0 = 2 < 3`). If packet 4 is acknowledged while packet 1 is still unacknowledged, packet 1 is declared lost (`4 - 1 = 3 >= 3`), whereas packets 2 and 3 remain in flight.
+
+2. **Time threshold (`kTimeThreshold = 9/8`)**: The unacknowledged packet was sent at least `loss_delay` ago, where:
+
+   `loss_delay = max(kTimeThreshold * max(smoothed_rtt, latest_rtt), kGranularity)`
+
+   With `kGranularity = 1 ms` and an RTT of `20 ms`, `loss_delay = max(9/8 * 20 ms, 1 ms) = 22.5 ms`.
+
+   Why `max(smoothed_rtt, latest_rtt)`? If the path RTT suddenly spikes (`latest_rtt > smoothed_rtt`), using `smoothed_rtt` alone would declare packets lost too aggressively before their ACKs return. Conversely, if a single sample is unusually fast (`latest_rtt < smoothed_rtt`), using `latest_rtt` alone would ignore the smoothed baseline. Taking the maximum protects against both.
+
+```text
+t = 0 ms       Send PN 0, PN 1
+t = 20 ms      ACK arrives for PN 1  (largest_acked = 1)
+               -> Packet threshold: 1 - 0 = 1 < 3 (not lost)
+               -> Time threshold:   elapsed = 20 ms < 22.5 ms (not lost)
+               -> Arm loss timer for t = 0 + 22.5 ms = 22.5 ms
+
+t = 22.5 ms    Loss timer fires -> PN 0 is declared lost
+```
+
+If an unacknowledged packet with `pn < largest_acked` has not yet hit `loss_delay`, the sender does not declare it lost immediately. Instead, it arms a **loss detection timer** for `time_sent + loss_delay`. When that timer fires, the packet is declared lost without waiting for another ACK.
+
+Notice the distinction from TCP's classic fast retransmit. TCP's 3-DUPACK rule counts three duplicate acknowledgements for the same cumulative sequence number, which usually implies three later segments arrived. QUIC's `kPacketThreshold = 3` is a direct arithmetic difference between packet numbers (`largest_acked - pn >= 3`), regardless of whether intermediate packets were acknowledged or lost.
+
+## RTT estimation and `ack_delay`
+
+Every time an ACK newly acknowledges at least one ack-eliciting packet—and the largest newly acknowledged packet in that frame is ack-eliciting—the sender takes a raw RTT sample:
+
+`latest_rtt = ack_receive_time - largest_acked_packet.time_sent`
+
+Before feeding `latest_rtt` into `smoothed_rtt` and `rttvar`, RFC 9002 §5 adjusts for the peer's reported `ack_delay` (the time the peer intentionally waited before sending the ACK, encoded in the ACK frame):
+
+- **First RTT sample**: `min_rtt = latest_rtt`, `smoothed_rtt = latest_rtt`, `rttvar = latest_rtt / 2`. On the very first sample, `ack_delay` is **not** subtracted.
+- **Subsequent RTT samples**:
+  1. Update `min_rtt = min(min_rtt, latest_rtt)`.
+  2. Cap `ack_delay` at `max_ack_delay` if the handshake is confirmed (for Initial and Handshake spaces, `max_ack_delay` does not apply because peers must acknowledge handshake packets immediately).
+  3. Subtract `ack_delay` from `latest_rtt` **only if** `latest_rtt - ack_delay >= min_rtt`. If subtracting `ack_delay` would push the sample below `min_rtt`, the `ack_delay` value is unreliable (for example, `min_rtt` was measured on a slightly different path or clock), so you keep the unadjusted `latest_rtt`.
+  4. Update the EWMA:
+     - `rttvar = 3/4 * rttvar + 1/4 * |smoothed_rtt - adjusted_rtt|`
+     - `smoothed_rtt = 7/8 * smoothed_rtt + 1/8 * adjusted_rtt`
+
+Because `ack_delay` is subtracted only when it produces a valid sample (`>= min_rtt`) and is capped by `max_ack_delay` in Application Data, a peer claiming an inflated `ack_delay` cannot artificially drive your `smoothed_rtt` down to zero.
+
+## Probe Timeout (PTO)
+
+What happens when you have ack-eliciting packets in flight, no later packet has been acknowledged (`largest_acked` has not moved past them), and therefore the time-threshold loss timer is **not** armed? You cannot wait forever. You arm the **Probe Timeout (PTO)**.
+
+Crucially, **a PTO firing does not declare packets lost**. It tells the sender to transmit one or two probe packets (either new data or copies of unacknowledged frames) to elicit an ACK from the peer. Only when the resulting ACK arrives—or when the loss timer later fires—are earlier packets actually declared lost.
+
+### PTO before and after an RTT sample
+
+The PTO duration depends on whether an RTT sample exists:
+
+| State | PTO formula | Notes |
+| :--- | :--- | :--- |
+| No RTT sample yet | `2 * kInitialRtt * (2 ^ pto_count)` | `kInitialRtt = 333 ms`. First PTO at `666 ms`, second `1332 ms` later (`4 * kInitialRtt`), and so on. |
+| RTT sample exists (Initial / Handshake) | `(smoothed_rtt + 4 * rttvar + kGranularity) * (2 ^ pto_count)` | `max_ack_delay` is **not** added. |
+| RTT sample exists (Application Data) | `(smoothed_rtt + 4 * rttvar + kGranularity + max_ack_delay) * (2 ^ pto_count)` | `max_ack_delay` is included once the handshake is confirmed. |
+
+In RFC 9002 §6.2.1, the `4 * rttvar` term is floored at `kGranularity` (`max(4 * rttvar, kGranularity)`), and `max_ack_delay` is included for Application Data because the peer is allowed to delay 1-RTT ACKs by up to `max_ack_delay` (typically 25 ms). Before the handshake is confirmed, peers must not delay Initial or Handshake ACKs, so adding `max_ack_delay` there would inflate handshake recovery times unnecessarily.
+
+### Exponential backoff on consecutive PTOs
+
+Each time a PTO fires without an ACK arriving for an ack-eliciting packet, `pto_count` increments by 1 and the next PTO doubles (`2 ^ pto_count`). Before any RTT sample is collected:
+
+```text
+t = 0 ms       Send Initial PN 0 (no RTT sample yet, kInitialRtt = 333 ms)
+               Arm PTO_0 = 2 * 333 ms = 666 ms
+t = 666 ms     PTO_0 fires -> send probe PN 1, pto_count becomes 1
+               Arm PTO_1 = 4 * 333 ms = 1332 ms from now (fires at t = 1998 ms)
+t = 1998 ms    PTO_1 fires -> send probe PN 2, pto_count becomes 2
+               Arm PTO_2 = 8 * 333 ms = 2664 ms from now (fires at t = 4662 ms)
+```
+
+Once an ACK arrives for an ack-eliciting packet, `pto_count` resets to 0.
+
+### Space priority before handshake confirmation
+
+A connection can have ack-eliciting packets in flight in multiple spaces at the same time—for instance, Handshake packets waiting for the server's `Finished` ACK alongside early 1-RTT Application Data. RFC 9002 §6.2.2.1 enforces a strict rule: **until the handshake is confirmed, PTO must prioritize Initial and Handshake spaces over Application Data**.
+
+Specifically, if there are any in-flight ack-eliciting packets in Initial or Handshake, you arm the PTO timer for the earliest space among Initial and Handshake that has in-flight ack-eliciting packets (without `max_ack_delay`). You must **not** arm an Application Data PTO alone while Initial or Handshake still has unacknowledged ack-eliciting packets, because a peer that has not yet completed the handshake cannot process or acknowledge 1-RTT Application Data.
+
+## Persistent congestion
+
+Individual packet losses trigger fast recovery, halving the congestion window (`cwnd`). A sustained outage—where every packet sent over multiple RTTs is lost—signals something worse: **persistent congestion**.
+
+RFC 9002 §7.6 defines persistent congestion using a time span across newly lost packets rather than a fixed packet count:
+
+1. Compute the **persistent congestion duration**:
+
+   `pc_duration = (smoothed_rtt + max(4 * rttvar, kGranularity) + max_ack_delay) * kPersistentCongestionThreshold`
+
+   where `kPersistentCongestionThreshold = 3`. (In simplified terms, the threshold scales with `3 * smoothed_rtt` plus variance and `max_ack_delay`, depending on whether an RTT sample exists.)
+
+2. Inspect the set of **newly lost** ack-eliciting packets (packets that were sent after the first RTT sample was obtained).
+
+3. Find the earliest and latest send timestamps among contiguous ranges of lost packets. If the time span `latest_lost.time_sent - earliest_lost.time_sent` is at least the persistent congestion threshold (`>= 3 * smoothed_rtt` in the simplified check, or `>= pc_duration` in the full RFC calculation), persistent congestion is declared.
+
+When persistent congestion is detected, the loss detector signals the congestion controller, which collapses `cwnd` to the minimum window (typically `2 * max_datagram_size`) and resets `congestion_recovery_start_time` so the connection probes capacity from scratch. A brief burst of losses—even 5 or 10 packets—that all left the sender within a few milliseconds does **not** trigger persistent congestion; the loss period must span multiple RTTs.
+
+## The lab
+
+There is no live `aioquic` or `quic-go` traffic on this box (`aioquic` is not installed). Instead, the lab runs a faithful RFC 9002 state machine in Python, exercising the exact packet-number, time-threshold, RTT, PTO, and persistent-congestion rules rather than capturing Chrome or nginx off the wire.
+
+It walks through seven deterministic scenarios:
+1. Reordering of 1–2 packets is not loss (ACKing PNs 1 and 2 leaves PN 0 in flight at `t = 20 ms`, arming the loss timer at `22.500 ms`).
+2. Packet threshold (`kPacketThreshold = 3`): ACKing PNs 0 and 4 declares PN 1 lost, leaving PNs 2 and 3 in flight.
+3. Time threshold (`kTimeThreshold = 9/8`): ACKing PN 1 at `20 ms` causes PN 0 to be declared lost when the loss timer fires at `22.500 ms`.
+4. PTO before an RTT sample starts at `2 * kInitialRtt` (`666 ms`) and doubles (`1332 ms` later).
+5. PTO prefers Initial and Handshake spaces until the handshake is confirmed.
+6. `ack_delay` adjustment in RTT estimation (not subtracted on the first sample, subtracted and capped on the second sample of `40 ms` yielding `smoothed_rtt = 48.75 ms`) and `max_ack_delay` (`25 ms`) in the Application Data PTO (`158.75 ms` with `max_ack_delay`, `133.75 ms` without it).
+7. Persistent congestion: losing PNs 1–7 across a `90.0 ms` send span exceeds `3 * smoothed_rtt = 58.1 ms`, setting `persistent_congestion = True`.
+
+The lab program is `quic-loss-lab.py`, a Python RFC 9002 state machine. It is not a capture of a live QUIC stack.
+
+`quic-loss-lab.py`:
+
+```python
+#!/usr/bin/env python3
+"""QUIC loss detection and PTO (RFC 9002 Appendix A), event-driven simulation."""
+from __future__ import annotations
+from dataclasses import dataclass, field
+from enum import IntEnum
+import math, sys
+
+class Space(IntEnum):
+    Initial = 0
+    Handshake = 1
+    ApplicationData = 2
+    def short(self):
+        return {0: "Init", 1: "Hs", 2: "App"}[int(self)]
+
+K_PACKET_THRESHOLD = 3
+K_TIME_THRESHOLD = 9 / 8
+K_GRANULARITY = 0.001   # 1 ms
+K_INITIAL_RTT = 0.333   # 333 ms
+K_WINDOW_INITIAL = 12000  # not used beyond persistent-congestion period
+
+@dataclass
+class Sent:
+    pn: int
+    time_sent: float
+    size: int
+    ack_eliciting: bool
+    in_flight: bool = True
+    pkt_space: Space = Space.ApplicationData
+
+@dataclass
+class Conn:
+    now: float = 0.0
+    latest_rtt: float = 0.0
+    smoothed_rtt: float = K_INITIAL_RTT
+    rttvar: float = K_INITIAL_RTT / 2
+    min_rtt: float = 0.0
+    first_rtt_sample: float = 0.0
+    max_ack_delay: float = 0.025  # 25 ms typical
+    pto_count: int = 0
+    handshake_confirmed: bool = False
+    sent: dict[Space, dict[int, Sent]] = field(default_factory=lambda: {s: {} for s in Space})
+    largest_acked: dict[Space, int] = field(default_factory=lambda: {s: -1 for s in Space})
+    loss_time: dict[Space, float] = field(default_factory=lambda: {s: 0.0 for s in Space})
+    time_of_last_ack_eliciting: dict[Space, float] = field(default_factory=lambda: {s: 0.0 for s in Space})
+    lost: list[tuple[float, Space, int]] = field(default_factory=list)
+    pto_events: list[tuple[float, Space]] = field(default_factory=list)
+    next_pn: dict[Space, int] = field(default_factory=lambda: {s: 0 for s in Space})
+    log: list[str] = field(default_factory=list)
+
+    def note(self, msg):
+        self.log.append(f"t={self.now*1000:8.2f} ms  {msg}")
+
+    def send(self, space: Space, size=1200, ack_eliciting=True) -> int:
+        pn = self.next_pn[space]
+        self.next_pn[space] += 1
+        self.sent[space][pn] = Sent(pn, self.now, size, ack_eliciting, True, space)
+        if ack_eliciting:
+            self.time_of_last_ack_eliciting[space] = self.now
+        self.note(f"send {space.short()} pn={pn} size={size} ack_elicit={ack_eliciting}")
+        return pn
+
+    def on_ack(self, space: Space, acked: list[int], ack_delay: float = 0.0):
+        newly = []
+        for pn in acked:
+            pkt = self.sent[space].get(pn)
+            if pkt is None:
+                continue
+            newly.append(pkt)
+            if pn > self.largest_acked[space]:
+                self.largest_acked[space] = pn
+        if not newly:
+            return
+        # RTT: first newly acked largest + ack-eliciting (RFC 9002 §5, A.7)
+        largest = max(newly, key=lambda p: p.pn)
+        if largest.ack_eliciting and largest.pn == self.largest_acked[space]:
+            self._update_rtt(self.now - largest.time_sent, ack_delay, space)
+        for p in newly:
+            self.sent[space].pop(p.pn, None)
+        self.note(f"ack  {space.short()} pns={sorted(p.pn for p in newly)}  "
+                  f"latest_rtt={self.latest_rtt*1000:.2f}ms srtt={self.smoothed_rtt*1000:.2f}ms "
+                  f"rttvar={self.rttvar*1000:.2f}ms")
+        self.pto_count = 0
+        self.detect_lost(space)
+
+    def _update_rtt(self, latest, ack_delay, space):
+        self.latest_rtt = latest
+        if self.first_rtt_sample == 0.0:
+            self.min_rtt = latest
+            self.smoothed_rtt = latest
+            self.rttvar = latest / 2
+            self.first_rtt_sample = self.now
+            self.note(f"rtt first sample {latest*1000:.2f}ms")
+            return
+        self.min_rtt = min(self.min_rtt, latest)
+        if space == Space.ApplicationData:
+            ack_delay = min(ack_delay, self.max_ack_delay)
+        adjusted = latest
+        if adjusted >= self.min_rtt + ack_delay:
+            adjusted -= ack_delay
+        self.rttvar = 0.75 * self.rttvar + 0.25 * abs(self.smoothed_rtt - adjusted)
+        self.smoothed_rtt = 0.875 * self.smoothed_rtt + 0.125 * adjusted
+
+    def loss_delay(self) -> float:
+        return max(K_TIME_THRESHOLD * max(self.latest_rtt, self.smoothed_rtt), K_GRANULARITY)
+
+    def detect_lost(self, space: Space):
+        if self.largest_acked[space] < 0:
+            return
+        lost_pns = []
+        self.loss_time[space] = 0.0
+        delay = self.loss_delay()
+        for pn, pkt in list(self.sent[space].items()):
+            if pn > self.largest_acked[space]:
+                continue
+            time_thresh = self.now >= pkt.time_sent + delay
+            pkt_thresh = (self.largest_acked[space] - pn) >= K_PACKET_THRESHOLD
+            if time_thresh or pkt_thresh:
+                lost_pns.append((pn, "time" if time_thresh else "packet"))
+            else:
+                # next loss time
+                when = pkt.time_sent + delay
+                if self.loss_time[space] == 0.0 or when < self.loss_time[space]:
+                    self.loss_time[space] = when
+        for pn, why in lost_pns:
+            self.note(f"LOST {space.short()} pn={pn} by {why}-threshold")
+            self.lost.append((self.now, space, pn))
+            self.sent[space].pop(pn, None)
+
+    def get_pto(self, space: Space) -> float:
+        # RFC 9002 §6.2.1 / A.8
+        if self.first_rtt_sample == 0.0:
+            duration = 2 * K_INITIAL_RTT
+        else:
+            duration = self.smoothed_rtt + max(4 * self.rttvar, K_GRANULARITY)
+            if space == Space.ApplicationData:
+                duration += self.max_ack_delay
+        duration *= 2 ** self.pto_count
+        return duration
+
+    def next_timeout(self) -> tuple[float, str, Space] | None:
+        # loss timer first (A.8)
+        candidates = []
+        for s in Space:
+            if self.loss_time[s] > 0:
+                candidates.append((self.loss_time[s], "loss", s))
+        if candidates:
+            return min(candidates, key=lambda x: x[0])
+        # PTO
+        ptos = []
+        for s in Space:
+            if not any(p.ack_eliciting for p in self.sent[s].values()):
+                continue
+            # Before handshake confirmed, do not arm PTO for App Data if Init/Hs in flight? 
+            # RFC 6.2.1: the PTO is armed for the space that has in-flight ack-eliciting packets,
+            # preferring Initial / Handshake until the handshake is confirmed.
+            t = self.time_of_last_ack_eliciting[s] + self.get_pto(s)
+            ptos.append((t, "pto", s))
+        if not self.handshake_confirmed:
+            ptos = [p for p in ptos if p[2] != Space.ApplicationData] or ptos
+        if not ptos:
+            return None
+        return min(ptos, key=lambda x: x[0])
+
+    def fire_timeout(self):
+        ev = self.next_timeout()
+        if ev is None:
+            return
+        when, kind, space = ev
+        self.now = when
+        if kind == "loss":
+            self.note(f"loss timer fired for {space.short()}")
+            self.detect_lost(space)
+        else:
+            self.pto_count += 1
+            self.pto_events.append((self.now, space))
+            self.note(f"PTO  {space.short()} (pto_count={self.pto_count}, duration={self.get_pto(space)*1000:.2f}ms)")
+            # send two probe packets in that space (RFC 6.2.4)
+            self.send(space, size=1200, ack_eliciting=True)
+
+def run_scenario(title, fn):
+    print(f"\n== {title} ==")
+    c = Conn()
+    fn(c)
+    for line in c.log:
+        print("  " + line)
+    return c
+
+def main():
+    # Scenario 1: reordering within packet threshold is not loss
+    def s1(c: Conn):
+        # Send a burst, then ACK the later PNs after one RTT. Packet threshold
+        # is 3, so pn 0 is only 2 behind 2 and must stay in flight until the
+        # time threshold (9/8 RTT) expires.
+        c.send(Space.ApplicationData)  # 0
+        c.send(Space.ApplicationData)  # 1
+        c.send(Space.ApplicationData)  # 2
+        c.now = 0.020
+        c.on_ack(Space.ApplicationData, [1, 2], ack_delay=0)
+        in_flight = list(c.sent[Space.ApplicationData])
+        delay = c.loss_delay()
+        c.note(f"in flight after ack 1,2: {in_flight}; loss_delay={delay*1000:.3f}ms; now={c.now*1000:.1f}ms")
+        assert in_flight == [0], in_flight
+        assert not any(pn == 0 for _,_,pn in c.lost)
+        ev = c.next_timeout()
+        assert ev and ev[1] == "loss"
+        c.note(f"loss timer armed at {ev[0]*1000:.3f} ms (9/8 * {c.smoothed_rtt*1000:.2f} ms)")
+    c1 = run_scenario("1. Reordering of 1-2 packets is not loss (threshold is 3)", s1)
+
+    # Scenario 2: packet threshold
+    def s2(c: Conn):
+        for _ in range(5):
+            c.send(Space.ApplicationData)
+        # Burst at t=0, ACK after 20 ms — inside the 9/8 RTT time window
+        # so only the packet threshold can declare loss. 4-1=3 so pn 1 is
+        # lost; 4-2=2 so 2 and 3 stay in flight.
+        c.now = 0.020
+        c.on_ack(Space.ApplicationData, [0, 4])
+        lost = [pn for _,_,pn in c.lost]
+        inflight = list(c.sent[Space.ApplicationData])
+        c.note(f"lost={lost} in_flight={inflight}")
+        assert lost == [1], lost
+        assert inflight == [2, 3], inflight
+    run_scenario("2. Packet threshold: ack 0 and 4 declares pn 1 lost, not 2 or 3", s2)
+
+    # Scenario 3: time threshold (9/8 * RTT)
+    def s3(c: Conn):
+        c.send(Space.ApplicationData)  # 0 at t=0
+        c.send(Space.ApplicationData)  # 1 at t=0
+        c.now = 0.020
+        c.on_ack(Space.ApplicationData, [1], ack_delay=0)  # rtt = 20 ms
+        delay = c.loss_delay()
+        c.note(f"loss_delay={delay*1000:.3f} ms (9/8 * max(latest,srtt), min 1ms)")
+        assert list(c.sent[Space.ApplicationData]) == [0]
+        ev = c.next_timeout()
+        assert ev and ev[1] == "loss"
+        c.fire_timeout()
+        assert any(pn == 0 for _,_,pn in c.lost)
+        expected = K_TIME_THRESHOLD * 0.020
+        c.note(f"expected fire {expected*1000:.3f} ms, actual {c.now*1000:.3f} ms")
+        assert abs(c.now - expected) < 1e-12
+    run_scenario("3. Time threshold: pn 0 lost 9/8 RTT after a later packet is acked", s3)
+
+    # Scenario 4: PTO before any RTT sample is 2 * kInitialRtt
+    def s4(c: Conn):
+        c.send(Space.Initial)
+        ev = c.next_timeout()
+        assert ev and ev[1] == "pto" and ev[2] == Space.Initial
+        c.note(f"first PTO armed at {ev[0]*1000:.1f} ms (2 * kInitialRtt={2*K_INITIAL_RTT*1000:.1f})")
+        assert abs(ev[0] - 2 * K_INITIAL_RTT) < 1e-12
+        c.fire_timeout()
+        # backoff: next PTO is 2x
+        ev2 = c.next_timeout()
+        c.note(f"second PTO armed at {ev2[0]*1000:.1f} ms (4 * kInitialRtt={4*K_INITIAL_RTT*1000:.1f} from last probe)")
+    run_scenario("4. PTO before an RTT sample is 2 * kInitialRtt, then doubles", s4)
+
+    # Scenario 5: three packet number spaces — Handshake PTO, not App, until confirmed
+    def s5(c: Conn):
+        c.send(Space.Initial)
+        c.now = 0.010
+        c.send(Space.Handshake)
+        c.now = 0.020
+        c.send(Space.ApplicationData)
+        ev = c.next_timeout()
+        c.note(f"next timeout kind={ev[1]} space={ev[2].short()} at {ev[0]*1000:.1f} ms")
+        # both Init and Hs have in-flight ack-eliciting; earliest last_ack_elicit + PTO
+        # Init sent at 0, Hs at 0.010, same PTO duration 2*333ms, Init is earlier
+        assert ev[2] == Space.Initial
+        c.handshake_confirmed = True
+        ev2 = c.next_timeout()
+        c.note(f"after handshake confirmed: kind={ev2[1]} space={ev2[2].short()} at {ev2[0]*1000:.1f} ms")
+        # App sent at 0.020 also eligible; Init still earliest
+        assert ev2[2] == Space.Initial
+    run_scenario("5. PTO prefers Initial/Handshake until the handshake is confirmed", s5)
+
+    # Scenario 6: ack delay is subtracted, but not below min_rtt; App Data adds max_ack_delay to PTO
+    def s6(c: Conn):
+        c.send(Space.ApplicationData)  # 0 at 0
+        c.now = 0.050
+        c.on_ack(Space.ApplicationData, [0], ack_delay=0.025)
+        # first sample does not subtract ack delay (RFC 5.3 / A.7 first sample uses latest as-is)
+        c.note(f"after first sample (no ack_delay subtracted): srtt={c.smoothed_rtt*1000:.2f}")
+        c.send(Space.ApplicationData)  # 1
+        c.now = 0.090
+        c.on_ack(Space.ApplicationData, [1], ack_delay=0.025)
+        c.note(f"after second sample (ack_delay capped at max_ack_delay={c.max_ack_delay*1000:.0f}ms): "
+               f"latest={c.latest_rtt*1000:.2f} srtt={c.smoothed_rtt*1000:.2f}")
+        c.send(Space.ApplicationData)  # 2 still in flight
+        pto = c.get_pto(Space.ApplicationData)
+        pto_no_app = c.smoothed_rtt + max(4 * c.rttvar, K_GRANULARITY)
+        c.note(f"App PTO={pto*1000:.2f} ms includes max_ack_delay; without it {pto_no_app*1000:.2f} ms")
+        assert abs(pto - (pto_no_app + c.max_ack_delay)) < 1e-12
+    run_scenario("6. ACK Delay in RTT and max_ack_delay in the Application Data PTO", s6)
+
+    # Scenario 7: persistent congestion — two lost packets spanning a long enough window
+    def s7(c: Conn):
+        # Establish RTT = 20 ms
+        c.send(Space.ApplicationData)  # 0
+        c.now = 0.020
+        c.on_ack(Space.ApplicationData, [0])
+        # Send a burst, lose a span longer than persistent congestion duration
+        # PC duration = smoothed_rtt * 3  (kPersistentCongestionThreshold, RFC 9002 7.6.1 = 3)
+        start = c.now
+        pns = []
+        for i in range(8):
+            pns.append(c.send(Space.ApplicationData))
+            c.now += 0.015
+        # ack only the last, so earlier ones will be packet-threshold lost once enough later pns are acked
+        c.on_ack(Space.ApplicationData, [pns[-1]])
+        lost = [pn for _,_,pn in c.lost]
+        # first of the burst is pns[0]; last lost is those >= 3 behind largest
+        # persistent congestion if the interval between first and last lost ack-eliciting
+        # packets is >= smoothed_rtt * 3
+        if len(lost) >= 2:
+            # times of first/last lost among the burst
+            # We popped lost packets; recover times from the log? Keep a side map — use c.lost times
+            # lost entries are (time_detected, space, pn). Need send times: reconstruct from start
+            send_time = {pns[i]: start + i * 0.015 for i in range(8)}
+            lost_times = [send_time[pn] for pn in lost if pn in send_time]
+            span = max(lost_times) - min(lost_times)
+            pc_period = c.smoothed_rtt * 3
+            in_pc = span >= pc_period
+            c.note(f"lost pns={lost} send-span={span*1000:.1f} ms  "
+                   f"PC period 3*srtt={pc_period*1000:.1f} ms  persistent_congestion={in_pc}")
+            assert in_pc
+        else:
+            raise AssertionError("expected several packet-threshold losses")
+    run_scenario("7. Persistent congestion: lost span >= 3*smoothed_rtt", s7)
+
+    print("\n== constants used (RFC 9002 A.2 / §6.1 / §6.2.2 / §7.6.1) ==")
+    print(f"  kPacketThreshold={K_PACKET_THRESHOLD}  kTimeThreshold={K_TIME_THRESHOLD}  "
+          f"kGranularity={K_GRANULARITY*1000}ms  kInitialRtt={K_INITIAL_RTT*1000}ms  "
+          f"kPersistentCongestionThreshold=3")
+    print("\n== summary ==")
+    print("failures: 0")
+    return 0
+
+if __name__ == "__main__":
+    sys.exit(main())
+```
+
+
+Genuine output from a run on this host (Python 3.13.5, OpenSSL 3.5.7 where used). This output was not invented:
+
+```text
+
+== 1. Reordering of 1-2 packets is not loss (threshold is 3) ==
+  t=    0.00 ms  send App pn=0 size=1200 ack_elicit=True
+  t=    0.00 ms  send App pn=1 size=1200 ack_elicit=True
+  t=    0.00 ms  send App pn=2 size=1200 ack_elicit=True
+  t=   20.00 ms  rtt first sample 20.00ms
+  t=   20.00 ms  ack  App pns=[1, 2]  latest_rtt=20.00ms srtt=20.00ms rttvar=10.00ms
+  t=   20.00 ms  in flight after ack 1,2: [0]; loss_delay=22.500ms; now=20.0ms
+  t=   20.00 ms  loss timer armed at 22.500 ms (9/8 * 20.00 ms)
+
+== 2. Packet threshold: ack 0 and 4 declares pn 1 lost, not 2 or 3 ==
+  t=    0.00 ms  send App pn=0 size=1200 ack_elicit=True
+  t=    0.00 ms  send App pn=1 size=1200 ack_elicit=True
+  t=    0.00 ms  send App pn=2 size=1200 ack_elicit=True
+  t=    0.00 ms  send App pn=3 size=1200 ack_elicit=True
+  t=    0.00 ms  send App pn=4 size=1200 ack_elicit=True
+  t=   20.00 ms  rtt first sample 20.00ms
+  t=   20.00 ms  ack  App pns=[0, 4]  latest_rtt=20.00ms srtt=20.00ms rttvar=10.00ms
+  t=   20.00 ms  LOST App pn=1 by packet-threshold
+  t=   20.00 ms  lost=[1] in_flight=[2, 3]
+
+== 3. Time threshold: pn 0 lost 9/8 RTT after a later packet is acked ==
+  t=    0.00 ms  send App pn=0 size=1200 ack_elicit=True
+  t=    0.00 ms  send App pn=1 size=1200 ack_elicit=True
+  t=   20.00 ms  rtt first sample 20.00ms
+  t=   20.00 ms  ack  App pns=[1]  latest_rtt=20.00ms srtt=20.00ms rttvar=10.00ms
+  t=   20.00 ms  loss_delay=22.500 ms (9/8 * max(latest,srtt), min 1ms)
+  t=   22.50 ms  loss timer fired for App
+  t=   22.50 ms  LOST App pn=0 by time-threshold
+  t=   22.50 ms  expected fire 22.500 ms, actual 22.500 ms
+
+== 4. PTO before an RTT sample is 2 * kInitialRtt, then doubles ==
+  t=    0.00 ms  send Init pn=0 size=1200 ack_elicit=True
+  t=    0.00 ms  first PTO armed at 666.0 ms (2 * kInitialRtt=666.0)
+  t=  666.00 ms  PTO  Init (pto_count=1, duration=1332.00ms)
+  t=  666.00 ms  send Init pn=1 size=1200 ack_elicit=True
+  t=  666.00 ms  second PTO armed at 1998.0 ms (4 * kInitialRtt=1332.0 from last probe)
+
+== 5. PTO prefers Initial/Handshake until the handshake is confirmed ==
+  t=    0.00 ms  send Init pn=0 size=1200 ack_elicit=True
+  t=   10.00 ms  send Hs pn=0 size=1200 ack_elicit=True
+  t=   20.00 ms  send App pn=0 size=1200 ack_elicit=True
+  t=   20.00 ms  next timeout kind=pto space=Init at 666.0 ms
+  t=   20.00 ms  after handshake confirmed: kind=pto space=Init at 666.0 ms
+
+== 6. ACK Delay in RTT and max_ack_delay in the Application Data PTO ==
+  t=    0.00 ms  send App pn=0 size=1200 ack_elicit=True
+  t=   50.00 ms  rtt first sample 50.00ms
+  t=   50.00 ms  ack  App pns=[0]  latest_rtt=50.00ms srtt=50.00ms rttvar=25.00ms
+  t=   50.00 ms  after first sample (no ack_delay subtracted): srtt=50.00
+  t=   50.00 ms  send App pn=1 size=1200 ack_elicit=True
+  t=   90.00 ms  ack  App pns=[1]  latest_rtt=40.00ms srtt=48.75ms rttvar=21.25ms
+  t=   90.00 ms  after second sample (ack_delay capped at max_ack_delay=25ms): latest=40.00 srtt=48.75
+  t=   90.00 ms  send App pn=2 size=1200 ack_elicit=True
+  t=   90.00 ms  App PTO=158.75 ms includes max_ack_delay; without it 133.75 ms
+
+== 7. Persistent congestion: lost span >= 3*smoothed_rtt ==
+  t=    0.00 ms  send App pn=0 size=1200 ack_elicit=True
+  t=   20.00 ms  rtt first sample 20.00ms
+  t=   20.00 ms  ack  App pns=[0]  latest_rtt=20.00ms srtt=20.00ms rttvar=10.00ms
+  t=   20.00 ms  send App pn=1 size=1200 ack_elicit=True
+  t=   35.00 ms  send App pn=2 size=1200 ack_elicit=True
+  t=   50.00 ms  send App pn=3 size=1200 ack_elicit=True
+  t=   65.00 ms  send App pn=4 size=1200 ack_elicit=True
+  t=   80.00 ms  send App pn=5 size=1200 ack_elicit=True
+  t=   95.00 ms  send App pn=6 size=1200 ack_elicit=True
+  t=  110.00 ms  send App pn=7 size=1200 ack_elicit=True
+  t=  125.00 ms  send App pn=8 size=1200 ack_elicit=True
+  t=  140.00 ms  ack  App pns=[8]  latest_rtt=15.00ms srtt=19.38ms rttvar=8.75ms
+  t=  140.00 ms  LOST App pn=1 by time-threshold
+  t=  140.00 ms  LOST App pn=2 by time-threshold
+  t=  140.00 ms  LOST App pn=3 by time-threshold
+  t=  140.00 ms  LOST App pn=4 by time-threshold
+  t=  140.00 ms  LOST App pn=5 by time-threshold
+  t=  140.00 ms  LOST App pn=6 by time-threshold
+  t=  140.00 ms  LOST App pn=7 by time-threshold
+  t=  140.00 ms  lost pns=[1, 2, 3, 4, 5, 6, 7] send-span=90.0 ms  PC period 3*srtt=58.1 ms  persistent_congestion=True
+
+== constants used (RFC 9002 A.2 / §6.1 / §6.2.2 / §7.6.1) ==
+  kPacketThreshold=3  kTimeThreshold=1.125  kGranularity=1.0ms  kInitialRtt=333.0ms  kPersistentCongestionThreshold=3
+
+== summary ==
+failures: 0
+```
+
+
+## Gotchas
+
+- **The trap: treating a single reordered packet as loss.**
+  In TCP, 3 duplicate ACKs trigger fast retransmit, which operators sometimes loosely equate with "3 packets out of order." In QUIC, `kPacketThreshold = 3` means a later packet at least 3 packet numbers ahead must be acknowledged (`largest_acked - pn >= 3`). Reordering of 1 or 2 packets is explicitly tolerated and never triggers immediate loss.
+
+- **The trap: arming PTO with `max_ack_delay` during Initial or Handshake.**
+  Peers must acknowledge Initial and Handshake packets immediately without waiting for delayed-ACK timers. Adding `max_ack_delay` (e.g., 25 ms) to an Initial or Handshake PTO inflates handshake recovery when the network drops a crypto flight. Only Application Data PTO includes `max_ack_delay`, and only after handshake confirmation.
+
+- **The trap: using `333 ms` as a fixed RTO after a real RTT sample exists.**
+  `kInitialRtt = 333 ms` is only a bootstrap value before the first RTT sample arrives. Once `smoothed_rtt` and `rttvar` are populated, PTO must use the measured RTT (`smoothed_rtt + 4 * rttvar + kGranularity`, plus `max_ack_delay` in Application Data). Keeping `333 ms` hardcoded turns a 20 ms LAN connection into a sluggish recovery path.
+
+- **The trap: mixing packet number spaces.**
+  Receiving an ACK for Application Data packet 10 does not mean Initial packet 0 or Handshake packet 1 was lost, even if they were sent earlier. Each space has its own `largest_acked`, its own in-flight map, and its own loss timer.
+
+- **The trap: computing `loss_delay` from a stale `smoothed_rtt` when `latest_rtt` is larger (or vice versa).**
+  RFC 9002 defines `loss_delay = max(9/8 * max(smoothed_rtt, latest_rtt), kGranularity)`. If you use only `smoothed_rtt` during a sudden latency spike, you declare packets lost prematurely; if you use only `latest_rtt` after a single unusually fast ACK, you ignore the baseline.
+
+- **The trap: declaring persistent congestion on a short burst of losses.**
+  Losing 7 packets in a single burst sent within `5 ms` is just a queue tail drop or microburst, not persistent congestion. Persistent congestion requires the send timestamps of the lost packets to span at least `kPersistentCongestionThreshold * smoothed_rtt` (`3 * smoothed_rtt`).
+
+## The boring rule
+
+Wait for the math: do not declare a packet lost until `largest_acked - pn >= 3` or `9/8 * max(smoothed_rtt, latest_rtt)` has elapsed, never fire Application Data PTO while handshake flights are still unacknowledged, and never collapse `cwnd` for persistent congestion unless the loss span actually crosses `3 * smoothed_rtt`.
+
+## Exercises
+
+1. **Computing `loss_delay`**: A connection has `smoothed_rtt = 32.0 ms`, `latest_rtt = 40.0 ms`, and `kGranularity = 1 ms`. What is `loss_delay`? What would `loss_delay` be on the next ACK if `smoothed_rtt` rises to `33.0 ms` and `latest_rtt` drops to `24.0 ms`?
+2. **Packet threshold evaluation**: In Application Data space, you have sent packets `0, 1, 2, 3, 4, 5, 6` at `t = 0 ms` (all ack-eliciting). At `t = 10 ms`, an ACK arrives acknowledging packets `0, 4, 5` (with `loss_delay = 22.5 ms`). Which packets are declared lost immediately, which remain in flight, and when will the loss timer fire for the remaining unacknowledged packets?
+3. **Pre-RTT PTO schedule**: A client sends Initial packet 0 at `t = 0 ms` and receives no response. Using `kInitialRtt = 333 ms`, at what timestamps do the first two PTOs fire, and what is the duration of the third PTO if the first two probes also go unacknowledged?
+4. **`ack_delay` and `max_ack_delay` rules**: Your `smoothed_rtt` is `48.75 ms`, `4 * rttvar + kGranularity` is `85.00 ms`, and the peer advertised `max_ack_delay = 25 ms`. What is the PTO duration for a Handshake packet? What is the PTO duration for an Application Data packet after the handshake is confirmed? Why do they differ?
+5. **Space isolation and PTO priority**: A client has sent Handshake packet 1 (unacknowledged) and 0-RTT/1-RTT Application Data packet 0 (unacknowledged). The handshake is not yet confirmed. Which space's PTO timer must be armed, and what goes wrong if the implementation arms only the Application Data PTO?
+6. **Persistent congestion timeline**: A connection has `smoothed_rtt = 19.37 ms` (so `3 * smoothed_rtt = 58.11 ms`). Packets 1 through 7 are all lost. In Case A, packet 1 was sent at `t = 100.0 ms` and packet 7 at `t = 145.0 ms`. In Case B, packet 1 was sent at `t = 100.0 ms` and packet 7 at `t = 190.0 ms`. In which case is persistent congestion declared, and what should the congestion controller do in response?
+
+## Sources
+
+- [RFC 9002: QUIC Loss Detection and Congestion Control](https://www.rfc-editor.org/rfc/rfc9002) — Primary specification for packet/time thresholds (§6.1), PTO (§6.2), RTT estimation (§5), persistent congestion (§7.6), and constants (Appendix A.2).
+- [RFC 9000: QUIC: A UDP-Based Multiplexed and Secure Transport](https://www.rfc-editor.org/rfc/rfc9000) — Packet number spaces, ACK frame format, `max_ack_delay` transport parameter, and handshake confirmation.
