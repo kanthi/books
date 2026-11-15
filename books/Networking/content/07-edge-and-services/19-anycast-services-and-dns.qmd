@@ -1,0 +1,356 @@
+---
+title: "Anycast Services: One Address, Many Servers, and Withdrawing When Sick"
+author:
+  - name: "K19G"
+  - name: "grok-bot"
+---
+
+# Anycast Services: One Address, Many Servers, and Withdrawing When Sick
+
+## Learning goals
+
+- Explain what anycast is at the routing layer: the same service prefix announced from several places, with ordinary best-path selection choosing which one each client reaches
+- Name the parts RFC 4786 uses (service address, anycast node, local vs global node) and the rule that matters most: the route announcement must follow the health of the service
+- Reproduce, without root, the three behaviours that decide whether an anycast deployment is safe: best-path stickiness, a black hole when a dead node keeps announcing, and failover when it withdraws
+- Show how ECMP hashing (`fib_multipath_hash_policy`) decides whether one client is pinned to one instance or spread across several
+- Reproduce a TCP connection being reset when the routing system moves it to a different instance, and say why DNS and other short transactions tolerate this
+- Identify which instance answered a query (`id.server` / `hostname.bind`, NSID) when debugging
+
+## Thesis
+
+Anycast is not a protocol. No packet carries an "anycast" bit, and no router knows it is doing it. You put the same address on several servers in different places, announce the prefix that contains it from each place, and let routing do what it always does: pick one best path per destination. Each client reaches whichever instance is "closest" in routing terms, which is not always closest on a map. Root and TLD DNS servers, public resolvers and CDNs all work this way because it gives you load spreading, DDoS dilution and failover without a single extra protocol.
+
+The price is that routing now decides which server holds a client's state. That has two consequences, and both are easy to get wrong. First, the announcement must be tied to the health of the service. A node whose daemon died but whose router still announces the prefix is a black hole for every client routed to it. Second, a routing change in the middle of a connection silently moves the client to another instance, one that has never heard of the connection. For a one-packet DNS query that is harmless. For a long TCP download it is a reset. This chapter builds both failures in four network namespaces and draws the operating rules from them.
+
+## Mental model
+
+```text
+                         192.0.2.53/32 is configured on BOTH servers' loopbacks
+
+   client 10.0.1.2 ----- r (router) ---- 10.0.2.2  s1 "mumbai"   lo: 192.0.2.53
+                          |  \
+                          |   `--------- 10.0.3.2  s2 "chennai"  lo: 192.0.2.53
+                          |
+   r's routing table decides who "is" 192.0.2.53 for this client:
+
+     best path    192.0.2.53 via s1 metric 10      -> every packet to s1
+                  192.0.2.53 via s2 metric 20      -> backup, used only if s1's route goes
+     ECMP         192.0.2.53 nexthop s1 nexthop s2 -> per-flow hash picks one
+     withdrawal   delete "via s1"                  -> everything moves to s2
+
+   On the Internet, "r" is the whole BGP system and "metric" is AS-path length,
+   local preference and the rest of best-path selection. The behaviour is the same.
+```
+
+## Words RFC 4786 uses
+
+RFC 4786 (BCP 126, *Operation of Anycast Services*) is the operator's document. Its vocabulary is worth adopting because it keeps the routing part separate from the service part:
+
+| Term | Meaning |
+|------|---------|
+| **Service address** | The address clients use, e.g. `192.0.2.53`. It is configured on every node. |
+| **Service supernet** | The prefix announced in routing that covers the service address. On the global Internet it has to be at least a /24 (IPv4) or /48 (IPv6) to survive common prefix filters. |
+| **Anycast node** | One location that offers the service and originates the supernet. |
+| **Global node** | A node whose announcement propagates everywhere. |
+| **Local node** | A node whose announcement is meant to stay near it. RFC 4786 suggests tagging it with the `NO_EXPORT` community, so that only the networks peering at that exchange point use it. |
+
+Two pieces of RFC 4786 advice matter more than the rest:
+
+1. **Tie the route to the service.** It recommends that a node withdraw its announcement when the service fails, and treats that as part of the node, not an afterthought. The usual way to do it is a local health check that drives the BGP speaker: a script that probes the daemon on the node and enables or disables the BGP announcement (a BIRD protocol, an FRR `network` statement behind a route-map, or ExaBGP's health-check helper).
+2. **Give every node a unique unicast management address**, so you can reach a *specific* instance for debugging and monitoring. The service address can never do that, by definition.
+
+RFC 3258 describes the same idea specifically for authoritative DNS ("shared unicast addresses"). RFC 7094 explains why anycast works for stateful protocols *in practice* even though nothing guarantees it. RFC 9199, written by large authoritative DNS operators, recommends anycast and covers how routing choices shape latency and attack absorption.
+
+## Why DNS is the canonical anycast service
+
+A classic DNS query is one UDP datagram in and one out. There is no connection to break: if routing moves between two queries, the second one simply lands on another instance with the same zone data. That is why the root servers and almost every large authoritative and recursive DNS service are anycast. The same reasoning covers NTP, and any protocol whose transactions are short compared with how often routes change.
+
+TCP, TLS and QUIC carry state in the server. Anycast still works for them, and CDNs serve HTTP over anycast every day, because Internet routes are stable for most clients for minutes or hours at a time (RFC 7094 section 4.2, "Transport Implications", discusses this assumption). Stable is not guaranteed, though, and the lab below shows what the rare unlucky connection sees.
+
+## Lab: four namespaces, one service address
+
+The lab runs as an unprivileged user with `unshare -urnm` (a user, network and mount namespace), then creates four named network namespaces inside it: `client`, router `r`, and two servers `s1` and `s2`. Both servers put `192.0.2.53/32` on their loopback and run the same small responder. It needs only `iproute2` and Python 3; nothing is installed and `sudo` is never used.
+
+### The responder
+
+Each instance answers CHAOS-class TXT queries with its own name. This is the convention RFC 4892 describes for `id.server` and `hostname.bind`, and real servers (BIND, NSD, Knot, Unbound) support it. It also offers a tiny TCP echo on port 5300 so we can watch a long-lived connection.
+
+```python
+#!/usr/bin/env python3
+"""Tiny DNS responder for the anycast lab.
+Answers CHAOS TXT queries for id.server / hostname.bind (RFC 4892) with this
+instance's name, so a client can tell which anycast instance answered.
+Also serves a TCP echo-ish service on port 5300 to show what a path change
+does to an established TCP connection.
+usage: dnsid.py ADDR NAME
+"""
+import socket, struct, sys, threading
+
+addr, name = sys.argv[1], sys.argv[2]
+
+def answer(q: bytes) -> bytes:
+    qid, flags, qd = struct.unpack("!HHH", q[:6])
+    i = 12
+    while q[i]:
+        i += q[i] + 1
+    qend = i + 5                       # zero label + QTYPE + QCLASS
+    qtype, qclass = struct.unpack("!HH", q[i + 1:qend])
+    txt = name.encode()
+    rdata = bytes([len(txt)]) + txt
+    rr = b"\xc0\x0c" + struct.pack("!HHIH", 16, qclass, 0, len(rdata)) + rdata
+    ok = qtype == 16 and qclass == 3   # TXT CH
+    hdr = struct.pack("!HHHHHH", qid, 0x8400 | (0 if ok else 4), 1, 1 if ok else 0, 0, 0)
+    return hdr + q[12:qend] + (rr if ok else b"")
+
+def udp():
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.bind((addr, 53))
+    while True:
+        q, peer = s.recvfrom(512)
+        s.sendto(answer(q), peer)
+
+def tcp():
+    s = socket.socket()
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s.bind((addr, 5300)); s.listen()
+    while True:
+        c, _ = s.accept()
+        threading.Thread(target=serve, args=(c,), daemon=True).start()
+
+def serve(c):
+    with c:
+        while (d := c.recv(100)):
+            c.sendall(name.encode() + b":" + d)
+
+threading.Thread(target=tcp, daemon=True).start()
+udp()
+```
+
+### The client
+
+`ask.py` sends N `id.server CH TXT` queries. Each query uses a new socket, and therefore a new ephemeral source port. It then counts which instance answered. `tcpprobe.py` holds one TCP connection and sends a line every 0.3 s.
+
+```python
+#!/usr/bin/env python3
+"""Send N CHAOS TXT id.server queries (RFC 4892), each from a fresh source
+port, and count which anycast instance answered.  usage: ask.py ADDR N"""
+import collections, socket, struct, sys
+
+addr, n = sys.argv[1], int(sys.argv[2])
+QNAME = b"\x02id\x06server\x00"
+seen = collections.Counter()
+for qid in range(n):
+    q = struct.pack("!HHHHHH", qid, 0x0100, 1, 0, 0, 0) + QNAME + struct.pack("!HH", 16, 3)
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+        s.settimeout(0.3)
+        s.bind(("0.0.0.0", 0))                 # new ephemeral port every time
+        s.sendto(q, (addr, 53))
+        try:
+            r, _ = s.recvfrom(512)
+        except socket.timeout:
+            seen["timeout"] += 1
+            continue
+    rdata = r[12 + len(QNAME) + 4 + 2 + 10:]   # header, question, RR name ptr + fixed part
+    seen[rdata[1:1 + rdata[0]].decode()] += 1
+print("  ".join(f"{k}={v}" for k, v in sorted(seen.items())))
+```
+
+```python
+#!/usr/bin/env python3
+"""Hold one TCP connection to the anycast address and send a line every
+0.3 s; print who answered.  A path change mid-connection shows up here.
+usage: tcpprobe.py ADDR ROUNDS"""
+import socket, sys, time
+addr, rounds = sys.argv[1], int(sys.argv[2])
+c = socket.create_connection((addr, 5300), timeout=2)
+print("   local port", c.getsockname()[1])
+for i in range(rounds):
+    try:
+        c.sendall(b"ping%d" % i)
+        d = c.recv(100)
+        print("   round", i, "->", d.decode() if d else "EOF (peer closed)")
+        if not d:
+            break
+    except OSError as e:
+        print("   round", i, "->", type(e).__name__, e.errno, e.strerror)
+        break
+    time.sleep(0.3)
+```
+
+### The topology and the six experiments
+
+The box has no `sysctl` binary, so the script writes `/proc/sys` directly inside the router's namespace.
+
+```bash
+#!/bin/sh
+# Run as: unshare -urnm sh lab.sh
+# client --- router ===( two paths )=== s1, s2   both s1 and s2 own 192.0.2.53/32
+set -e
+mount -t tmpfs tmpfs /run; mkdir -p /run/netns
+for ns in client r s1 s2; do ip netns add $ns; ip -n $ns link set lo up; done
+link() { ip link add $1 type veth peer name $3; ip link set $1 netns $2; ip link set $3 netns $4
+         ip -n $2 link set $1 up; ip -n $4 link set $3 up; }
+link c0 client r0 r; link r1 r s1e s1; link r2 r s2e s2
+ip -n client addr add 10.0.1.2/24 dev c0; ip -n r addr add 10.0.1.1/24 dev r0
+ip -n r addr add 10.0.2.1/24 dev r1;      ip -n s1 addr add 10.0.2.2/24 dev s1e
+ip -n r addr add 10.0.3.1/24 dev r2;      ip -n s2 addr add 10.0.3.2/24 dev s2e
+ip -n client route add default via 10.0.1.1
+ip -n s1 route add default via 10.0.2.1;  ip -n s2 route add default via 10.0.3.1
+ip -n s1 addr add 192.0.2.53/32 dev lo;   ip -n s2 addr add 192.0.2.53/32 dev lo
+sysw() { ip netns exec r sh -c "echo $2 > /proc/sys/${1}" && echo "   $(echo $1 | tr / .) = $(ip netns exec r cat /proc/sys/$1)"; }
+sysw net/ipv4/ip_forward 1 >/dev/null
+H=$(pwd)
+ip netns exec s1 python3 $H/dnsid.py 192.0.2.53 s1-mumbai & P1=$!
+ip netns exec s2 python3 $H/dnsid.py 192.0.2.53 s2-chennai & P2=$!
+sleep 0.5
+C="ip netns exec client python3"
+
+echo "== 1. one best path (s1 metric 10, s2 metric 20): who answers 50 queries?"
+ip -n r route add 192.0.2.53/32 via 10.0.2.2 metric 10
+ip -n r route add 192.0.2.53/32 via 10.0.3.2 metric 20
+ip -n r route show 192.0.2.53/32 | sed 's/^/   /'
+$C $H/ask.py 192.0.2.53 50 | sed 's/^/   /'
+
+echo "== 2. s1 process dies but its route stays (no health-tied withdrawal)"
+kill $P1; wait $P1 2>/dev/null || true
+$C $H/ask.py 192.0.2.53 20 | sed 's/^/   /'
+ip netns exec s1 python3 $H/dnsid.py 192.0.2.53 s1-mumbai & P1=$!; sleep 0.3
+
+echo "== 3. health check withdraws s1 (route deleted): who answers now?"
+ip -n r route del 192.0.2.53/32 via 10.0.2.2 metric 10
+$C $H/ask.py 192.0.2.53 20 | sed 's/^/   /'
+ip -n r route add 192.0.2.53/32 via 10.0.2.2 metric 10
+
+echo "== 4. ECMP at the router, hash policy 0 (L3: src+dst IP only)"
+ip -n r route del 192.0.2.53/32 metric 10; ip -n r route del 192.0.2.53/32 metric 20
+ip -n r route add 192.0.2.53/32 nexthop via 10.0.2.2 nexthop via 10.0.3.2
+ip -n r route show 192.0.2.53/32 | sed 's/^/   /'
+sysw net/ipv4/fib_multipath_hash_policy 0
+$C $H/ask.py 192.0.2.53 200 | sed 's/^/   /'
+
+echo "== 5. same ECMP, hash policy 1 (L4: 5-tuple), fresh source port per query"
+sysw net/ipv4/fib_multipath_hash_policy 1
+$C $H/ask.py 192.0.2.53 200 | sed 's/^/   /'
+
+echo "== 6. TCP across a path change: connection pinned to one instance, then the route moves"
+ip -n r route replace 192.0.2.53/32 via 10.0.2.2
+$C $H/tcpprobe.py 192.0.2.53 6 > /tmp/tcp.out 2>&1 & T=$!
+sleep 0.8
+ip -n r route replace 192.0.2.53/32 via 10.0.3.2
+echo "   (route moved to s2 at ~0.8 s)"
+wait $T || true; cat /tmp/tcp.out
+
+kill $P1 $P2 2>/dev/null || true
+```
+
+Run it:
+
+```bash
+unshare -urnm sh lab.sh
+```
+
+Output, unedited (kernel 6.12.94+, iproute2 6.15.0, Python 3.13.5):
+
+```text
+== 1. one best path (s1 metric 10, s2 metric 20): who answers 50 queries?
+   192.0.2.53 via 10.0.2.2 dev r1 metric 10 
+   192.0.2.53 via 10.0.3.2 dev r2 metric 20 
+   s1-mumbai=50
+== 2. s1 process dies but its route stays (no health-tied withdrawal)
+   timeout=20
+== 3. health check withdraws s1 (route deleted): who answers now?
+   s2-chennai=20
+== 4. ECMP at the router, hash policy 0 (L3: src+dst IP only)
+   192.0.2.53 
+   	nexthop via 10.0.2.2 dev r1 weight 1 
+   	nexthop via 10.0.3.2 dev r2 weight 1 
+   net.ipv4.fib_multipath_hash_policy = 0
+   s1-mumbai=200
+== 5. same ECMP, hash policy 1 (L4: 5-tuple), fresh source port per query
+   net.ipv4.fib_multipath_hash_policy = 1
+   s1-mumbai=109  s2-chennai=91
+== 6. TCP across a path change: connection pinned to one instance, then the route moves
+   (route moved to s2 at ~0.8 s)
+   local port 46118
+   round 0 -> s1-mumbai:ping0
+   round 1 -> s1-mumbai:ping1
+   round 2 -> s1-mumbai:ping2
+   round 3 -> ConnectionResetError 104 Connection reset by peer
+```
+
+### Reading the output
+
+**1. Best path is sticky.** With s1 at metric 10 and s2 at metric 20, all 50 queries went to s1. s2 was healthy the whole time and received nothing. This is what most of the Internet sees for most anycast services: one site per client, chosen by routing, with no regard for load. If your Mumbai node takes 80 percent of your traffic, the fix is in routing (prepend, communities, more nodes, local nodes), not in the server.
+
+**2. A dead daemon behind a live route is a black hole.** We killed the responder on s1 but left the router's route in place. Every one of the 20 queries timed out. s2 was up, and it did not matter. Note *how* it failed: the client saw silence, not an error. s1's kernel may answer with an ICMP port unreachable, but an unconnected UDP socket does not report it to the application, so a stub resolver just waits for its retry timer. In production this looks like "DNS is slow for users in one region", which is one of the hardest outages to see from a central monitoring point. It is the reason RFC 4786 wants the announcement tied to the service.
+
+**3. Withdrawal is the failover.** Once the route via s1 was deleted (the equivalent of the health check telling BGP to withdraw), the next query went to s2 and all 20 succeeded. No client changed anything. How fast this happens on the real Internet depends on how quickly the withdrawal propagates. That ranges from sub-second inside one network to tens of seconds across the Internet, because of MRAI timers and path exploration.
+
+**4 and 5. ECMP hash policy decides spreading.** Same two equal next hops, two hash policies:
+
+- `fib_multipath_hash_policy = 0` hashes on source and destination IP only. One client, one destination, one hash result: all 200 queries went to s1, even though each used a new source port.
+- `fib_multipath_hash_policy = 1` adds the protocol and ports (the 5-tuple). The same 200 queries split 109 / 91.
+
+Neither is "right". Policy 0 keeps a client's flows together, which suits stateful services and a resolver that sends many queries from the same address. Policy 1 spreads load better when there are few clients and many flows. The kernel documentation (`ip-sysctl`, `fib_multipath_hash_policy`) also lists policy 2 (inner headers for encapsulated traffic) and 3 (a custom field set chosen with `fib_multipath_hash_fields`). The common in-site pattern is several servers behind a router, each announcing the service /32 over BGP with ECMP enabled, and it relies on exactly this hash.
+
+**6. TCP does not survive a move.** The TCP connection was established to s1 and three round trips worked. Then the route moved to s2. The next segment arrived at s2, which has a listener on port 5300 but no connection matching that 4-tuple, so s2's kernel answered with a RST. The client got `ECONNRESET`. Nothing was misconfigured. This is what anycast means for stateful protocols: correctness depends on routing not changing for the life of the connection.
+
+## Debugging which instance you reached
+
+From the outside, every instance has the same address, so `ping` and `traceroute` do not tell you which one answered. Use the service itself:
+
+```bash
+dig @192.0.2.53 id.server CH TXT +short       # RFC 4892 convention; also hostname.bind
+dig @192.0.2.53 example.test +nsid            # RFC 5001 NSID option in the EDNS OPT record
+```
+
+Both depend on the server being configured to reveal an identity. Most operators publish a site code rather than a hostname. These commands are not run here because `dig` is not installed on this box; the lab's `ask.py` does the same `id.server` query by hand. From many vantage points at once, the RIPE Atlas built-in measurements query `hostname.bind` against the root servers continuously, which is how people map anycast catchments.
+
+## Operating rules that fall out of the lab
+
+1. **Health-checked announcements, always.** The check should exercise the real service, for example by asking the local daemon for a known record. A process check alone is not enough. Withdraw on failure, and add hold-down or dampening so a flapping daemon does not flap your routes across the Internet.
+2. **Announce the same supernet everywhere, and cover it with ROAs.** If several sites originate from the same ASN, one ROA for that ASN covers them all. If some sites use a different origin ASN (a partner network, a local node hosted by an IXP member), each origin ASN needs its own ROA, or RPKI-validating networks drop those announcements as Invalid. Keep the ROA's maxLength equal to the announced length unless you really announce more-specifics.
+3. **Never anycast without per-node unicast addresses** for management, health monitoring and log collection.
+4. **Keep catchments observable.** Log which node served each query, and alert on sudden shifts of traffic share between nodes. A shift with no event on your side is often someone else's routing change.
+5. **Think about state per protocol.** DNS over UDP is fine. DNS over TCP and DoT, HTTP and TLS work because routes are usually stable, so keep connection lifetimes modest. QUIC can survive some path changes with connection IDs plus a load balancer that routes on them, but only *within* a site. Two different anycast sites do not share QUIC state either.
+6. **Local nodes stay local.** If a node is meant only for one exchange, use `NO_EXPORT` (or your upstreams' scoping communities) and check from a looking glass that it does not leak.
+
+## Case
+
+A small authoritative DNS operator runs three nodes (Mumbai, Chennai, Singapore), each announcing `198.51.100.0/24` from the same ASN over two transit providers. After a kernel upgrade, the DNS daemon on the Chennai node fails to start because of a bad configuration line. The BGP daemon starts fine. For forty minutes, resolvers in South India get timeouts for every zone the operator hosts. External monitoring probes from Europe and the US all pass, because they reach Singapore. The fix was two lines: a health check that queries the local daemon for the zone's SOA every two seconds and disables the BGP announcement after three failures, plus a monitoring probe that queries `id.server` from each region and alerts when one region stops answering.
+
+## Trap
+
+**"Anycast gives me load balancing."** It gives you *routing-defined* distribution, which can be very uneven (experiment 1 sent 100 percent to one site). If you need even load, you need more nodes, routing adjustments, or a load balancer behind each site.
+
+**"ECMP across instances is free redundancy."** In experiment 6 the route moved on purpose, but an ECMP group losing a next hop has the same effect on some *surviving* flows. With plain hash-threshold ECMP, removing one next hop can remap flows that were going to the healthy ones. Linux resilient next-hop groups (`ip nexthop add ... type resilient`, see `ip-nexthop(8)`) exist to limit that churn.
+
+**"The daemon is up, so the node is healthy."** A daemon serving an empty or stale zone is worse than a dead one: it answers quickly and wrongly. Health checks should verify content, such as the SOA serial or a canary record, not just liveness.
+
+## Boring rule
+
+Announce only what you can serve: the BGP announcement and the service's health are one switch, not two. Give every node a unicast name, every query an instance ID in the logs, and every origin ASN a ROA.
+
+## Try this
+
+1. Add a third server `s3` with weight 2 in the ECMP group (`nexthop via ... weight 2`) and check that the policy-1 split moves towards 50/25/25.
+2. Run experiment 6 again with the ECMP group and policy 1, and delete one next hop instead of replacing the route. Run `tcpprobe.py` several times: some connections survive, some are reset, depending on where their hash lands.
+3. Change `ask.py` to use one socket for all queries (fixed source port) and rerun experiment 5. Explain the result.
+4. Write a ten-line health checker that runs in `s1`, queries `127.0.0.1` for `id.server`, and calls `ip -n r route del ...` after three failures (it can reach the router namespace because everything is inside the same user namespace). Kill the responder and time the failover.
+
+## Verification
+
+- `unshare -urnm sh lab.sh` was run on this box as an unprivileged user (no sudo, nothing installed). The output above is pasted verbatim. Kernel 6.12.94+, iproute2 6.15.0, Python 3.13.5.
+- The ECMP split (109 / 91) depends on the random source ports, so expect different numbers each run. With policy 0, expect all queries on one instance.
+- Not run: real BGP (BIRD, FRR, ExaBGP), RPKI, `dig` (not installed) and RIPE Atlas. These parts are written from the cited documentation.
+
+## Sources
+
+- RFC 4786 / BCP 126, *Operation of Anycast Services*: <https://www.rfc-editor.org/rfc/rfc4786>
+- RFC 3258, *Distributing Authoritative Name Servers via Shared Unicast Addresses*: <https://www.rfc-editor.org/rfc/rfc3258>
+- RFC 7094, *Architectural Considerations of IP Anycast*: <https://www.rfc-editor.org/rfc/rfc7094>
+- RFC 9199, *Considerations for Large Authoritative DNS Server Operators*: <https://www.rfc-editor.org/rfc/rfc9199>
+- RFC 4892, *Requirements for a Mechanism Identifying a Name Server Instance*: <https://www.rfc-editor.org/rfc/rfc4892>
+- RFC 5001, *DNS Name Server Identifier (NSID) Option*: <https://www.rfc-editor.org/rfc/rfc5001>
+- Linux kernel `ip-sysctl` documentation (`fib_multipath_hash_policy`, `fib_multipath_hash_fields`): <https://docs.kernel.org/networking/ip-sysctl.html>
+- `ip-route(8)`, `ip-nexthop(8)`: <https://man7.org/linux/man-pages/man8/ip-route.8.html>, <https://man7.org/linux/man-pages/man8/ip-nexthop.8.html>
