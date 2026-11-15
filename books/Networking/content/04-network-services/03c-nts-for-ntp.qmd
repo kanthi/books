@@ -1,0 +1,971 @@
+---
+title: "Network Time Security: NTS-KE, Cookies and Authenticated NTP (RFC 8915)"
+author:
+  - name: "K19G"
+  - name: "grok-bot"
+---
+
+# Network Time Security: NTS-KE, Cookies and Authenticated NTP (RFC 8915)
+
+Unauthenticated NTP trusts any UDP packet arriving on port 123 that carries a matching transmit timestamp. On an untrusted path, an on-path attacker can forge stratum-1 responses and walk a host's clock forward or backward, breaking TLS certificate validation, Kerberos tickets, log correlation, and distributed consensus leases. While the Name, Time, and Log Hygiene chapter covers basic `chrony` and `systemd-timesyncd` operation, and Precision Time Protocol (PTP): Beyond NTP covers hardware timestamping on controlled LANs, neither addresses cryptographic authentication over the public internet.
+
+Network Time Security (NTS), specified in [RFC 8915](https://datatracker.ietf.org/doc/html/rfc8915), closes that gap without turning every UDP time query into a TLS handshake. It splits the problem into two phases: a short-lived TLS 1.3 key-exchange session (NTS-KE) over TCP that negotiates parameters and mints opaque cookies, followed by stateless, AEAD-authenticated NTPv4 packets over UDP.
+
+## Learning goals
+
+- Trace the two-phase NTS architecture across NTS-KE (TCP/4460, TLS 1.3, ALPN `ntske/1`) and authenticated NTPv4 (UDP/123 or negotiated port).
+- Decode and construct NTS-KE wire records, including the critical bit, Next Protocol Negotiation, AEAD Algorithm Negotiation, Server/Port Negotiation, and New Cookie records.
+- Derive C2S and S2C directional keys using the RFC 5705 / RFC 8446 TLS exporter with the exact five-octet NTS context.
+- Construct and verify authenticated NTPv4 packets using extension fields `0x0104` through `0x0404` and AEAD associated data boundaries.
+- Configure `chrony` for NTS in production and diagnose common deployment failures, including `:4460` middlebox resets and split KE/NTP hostnames.
+- Quantify the threats NTS does not mitigate, including symmetric and asymmetric delay attacks, clock-bootstrap circularity, and authenticated bad-time servers.
+
+## Two-phase architecture
+
+NTP's core strength is its low-jitter, stateless UDP request-response loop. Running TLS directly over DTLS for every NTP association would force time servers to maintain per-client cryptographic state for millions of hosts. NTS avoids server-side per-client state by separating **key establishment** from **packet authentication**:
+
+1. **Phase 1: NTS Key Establishment (NTS-KE).** The client opens a TLS 1.3 connection to the NTS-KE server—typically TCP port `4460`—and negotiates the ALPN token `ntske/1`. Inside the TLS tunnel, client and server exchange binary records to agree on the next protocol (NTPv4, Protocol ID `0`) and an AEAD algorithm. Both sides then run the TLS exporter to derive two directional keys: Client-to-Server (`C2S`) and Server-to-Client (`S2C`). The server seals those keys (along with any metadata it needs) inside opaque **cookies** encrypted with a local server key, and sends a batch of cookies (eight by default) to the client before closing the TLS connection.
+2. **Phase 2: Authenticated NTPv4.** The client sends standard NTPv4 packets over UDP (port `123`, or a port specified during KE) to the NTP responder (either the KE server's IP or a hostname/IP provided in a Server Negotiation record). Each request carries one unused cookie, a random Unique Identifier, optional Cookie Placeholders, and an AEAD authenticator computed with the `C2S` key. The server decrypts the cookie with its local master key to recover `C2S` and `S2C` without storing any database row for the client, verifies the request, stamps the time, and replies with an AEAD authenticator computed with `S2C` plus fresh encrypted cookies.
+
+```text
+Client                                    NTS-KE Server (TCP/4460)       NTP Server (UDP/123 or negotiated)
+  |                                                 |                                   |
+  |--- TLS 1.3 ClientHello (ALPN: ntske/1) -------->|                                   |
+  |<-- TLS 1.3 ServerHello + Cert + Finished -------|                                   |
+  |                                                 |                                   |
+  |--- NTS-KE: NextProto(0), AEAD(15), EOM -------->|                                   |
+  |<-- NTS-KE: NextProto(0), AEAD(15),              |                                   |
+  |            Server, Port, 8x Cookie, EOM --------|                                   |
+  |                                                 |                                   |
+  |  [TLS Exporter -> C2S, S2C keys]                |  [Cookies seal C2S, S2C]          |
+  |--- Close TLS ---------------------------------->|                                   |
+  |                                                                                     |
+  |--- UDP NTPv4 + UniqueID(0x0104) + Cookie(0x0204) + Auth(0x0404, C2S) -------------->|
+  |                                                   [Server unseals Cookie -> C2S,S2C]|
+  |<-- UDP NTPv4 + UniqueID + Auth(0x0404, S2C, encrypted New Cookies) -----------------|
+```
+
+## NTS-KE wire protocol and records
+
+Every NTS-KE message over the TLS 1.3 stream is a sequence of variable-length records. Each record starts with a 16-bit header word (criticality flag + 15-bit record type) followed by a 16-bit unsigned body length in network byte order:
+
+```text
+ 0                   1                   2                   3
+ 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|C|         Record Type         |          Body Length          |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                                                               |
+.                        Record Body                            .
+.                   (Body Length octets)                        .
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+```
+
+If the `C` (Critical) bit is set to `1` and the receiver does not recognize the record type, the receiver MUST respond with an Error record and abort the handshake. If `C` is `0`, an unrecognized record is ignored. Every NTS-KE request and response MUST terminate with an `End of Message` record.
+
+| Type | Name | Critical | Direction | Body format |
+| :--- | :--- | :--- | :--- | :--- |
+| `0` | End of Message | Yes | Both | Empty (`length = 0`). |
+| `1` | Next Protocol Negotiation | Yes | Both | Sequence of 16-bit protocol IDs (`0` = NTPv4). |
+| `2` | Error | Yes | Server -> Client | 16-bit error code (`0` = Unrecognized Critical Record, `1` = Bad Request, `2` = Internal Server Error). |
+| `3` | Warning | Yes | Server -> Client | 16-bit warning code. |
+| `4` | AEAD Algorithm Negotiation | No/Yes | Both | Sequence of 16-bit IANA AEAD IDs (`15` = `AEAD_AES_SIV_CMAC_256`). |
+| `5` | New Cookie for NTPv4 | No | Server -> Client | Opaque cookie octets. Server SHOULD send 8; clients MUST NOT send. |
+| `6` | NTPv4 Server Negotiation | No | Server -> Client | ASCII IPv4 address, IPv6 address, or FQDN. |
+| `7` | NTPv4 Port Negotiation | No | Server -> Client | 16-bit unsigned port number (`uint16`). |
+
+If the server omits record `6` (NTPv4 Server Negotiation), the client MUST use the same IP address as the NTS-KE server for Phase 2. If the server includes record `6`, the client MUST switch to that target—even if it resolves to a completely different hostname or cluster.
+
+## TLS key exporter and AEAD selection
+
+Once the TLS 1.3 handshake completes and both peers agree on the Next Protocol (`0` for NTPv4) and an AEAD algorithm, they derive the `C2S` and `S2C` keys using the TLS keying material exporter ([RFC 5705](https://datatracker.ietf.org/doc/html/rfc5705) / [RFC 8446](https://datatracker.ietf.org/doc/html/rfc8446) §7.5; [RFC 8915](https://datatracker.ietf.org/doc/html/rfc8915) §5.1).
+
+The exporter parameters are strictly defined:
+
+- **Label:** `EXPORTER-network-time-security` (ASCII, no null terminator).
+- **Context (5 octets):**
+  - Octets `0..1`: Next Protocol ID in network byte order (`0x00 0x00` for NTPv4).
+  - Octets `2..3`: Negotiated AEAD numeric ID in network byte order (e.g., `0x00 0x0f` for ID `15`).
+  - Octet `4`: Direction byte (`0x00` for `C2S`, `0x01` for `S2C`).
+
+The output length depends on the negotiated AEAD algorithm:
+
+| IANA AEAD ID | Algorithm | Key length per direction | Status in RFC 8915 |
+| :--- | :--- | :--- | :--- |
+| `15` | `AEAD_AES_SIV_CMAC_256` | **32 octets** | Mandatory to implement |
+| `17` | `AEAD_AES_SIV_CMAC_512` | **64 octets** | Optional |
+| `30` | `AEAD_AES_128_GCM_SIV` | **16 octets** | Optional (used in some fleets) |
+
+For mandatory `AEAD_AES_SIV_CMAC_256` ([RFC 5297](https://datatracker.ietf.org/doc/html/rfc5297)), the exporter is called twice—once with direction `0x00` and once with `0x01`—requesting **32 octets** each time. Do not confuse the `256` in `AEAD_AES_SIV_CMAC_256` with a 256-bit AES block key that doubles to 64 octets for SIV; in RFC 5297 naming, `256` is the total key length (two 128-bit AES keys, `K1` and `K2`, totaling 32 octets). By contrast, `AEAD_AES_SIV_CMAC_512` (ID `17`) uses two 256-bit keys totaling 64 octets.
+
+## Authenticated NTPv4 packets and cookies
+
+An NTS-protected NTPv4 packet starts with the standard 48-octet NTP header, followed by NTP extension fields formatted according to [RFC 7822](https://datatracker.ietf.org/doc/html/rfc7822) (each extension field has a 16-bit type, 16-bit total length in octets, and 32-bit word alignment):
+
+```text
++-------------------------------------------------------------------+
+| Standard 48-octet NTPv4 Header (LI, VN, Mode, Timestamps, ...)    |  <--+
++-------------------------------------------------------------------+      |
+| EF 0x0104: Unique Identifier (32+ random octets)                  |      |
++-------------------------------------------------------------------+      | Associated Data
+| EF 0x0204: NTS Cookie (1 cookie consumed per request)             |      | (AD) for AEAD
++-------------------------------------------------------------------+      |
+| EF 0x0304: NTS Cookie Placeholder(s) (optional, 0..N)             |      |
++-------------------------------------------------------------------+  <--+
+| EF 0x0404: NTS Authenticator and Encrypted Extension Fields       |
+|   - Nonce Length (uint16), Ciphertext Length (uint16)             |
+|   - Nonce (random, e.g. 16 octets for AES-SIV)                    |
+|   - Ciphertext (AEAD(Key=C2S/S2C, Nonce, AD, Plaintext))          |
+|     [In server response, Plaintext holds new 0x0204 Cookie EFs]   |
++-------------------------------------------------------------------+
+```
+
+RFC 8915 §5 defines four extension field types:
+
+| Extension Field Type | Name | Role |
+| :--- | :--- | :--- |
+| `0x0104` | Unique Identifier | At least 32 octets of CSPRNG output in the client request; server echoes it verbatim in the response to bind request and reply and prevent replay. |
+| `0x0204` | NTS Cookie | Opaque token carrying the client's `C2S`/`S2C` keys encrypted under the server's local master key. Sent unencrypted in client requests; sent encrypted inside `0x0404` in server responses. |
+| `0x0304` | NTS Cookie Placeholder | Empty-valued (or zero-padded to cookie size) extension field sent by the client to request extra cookies without inflating server response size past the request size (amplification protection). |
+| `0x0404` | NTS Authenticator and Encrypted Extension Fields | Holds the AEAD nonce and ciphertext (which includes the authentication tag). |
+
+The AEAD **associated data (AD)** covers every byte from the start of the 48-octet NTP header up to—but not including—the `0x0404` Authenticator extension field.
+
+- **Client requests** commonly carry no encrypted extension fields, meaning the AEAD plaintext is **empty (0 octets)**. In `AEAD_AES_SIV_CMAC_256`, empty plaintext is completely valid: the SIV tag still authenticates the AD (the NTP header, Unique Identifier, Cookie, and Placeholders).
+- **Server responses** place one or more fresh `0x0204` NTS Cookie extension fields inside the encrypted plaintext of `0x0404`.
+- **Cookie pool management:** Clients SHOULD NOT reuse a cookie. Sending the same cookie twice lets a passive observer correlate the client across IP address changes (such as roaming between Wi-Fi and cellular). Each request consumes one cookie; to keep its pool near eight cookies without triggering a fresh NTS-KE handshake, the client appends `0x0304` Cookie Placeholder fields (typically up to 7 when starting from 1, or 1 per consumed cookie) so the server can return an equal number of fresh cookies inside `0x0404`.
+
+## Production deployment: `chrony` and real-world rollouts
+
+On Linux, `chrony` is the standard NTS-capable NTP client and server daemon. (`systemd-timesyncd`, covered in the Name, Time, and Log Hygiene chapter, does not implement RFC 8915 NTS; hosts requiring authenticated time must migrate to `chrony`.)
+
+Inspired by recent public-time-service rollouts—most notably Meta's deployment documented in [NTS: Authenticated Time at Meta](https://engineering.fb.com/2026/10/06/production-engineering/nts-authenticated-time-at-meta/) (6 October 2026)—several operational patterns matter in production:
+
+- **Split KE and NTP endpoints:** Meta's public NTS-KE endpoint is `nts.meta.com` (TCP/4460). During the NTS-KE exchange, the server returns an NTPv4 Server Negotiation record (`6`) pointing the client to `time.meta.com` for Phase 2 UDP traffic. The hostname you put in `chrony.conf` is not necessarily the host receiving your UDP/123 packets.
+- **Stateless cookie key derivation:** High-volume public servers do not store per-client keys in memory or a database. Instead, they derive or rotate a local cookie encryption key and seal the client's `C2S`/`S2C` keys inside the `0x0204` cookie. Server-side cookie master keys are local to the server cluster and may be longer than 32 octets, independent of the 32-octet `C2S`/`S2C` keys derived for AEAD `15`.
+- **Negotiated AEAD suites and silent failures:** Meta's NTS service negotiates AEAD `15` (`AEAD_AES_SIV_CMAC_256`), `17` (`AEAD_AES_SIV_CMAC_512`), and `30` (`AEAD_AES_128_GCM_SIV`). Crucially, their responders do **not** emit an NTS NAK (a Kiss-o'-Death `NTSN` packet) when authentication fails; a verification failure looks identical to UDP packet loss on the wire.
+
+A documented `chrony` configuration line for a public NTS pool looks like this (marked **not run** here—do not modify system packages or `/etc/chrony/` without operator intent):
+
+```text
+# /etc/chrony/chrony.conf (not run)
+pool nts.meta.com nts iburst maxsources 5
+```
+
+If your host sits behind a restrictive firewall, verify outbound TCP/4460 to the KE hostname *and* outbound UDP/123 to the negotiated NTP responder IP before blaming `chronyd`.
+
+## What NTS does not fix
+
+Cryptographic authentication proves *who* sent the packet and *that* it was not altered in transit. It does not solve the physics of network timing or trust in the time source itself:
+
+1. **Delay attacks:** An on-path attacker cannot forge a valid `0x0404` authenticator, but it can still buffer an NTP packet and release it later. If the attacker delays only the client-to-server request (or only the server-to-client response) by $\Delta t$ milliseconds, the client's symmetric-path assumption breaks and the calculated clock offset shifts by up to $\Delta t / 2$. NTS cannot detect pure packet holding; defending against delay attacks requires multi-source consensus (comparing independent paths) and strict `maxdelay` bounds.
+2. **Clock-bootstrap circularity:** NTS-KE uses TLS 1.3, which validates X.509 certificate `notBefore` and `notAfter` timestamps. A device booting from 1970-01-01 with no RTC battery will reject valid NTS-KE certificates unless it uses a fallback, a local hardware clock, or an initial unauthenticated/pinned bootstrap window.
+3. **Authenticated bad time:** If an NTS-authenticated stratum-1 server suffers a GPS leap-second bug or an internal clock jump, the `0x0404` tag will still verify cleanly. Authentication proves origin, not accuracy.
+
+## The lab
+
+In this lab, you inspect a loopback NTS-KE exchange and authenticated NTPv4 transaction built against OpenSSL 3.5.7 and Python 3.13.5. Public NTS-KE tests to `time.cloudflare.com:4460` and other public `:4460` endpoints on this host failed immediately after TCP connect with a TLS reset (`SSLEOFError: unexpected EOF`), so public `:4460` exchanges are treated as **not run**. Furthermore, CPython 3.13.5's standard `ssl` module on this host does not expose `SSLSocket.export_keying_material`, so a small C helper (`nts-export.c`) linked against `libssl.so.3` runs a TLS 1.3 BIO pair with ALPN `ntske/1` to verify `SSL_export_keying_material` produces matching 32-octet `C2S` and `S2C` keys (`C2S != S2C`). A Python loopback harness then binds those keys into 8 cookies over a TLS 1.3 (`TLS_AES_256_GCM_SHA384`, ALPN `ntske/1`) NTS-KE session advertising `127.0.0.1` and an ephemeral UDP port, and executes an authenticated NTPv4 request/response (mode 4, stratum 2, Unique Identifier echoed, new cookie encrypted inside `0x0404`) using a local RFC 5297 helper that supports empty-plaintext AES-SIV (which `cryptography`'s `AESSIV` API rejects, while matching `AESSIV` byte-for-byte on non-empty plaintext).
+
+The lab program is `nts-lab.py`, together with a small OpenSSL helper `nts-export.c` compiled against the already-installed `libssl` (no packages were installed). Public `:4460` NTS-KE is marked not run in the output below.
+
+`nts-lab.py`:
+
+```python
+#!/usr/bin/env python3
+"""Network Time Security (RFC 8915): NTS-KE records, AES-SIV cookies, live handshake."""
+from __future__ import annotations
+import os, socket, ssl, struct, sys, time, threading, subprocess, pathlib
+from cryptography.hazmat.primitives.ciphers.aead import AESSIV
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from cryptography.hazmat.primitives.cmac import CMAC
+
+# Record types (RFC 8915 §4.1 / §7.6)
+RT_END, RT_NEXT, RT_ERROR, RT_WARNING, RT_AEAD, RT_COOKIE, RT_SERVER, RT_PORT = range(8)
+RT_NAME = {
+    0: "End of Message", 1: "Next Protocol Negotiation", 2: "Error", 3: "Warning",
+    4: "AEAD Algorithm Negotiation", 5: "New Cookie for NTPv4",
+    6: "NTPv4 Server Negotiation", 7: "NTPv4 Port Negotiation",
+}
+AEAD_AES_SIV_CMAC_256 = 15
+PROTO_NTPV4 = 0
+# NTP extension Field Types (RFC 8915 §7.5)
+XT_UNIQUE = 0x0104
+XT_COOKIE = 0x0204
+XT_COOKIE_PLACEHOLDER = 0x0304
+XT_AUTH = 0x0404
+
+
+def _dbl(s: bytes) -> bytes:
+    x = int.from_bytes(s, "big")
+    if s[0] & 0x80:
+        y = ((x << 1) & ((1 << 128) - 1)) ^ 0x87
+    else:
+        y = (x << 1) & ((1 << 128) - 1)
+    return y.to_bytes(16, "big")
+
+def _cmac(key: bytes, msg: bytes) -> bytes:
+    c = CMAC(algorithms.AES(key))
+    c.update(msg)
+    return c.finalize()
+
+def _s2v(k1: bytes, ads: list[bytes], plaintext: bytes) -> bytes:
+    d = _cmac(k1, b"\x00" * 16)
+    for ad in ads:
+        d = bytes(a ^ b for a, b in zip(_dbl(d), _cmac(k1, ad)))
+    if len(plaintext) >= 16:
+        t = plaintext[:-16] + bytes(a ^ b for a, b in zip(plaintext[-16:], d))
+    else:
+        pad = plaintext + b"\x80" + b"\x00" * (15 - len(plaintext))
+        t = bytes(a ^ b for a, b in zip(_dbl(d), pad))
+    return _cmac(k1, t)
+
+def aes_siv_cmac_256_encrypt(key: bytes, plaintext: bytes, aads: list[bytes]) -> bytes:
+    """AEAD_AES_SIV_CMAC_256 (RFC 5297). Key is 32 octets. Empty plaintext is legal."""
+    if len(key) != 32:
+        raise ValueError(f"AEAD_AES_SIV_CMAC_256 key must be 32 octets, got {len(key)}")
+    k1, k2 = key[:16], key[16:]
+    v = _s2v(k1, aads, plaintext)
+    q = bytearray(v)
+    q[8] &= 0x7F
+    q[12] &= 0x7F
+    enc = Cipher(algorithms.AES(k2), modes.CTR(bytes(q))).encryptor()
+    return v + enc.update(plaintext) + enc.finalize()
+
+def aes_siv_cmac_256_decrypt(key: bytes, blob: bytes, aads: list[bytes]) -> bytes:
+    if len(key) != 32:
+        raise ValueError(f"AEAD_AES_SIV_CMAC_256 key must be 32 octets, got {len(key)}")
+    if len(blob) < 16:
+        raise ValueError("ciphertext too short")
+    v, c = blob[:16], blob[16:]
+    k1, k2 = key[:16], key[16:]
+    q = bytearray(v)
+    q[8] &= 0x7F
+    q[12] &= 0x7F
+    dec = Cipher(algorithms.AES(k2), modes.CTR(bytes(q))).decryptor()
+    p = dec.update(c) + dec.finalize()
+    if _s2v(k1, aads, p) != v:
+        raise ValueError("InvalidTag")
+    return p
+
+
+def encode_record(critical: bool, typ: int, body: bytes) -> bytes:
+    typ_field = ((1 if critical else 0) << 15) | (typ & 0x7FFF)
+    return struct.pack("!HH", typ_field, len(body)) + body
+
+def decode_records(buf: bytes) -> list[dict]:
+    recs, off = [], 0
+    while off < len(buf):
+        if off + 4 > len(buf):
+            raise ValueError("truncated record header")
+        typ_field, ln = struct.unpack_from("!HH", buf, off)
+        off += 4
+        if off + ln > len(buf):
+            raise ValueError("truncated record body")
+        recs.append({
+            "critical": bool(typ_field >> 15),
+            "type": typ_field & 0x7FFF,
+            "body": buf[off:off+ln],
+        })
+        off += ln
+        if recs[-1]["type"] == RT_END:
+            break
+    if not recs or recs[-1]["type"] != RT_END:
+        raise ValueError("NTS-KE message not terminated by End of Message")
+    return recs
+
+def describe(rec) -> str:
+    name = RT_NAME.get(rec["type"], f"type {rec['type']}")
+    c = "C" if rec["critical"] else "-"
+    b = rec["body"]
+    extra = ""
+    if rec["type"] == RT_NEXT:
+        ids = [struct.unpack_from("!H", b, i)[0] for i in range(0, len(b), 2)]
+        extra = f" protocols={ids}"
+    elif rec["type"] == RT_AEAD:
+        ids = [struct.unpack_from("!H", b, i)[0] for i in range(0, len(b), 2)]
+        extra = f" algorithms={ids}" + (" (AEAD_AES_SIV_CMAC_256)" if 15 in ids else "")
+    elif rec["type"] == RT_COOKIE:
+        extra = f" cookie_len={len(b)}"
+    elif rec["type"] == RT_SERVER:
+        extra = f" server={b.decode('ascii', 'replace')}"
+    elif rec["type"] == RT_PORT:
+        extra = f" port={struct.unpack('!H', b)[0]}"
+    elif rec["type"] == RT_ERROR:
+        extra = f" error={struct.unpack('!H', b)[0] if len(b)==2 else b!r}"
+    return f"[{c}] {name:28s} body={len(b):3d}B{extra}"
+
+def client_ke_message(aead=AEAD_AES_SIV_CMAC_256) -> bytes:
+    return (
+        encode_record(True, RT_NEXT, struct.pack("!H", PROTO_NTPV4))
+        + encode_record(True, RT_AEAD, struct.pack("!H", aead))
+        + encode_record(True, RT_END, b"")
+    )
+
+
+def server_ke_message(cookies: list[bytes], aead=AEAD_AES_SIV_CMAC_256) -> bytes:
+    body = (
+        encode_record(True, RT_NEXT, struct.pack("!H", PROTO_NTPV4))
+        + encode_record(True, RT_AEAD, struct.pack("!H", aead))
+    )
+    for c in cookies:
+        body += encode_record(False, RT_COOKIE, c)
+    body += encode_record(False, RT_SERVER, b"127.0.0.1")
+    body += encode_record(False, RT_PORT, struct.pack("!H", 0))  # filled later
+    body += encode_record(True, RT_END, b"")
+    return body
+
+class LocalNTS:
+    """Loopback NTS-KE (TLS) plus NTS-protected NTP (UDP)."""
+    def __init__(self, certfile, keyfile):
+        self.certfile, self.keyfile = certfile, keyfile
+        self.sessions = {}  # cookie -> (c2s, s2c)
+        self.master = AESSIV.generate_key(512)
+        self.ke_port = None
+        self.ntp_port = None
+
+    def _issue_cookies(self, c2s, s2c, n=8):
+        out = []
+        aead = AESSIV(self.master)
+        for _ in range(n):
+            nonce = os.urandom(16)
+            token = os.urandom(16)
+            cookie = nonce + aead.encrypt(token, [nonce])
+            self.sessions[cookie] = (c2s, s2c)
+            out.append(cookie)
+        return out
+
+    def start(self):
+        import threading
+        # NTP UDP first so we can advertise the port in KE
+        ntp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        ntp.bind(("127.0.0.1", 0))
+        self.ntp_port = ntp.getsockname()[1]
+        threading.Thread(target=self._ntp_loop, args=(ntp,), daemon=True).start()
+        ke = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        ke.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        ke.bind(("127.0.0.1", 0))
+        ke.listen(5)
+        self.ke_port = ke.getsockname()[1]
+        threading.Thread(target=self._ke_loop, args=(ke,), daemon=True).start()
+        return self.ke_port, self.ntp_port
+
+    def _ke_loop(self, lsock):
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.load_cert_chain(self.certfile, self.keyfile)
+        ctx.set_alpn_protocols(["ntske/1"])
+        while True:
+            try:
+                conn, _ = lsock.accept()
+                tls = ctx.wrap_socket(conn, server_side=True)
+            except Exception:
+                continue
+            try:
+                buf = b""
+                while True:
+                    chunk = tls.recv(16384)
+                    if not chunk:
+                        break
+                    buf += chunk
+                    try:
+                        recs = decode_records(buf)
+                        break
+                    except ValueError:
+                        continue
+                # CPython 3.13 ssl on this host has no export_keying_material.
+                # Keys come from the OpenSSL helper (RFC 8915 §5.1), injected
+                # after ALPN ntske/1 succeeds, and are bound into the cookies.
+                if not hasattr(self, "lab_keys") or self.lab_keys is None:
+                    raise RuntimeError("lab_keys not set (OpenSSL exporter must run first)")
+                c2s, s2c = self.lab_keys
+                cookies = self._issue_cookies(c2s, s2c, n=8)
+                # advertise the real NTP port
+                msg = (
+                    encode_record(True, RT_NEXT, struct.pack("!H", PROTO_NTPV4))
+                    + encode_record(True, RT_AEAD, struct.pack("!H", AEAD_AES_SIV_CMAC_256))
+                )
+                for c in cookies:
+                    msg += encode_record(False, RT_COOKIE, c)
+                msg += encode_record(False, RT_SERVER, b"127.0.0.1")
+                msg += encode_record(False, RT_PORT, struct.pack("!H", self.ntp_port))
+                msg += encode_record(True, RT_END, b"")
+                tls.sendall(msg)
+            except Exception:
+                pass
+            try:
+                tls.close()
+            except Exception:
+                pass
+
+    def _ntp_loop(self, sock):
+        sock.settimeout(0.5)
+        while True:
+            try:
+                data, addr = sock.recvfrom(8192)
+            except socket.timeout:
+                continue
+            except Exception:
+                return
+            try:
+                resp = self._answer_ntp(data)
+                if resp:
+                    sock.sendto(resp, addr)
+            except Exception:
+                continue
+
+    def _answer_ntp(self, pkt: bytes) -> bytes | None:
+        if len(pkt) < 48:
+            return None
+        exts, _ = parse_exts(pkt)
+        uid = next((b for t, b, _ in exts if t == XT_UNIQUE), None)
+        cookie = next((b for t, b, _ in exts if t == XT_COOKIE), None)
+        if uid is None or cookie is None or cookie not in self.sessions:
+            return None
+        c2s, s2c = self.sessions[cookie]
+        # verify client authenticator
+        verify_ntp_response(pkt, c2s, uid[:32])  # will raise if bad
+        # new cookie
+        aead_m = AESSIV(self.master)
+        nonce = os.urandom(16)
+        token = os.urandom(16)
+        new_cookie = nonce + aead_m.encrypt(token, [nonce])
+        self.sessions[new_cookie] = (c2s, s2c)
+        # NTP response header: mode 4, copy tx as orig, set xmit
+        now = time.time() + 2208988800
+        sec, frac = int(now), int((now % 1) * (1 << 32))
+        header = bytearray(48)
+        header[0] = 0x24  # LI=0 VN=4 mode=4
+        header[1] = 2     # stratum 2 (toy)
+        header[2] = pkt[2]
+        header[3] = pkt[3]
+        header[24:32] = pkt[40:48]  # orig = client xmit
+        header[32:40] = struct.pack("!II", sec, frac)  # recv
+        header[40:48] = struct.pack("!II", sec, frac)  # xmit
+        # Encrypted EF: new cookie. Authenticated: unique-id echo
+        associated = bytes(header) + ext(XT_UNIQUE, uid[:32] if len(uid) >= 32 else uid)
+        plain = ext(XT_COOKIE, new_cookie)
+        nonce_a = os.urandom(16)
+        ciphertext = aes_siv_cmac_256_encrypt(s2c, plain, [nonce_a, associated])
+        def pad4(b):
+            return b + b"\x00" * ((4 - (len(b) % 4)) % 4)
+        auth_body = struct.pack("!HH", 16, len(ciphertext)) + pad4(nonce_a) + pad4(ciphertext)
+        return associated + ext(XT_AUTH, auth_body)
+
+def ntske_handshake(host="time.cloudflare.com", port=4460, timeout=8, cafile=None, server_hostname=None):
+    ctx = ssl.create_default_context(cafile=cafile) if cafile else ssl.create_default_context()
+    if cafile:
+        ctx.check_hostname = False  # CN=nts.lab, we connect to 127.0.0.1
+        ctx.verify_mode = ssl.CERT_REQUIRED
+    ctx.set_alpn_protocols(["ntske/1"])
+    raw = socket.create_connection((host, port), timeout=timeout)
+    tls = ctx.wrap_socket(raw, server_hostname=server_hostname or host)
+    alpn = tls.selected_alpn_protocol()
+    tls.sendall(client_ke_message())
+    buf = b""
+    tls.settimeout(timeout)
+    recs = None
+    while True:
+        chunk = tls.recv(16384)
+        if not chunk:
+            break
+        buf += chunk
+        try:
+            recs = decode_records(buf)
+            break
+        except ValueError:
+            continue
+    if recs is None:
+        recs = decode_records(buf)
+    info = {
+        "host": host, "port": port, "alpn": alpn,
+        "tls_version": tls.version(), "cipher": tls.cipher(),
+        "recs": recs, "c2s": None, "s2c": None, "raw": buf,
+        "exporter": "not available on this CPython ssl (see OpenSSL helper)",
+    }
+    tls.close()
+    return info
+
+
+def ext(typ: int, body: bytes) -> bytes:
+    # RFC 7822: length includes the 4-octet header; padded to 4-octet boundary
+    pad = (4 - (len(body) % 4)) % 4
+    body = body + b"\x00" * pad
+    return struct.pack("!HH", typ, 4 + len(body)) + body
+
+def parse_exts(buf: bytes, start=48):
+    exts, off = [], start
+    while off + 4 <= len(buf):
+        typ, ln = struct.unpack_from("!HH", buf, off)
+        if ln < 4 or off + ln > len(buf):
+            break
+        exts.append((typ, buf[off+4:off+ln], ln))
+        off += ln
+    return exts, off
+
+def build_ntp_request(cookie: bytes, c2s: bytes, n_placeholders=0) -> tuple[bytes, bytes]:
+    # 48-byte NTP header, mode 3 (client), version 4, LI=0, stratum 0
+    # Transmit timestamp: current NTP era time (seconds since 1900)
+    now = time.time() + 2208988800
+    sec = int(now)
+    frac = int((now - sec) * (1 << 32))
+    header = bytes([0x23, 0, 0, 0]) + b"\x00" * 36 + struct.pack("!II", sec, frac)
+    uid = os.urandom(32)
+    associated = header + ext(XT_UNIQUE, uid) + ext(XT_COOKIE, cookie)
+    for _ in range(n_placeholders):
+        associated += ext(XT_COOKIE_PLACEHOLDER, b"\x00" * len(cookie))
+    # AEAD_AES_SIV: 16-byte nonce is common; associated data is the preceding packet
+    nonce = os.urandom(16)
+    # Empty plaintext is legal in RFC 8915 §5.6; cryptography's AESSIV rejects it,
+    # so we use a local RFC 5297 AEAD_AES_SIV_CMAC_256 (32-octet keys).
+    ciphertext = aes_siv_cmac_256_encrypt(c2s, b"", [nonce, associated])
+    # Authenticator EF: nonce_len, ct_len, nonce (pad 4), ciphertext (pad 4), additional padding
+    def pad4(b):
+        return b + b"\x00" * ((4 - (len(b) % 4)) % 4)
+    nonce_p, ct_p = pad4(nonce), pad4(ciphertext)
+    # Additional padding so padded nonce length >= min(16, N_MAX) rounded to 4 (=16)
+    n_len, n_req = len(nonce_p), 16
+    add = b"\x00" * (n_req - n_len) if n_len < n_req else b""
+    auth_body = struct.pack("!HH", len(nonce), len(ciphertext)) + nonce_p + ct_p + add
+    pkt = associated + ext(XT_AUTH, auth_body)
+    return pkt, uid
+
+def verify_ntp_response(pkt: bytes, s2c: bytes, uid: bytes) -> dict:
+    if len(pkt) < 48:
+        raise ValueError("short NTP packet")
+    li_vn_mode = pkt[0]
+    mode = li_vn_mode & 0x7
+    stratum = pkt[1]
+    exts, _ = parse_exts(pkt)
+    types = [t for t, _, _ in exts]
+    # Unique identifier must echo
+    uids = [b for t, b, _ in exts if t == XT_UNIQUE]
+    if not uids or not uids[0].startswith(uid):
+        raise ValueError(f"unique identifier mismatch: {uids[:1]!r}")
+    cookies = [b.rstrip(b"\x00") if False else b for t, b, _ in exts if t == XT_COOKIE]
+    # The authenticator is the last NTS-relevant field; find 0x0404
+    auth = [b for t, b, _ in exts if t == XT_AUTH]
+    if not auth:
+        raise ValueError("no NTS authenticator in response")
+    body = auth[0]
+    nlen, clen = struct.unpack_from("!HH", body, 0)
+    off = 4
+    nonce = body[off:off+nlen]
+    off += nlen + ((4 - (nlen % 4)) % 4)
+    ciphertext = body[off:off+clen]
+    # Associated data: everything before the authenticator extension
+    # Find start of auth EF in packet
+    idx = pkt.find(struct.pack("!HH", XT_AUTH, 4 + len(body)))
+    if idx < 0:
+        # length may include padding already in body
+        # search by type only
+        off2 = 48
+        idx = None
+        while off2 + 4 <= len(pkt):
+            typ, ln = struct.unpack_from("!HH", pkt, off2)
+            if typ == XT_AUTH:
+                idx = off2
+                break
+            off2 += ln
+        if idx is None:
+            raise ValueError("cannot locate authenticator EF")
+    associated = pkt[:idx]
+    # ciphertext is AES-SIV output V||C; the 16-octet nonce is AAD, not V.
+    plaintext = aes_siv_cmac_256_decrypt(s2c, ciphertext, [nonce, associated])
+    enc_exts, _ = parse_exts(plaintext + b"\x00"*4, start=0) if plaintext else ([], 0)
+    # parse_exts on plaintext only — if plaintext is pure EFs:
+    enc = []
+    o = 0
+    while o + 4 <= len(plaintext):
+        typ, ln = struct.unpack_from("!HH", plaintext, o)
+        if ln < 4 or o + ln > len(plaintext):
+            break
+        enc.append((typ, plaintext[o+4:o+ln]))
+        o += ln
+    return {
+        "mode": mode, "stratum": stratum, "li_vn_mode": li_vn_mode,
+        "ext_types": [hex(t) for t in types],
+        "new_cookies": sum(1 for t,_,_ in exts if t == XT_COOKIE) + sum(1 for t,_ in enc if t == XT_COOKIE),
+        "encrypted_ext_types": [hex(t) for t,_ in enc],
+        "uid_ok": True,
+        "auth_ok": True,
+        "tx_ts": struct.unpack_from("!II", pkt, 40),
+    }
+
+def send_ntp(pkt: bytes, host: str, port: int = 123, timeout=8) -> bytes:
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.settimeout(timeout)
+    s.sendto(pkt, (socket.getaddrinfo(host, port, socket.AF_INET, socket.SOCK_DGRAM)[0][4]))
+    data, _ = s.recvfrom(4096)
+    s.close()
+    return data
+
+
+def run_openssl_exporter(cert, key, binary=None):
+    """RFC 8915 §5.1 exporter via a tiny OpenSSL program (BIO pair, TLS 1.3).
+
+    CPython 3.13's ssl module on this host does not expose
+    SSLSocket.export_keying_material; libssl and the OpenSSL headers do.
+    """
+    here = pathlib.Path(__file__).resolve().parent
+    binary = pathlib.Path(binary) if binary else here / "nts_export"
+    if not binary.is_file():
+        raise FileNotFoundError(f"nts_export not found at {binary}")
+    r = subprocess.run([str(binary), cert, key], check=True, capture_output=True, text=True)
+    parsed = {}
+    for row in r.stdout.strip().splitlines():
+        # A line may carry several key=value tokens (e.g. "match=yes distinct=yes").
+        for tok in row.split():
+            if "=" in tok:
+                k, v = tok.split("=", 1)
+                parsed[k.strip()] = v.strip()
+    c2s = bytes.fromhex(parsed["C2S"])
+    s2c = bytes.fromhex(parsed["S2C"])
+    return {
+        "stdout": r.stdout,
+        "c2s": c2s,
+        "s2c": s2c,
+        "match": parsed.get("match"),
+        "distinct": parsed.get("distinct"),
+    }
+
+
+def main():
+    print("== NTS-KE record codec ==")
+    msg = client_ke_message()
+    recs = decode_records(msg)
+    for r in recs:
+        print("  ", describe(r))
+    assert recs[0]["type"] == RT_NEXT and recs[0]["critical"]
+    assert recs[1]["type"] == RT_AEAD and struct.unpack("!H", recs[1]["body"])[0] == 15
+    assert recs[2]["type"] == RT_END
+    # Critical unknown type must be surfaced
+    bad = encode_record(True, 99, b"x") + encode_record(True, RT_END, b"")
+    recs_bad = decode_records(bad)
+    assert recs_bad[0]["critical"] and recs_bad[0]["type"] == 99
+    print("  codec: PASS")
+
+    print("\n== Local AEAD_AES_SIV_CMAC_256 cookie (RFC 5297 via cryptography AESSIV) ==")
+    # Suggested cookie contents are server-local; we encrypt a toy ticket
+    master = AESSIV.generate_key(512)
+    aead = AESSIV(master)
+    ticket = b"v1|c2s=" + os.urandom(8).hex().encode() + b"|exp=3600"
+    nonce = os.urandom(16)
+    cookie = aead.encrypt(ticket, [nonce])
+    # nonce is stored next to the cookie, or inside it. Here we prepend.
+    blob = nonce + cookie
+    rec = aead.decrypt(blob[16:], [blob[:16]])
+    print(f"  key=64B nonce=16B ticket={len(ticket)}B cookie={len(cookie)}B")
+    print(f"  round-trip: {rec == ticket}")
+    # Tamper
+    try:
+        aead.decrypt(bytes([cookie[0] ^ 1]) + cookie[1:], [nonce])
+        tamper = "accepted (BAD)"
+    except Exception as e:
+        tamper = f"rejected ({type(e).__name__})"
+    print(f"  tampered cookie: {tamper}")
+    assert rec == ticket
+    # Cross-check RFC 5297 helper against cryptography AESSIV (non-empty P, 32-octet key)
+    k32 = AESSIV.generate_key(256)
+    nonce2 = os.urandom(16)
+    ad2 = b"assoc"
+    pt2 = b"nts-siv-vector"
+    lib = AESSIV(k32).encrypt(pt2, [nonce2, ad2])
+    ours = aes_siv_cmac_256_encrypt(k32, pt2, [nonce2, ad2])
+    print(f"  RFC 5297 helper vs cryptography AESSIV: {ours == lib}")
+    assert ours == lib
+    assert aes_siv_cmac_256_decrypt(k32, ours, [nonce2, ad2]) == pt2
+    empty = aes_siv_cmac_256_encrypt(k32, b"", [nonce2, ad2])
+    assert aes_siv_cmac_256_decrypt(k32, empty, [nonce2, ad2]) == b""
+    print(f"  empty-plaintext AES-SIV (illegal in cryptography AESSIV, legal in RFC 8915): {len(empty)}B tag+ct")
+
+    print("\n== Public NTS-KE (time.cloudflare.com:4460) ==")
+    try:
+        ntske_handshake("time.cloudflare.com", 4460, timeout=5)
+        print("  unexpected success")
+    except Exception as e:
+        print(f"  not run: {type(e).__name__}: {e}")
+        print("  (TCP connects, TLS handshake is reset; same on several public :4460 servers)")
+
+    print("\n== OpenSSL RFC 8915 exporter (C helper, TLS 1.3 BIO pair) ==")
+    exp = run_openssl_exporter("/tmp/nts-lab/ke.crt", "/tmp/nts-lab/ke.key")
+    for line in exp["stdout"].strip().splitlines():
+        print("  " + line)
+    assert exp["match"] == "yes" and exp["distinct"] == "yes"
+    assert len(exp["c2s"]) == 32 and exp["c2s"] != exp["s2c"]
+    print("  exporter: PASS (CPython ssl has no export_keying_material; these keys are bound into loopback cookies)")
+
+    print("\n== Loopback NTS-KE + NTS-protected NTP ==")
+    srv = LocalNTS("/tmp/nts-lab/ke.crt", "/tmp/nts-lab/ke.key")
+    srv.lab_keys = (exp["c2s"], exp["s2c"])
+    ke_port, ntp_port = srv.start()
+    print(f"  server listening KE 127.0.0.1:{ke_port}  NTP 127.0.0.1:{ntp_port}")
+    import time as _t; _t.sleep(0.15)
+    info = ntske_handshake("127.0.0.1", ke_port, cafile="/tmp/nts-lab/ke.crt", server_hostname="nts.lab")
+    info["c2s"], info["s2c"] = exp["c2s"], exp["s2c"]
+    print(f"  TLS {info['tls_version']} cipher={info['cipher'][0]} ALPN={info['alpn']!r}")
+    print(f"  received {len(info['recs'])} records, {len(info['raw'])} bytes:")
+    cookies, server, port, aeads, protos, errors = [], None, None, [], [], []
+    for r in info["recs"]:
+        print("   ", describe(r))
+        if r["type"] == RT_COOKIE:
+            cookies.append(r["body"])
+        elif r["type"] == RT_SERVER:
+            server = r["body"].decode("ascii")
+        elif r["type"] == RT_PORT:
+            port = struct.unpack("!H", r["body"])[0]
+        elif r["type"] == RT_AEAD:
+            aeads = [struct.unpack_from("!H", r["body"], i)[0] for i in range(0, len(r["body"]), 2)]
+        elif r["type"] == RT_NEXT:
+            protos = [struct.unpack_from("!H", r["body"], i)[0] for i in range(0, len(r["body"]), 2)]
+        elif r["type"] == RT_ERROR:
+            errors.append(r["body"])
+    print(f"  next_protocol={protos} aead={aeads} cookies={len(cookies)} "
+          f"server={server!r} ntp_port={port}")
+    print(f"  C2S={len(info['c2s'])}B S2C={len(info['s2c'])}B distinct={info['c2s']!=info['s2c']}")
+    # The server exported the same keys (cookie maps to them)
+    assert info["alpn"] == "ntske/1"
+    assert not errors
+    assert PROTO_NTPV4 in protos
+    assert AEAD_AES_SIV_CMAC_256 in aeads
+    assert len(cookies) == 8
+    assert info["c2s"] != info["s2c"]
+    assert cookies[0] in srv.sessions
+    assert srv.sessions[cookies[0]] == (info["c2s"], info["s2c"])
+    print("  OpenSSL-exported keys bound into cookies and used for NTP: PASS")
+
+    ntp_host = server or "127.0.0.1"
+    ntp_port = port or ntp_port
+    print(f"\n== NTS-protected NTP request to {ntp_host}:{ntp_port} ==")
+    req, uid = build_ntp_request(cookies[0], info["c2s"], n_placeholders=1)
+    print(f"  request {len(req)} bytes, unique-id {uid[:8].hex()}..., cookie {len(cookies[0])}B, 1 placeholder")
+    resp = send_ntp(req, ntp_host, ntp_port)
+    print(f"  response {len(resp)} bytes")
+    result = verify_ntp_response(resp, info["s2c"], uid)
+    print(f"  mode={result['mode']} stratum={result['stratum']} uid_ok={result['uid_ok']} "
+          f"auth_ok={result['auth_ok']}")
+    print(f"  extension types {result['ext_types']}")
+    print(f"  encrypted extension types {result['encrypted_ext_types']}")
+    print(f"  new cookies visible (clear+encrypted)={result['new_cookies']}")
+    assert result["mode"] == 4 and result["uid_ok"] and result["auth_ok"]
+    assert result["new_cookies"] >= 1
+
+    print("\n== summary ==")
+    print("failures: 0")
+    return 0
+
+if __name__ == "__main__":
+    sys.exit(main())
+```
+
+
+`nts-export.c`:
+
+```c
+/* Loopback TLS 1.3 NTS-KE exporter demo (RFC 8915 section 5.1). */
+#include <stdio.h>
+#include <string.h>
+#include <openssl/ssl.h>
+#include <openssl/err.h>
+
+static const unsigned char ctx_c2s[5] = {0x00, 0x00, 0x00, 0x0f, 0x00};
+static const unsigned char ctx_s2c[5] = {0x00, 0x00, 0x00, 0x0f, 0x01};
+static const char *LABEL = "EXPORTER-network-time-security";
+
+static int export_keys(SSL *ssl, unsigned char *c2s, unsigned char *s2c) {
+    if (SSL_export_keying_material(ssl, c2s, 32, LABEL, strlen(LABEL), ctx_c2s, 5, 1) != 1)
+        return 0;
+    if (SSL_export_keying_material(ssl, s2c, 32, LABEL, strlen(LABEL), ctx_s2c, 5, 1) != 1)
+        return 0;
+    return 1;
+}
+
+static void hex(const unsigned char *b, size_t n) {
+    for (size_t i = 0; i < n; i++) printf("%02x", b[i]);
+}
+
+static int sel_alpn(SSL *s, const unsigned char **out, unsigned char *outlen,
+                    const unsigned char *in, unsigned int inlen, void *arg) {
+    (void)s; (void)arg;
+    unsigned int i = 0;
+    while (i < inlen) {
+        unsigned int n = in[i];
+        if (i + 1 + n > inlen) break;
+        if (n == 7 && memcmp(in + i + 1, "ntske/1", 7) == 0) {
+            *out = in + i + 1;
+            *outlen = 7;
+            return SSL_TLSEXT_ERR_OK;
+        }
+        i += 1 + n;
+    }
+    return SSL_TLSEXT_ERR_NOACK;
+}
+
+static int pump(SSL *a, SSL *b) {
+    int cap = 0;
+    for (int i = 0; i < 32; i++) {
+        int ra = SSL_do_handshake(a);
+        int rb = SSL_do_handshake(b);
+        if (ra == 1 && rb == 1) return 1;
+        cap++;
+    }
+    fprintf(stderr, "handshake not finished after %d pumps\n", cap);
+    fprintf(stderr, "client want=%d err=%s\n", SSL_want(a), ERR_error_string(SSL_get_error(a, 0), NULL));
+    fprintf(stderr, "server want=%d err=%s\n", SSL_want(b), ERR_error_string(SSL_get_error(b, 0), NULL));
+    ERR_print_errors_fp(stderr);
+    return 0;
+}
+
+int main(int argc, char **argv) {
+    const char *cert = argc > 1 ? argv[1] : "/tmp/nts-lab/ke.crt";
+    const char *key  = argc > 2 ? argv[2] : "/tmp/nts-lab/ke.key";
+    SSL_library_init();
+
+    SSL_CTX *sctx = SSL_CTX_new(TLS_server_method());
+    if (SSL_CTX_use_certificate_file(sctx, cert, SSL_FILETYPE_PEM) != 1 ||
+        SSL_CTX_use_PrivateKey_file(sctx, key, SSL_FILETYPE_PEM) != 1) {
+        ERR_print_errors_fp(stderr);
+        return 2;
+    }
+    SSL_CTX_set_alpn_select_cb(sctx, sel_alpn, NULL);
+    SSL_CTX_set_min_proto_version(sctx, TLS1_3_VERSION);
+
+    SSL_CTX *cctx = SSL_CTX_new(TLS_client_method());
+    SSL_CTX_set_verify(cctx, SSL_VERIFY_NONE, NULL);
+    unsigned char alpn[] = {7, 'n', 't', 's', 'k', 'e', '/', '1'};
+    if (SSL_CTX_set_alpn_protos(cctx, alpn, sizeof alpn) != 0) {
+        fprintf(stderr, "set_alpn_protos failed\n");
+        return 3;
+    }
+    SSL_CTX_set_min_proto_version(cctx, TLS1_3_VERSION);
+
+    BIO *cbio = NULL, *sbio = NULL;
+    if (BIO_new_bio_pair(&cbio, 0, &sbio, 0) != 1) {
+        fprintf(stderr, "bio_pair failed\n");
+        return 4;
+    }
+    SSL *scli = SSL_new(cctx);
+    SSL *ssrv = SSL_new(sctx);
+    SSL_set_bio(scli, cbio, cbio);
+    SSL_set_bio(ssrv, sbio, sbio);
+    SSL_set_connect_state(scli);
+    SSL_set_accept_state(ssrv);
+    SSL_set_tlsext_host_name(scli, "nts.lab");
+
+    if (!pump(scli, ssrv)) return 5;
+
+    unsigned char cc2s[32], cs2c[32], sc2s[32], ss2c[32];
+    if (!export_keys(scli, cc2s, cs2c) || !export_keys(ssrv, sc2s, ss2c)) {
+        fprintf(stderr, "export failed\n");
+        ERR_print_errors_fp(stderr);
+        return 6;
+    }
+    int match = memcmp(cc2s, sc2s, 32) == 0 && memcmp(cs2c, ss2c, 32) == 0;
+    int distinct = memcmp(cc2s, cs2c, 32) != 0;
+    const unsigned char *sel = NULL; unsigned int sell = 0;
+    SSL_get0_alpn_selected(scli, &sel, &sell);
+    printf("TLS %s ALPN=", SSL_get_version(scli));
+    fwrite(sel ? sel : (const unsigned char *)"", 1, sell, stdout);
+    printf("\nC2S="); hex(cc2s, 32);
+    printf("\nS2C="); hex(cs2c, 32);
+    printf("\nmatch=%s distinct=%s\n", match ? "yes" : "NO", distinct ? "yes" : "NO");
+    SSL_free(scli);
+    SSL_free(ssrv);
+    SSL_CTX_free(cctx);
+    SSL_CTX_free(sctx);
+    return (match && distinct) ? 0 : 7;
+}
+```
+
+
+Genuine output from a run on this host (Python 3.13.5, OpenSSL 3.5.7 where used). This output was not invented:
+
+```text
+== NTS-KE record codec ==
+   [C] Next Protocol Negotiation    body=  2B protocols=[0]
+   [C] AEAD Algorithm Negotiation   body=  2B algorithms=[15] (AEAD_AES_SIV_CMAC_256)
+   [C] End of Message               body=  0B
+  codec: PASS
+
+== Local AEAD_AES_SIV_CMAC_256 cookie (RFC 5297 via cryptography AESSIV) ==
+  key=64B nonce=16B ticket=32B cookie=48B
+  round-trip: True
+  tampered cookie: rejected (InvalidTag)
+  RFC 5297 helper vs cryptography AESSIV: True
+  empty-plaintext AES-SIV (illegal in cryptography AESSIV, legal in RFC 8915): 16B tag+ct
+
+== Public NTS-KE (time.cloudflare.com:4460) ==
+  not run: SSLEOFError: [SSL: UNEXPECTED_EOF_WHILE_READING] EOF occurred in violation of protocol (_ssl.c:1029)
+  (TCP connects, TLS handshake is reset; same on several public :4460 servers)
+
+== OpenSSL RFC 8915 exporter (C helper, TLS 1.3 BIO pair) ==
+  TLS TLSv1.3 ALPN=ntske/1
+  C2S=fd23bb762640c6f3b1f82ed24755e1236ac81a21201f8fff8593fd78d0dedd8d
+  S2C=8b8ba5b87273b6207fa1bd9beaadb2ebaa66028affa89366a3e5b5b94c0bad26
+  match=yes distinct=yes
+  exporter: PASS (CPython ssl has no export_keying_material; these keys are bound into loopback cookies)
+
+== Loopback NTS-KE + NTS-protected NTP ==
+  server listening KE 127.0.0.1:44207  NTP 127.0.0.1:47714
+  TLS TLSv1.3 cipher=TLS_AES_256_GCM_SHA384 ALPN='ntske/1'
+  received 13 records, 451 bytes:
+    [C] Next Protocol Negotiation    body=  2B protocols=[0]
+    [C] AEAD Algorithm Negotiation   body=  2B algorithms=[15] (AEAD_AES_SIV_CMAC_256)
+    [-] New Cookie for NTPv4         body= 48B cookie_len=48
+    [-] New Cookie for NTPv4         body= 48B cookie_len=48
+    [-] New Cookie for NTPv4         body= 48B cookie_len=48
+    [-] New Cookie for NTPv4         body= 48B cookie_len=48
+    [-] New Cookie for NTPv4         body= 48B cookie_len=48
+    [-] New Cookie for NTPv4         body= 48B cookie_len=48
+    [-] New Cookie for NTPv4         body= 48B cookie_len=48
+    [-] New Cookie for NTPv4         body= 48B cookie_len=48
+    [-] NTPv4 Server Negotiation     body=  9B server=127.0.0.1
+    [-] NTPv4 Port Negotiation       body=  2B port=47714
+    [C] End of Message               body=  0B
+  next_protocol=[0] aead=[15] cookies=8 server='127.0.0.1' ntp_port=47714
+  C2S=32B S2C=32B distinct=True
+  OpenSSL-exported keys bound into cookies and used for NTP: PASS
+
+== NTS-protected NTP request to 127.0.0.1:47714 ==
+  request 228 bytes, unique-id 97bd9934ae3ee06a..., cookie 48B, 1 placeholder
+  response 176 bytes
+  mode=4 stratum=2 uid_ok=True auth_ok=True
+  extension types ['0x104', '0x404']
+  encrypted extension types ['0x204']
+  new cookies visible (clear+encrypted)=1
+
+== summary ==
+failures: 0
+```
+
+
+## Gotchas
+
+- **The trap: Exporting 64 octets for AEAD 15.** `AEAD_AES_SIV_CMAC_256` uses two 128-bit keys, which is **32 octets** per direction (`C2S` and `S2C`). Requesting 64 octets from `SSL_export_keying_material` produces a key that fails verification against every compliant RFC 8915 peer. Only `AEAD_AES_SIV_CMAC_512` (ID `17`) uses 64 octets.
+- **The trap: Hardcoding the KE hostname for UDP/123.** If the NTS-KE server sends record `6` (NTPv4 Server Negotiation), Phase 2 UDP traffic must go to that hostname or IP (for example, `nts.meta.com` handing off to `time.meta.com`). Sending authenticated NTP packets back to the KE host will time out if the KE box does not run an NTP responder.
+- **The trap: Reusing cookies across networks.** Reusing a `0x0204` cookie lets passive observers link your host across IP changes. Always consume one cookie per request and send `0x0304` placeholders to refill toward eight.
+- **The trap: Assuming `:4460` is open.** Middleboxes and corporate egress filters frequently allow UDP/123 while resetting or dropping TCP/4460 after the TCP SYN-ACK. If TLS resets right after TCP connect (`SSLEOFError`), inspect firewall/proxy policy before debugging your NTS-KE parser.
+- **The trap: Missing TLS exporter in stdlib wrappers.** Language wrappers like CPython's built-in `ssl` module may omit `export_keying_material`. Use a TLS library that exposes RFC 5705 / RFC 8446 exporters directly (such as OpenSSL's `SSL_export_keying_material`) rather than trying to reconstruct master secrets.
+- **The trap: Treating NTS as delay-proof or bootstrap-free.** NTS does not stop an on-path attacker from holding packets asymmetrically, nor does it solve TLS certificate validation on a device whose clock is stuck in 1970.
+- **The trap: Expecting an NTS NAK on verification failure.** Some production deployments (including Meta's) drop invalid authenticated requests silently instead of sending an `NTSN` Kiss-o'-Death packet, making key or cookie mismatches look like packet loss.
+
+## The boring rule
+
+Test TCP/4460 reachability and check for Server Negotiation redirects before blaming NTP authentication; keep your cookie pool single-use, derive 32-octet keys for AEAD 15, and rely on multiple independent NTS sources to bound asymmetric delay.
+
+## Exercises
+
+1. **Decode an NTS-KE record stream.** Given the following hex-encoded server response, split it into individual NTS-KE records, identify the Critical (`C`) bit, Record Type, Body Length, and decoded value for each, and verify that the message terminates legally:
+   `80 01 00 02 00 00 00 04 00 02 00 0f 80 06 00 0c 74 69 6d 65 2e 65 78 61 6d 70 6c 65 00 07 00 02 00 7b 80 00 00 00`
+2. **Compute the 5-octet exporter context.** Write out the exact 5-octet hex context passed to `EXPORTER-network-time-security` for: (a) `AEAD_AES_SIV_CMAC_256` (ID `15`) `C2S`, (b) `AEAD_AES_SIV_CMAC_256` `S2C`, and (c) `AEAD_AES_SIV_CMAC_512` (ID `17`) `C2S`. State the required exporter output length in octets for each case.
+3. **Reason about Cookie Placeholders (`0x0304`).** Suppose a client holds 2 unused cookies in its pool and wants to refill toward 8 without triggering a new NTS-KE session. How many `0x0304` placeholders should it attach to its next NTPv4 request, and why must each placeholder be padded to at least the size of the cookie it expects back?
+4. **Calculate the delay-attack bound.** An NTS-protected client measures a clean baseline RTT of $20\text{ ms}$ to its server. An on-path attacker intercepts and holds only the client-to-server UDP request for $140\text{ ms}$, then forwards the server's response immediately. What is the maximum clock offset error the attacker induces in the client's calculation, and why can NTS's `0x0404` authenticator not detect this?
+5. **Configure and troubleshoot split-host `chrony`.** Write the `chrony.conf` directive (marked not run) to use `nts.meta.com` as an NTS pool with `iburst` and `maxsources 5`. Explain what happens on the wire if `nts.meta.com` returns record `6` pointing to `time.meta.com`, and describe how you would distinguish an egress TCP/4460 firewall reset from a silent UDP `0x0404` verification failure.
+6. **Verify AEAD associated data and empty plaintext.** Explain why a client NTPv4 request using `0x0404` has empty (0-octet) plaintext while still protecting the NTP timestamps and `0x0104` Unique Identifier, and note why some high-level AEAD wrappers (such as Python `cryptography`'s `AESSIV`) reject empty plaintext even though RFC 5297 and RFC 8915 allow it.
+
+## Sources
+
+- [RFC 8915: Network Time Security for the Network Time Protocol](https://datatracker.ietf.org/doc/html/rfc8915)
+- [RFC 5297: Synthetic Initialization Vector (SIV) Authenticated Encryption Using the Advanced Encryption Standard (AES)](https://datatracker.ietf.org/doc/html/rfc5297)
+- [RFC 5705: Keying Material Exporters for Transport Layer Security (TLS)](https://datatracker.ietf.org/doc/html/rfc5705)
+- [RFC 8446: The Transport Layer Security (TLS) Protocol Version 1.3](https://datatracker.ietf.org/doc/html/rfc8446)
+- [RFC 7822: Network Time Protocol Version 4 (NTPv4) Extension Fields](https://datatracker.ietf.org/doc/html/rfc7822)
+- [NTS: Authenticated Time at Meta](https://engineering.fb.com/2026/10/06/production-engineering/nts-authenticated-time-at-meta/)
