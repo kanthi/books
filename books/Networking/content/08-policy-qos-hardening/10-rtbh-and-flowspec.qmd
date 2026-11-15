@@ -1,0 +1,672 @@
+---
+title: "Dropping Attack Traffic with Routing: RTBH, Source-Based RTBH and BGP FlowSpec"
+author:
+  - name: "K19G"
+  - name: "grok-bot"
+---
+
+# Dropping Attack Traffic with Routing: RTBH, Source-Based RTBH and BGP FlowSpec
+
+When a volumetric attack fills your upstream links, filters on your own routers are too late: the damage is done on the link before your ACL sees a packet. The only place to drop that traffic is further upstream, on routers you do not configure. Operators solved this years ago by reusing the one control channel they already share with their neighbours and inside their own network: BGP. Announce a route with the right attributes, and every router that honours it drops the matching traffic at line rate.
+
+There are three generations of this idea, and each fixes a problem of the previous one:
+
+- **Destination-based Remote Triggered Black Hole (RTBH)** drops everything *to* the attacked address. Cheap and universal, but it finishes the attacker's job for that address.
+- **Source-based RTBH** drops everything *from* the attacking sources, using unicast reverse-path forwarding (uRPF) as the trigger. Precise when the sources are real, dangerous when they are spoofed.
+- **BGP Flow Specification (FlowSpec)** carries a real match rule (destination, source, protocol, ports, length, fragments, DSCP) and an action (drop, rate-limit, redirect, mark) in BGP. Surgical, but more complex, and the rules are code running in your routers' control plane.
+
+This chapter shows all three working: RTBH and source RTBH on Linux namespaces, where you can watch which packets survive, and FlowSpec through a stdlib encoder, decoder and matcher that reproduces the RFC's own encoding examples byte for byte.
+
+## Learning goals
+
+- Explain destination-based RTBH, the BLACKHOLE community (RFC 7999) and the discard next-hop trick (RFC 5635), including what "completing the attack" means.
+- Explain source-based RTBH, why it needs uRPF, why loose mode is used at the edge, and why spoofed sources make it risky.
+- Reproduce both on Linux with blackhole routes and `rp_filter`, and read the counters that prove which packets were dropped.
+- Read and write RFC 8955 FlowSpec NLRI: component types, numeric and bitmask operators, AND/OR precedence, and the length encoding.
+- Know the FlowSpec traffic-filtering actions (extended communities) and the validation rule that stops a neighbour from filtering traffic it does not own.
+- Avoid the classic FlowSpec mistake: port-based rules do not match non-first fragments.
+
+## Version note
+
+Ran on this box as an unprivileged user: Linux **6.12.94**, iproute2 **6.15.0**, Python **3.13.5** (standard library only). The RTBH lab uses `unshare -urnm` and three named network namespaces joined by veth pairs; Linux plays the edge router, with `ip route add blackhole` standing in for the route a BGP policy would install, and `rp_filter` standing in for uRPF. The FlowSpec part is a pure Python program that encodes, decodes and evaluates RFC 8955 NLRI. All outputs are pasted unedited.
+
+Not run here: any BGP daemon. FRR, BIRD and ExaBGP configuration later in the chapter is written from their documentation and marked "not run here"; the box has no routing daemons and nothing may be installed. The counting helper `netdelta.py` is a small snapshot-and-diff tool: it reads `nstat`, `ip -s link` and the kernel-wide routing and neighbour statistics before and after a command and prints the drop-related counters that moved. It is listed in the lab so the chapter stands alone.
+
+## Destination-based RTBH
+
+The mechanism in RFC 5635 has two halves, prepared in advance and triggered in seconds.
+
+**Preparation on every edge router.** Configure a static route for an unused address (the RFC uses 192.0.2.1 from documentation space; many networks use something in 192.0.2.0/24 or a dedicated prefix) pointing at the discard interface (`Null0`, `discard`, or on Linux a `blackhole` route). Then configure an inbound BGP policy: routes from the trigger router carrying the RTBH community get their next hop rewritten to that discard address.
+
+**Trigger.** When an address is under attack, a single trigger router (often a small box or a route server dedicated to the job) announces the victim's /32 via iBGP with the community. Every edge router installs "victim /32 via 192.0.2.1", resolves 192.0.2.1 to the discard interface, and drops every packet to the victim at the ingress edge, at forwarding-plane speed.
+
+```text
+          trigger router --iBGP: 192.0.2.10/32, community RTBH, next hop 192.0.2.1-->
+                                                  |
+   upstream A --> [edge 1]  192.0.2.10/32 -> 192.0.2.1 -> discard     (drop at ingress)
+   upstream B --> [edge 2]  192.0.2.10/32 -> 192.0.2.1 -> discard     (drop at ingress)
+                          \--> core --> 192.0.2.0/24 servers (everything else still flows)
+```
+
+Dropping inside your own edge saves your core, but the attack still fills the links from your upstreams. To push the drop into their networks you announce the /32 to them with a community they honour. RFC 7999 standardised one well-known value for this: **BLACKHOLE, 65535:666** (`0xFFFF029A`). Its rules are short and worth knowing exactly:
+
+- Honouring it is a bilateral decision, agreed before use; networks that do not use it should ignore it.
+- A receiver should add NO_EXPORT or NO_ADVERTISE so the blackhole does not travel further than intended.
+- Accept a blackhole announcement only for a prefix covered by an equal or shorter prefix the neighbour is authorised to announce. Without that check, anyone could blackhole anyone.
+- Blackhole prefixes should be as specific as possible, /32 for IPv4 and /128 for IPv6, even though prefixes longer than /24 and /48 are normally filtered. Your import policy needs an explicit exception for them.
+- Origin validation (ROV) must not accidentally reject legitimate blackhole announcements; a ROA with a maxLength of /24 makes a /32 "Invalid", so blackhole sessions need their own ROV handling.
+- Implementations should not drop traffic for BLACKHOLE-tagged routes without explicit configuration, and the RFC suggests the keyword `blackhole` for the community.
+- Store every BLACKHOLE update for audit.
+
+The price is in the name. Destination RTBH drops *all* traffic to the victim, legitimate users included. It "completes the attack" for that address in exchange for saving everything else that shares the links. That is often the right trade (a single customer IP versus a whole data centre), and it is why destination RTBH is usually the first lever pulled.
+
+## Source-based RTBH
+
+RFC 5635's second technique turns the same machinery around. Instead of blackholing the destination, you blackhole the *sources*: the trigger announces the attackers' addresses with the community, and every edge installs "attacker /32 via discard". By itself that only stops *return* traffic to the attacker, which is useless. The trick is uRPF on the ingress interfaces. uRPF checks the source address of each arriving packet against the forwarding table:
+
+- **Strict mode**: the best route back to the source must point out of the interface the packet arrived on.
+- **Loose mode**: there must be *some* route back to the source, and that route must not be a discard route.
+
+With a discard route for the attacker installed, both modes now fail for packets *from* the attacker, and the edge drops them before they enter. Loose mode is the one used at Internet edges, because traffic from a given source routinely arrives on a different upstream than the one you would use to reach it (asymmetric routing); strict mode would drop legitimate traffic there. RFC 3704 describes both modes.
+
+The weakness is just as clear. If the sources are spoofed (as in reflection and many SYN floods), blackholing them blocks innocent addresses that happen to be forged, and the attacker can pick which addresses you block. Source RTBH is the right tool against a botnet of real hosts, not against spoofed floods.
+
+## The RTBH lab
+
+The topology has an upstream namespace `inet` holding two source addresses on its loopback, an edge router `r`, and a victim namespace `v` with two servers on one /24:
+
+```text
+   inet                         r (edge)                         v
+   198.51.100.66 (attacker) ]   up0 10.255.0.1/30                192.0.2.10 (under attack)
+   203.0.113.10  (client)   ]-- i0 10.255.0.2/30 -- up0 | dn0 -- v0 192.0.2.20 (neighbour)
+                                default route via inet           192.0.2.1/24 on dn0
+```
+
+`blast.py` sends 50 datagrams from each source to each victim address; `count.py` on the victim counts what arrives per (source, destination) pair, using `IP_PKTINFO` to learn which local address each datagram was sent to. `netdelta.py` measures the router.
+
+```{.python filename="count.py"}
+# count.py PORT SECONDS: count UDP datagrams per (source, destination) for SECONDS
+import collections, socket, sys
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.setsockopt(socket.SOL_IP, socket.IP_PKTINFO, 1)
+s.bind(("0.0.0.0", int(sys.argv[1]))); s.settimeout(float(sys.argv[2]))
+seen = collections.Counter()
+try:
+    while True:
+        data, anc, _, src = s.recvmsg(2048, 256)
+        dst = socket.inet_ntoa(anc[0][2][8:12])      # in_pktinfo.ipi_addr
+        seen[(src[0], dst)] += 1
+except socket.timeout:
+    pass
+for (src, dst), n in sorted(seen.items()):
+    print(f"   {src:>15} -> {dst:<12} {n:>3} received")
+if not seen:
+    print("   nothing received")
+```
+
+```{.python filename="blast.py"}
+# blast.py N: from each source, send N datagrams to each victim address (UDP 5300)
+import socket, sys
+n = int(sys.argv[1])
+for src in ("198.51.100.66", "203.0.113.10"):          # attacker, legitimate client
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.bind((src, 0))
+    for dst in ("192.0.2.10", "192.0.2.20"):           # attacked host, its neighbour
+        for _ in range(n):
+            s.sendto(b"q" * 40, (dst, 5300))
+```
+
+```{.python filename="netdelta.py"}
+#!/usr/bin/env python3
+"""netdelta.py: snapshot the kernel's drop-related counters, run a command, print what moved.
+
+Usage: netdelta.py [--all] [--ns NAME]... -- command args...
+Only counters whose names look like drops or errors are printed, unless --all.
+Sources: nstat -saz (SNMP + netstat MIBs, per namespace), ip -s -j link (per device),
+and three kernel-wide tables: /proc/net/softnet_stat, /proc/net/stat/rt_cache, /proc/net/stat/arp_cache.
+"""
+import json, re, subprocess, sys
+
+DROPPY = re.compile(r"Drop|Discard|Err|NoRoute|NoPort|Overflow|Fail|Filter|TimeExcd|DestUnreach|Prune|Collapse|dropped|errors|squeeze|InAddr|Csum|RateLimit")
+
+def sh(ns, *argv):
+    pre = ["ip", "netns", "exec", ns] if ns else []
+    return subprocess.run(pre + list(argv), capture_output=True, text=True).stdout
+
+def snapshot(ns):
+    snap = {}
+    data = json.loads(sh(ns, "nstat", "-saz", "--json") or "{}")
+    for table in data.values():
+        for k, v in table.items():
+            snap[k] = v
+    for dev in json.loads(sh(ns, "ip", "-s", "-j", "link") or "[]"):
+        st = dev.get("stats64", {})
+        for d in ("rx", "tx"):
+            for k in ("dropped", "errors"):
+                snap[f"{dev['ifname']}.{d}_{k}"] = st.get(d, {}).get(k, 0)
+    return snap
+
+def global_snapshot():
+    """Kernel-wide counters: NOT per network namespace, so other traffic on the host shows up too."""
+    snap = {}
+    for cpu, row in enumerate(open("/proc/net/softnet_stat")):
+        f = [int(x, 16) for x in row.split()]
+        snap[f"softnet.cpu{cpu}.dropped"] = f[1]
+        snap[f"softnet.cpu{cpu}.time_squeeze"] = f[2]
+    rows = open("/proc/net/stat/rt_cache").read().split("\n")
+    names = rows[0].split()
+    for name in ("in_no_route", "in_martian_dst", "in_martian_src"):
+        i = names.index(name)
+        snap[f"rt_cache.{name}"] = sum(int(r.split()[i], 16) for r in rows[1:] if r.strip())
+    # /proc/net/stat/arp_cache only exists in the initial namespace; ip ntable works everywhere
+    out = subprocess.run(["ip", "-s", "ntable", "show", "name", "arp_cache"],
+                         capture_output=True, text=True).stdout
+    for name in ("res_failed", "unresolved_discards", "table_fulls"):
+        m = re.search(rf"\b{name} (\d+)", out)
+        if m:
+            snap[f"arp_cache.{name}"] = int(m.group(1))
+    return snap
+
+def main():
+    args = sys.argv[1:]
+    nss, show_all = [], False
+    if args and args[0] == "--all":
+        show_all, args = True, args[1:]
+    while args and args[0] == "--ns":
+        nss.append(args[1]); args = args[2:]
+    if args and args[0] == "--":
+        args = args[1:]
+    nss = nss or [None]
+    before = {ns: snapshot(ns) for ns in nss}
+    gbefore = global_snapshot()
+    rc = subprocess.run(args).returncode
+    gafter = global_snapshot()
+    for ns in nss:
+        after = snapshot(ns)
+        moved = {k: after[k] - before[ns].get(k, 0) for k in after
+                 if after[k] != before[ns].get(k, 0) and (show_all or DROPPY.search(k))}
+        for k in sorted(moved):
+            print(f"   [{ns or 'host'}] {k:<34} +{moved[k]}")
+    for k in sorted(gafter):
+        if gafter[k] != gbefore[k] and (show_all or DROPPY.search(k) or k.startswith(("rt_cache", "arp_cache"))):
+            print(f"   [kernel-wide] {k:<28} +{gafter[k] - gbefore[k]}")
+    return rc
+
+if __name__ == "__main__":
+    sys.exit(main())
+```
+
+The script runs five rounds, each measured on the edge router with `netdelta.py`:
+
+```{.bash filename="lab.sh"}
+#!/bin/sh
+# Run as: unshare -urnm sh lab.sh   (user + net + mount namespaces, no sudo)
+H=$(pwd); D="python3 $H/netdelta.py"
+mount -t tmpfs tmpfs /run; mkdir -p /run/netns
+for ns in inet r v; do ip netns add $ns; ip -n $ns link set lo up; done
+ip link add up0 type veth peer name i0; ip link set up0 netns r; ip link set i0 netns inet
+ip link add dn0 type veth peer name v0; ip link set dn0 netns r; ip link set v0 netns v
+ip -n inet addr add 10.255.0.2/30 dev i0; ip -n r addr add 10.255.0.1/30 dev up0
+ip -n inet addr add 198.51.100.66/32 dev lo; ip -n inet addr add 203.0.113.10/32 dev lo
+ip -n r addr add 192.0.2.1/24 dev dn0
+ip -n v addr add 192.0.2.10/24 dev v0; ip -n v addr add 192.0.2.20/24 dev v0
+for d in inet:i0 r:up0 r:dn0 v:v0; do ip -n ${d%:*} link set ${d#*:} up; done
+ip netns exec r sh -c 'echo 1 > /proc/sys/net/ipv4/ip_forward'
+ip -n inet route add 192.0.2.0/24 via 10.255.0.1
+ip -n r route add default via 10.255.0.2          # "the Internet" is behind up0
+ip -n v route add default via 192.0.2.1
+sleep 1
+round() {   # round LABEL: 50 datagrams per (source, destination) pair, count at the victim
+  echo "   $1"
+  ip netns exec v python3 $H/count.py 5300 1.5 & C=$!; sleep 0.3
+  $D --ns r -- ip netns exec inet python3 $H/blast.py 50
+  wait $C
+}
+
+echo "== 1. baseline: attacker and client both reach both servers"
+round "no mitigation"
+
+echo "== 2. destination-based RTBH: the /32 under attack goes to discard"
+ip -n r route add blackhole 192.0.2.10/32
+ip -n r route show 192.0.2.10/32
+round "blackhole 192.0.2.10/32"
+ip -n r route del blackhole 192.0.2.10/32
+
+echo "== 3. source-based RTBH without uRPF: blackhole the attacker's /32"
+ip -n r route add blackhole 198.51.100.66/32
+round "blackhole 198.51.100.66/32, rp_filter=$(ip netns exec r cat /proc/sys/net/ipv4/conf/up0/rp_filter)"
+
+echo "== 4. source-based RTBH with loose uRPF on the upstream interface"
+ip netns exec r sh -c 'echo 2 > /proc/sys/net/ipv4/conf/up0/rp_filter'
+round "blackhole 198.51.100.66/32, rp_filter=2 on up0"
+
+echo "== 5. S-RTBH aimed at a whole /24 that also holds a legitimate client"
+ip -n r route del blackhole 198.51.100.66/32
+ip -n r route add blackhole 203.0.113.0/24
+round "blackhole 203.0.113.0/24, rp_filter=2 on up0"
+```
+
+```bash
+unshare -urnm sh lab.sh
+```
+
+### Baseline
+
+```text
+== 1. baseline: attacker and client both reach both servers
+   no mitigation
+     198.51.100.66 -> 192.0.2.10    50 received
+     198.51.100.66 -> 192.0.2.20    50 received
+      203.0.113.10 -> 192.0.2.10    50 received
+      203.0.113.10 -> 192.0.2.20    50 received
+```
+
+Four flows, fifty datagrams each, all delivered.
+
+### Destination RTBH
+
+```text
+== 2. destination-based RTBH: the /32 under attack goes to discard
+blackhole 192.0.2.10 
+   blackhole 192.0.2.10/32
+   [kernel-wide] rt_cache.in_no_route         +100
+     198.51.100.66 -> 192.0.2.20    50 received
+      203.0.113.10 -> 192.0.2.20    50 received
+```
+
+The route `blackhole 192.0.2.10/32` is what a BGP policy installs when it rewrites the next hop of a BLACKHOLE-tagged /32 to the discard address. The neighbour 192.0.2.20 is untouched and both sources still reach it. Everything to 192.0.2.10 is gone, *including the legitimate client*. This is "completing the attack": the victim is offline, but by your hand and only that one address.
+
+Note how quiet the drop is. No per-namespace counter moved in `r`; the only evidence is the kernel-wide routing statistic `rt_cache.in_no_route +100` (two sources, 50 datagrams each). Linux treats a blackhole route as a lookup error (`EINVAL` in `ip_error()`) and frees the packet without SNMP accounting or ICMP. If you rely on blackholing, count the drops somewhere else, for example with flow export or a firewall counter, or you will not be able to tell your customer how much traffic you discarded.
+
+### Source RTBH without uRPF
+
+```text
+== 3. source-based RTBH without uRPF: blackhole the attacker's /32
+   blackhole 198.51.100.66/32, rp_filter=0
+     198.51.100.66 -> 192.0.2.10    50 received
+     198.51.100.66 -> 192.0.2.20    50 received
+      203.0.113.10 -> 192.0.2.10    50 received
+      203.0.113.10 -> 192.0.2.20    50 received
+```
+
+Blackholing the attacker's /32 on its own changes nothing for the attack. The route only affects packets *to* 198.51.100.66, and the attack consists of packets *from* it. `rp_filter=0` means the router never asks where the source lives. This is the most common way source RTBH is deployed wrongly: the trigger works, the route is installed everywhere, and the graphs do not move.
+
+### Source RTBH with loose uRPF
+
+```text
+== 4. source-based RTBH with loose uRPF on the upstream interface
+   blackhole 198.51.100.66/32, rp_filter=2 on up0
+   [r] TcpExtIPReversePathFilter          +100
+   [kernel-wide] rt_cache.in_martian_src      +100
+      203.0.113.10 -> 192.0.2.10    50 received
+      203.0.113.10 -> 192.0.2.20    50 received
+```
+
+Now the upstream interface has `rp_filter=2`, Linux's loose mode. Every packet from 198.51.100.66 fails the check because the only route back to it is the blackhole, and the router counts them: `TcpExtIPReversePathFilter +100` (the reverse-path filter counter, which lives in the `TcpExt` table despite its name) and the kernel-wide `in_martian_src +100`. The legitimate client reaches both servers. This is the outcome RFC 5635 promises: drop the attacker, keep the victim online.
+
+Two details about Linux matter if you build this on Linux edges. The effective `rp_filter` on an interface is the maximum of `net.ipv4.conf.all.rp_filter` and the interface's own value. And in loose mode a blackhole (or unreachable, or prohibit) route to the source fails the check, which is exactly the behaviour RTBH needs; a default route covering the source passes.
+
+### Source RTBH aimed too wide
+
+```text
+== 5. S-RTBH aimed at a whole /24 that also holds a legitimate client
+   blackhole 203.0.113.0/24, rp_filter=2 on up0
+   [r] TcpExtIPReversePathFilter          +100
+   [kernel-wide] rt_cache.in_martian_src      +100
+     198.51.100.66 -> 192.0.2.10    50 received
+     198.51.100.66 -> 192.0.2.20    50 received
+```
+
+The last round blackholes 203.0.113.0/24 as a source prefix. Every packet from the legitimate client fails uRPF and is dropped, while the attacker, outside that prefix, sails through. It is a contrived mistake here, but the same thing happens in production when an attack is attributed by prefix rather than by address, or when the "attacker" addresses were spoofed and belong to someone you wanted to talk to. Source blackholes deserve the same review as destination ones: as specific as possible, time-limited, and logged.
+
+## FlowSpec: a filter rule in a BGP route
+
+RTBH can only say "this address". FlowSpec, defined for IPv4 in RFC 8955 (which obsoleted RFC 5575) and for IPv6 in RFC 8956, lets a BGP route carry a full match expression. The route is in its own address family: AFI 1, SAFI 133 for IPv4, and SAFI 134 for flow rules inside BGP/MPLS VPNs. The "prefix" of the route is the rule itself, and the action rides along as extended communities.
+
+### Components
+
+The NLRI is a list of components, each starting with a one-octet type, and the types must appear in strictly increasing order with each type at most once. A packet matches the rule only if it matches *every* component present.
+
+| Type | Component | Operand | Notes |
+|---|---|---|---|
+| 1 | Destination prefix | prefix length + prefix | as in BGP UPDATE |
+| 2 | Source prefix | prefix length + prefix | |
+| 3 | IP protocol | numeric | |
+| 4 | Port | numeric | matches source **or** destination port |
+| 5 | Destination port | numeric | |
+| 6 | Source port | numeric | |
+| 7 | ICMP type | numeric | |
+| 8 | ICMP code | numeric | |
+| 9 | TCP flags | bitmask | 1 octet = flags octet; 2 octets = data offset (as 0) + flags |
+| 10 | Packet length | numeric | total IP length, header included, no L2 |
+| 11 | DSCP | numeric | 6 low bits |
+| 12 | Fragment | bitmask | DF `0x01`, IsF `0x02` (not first), FF `0x04` (first), LF `0x08` (last) |
+
+### Operators
+
+Every non-prefix component is a list of `{operator, value}` pairs. The **numeric operator** octet is `e a len 0 lt gt eq`: `e` (0x80) marks the last pair, `a` (0x40) means "AND with the previous pair" (otherwise OR), `len` gives the value size as 1, 2, 4 or 8 octets, and the three comparison bits combine into `==`, `>`, `>=`, `<`, `<=`, `!=`, always-true and always-false. AND binds tighter than OR, so `>=137 AND <=139 OR ==8080` means "137 to 139, or 8080". The **bitmask operator** octet is `e a len 0 0 not m`: with `m` set the test is "all these bits set", without it "any of these bits set", and `not` negates the result.
+
+The NLRI starts with its length: one octet if the length is under 240, otherwise two octets with the top nibble `0xF` (so the maximum is 4095).
+
+### Ordering and validation
+
+Several FlowSpec rules may match one packet, so RFC 8955 section 5.1 defines a deterministic order that every router computes the same way regardless of arrival order: compare component by component, a rule that has a lower component type wins over one that lacks it, more-specific prefixes win, and other components are compared as byte strings. Appendix A of the RFC gives Python for the comparison.
+
+Validation is the part that keeps FlowSpec from being an attack tool. By default (section 6) a received rule is feasible only if:
+
+1. it contains a destination prefix;
+2. the originator of the rule is also the originator of the best unicast route for that destination prefix; and
+3. no more-specific unicast routes for parts of that prefix were learned from a different neighbouring AS.
+
+In plain words: only the network you would send the traffic to may ask you to filter it. RFC 9117 revises this procedure, mainly so it works when rules and unicast routes arrive through route reflectors or from a centralised controller inside one AS. Rule 1 may be relaxed by configuration, which is common for rules distributed internally from a mitigation controller.
+
+### Actions
+
+Actions are transitive extended communities (RFC 8955 section 7):
+
+| Community type | Action | Encoding |
+|---|---|---|
+| `0x8006` | traffic-rate-bytes | 2-octet id + IEEE 754 float, bytes per second; 0 means discard |
+| `0x800c` | traffic-rate-packets | same encoding, packets per second |
+| `0x8007` | traffic-action | two bits: S (sample and log) and T ("terminal action"; read the gotcha below) |
+| `0x8008` (and `0x8108`, `0x8208`) | rt-redirect | redirect into the VRF whose import route target matches |
+| `0x8009` | traffic-marking | set DSCP |
+
+Rate 0 is "drop". Redirect is how scrubbing works with FlowSpec: matching traffic is pushed into a VRF whose route leads to a scrubbing centre, cleaned traffic comes back, and everything else takes the normal path.
+
+## The FlowSpec lab
+
+`flowspec.py` implements the IPv4 encoding, a decoder that prints rules in a readable form, a matcher that applies the RFC's semantics to a packet description, and the traffic-rate community encoding.
+
+```{.python filename="flowspec.py"}
+#!/usr/bin/env python3
+"""flowspec.py: RFC 8955 IPv4 Flow Specification NLRI encoder, decoder and matcher (stdlib only)."""
+import ipaddress, struct
+
+NAMES = {1: "dst", 2: "src", 3: "proto", 4: "port", 5: "dport", 6: "sport", 7: "icmp-type",
+         8: "icmp-code", 9: "tcp-flags", 10: "length", 11: "dscp", 12: "fragment"}
+BITMASK = {9, 12}
+OPS = {"==": 0b001, ">": 0b010, ">=": 0b011, "<": 0b100, "<=": 0b101, "!=": 0b110}
+FRAG = {"DF": 1, "IsF": 2, "FF": 4, "LF": 8}
+
+def enc_prefix(t, net):
+    net = ipaddress.ip_network(net)
+    nbytes = (net.prefixlen + 7) // 8
+    return bytes([t, net.prefixlen]) + net.network_address.packed[:nbytes]
+
+def enc_list(t, terms):
+    """terms: list of (and_bit, op, value). op is '==', '>=', ... or for bitmasks 'match'/'any'/'!match'."""
+    out = bytearray([t])
+    for i, (and_bit, op, value) in enumerate(terms):
+        size = 0 if value < 256 else 1                     # 1- or 2-octet values
+        b = (0x80 if i == len(terms) - 1 else 0) | (0x40 if and_bit and i else 0) | (size << 4)
+        if t in BITMASK:
+            b |= {"any": 0, "match": 1, "!any": 2, "!match": 3}[op]
+        else:
+            b |= OPS[op]
+        out += bytes([b]) + value.to_bytes(1 << size, "big")
+    return bytes(out)
+
+def encode(components):
+    """components: list of (type, arg) in increasing type order -> NLRI with length prefix."""
+    body = b"".join(enc_prefix(t, a) if t in (1, 2) else enc_list(t, a) for t, a in components)
+    assert len(body) < 240, "extended 2-octet length not needed for these examples"
+    return bytes([len(body)]) + body
+
+def decode(nlri):
+    n, i, comps = nlri[0], 1, []
+    end = 1 + n
+    while i < end:
+        t = nlri[i]; i += 1
+        if t in (1, 2):
+            plen = nlri[i]; nb = (plen + 7) // 8
+            addr = nlri[i + 1:i + 1 + nb] + bytes(4 - nb)
+            comps.append((t, ipaddress.ip_network(f"{ipaddress.IPv4Address(addr)}/{plen}")))
+            i += 1 + nb
+            continue
+        terms = []
+        while True:
+            op = nlri[i]; size = 1 << ((op >> 4) & 3)
+            val = int.from_bytes(nlri[i + 1:i + 1 + size], "big"); i += 1 + size
+            terms.append((bool(op & 0x40) and bool(terms), op & 0x0f, val))
+            if op & 0x80:
+                break
+        comps.append((t, terms))
+    return comps
+
+def term_str(t, bits, val):
+    if t in BITMASK:
+        flag = {0: "any", 1: "match", 2: "!any", 3: "!match"}[bits & 3]
+        if t == 12:
+            val = "+".join(k for k, v in FRAG.items() if val & v)
+        return f"{flag} {val}"
+    return {v: k for k, v in OPS.items()}.get(bits & 7, "?") + str(val)
+
+def show(comps):
+    parts = []
+    for t, a in comps:
+        if t in (1, 2):
+            parts.append(f"{NAMES[t]} {a}")
+        else:
+            s = ""
+            for k, (and_bit, bits, val) in enumerate(a):
+                s += ("" if k == 0 else " && " if and_bit else " || ") + term_str(t, bits, val)
+            parts.append(f"{NAMES[t]} {{{s}}}")
+    return " AND ".join(parts)
+
+def eval_terms(t, terms, x):
+    """AND binds tighter than OR (RFC 8955 4.2.1.1)."""
+    result, group = False, None
+    for and_bit, bits, val in terms:
+        if t in BITMASK:
+            hit = (x & val) == val if bits & 1 else (x & val) != 0
+            hit = not hit if bits & 2 else hit
+        else:
+            hit = (bits & 4 and x < val) or (bits & 2 and x > val) or (bits & 1 and x == val)
+        if and_bit:
+            group = group and hit
+        else:
+            result = result or bool(group)
+            group = hit
+    return result or bool(group)
+
+def matches(comps, p):
+    for t, a in comps:
+        if t == 1 and ipaddress.ip_address(p["dst"]) not in a: return False
+        if t == 2 and ipaddress.ip_address(p["src"]) not in a: return False
+        if t == 3 and not eval_terms(3, a, p["proto"]): return False
+        if t in (4, 5, 6):
+            if p["proto"] not in (6, 17) or p.get("frag_off", 0):    # no ports in later fragments
+                return False
+            ports = {4: (p["sport"], p["dport"]), 5: (p["dport"],), 6: (p["sport"],)}[t]
+            if not any(eval_terms(t, a, x) for x in ports): return False
+        if t == 10 and not eval_terms(10, a, p["len"]): return False
+        if t == 12:
+            f = (1 if p.get("df") else 0) | (2 if p.get("frag_off", 0) else 0) \
+                | (4 if not p.get("frag_off", 0) and p.get("mf") else 0) \
+                | (8 if p.get("frag_off", 0) and not p.get("mf") else 0)
+            if not eval_terms(12, a, f): return False
+    return True
+
+def traffic_rate(asn, rate_bytes_per_s):
+    """Transitive extended community 0x8006: 2-octet id + IEEE 754 float (bytes/s)."""
+    return struct.pack("!BBHf", 0x80, 0x06, asn & 0xFFFF, rate_bytes_per_s)
+
+if __name__ == "__main__":
+    print("== RFC 8955 section 4.3 examples")
+    examples = [
+        ("4.3.1", [(1, "192.0.2.0/24"), (3, [(0, "==", 6)]), (4, [(0, "==", 25)])],
+         "0b 01 18 c0 00 02 03 81 06 04 81 19"),
+        ("4.3.2", [(1, "192.0.2.0/24"), (2, "203.0.113.0/24"),
+                   (4, [(0, ">=", 137), (1, "<=", 139), (0, "==", 8080)])],
+         "12 01 18 c0 00 02 02 18 cb 00 71 04 03 89 45 8b 91 1f 90"),
+        ("4.3.3", [(1, "192.0.2.1/32"), (12, [(0, "any", FRAG["DF"] | FRAG["FF"])])],
+         "09 01 20 c0 00 02 01 0c 80 05"),
+    ]
+    for name, comps, want in examples:
+        got = encode(comps).hex(" ")
+        print(f"   {name}  {got}  {'matches RFC' if got == want else 'MISMATCH, RFC has ' + want}")
+        print(f"          decoded: {show(decode(bytes.fromhex(got)))}")
+
+    print("== a DNS-amplification rule, and the fragments it misses")
+    amp = decode(encode([(1, "192.0.2.10/32"), (3, [(0, "==", 17)]), (6, [(0, "==", 53)]),
+                         (10, [(0, ">=", 512)])]))
+    frag = decode(encode([(1, "192.0.2.10/32"), (12, [(0, "any", FRAG["IsF"])])]))
+    print(f"   rule A: {show(amp)}")
+    print(f"   rule B: {show(frag)}")
+    pkts = [
+        ("DNS answer 1400 B, first fragment", dict(src="198.51.100.7", dst="192.0.2.10", proto=17, sport=53, dport=40001, len=1400, mf=1)),
+        ("same answer, second fragment", dict(src="198.51.100.7", dst="192.0.2.10", proto=17, len=900, frag_off=185)),
+        ("normal DNS answer 120 B", dict(src="198.51.100.7", dst="192.0.2.10", proto=17, sport=53, dport=40002, len=120)),
+        ("HTTPS SYN to the victim", dict(src="203.0.113.10", dst="192.0.2.10", proto=6, sport=51000, dport=443, len=60)),
+        ("big DNS answer to a neighbour", dict(src="198.51.100.7", dst="192.0.2.20", proto=17, sport=53, dport=40003, len=1400)),
+    ]
+    for label, p in pkts:
+        a, b = matches(amp, p), matches(frag, p)
+        print(f"   {label:<36} A={'hit ' if a else 'miss'} B={'hit ' if b else 'miss'}")
+
+    print("== traffic-rate-bytes extended communities (RFC 8955 section 7.1)")
+    for rate in (0.0, 125000.0):
+        print(f"   rate {rate:>9.0f} B/s -> {traffic_rate(64500, rate).hex(' ')}")
+```
+
+```bash
+python3 flowspec.py
+```
+
+```text
+== RFC 8955 section 4.3 examples
+   4.3.1  0b 01 18 c0 00 02 03 81 06 04 81 19  matches RFC
+          decoded: dst 192.0.2.0/24 AND proto {==6} AND port {==25}
+   4.3.2  12 01 18 c0 00 02 02 18 cb 00 71 04 03 89 45 8b 91 1f 90  matches RFC
+          decoded: dst 192.0.2.0/24 AND src 203.0.113.0/24 AND port {>=137 && <=139 || ==8080}
+   4.3.3  09 01 20 c0 00 02 01 0c 80 05  matches RFC
+          decoded: dst 192.0.2.1/32 AND fragment {any DF+FF}
+== a DNS-amplification rule, and the fragments it misses
+   rule A: dst 192.0.2.10/32 AND proto {==17} AND sport {==53} AND length {>=512}
+   rule B: dst 192.0.2.10/32 AND fragment {any IsF}
+   DNS answer 1400 B, first fragment    A=hit  B=miss
+   same answer, second fragment         A=miss B=hit 
+   normal DNS answer 120 B              A=miss B=miss
+   HTTPS SYN to the victim              A=miss B=miss
+   big DNS answer to a neighbour        A=miss B=miss
+== traffic-rate-bytes extended communities (RFC 8955 section 7.1)
+   rate         0 B/s -> 80 06 fb f4 00 00 00 00
+   rate    125000 B/s -> 80 06 fb f4 47 f4 24 00
+```
+
+### Reading the output
+
+**The RFC examples.** The encoder reproduces the three examples of RFC 8955 section 4.3 exactly. Take the second one, `12 01 18 c0 00 02 02 18 cb 00 71 04 03 89 45 8b 91 1f 90`: length `0x12` (18 octets); type 1 with a /24 (`0x18`) and three prefix octets 192.0.2; type 2 with 203.0.113/24; then type 4 (port) with three pairs. `0x03` is "`>=`, one octet, not last" followed by 137; `0x45` is "AND, `<=`, one octet" followed by 139; `0x91` is "end of list, two-octet value, `==`" followed by `0x1f90` (8080). The decoder prints it back as `port {>=137 && <=139 || ==8080}`. The third example, `0c 80 05`, is a fragment component with a bitmask operator without the match bit, operand DF+FF, meaning "DF set **or** first fragment".
+
+**The fragment trap.** Rule A is a typical DNS reflection filter: to the victim, UDP, source port 53, packet length at least 512. It catches the first fragment of a 1400-byte answer (which carries the UDP header) but **misses the second fragment**, because RFC 8955 says port components never match a non-first fragment; there is no UDP header in it to match. Reflection attacks with large answers produce many fragments, so a port-only rule lets a large share of the attack through. Rule B, "to the victim and IsF", catches the trailing fragments. Real mitigation policies pair every port-based rule with a fragment rule for the same destination, or rate-limit fragments to the victim outright. Neither rule touches the normal 120-byte DNS answer, the HTTPS SYN, or traffic to the neighbour.
+
+**The action encodings.** `80 06 fb f4 00 00 00 00` is traffic-rate-bytes with id 64500 (`0xfbf4`) and rate 0.0, i.e. discard. `47 f4 24 00` is 125000.0 as an IEEE 754 single, 125 000 bytes per second or 1 Mbit/s. The id is informational only; routers must not interpret it.
+
+## Configuration you would use (not run here)
+
+The snippets below are written from each project's documentation for orientation, not tested here. Adapt names and addresses.
+
+**Edge router (FRR), destination RTBH via community.** Accept /32s tagged BLACKHOLE from the trigger and send them to a discard next hop:
+
+```text
+! not run here: written from the FRR docs
+ip route 192.0.2.1/32 blackhole
+!
+bgp community-list standard BH permit 65535:666
+!
+route-map FROM-TRIGGER permit 10
+ match community BH
+ set ip next-hop 192.0.2.1
+ set community no-export additive
+route-map FROM-TRIGGER permit 20
+!
+router bgp 64500
+ neighbor 10.0.0.99 remote-as 64500
+ neighbor 10.0.0.99 description rtbh-trigger
+ address-family ipv4 unicast
+  neighbor 10.0.0.99 route-map FROM-TRIGGER in
+```
+
+**Source RTBH on a Linux edge.** The same route-map installs attacker /32s; the uRPF half is a sysctl on the upstream interfaces:
+
+```bash
+# not run here on a real edge (the lab above ran the same commands in a namespace)
+sysctl -w net.ipv4.conf.all.rp_filter=0
+sysctl -w net.ipv4.conf.up0.rp_filter=2   # loose mode on upstream-facing interfaces only
+```
+
+**FlowSpec origination (BIRD 2).** BIRD has `flow4`/`flow6` tables and can originate rules from static routes:
+
+```text
+# not run here: written from the BIRD 2 user's guide (Flowspec section)
+protocol static {
+    flow4;
+    route flow4 {
+        dst 192.0.2.10/32;
+        proto 17;
+        sport 53;
+        length >= 512;
+    };
+    route flow4 {
+        dst 192.0.2.10/32;
+        fragment is_fragment;
+    };
+}
+```
+
+Export these routes to a BGP session with the `flow4` channel enabled and attach the traffic-rate action (`0x8006`, rate 0) as an extended community in the export filter, using the extended-community syntax documented for your BIRD version. ExaBGP is widely used to originate FlowSpec from scripts (for example, from a DDoS detector), and FRR can *receive* FlowSpec and install it through policy-based routing with iptables/ipset, but does not originate it.
+
+**Applying a decoded rule on a Linux box with nftables.** If a host or a Linux router needs the same filter locally, rules A and B translate directly (not run here: `nft` is not installed on this box):
+
+```text
+# not run here
+table inet ddos {
+  chain pre {
+    type filter hook prerouting priority -300; policy accept;
+    ip daddr 192.0.2.10 udp sport 53 ip length >= 512 counter drop
+    ip daddr 192.0.2.10 ip frag-off & 0x1fff != 0 counter drop
+  }
+}
+```
+
+## Gotchas
+
+1. **Destination RTBH completes the attack.** It saves shared capacity by taking the victim offline. Agree with the customer in advance when it may be used, and remove it as soon as the attack stops.
+2. **Source RTBH without uRPF does nothing.** A blackhole route for a source affects only traffic *to* it. The lab's third round is the failure mode: routes everywhere, attack unchanged.
+3. **Spoofed sources turn source RTBH against you.** Against reflection or spoofed floods, blocking "sources" blocks forged addresses that belong to others. Use it only for verified, non-spoofed sources.
+4. **Blackholes are silent on Linux.** No per-namespace counter, no ICMP: only the kernel-wide `in_no_route` moves. Measure discarded volume with flow export or firewall counters.
+5. **Your /32 will be filtered unless the session expects it.** Upstreams accept long prefixes only on sessions where BLACKHOLE handling is agreed, often a separate session or a specific community. ROV can mark the /32 Invalid if your ROAs have a short maxLength.
+6. **Port rules miss fragments.** FlowSpec port, ICMP and TCP-flag components never match non-first fragments. Always add a fragment rule for the same destination.
+7. **Validation surprises.** A FlowSpec rule without a destination prefix, or one for a destination whose best unicast route came from another neighbour, is not feasible by default and will be ignored. When a rule "does not install", check validation before suspecting the encoding.
+8. **FlowSpec is control-plane code that parses attacker-influenced input.** Implementations have had serious bugs in FlowSpec handling, including ones that crash or compromise the routing engine. Accept FlowSpec only from sessions that need it, cap the number of rules per session, keep router software patched, and test rule sets on a lab router first.
+9. **The T bit reads backwards.** RFC 8955 section 7.3 says that when the traffic-action T ("terminal action") bit is *set*, evaluation continues with later FlowSpec rules, and when it is *clear*, evaluation stops at this rule. The name suggests the opposite, and it is easy to get wrong in a controller. Check what your platform documents before relying on rule chaining.
+10. **Hardware limits.** Each FlowSpec rule consumes filter (TCAM) entries; rate actions consume policers. A detector that pushes hundreds of fine-grained rules during an attack can exhaust them. Aggregate rules and set a hard maximum.
+
+## Exercises
+
+1. **Strict mode at the edge.** Rerun the RTBH lab with `rp_filter=1` instead of 2 on `up0`. Does the result change for this topology? Then add a second upstream namespace and route the client's prefix back through it, and explain why strict mode now drops the legitimate client.
+2. **Measure what you discarded.** Extend `count.py` and `blast.py` so the sender numbers its datagrams, and report how many were lost per flow during the destination RTBH round. Compare with the kernel-wide counter while unrelated traffic runs.
+3. **Encode your own rule.** Use `flowspec.py` to encode "to 192.0.2.0/24, TCP, destination port 80 or 443, TCP SYN set and ACK clear". You will need the bitmask operator with the match bit for SYN and the `not` bit for ACK. Decode the result and check the operator octets by hand.
+4. **Order two rules.** Encode rule A and rule B and sort them with the RFC 8955 Appendix A comparison (copy the function from the RFC). Which one is evaluated first, and does it matter here?
+5. **Extended length.** Build a rule with enough port pairs to make the NLRI 240 octets or longer, and extend `encode()` to emit the two-octet `0xFnnn` length. Check that 240 encodes as `f0 f0`, as the RFC says.
+6. **Plan a BLACKHOLE policy.** Write the import policy for an upstream session that honours 65535:666: which prefix lengths you accept, which ownership check you apply, which community you add, and how ROV is handled for these routes.
+
+## Verification
+
+- Ran on this box, unprivileged: `unshare -urnm sh lab.sh` (five RTBH rounds with `count.py`, `blast.py` and `netdelta.py`) and `python3 flowspec.py`. Outputs are pasted verbatim.
+- The three RFC 8955 section 4.3 encodings were reproduced byte for byte by `flowspec.py` (printed as "matches RFC"). The traffic-rate float encoding was checked by the program's `struct` packing.
+- RFC 7999, RFC 5635 and RFC 8955 statements were checked against the RFC texts.
+- Not run here: FRR, BIRD, ExaBGP and nftables snippets (no daemons or `nft` on the box, nothing may be installed), and the multi-upstream variants in the exercises.
+
+## Sources
+
+- RFC 5635, Remote Triggered Black Hole Filtering with Unicast Reverse Path Forwarding (uRPF). <https://www.rfc-editor.org/rfc/rfc5635>
+- RFC 7999, BLACKHOLE Community. <https://www.rfc-editor.org/rfc/rfc7999>
+- RFC 3704, Ingress Filtering for Multihomed Networks. <https://www.rfc-editor.org/rfc/rfc3704>
+- RFC 8955, Dissemination of Flow Specification Rules. <https://www.rfc-editor.org/rfc/rfc8955>
+- RFC 8956, Dissemination of Flow Specification Rules for IPv6. <https://www.rfc-editor.org/rfc/rfc8956>
+- RFC 9117, Revised Validation Procedure for BGP Flow Specifications. <https://www.rfc-editor.org/rfc/rfc9117>
+- RFC 1997, BGP Communities Attribute (NO_EXPORT, NO_ADVERTISE). <https://www.rfc-editor.org/rfc/rfc1997>
+- Linux kernel documentation, IP sysctl (`rp_filter`). <https://docs.kernel.org/networking/ip-sysctl.html>
+- FRRouting documentation: BGP (community lists, route maps, Flowspec). <https://docs.frrouting.org/en/latest/bgp.html>
+- BIRD 2 user's guide (flowspec tables and static flow routes). <https://bird.network.cz/?get_doc&f=bird.html&v=20>
