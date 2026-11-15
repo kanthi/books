@@ -1,0 +1,696 @@
+---
+title: "Blind Resets and Challenge ACKs: RFC 5961 on Linux"
+author:
+  - name: "K19G"
+  - name: "grok-bot"
+---
+
+# Blind Resets and Challenge ACKs: RFC 5961 on Linux
+
+TCP was originally designed under the assumption that network paths were generally trustworthy or that end hosts were capable of keeping track of their sequence spaces without malicious off-path interference. Traditional TCP implementations followed RFC 793, which specified straightforward rules for processing control segments such as RST and SYN, as well as incoming ACK segments. Under RFC 793, any incoming RST segment with a sequence number falling anywhere within the current receive window was accepted as valid and immediately terminated the connection. Similarly, an incoming SYN segment on an established connection within the window would trigger an immediate reset.
+
+For long-lived TCP connections—such as BGP sessions between core routers, persistent database connections, or long-polling API streams—this permissive validation logic presented a severe vulnerability. An off-path attacker who could spoof the source and destination IP addresses and port numbers did not need to guess the exact 32-bit sequence number currently expected by the target host. Instead, the attacker only needed to hit any value within the wide range defined by the receiver's window (`RCV.NXT` to `RCV.NXT + RCV.WND`). With modern high-bandwidth networks advertising receive windows of tens of megabytes, the probability of successfully blind-resetting a connection with a small stream of forged RST packets approaches certainty in a matter of seconds.
+
+RFC 5961 ("Improving TCP's Robustness to Blind In-Window Attacks") was published to mitigate these vulnerabilities by narrowing the acceptance criteria for sequence and acknowledgment numbers on established TCP connections. Rather than tearing down a connection or processing out-of-order control segments immediately, RFC 5961 introduces the concept of a "Challenge ACK." When a suspicious segment arrives (such as an in-window RST that does not match `RCV.NXT` exactly, or an unexpected SYN on an established connection), the receiver does not terminate the state. Instead, it sends an acknowledgment segment back to the legitimate peer containing the exact sequence and acknowledgment numbers expected in the connection state. If the segment was genuine, the legitimate peer responds naturally or clears up the state; if it was forged by an off-path attacker, the challenge ACK is sent back to the spoofed source address, leaving the attacker unable to inspect the challenge or force a reset.
+
+Understanding RFC 5961 is essential for modern network engineering and systems troubleshooting. Linux implements RFC 5961 mechanisms alongside two distinct rate-limiting layers: a host-wide limiter (`tcp_challenge_ack_limit`) and a per-socket limiter (`tcp_invalid_ratelimit`). Operators must understand how these mechanisms interact with kernel SNMP counters, how historical side-channel vulnerabilities (such as CVE-2016-5696) changed Linux kernel defaults, and why RFC 5961 protects connection state integrity without providing message data authentication.
+
+## Learning goals
+
+- Explain the security vulnerabilities inherent in RFC 793 in-window segment validation for off-path attackers.
+- Detail the specific sequence validation rules mandated by RFC 5961 for RST, SYN, and DATA/ACK segments on established TCP connections.
+- Analyze the mechanics of Challenge ACKs and how they preserve established connection state against blind spoofing.
+- Trace the historical evolution of Linux kernel rate limiters for Challenge ACKs, including the impact of CVE-2016-5696.
+- Interpret kernel SNMP counters (`TCPChallengeACK`, `TCPSYNChallenge`, and `TCPACKSkippedChallenge`) to diagnose packet injection or network anomalies.
+- Evaluate the security boundary of RFC 5961 regarding data injection and understand why cryptographic authentication (TCP-AO/MD5) or GTSM remains mandatory for critical infrastructure like BGP.
+
+## Version note
+
+The kernel implementation details, sysctl parameters, and SNMP counter dynamics discussed in this chapter reflect Linux kernel version 6.12.94+ and modern upstream standards. On Linux, the host-wide challenge ACK rate limit sysctl `net.ipv4.tcp_challenge_ack_limit` defaults to `2147483647` (`INT_MAX`), effectively disabling host-wide rate limiting following the resolution of CVE-2016-5696. Per-socket rate limiting is controlled by `net.ipv4.tcp_invalid_ratelimit`, which defaults to `500` milliseconds (`HZ/2`).
+
+## Pre-RFC 5961 Vulnerabilities and Sequence Window Mechanics
+
+To understand why RFC 5961 was required, consider how an RFC 793 TCP stack validates incoming segments when a connection is in the `ESTABLISHED` state. A TCP receiver tracks its current receive window using `RCV.NXT` (the sequence number of the next byte expected) and `RCV.WND` (the size of the receive window offered to the remote peer).
+
+Under RFC 793 rules, an incoming segment carrying the `RST` flag was validated against the receive window as follows:
+
+```text
+RFC 793 RST Acceptance Range:
+[ RCV.NXT ---------------------------------------- RCV.NXT + RCV.WND - 1 ]
+  ^
+  Any RST with sequence number in this entire range terminates the socket!
+```
+
+If the RST sequence number fell anywhere inside the range `[RCV.NXT, RCV.NXT + RCV.WND - 1]`, the receiver processed the reset immediately, destroyed the Transmission Control Block (TCB), and returned `ECONNRESET` to the application. 
+
+For a connection with a small window size (e.g., 64 KiB), an attacker guessing sequence numbers at random needed to send approximately $2^{32} / 65536 = 65,536$ packets to hit the window. On modern high-throughput links where TCP window scaling allows receive windows of 16 MiB or larger, an attacker needs fewer than 256 forged packets to hit the window and tear down the connection. Because off-path attackers can easily spoof source IP addresses and port numbers if network edge ingress filtering (BCP 38) is absent, long-lived TCP sessions were highly vulnerable to blind reset attacks.
+
+A similar vulnerability existed for SYN segments. If an off-path attacker sent a forged `SYN` segment with a sequence number within the receive window of an established connection, RFC 793 specified that the receiver should send a `RST` back to abort the session under the assumption that the remote peer had crashed and restarted.
+
+## RFC 5961 Validation Specifications
+
+RFC 5961 addresses blind attacks by tightening validation rules across three main segment types: `RST`, `SYN`, and `ACK` / `DATA`.
+
+### Section 3: Handling In-Window RST Segments
+
+Under RFC 5961 §3, an incoming `RST` segment is subjected to strict equality checking against the expected receive sequence number.
+
+```text
+RFC 5961 RST Validation:
+  Incoming RST Seq == RCV.NXT  --->  Accept RST immediately (Close socket)
+  Incoming RST Seq in Window   --->  Send Challenge ACK, drop RST
+  Incoming RST Seq Out Window  --->  Drop RST silently
+```
+
+1. **Exact Match (`seq == RCV.NXT`)**: If the incoming `RST` sequence number exactly equals `RCV.NXT` (or `RCV.NXT - 1` if a FIN was previously processed, or matching the rightmost SACK edge on Linux), the stack accepts the `RST` and closes the connection immediately.
+2. **In-Window Mismatch (`RCV.NXT < seq < RCV.NXT + RCV.WND`)**: If the sequence number falls inside the receive window but does not match `RCV.NXT`, the receiver **must not** tear down the connection. Instead, it generates a Challenge ACK sent to the remote peer and drops the invalid `RST`.
+3. **Out-of-Window (`seq` outside window)**: The `RST` is silently ignored.
+
+When the receiver sends a Challenge ACK, it echoes its actual TCP state:
+- `SEQ` = `SND.NXT` (the sender's next sequence number)
+- `ACK` = `RCV.NXT` (the receiver's next expected sequence number)
+
+If the remote peer is genuine and actually intended to reset the session (for instance, if it had restarted and forgotten state), receiving the Challenge ACK will cause it to generate a valid `RST` with `seq == Challenge_ACK.ack` (which matches `RCV.NXT` at the receiver). The receiver then accepts the second `RST` and tears down the socket. If the `RST` was forged by an off-path attacker, the Challenge ACK lands at the legitimate peer, which ignores it or replies with an ACK, leaving the original session unharmed.
+
+### Section 4: Handling In-Window SYN Segments
+
+Under RFC 5961 §4, if a `SYN` segment arrives on a connection in the `ESTABLISHED` state (or `SYN-WAIT`, `FIN-WAIT-1`, `FIN-WAIT-2`, `CLOSE-WAIT`, `CLOSING`, `LAST-ACK`, or `TIME-WAIT`), regardless of whether its sequence number is in-window or out-of-window:
+
+1. The receiver does **not** send a `RST` and does **not** tear down the connection.
+2. The receiver sends a Challenge ACK back to the remote peer containing current `SND.NXT` and `RCV.NXT`.
+3. The invalid `SYN` is discarded.
+
+If the legitimate peer had crashed and initiated a new connection using the same 4-tuple, receiving the Challenge ACK will cause the peer to generate a `RST` (since the sequence numbers in the Challenge ACK do not match any active connection on the restarted host). Upon receiving that valid `RST`, the local socket is closed, allowing the client to retry establishing the connection.
+
+### Section 5: ACK Validation Rules
+
+RFC 5961 §5 defines validation checks for acknowledgment numbers (`ACK` field) on incoming data segments to prevent blind data injection or forced window truncation.
+
+An incoming `ACK` on an established connection is validated against two boundaries:
+
+| Check Type | Validation Condition | Receiver Action |
+| :--- | :--- | :--- |
+| **Old ACK Check** | `ack < SND.UNA - MAX.ACK.WINDOW` | Segment is considered an old/duplicate ACK; process normally or challenge if suspicious. |
+| **Unsent Data ACK Check** | `ack > SND.NXT` | Segment acknowledges data the host has not yet sent. **Must** send Challenge ACK and drop segment. |
+
+`MAX.ACK.WINDOW` is typically calculated as `2**31 - 1` bytes or bounded by max window limits to prevent integer wrapping issues during comparisons.
+
+## Linux Implementation: Dual-Layer Rate Limiting and CVE-2016-5696
+
+Sending a Challenge ACK for every invalid segment creates a potential CPU and bandwidth denial-of-service vector. If an attacker floods an established socket with forged in-window RSTs, the target system might consume excessive resources transmitting Challenge ACKs.
+
+To prevent this, RFC 5961 recommended rate-limiting Challenge ACKs. Linux implements this through a dual-layer architecture in `tcp_send_challenge_ack()`.
+
+```text
+Incoming In-Window Suspicious Segment (RST / SYN / Invalid ACK)
+                          |
+                          v
+        [ Per-Socket Limiter: __tcp_oow_rate_limited() ]
+        Checks socket's last ACK time vs tcp_invalid_ratelimit (500ms)
+                          |
+             +------------+------------+
+             |                         |
+       (Rate Exceeded)         (Within Rate)
+             |                         |
+             v                         v
+  Increment Counter:         [ Host-Wide Limiter: sysctl ]
+  TCPACKSkippedChallenge     Checks global challenge ACK token bucket
+             |                         |
+             v            +------------+------------+
+        Drop Packet       |                         |
+                    (Exceeded)                 (Allowed)
+                          |                         |
+                          v                         v
+               Increment Counter:         Transmit Challenge ACK
+               TCPACKSkippedChallenge     Increment Counter:
+                          |               TCPChallengeACK
+                          v                         |
+                     Drop Packet                    v
+                                            (Packet on Wire)
+```
+
+### Layer 1: Per-Socket Rate Limiting
+
+The first check occurs in `__tcp_oow_rate_limited()`. Linux tracks the timestamp of the last out-of-window / challenge ACK sent on a per-socket basis in the socket's control structure (`tp->rcv_ooop_when` or internal socket state timers).
+
+The sysctl `net.ipv4.tcp_invalid_ratelimit` defines the minimum interval between challenge ACKs for a single TCP socket:
+- **Default**: `500` ms (internal kernel representation `HZ / 2`).
+- **Behavior**: If a socket receives multiple in-window invalid RST or SYN segments within 500 ms, only the first segment triggers a Challenge ACK. Subsequent segments within the 500 ms window are dropped, and the kernel increments the `TCPACKSkippedChallenge` SNMP counter.
+
+### Layer 2: Host-Wide Rate Limiting and CVE-2016-5696
+
+Historically, Linux implemented a global token bucket rate limiter governed by `net.ipv4.tcp_challenge_ack_limit`. In older kernels (prior to 4.7), this limit defaulted to `100` Challenge ACKs per second host-wide across all TCP sockets.
+
+In 2016, researchers identified a critical side-channel vulnerability in this global rate limiter (**CVE-2016-5696**):
+1. Because the limit of 100 Challenge ACKs per second was shared across all sockets on the system, an off-path attacker could measure the global counter by opening a legitimate TCP connection to the victim system and sending out-of-window packets to count how many Challenge ACKs were returned before hitting the global cap.
+2. By probing the global counter while simultaneously spoofing packets targeting a victim session between two other hosts, the attacker could infer precisely when their spoofed packet triggered a Challenge ACK.
+3. This side channel allowed off-path attackers to determine exact sequence numbers and active port numbers of arbitrary TCP connections on the system in minutes.
+
+**Kernel Fix**:
+Linux resolved CVE-2016-5696 by removing the fixed global shared limit logic as the primary defensive boundary. Specifically:
+- `net.ipv4.tcp_challenge_ack_limit` was changed to default to `2147483647` (`INT_MAX`), effectively disabling the global rate limit bucket by default.
+- Modern kernels rely primarily on the per-socket rate limiter (`tcp_invalid_ratelimit`).
+- If host-wide limiting is explicitly re-enabled by setting `tcp_challenge_ack_limit` to a small value (e.g., 100), modern kernels apply a randomized refresh window (e.g., refreshing state every 50–150 ms rather than a predictable 1-second interval) to prevent side-channel exploitation.
+
+### Kernel SNMP Counters
+
+Linux tracks RFC 5961 operations in `/proc/net/netstat` under the `TcpExt` column block. Operators monitor three primary counters:
+
+- `TCPChallengeACK`: Incremented whenever the kernel successfully transmits a Challenge ACK in response to an RFC 5961 trigger (in-window RST, SYN on established, or out-of-bounds ACK).
+- `TCPSYNChallenge`: Incremented specifically when a Challenge ACK is generated due to an incoming `SYN` segment received on an established connection (subset of `TCPChallengeACK`).
+- `TCPACKSkippedChallenge`: Incremented when an RFC 5961 Challenge ACK was warranted, but suppressed by either the per-socket (`tcp_invalid_ratelimit`) or host-wide (`tcp_challenge_ack_limit`) rate limiter.
+
+## The Blind Data Injection Security Boundary
+
+It is vital for operators to understand what RFC 5961 does **not** protect against.
+
+RFC 5961 significantly narrows the sequence window for `RST` segments from the entire receive window down to the exact value `RCV.NXT`. However, for regular payload data segments (`DATA` / `ACK`), RFC 5961 requires that incoming payload sequence numbers fit within the receive window.
+
+If an off-path attacker knows or successfully guesses:
+1. The 4-tuple (source IP, source port, destination IP, destination port).
+2. The exact sequence number currently expected by the receiver (`seq == RCV.NXT`).
+3. An acknowledgment number within the acceptable sender window (`SND.UNA <= ack <= SND.NXT`).
+
+The attacker can inject arbitrary payload data into the stream. RFC 5961 **does not provide cryptographic packet authentication or data integrity verification**.
+
+```text
++-----------------------------------------------------------------------+
+|                       RFC 5961 Protection Boundary                     |
++------------------------------------+----------------------------------+
+| Vector                             | RFC 5961 Protection Status       |
++------------------------------------+----------------------------------+
+| In-window RST flooding             | Protected (requires exact seq)   |
+| SYN on established connection      | Protected (triggers challenge)   |
+| Out-of-bounds ACK numbers          | Protected (triggers challenge)   |
+| Data injection with exact seq/ack  | NOT Protected (accepted as data) |
++------------------------------------+----------------------------------+
+```
+
+For critical sessions such as BGP (Border Gateway Protocol), relying solely on RFC 5961 is insufficient. Protection against data injection requires cryptographic authentication mechanisms such as TCP-AO (TCP Authentication Option, RFC 5925) or TCP-MD5 (RFC 2385), or path-validation mechanisms such as GTSM (Generalized TTL Security Mechanism, RFC 5082).
+
+---
+
+## The lab
+
+### Lab files
+`blindtcp.py`:
+
+```python
+#!/usr/bin/env python3
+"""Blind in-window attacks against a real Linux TCP socket (RFC 5961 behaviour).
+
+Runs inside `unshare -urn` on the loopback interface. A sniffer (AF_PACKET) plays
+the role of "knowing the sequence numbers"; a raw socket forges segments that
+claim to come from the client. Every verdict comes from the kernel: socket
+errors, bytes delivered to the application, and TcpExt counters.
+"""
+import os, socket, struct, threading, time, random, errno
+
+SRV, CLI, PORT = "127.0.0.2", "127.0.0.3", 9000
+COUNTERS = ["TCPChallengeACK", "TCPSYNChallenge", "TCPACKSkippedChallenge",
+            "TCPACKSkippedSeq", "TCPAbortOnData"]
+
+def netstat():
+    vals = {}
+    for path in ("/proc/net/netstat", "/proc/net/snmp"):
+        lines = open(path).read().splitlines()
+        for h, v in zip(lines[::2], lines[1::2]):
+            p, names = h.split(":", 1); _, nums = v.split(":", 1)
+            for n, x in zip(names.split(), nums.split()):
+                vals[n] = int(x)
+    return vals
+
+def delta(before, after, keys=COUNTERS):
+    d = {k: after.get(k, 0) - before.get(k, 0) for k in keys}
+    return " ".join(f"{k}+{v}" for k, v in d.items() if v) or "(no counter moved)"
+
+def csum(data):
+    if len(data) % 2: data += b"\0"
+    s = sum(struct.unpack(f"!{len(data)//2}H", data))
+    while s >> 16: s = (s & 0xffff) + (s >> 16)
+    return ~s & 0xffff
+
+def forge(src, sport, dst, dport, seq, ack, flags, payload=b"", window=1024):
+    offres = (5 << 4)
+    tcp = struct.pack("!HHIIBBHHH", sport, dport, seq & 0xffffffff, ack & 0xffffffff,
+                      offres, flags, window, 0, 0) + payload
+    pseudo = socket.inet_aton(src) + socket.inet_aton(dst) + struct.pack("!BBH", 0, 6, len(tcp))
+    c = csum(pseudo + tcp)
+    tcp = tcp[:16] + struct.pack("!H", c) + tcp[18:]
+    ip = struct.pack("!BBHHHBBH4s4s", 0x45, 0, 20 + len(tcp), random.randrange(65536), 0, 64, 6, 0,
+                     socket.inet_aton(src), socket.inet_aton(dst))
+    ip = ip[:10] + struct.pack("!H", csum(ip)) + ip[12:]
+    raw = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_RAW)
+    raw.sendto(ip + tcp, (dst, 0)); raw.close()
+
+FIN, SYN, RST, PSH, ACK = 1, 2, 4, 8, 16
+
+class Sniffer(threading.Thread):
+    """Records every TCP segment on lo once (outgoing copy)."""
+    def __init__(self):
+        super().__init__(daemon=True)
+        self.s = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(3))
+        self.s.bind(("lo", 0)); self.log = []; self.lock = threading.Lock()
+    def run(self):
+        while True:
+            data, addr = self.s.recvfrom(65535)
+            if addr[2] != socket.PACKET_OUTGOING: continue
+            ip = data[14:]
+            if len(ip) < 40 or ip[9] != 6: continue
+            ihl = (ip[0] & 15) * 4; t = ip[ihl:]
+            sp, dp, seq, ack, off, fl, win = struct.unpack("!HHIIBBH", t[:16])
+            plen = len(ip) - ihl - (off >> 4) * 4
+            with self.lock:
+                self.log.append((time.monotonic(), socket.inet_ntoa(ip[12:16]), sp,
+                                 socket.inet_ntoa(ip[16:20]), dp, seq, ack, fl, win, plen))
+    def mark(self):
+        with self.lock: return len(self.log)
+    def since(self, m):
+        with self.lock: return list(self.log[m:])
+
+def fl(f):
+    return "".join(n for b, n in ((SYN, "S"), (FIN, "F"), (RST, "R"), (PSH, "P"), (ACK, "."))
+                   if f & b) or "-"
+
+def connect_pair(sn):
+    ls = socket.socket(); ls.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    ls.bind((SRV, PORT)); ls.listen(1)
+    c = socket.socket(); c.bind((CLI, 0)); c.connect((SRV, PORT))
+    s, _ = ls.accept(); ls.close()
+    c.sendall(b"hello from client"); s.recv(100)
+    s.sendall(b"hello from server"); c.recv(100)
+    time.sleep(0.6)  # let delayed ACKs settle and clear the per-socket 500 ms limiter
+    cport = c.getsockname()[1]
+    # rcv_nxt of the server = the client's next seq; snd_nxt of server = its next seq.
+    segs = [x for x in sn.since(0) if x[2] == cport and x[4] == PORT]
+    last = segs[-1]
+    cli_next = last[5] + last[9] + (1 if last[7] & (SYN | FIN) else 0)
+    srv_next = last[6]
+    srv_segs = [x for x in sn.since(0) if x[2] == PORT and x[4] == cport]
+    win = srv_segs[-1][8]
+    return c, s, cport, cli_next, srv_next, win
+
+def show(sn, m, cport):
+    out = []
+    for t, sa, sp, da, dp, seq, ack, f, w, pl in sn.since(m):
+        if cport not in (sp, dp): continue
+        who = "srv->cli" if sp == PORT else "cli->srv"
+        out.append(f"      {who} {fl(f):3} seq={seq} ack={ack} len={pl}")
+    return out
+
+def alive(s):
+    s.setblocking(False)
+    try:
+        d = s.recv(100)
+        r = f"recv -> {d!r}" if d else "recv -> EOF"
+    except BlockingIOError:
+        r = "recv -> EAGAIN (connection still up, nothing to read)"
+    except OSError as e:
+        r = f"recv -> {errno.errorcode[e.errno]}"
+    s.setblocking(True); return r
+
+def scenario(sn, title, build, settle=0.3, reuse=None):
+    print(f"== {title}")
+    c, s, cport, cli_next, srv_next, win = reuse or connect_pair(sn)
+    print(f"   server expects seq (RCV.NXT) = {cli_next}, server SND.NXT = {srv_next}, "
+          f"server advertised window field = {win}")
+    m = sn.mark(); b = netstat()
+    for desc, seq, ack, flags, payload in build(cli_next, srv_next):
+        print(f"   forge: {desc}")
+        forge(CLI, cport, SRV, PORT, seq, ack, flags, payload)
+        time.sleep(0.05)
+    time.sleep(settle)
+    for line in show(sn, m, cport): print(line)
+    print("   counters:", delta(b, netstat()))
+    print("   server socket:", alive(s))
+    return c, s, cport, cli_next, srv_next, win
+
+SCENARIOS = {
+    1: ("RST with the exact expected sequence number",
+        lambda n, a: [("RST seq=RCV.NXT", n, 0, RST, b"")]),
+    2: ("RST inside the window but not exact (seq = RCV.NXT + 1000)",
+        lambda n, a: [("RST seq=RCV.NXT+1000", n + 1000, 0, RST, b"")]),
+    3: ("RST outside the window (seq = RCV.NXT + 10,000,000)",
+        lambda n, a: [("RST seq=RCV.NXT+10000000", n + 10_000_000, 0, RST, b"")]),
+    4: ("Three in-window RSTs 50 ms apart (per-socket limiter)",
+        lambda n, a: [(f"RST seq=RCV.NXT+{k}", n + k, 0, RST, b"") for k in (100, 200, 300)]),
+    5: ("SYN on an established connection (seq in window)",
+        lambda n, a: [("SYN seq=RCV.NXT+5", n + 5, 0, SYN, b"")]),
+    6: ("Data with exact seq and acceptable ACK (blind injection succeeds)",
+        lambda n, a: [("PSH|ACK seq=RCV.NXT ack=SND.NXT 'INJECTED'", n, a, PSH | ACK, b"INJECTED")]),
+    7: ("Data with exact seq but ACK for bytes never sent (ack = SND.NXT + 100000)",
+        lambda n, a: [("PSH|ACK ack=SND.NXT+100000", n, a + 100000, PSH | ACK, b"INJECTED")]),
+    8: ("Data with exact seq but ACK far in the past (ack = SND.NXT - 1,000,000)",
+        lambda n, a: [("PSH|ACK ack=SND.NXT-1000000", n, a - 1_000_000, PSH | ACK, b"INJECTED")]),
+    9: ("Data inside the window but not at RCV.NXT (seq = RCV.NXT + 500)",
+        lambda n, a: [("PSH|ACK seq=RCV.NXT+500 ack=SND.NXT", n + 500, a, PSH | ACK, b"INJECTED")]),
+}
+
+
+def splice(sn, real_len):
+    title = (f"{11 if real_len == 500 else 12} Out-of-order injection at RCV.NXT+500, then the real client sends "
+             f"{real_len} bytes")
+    t = scenario(sn, title, lambda n, a: [("PSH|ACK seq=RCV.NXT+500 ack=SND.NXT 'INJECTED'", n + 500, a, PSH | ACK, b"INJECTED")])
+    c, s = t[0], t[1]
+    c.sendall(b"A" * real_len); time.sleep(0.3)
+    s.setblocking(False); got = b""
+    try:
+        while True:
+            d = s.recv(4096)
+            if not d: break
+            got += d
+    except BlockingIOError:
+        pass
+    print(f"   real client sent {real_len} x 'A'; server application read {len(got)} bytes;"
+          f" tail = {got[-12:]!r}")
+
+def limiter(sn):
+    print("== 10 Host-wide limiter re-enabled: tcp_challenge_ack_limit=100, tcp_invalid_ratelimit=0")
+    open("/proc/sys/net/ipv4/tcp_invalid_ratelimit", "w").write("0")
+    open("/proc/sys/net/ipv4/tcp_challenge_ack_limit", "w").write("100")
+    c, s, cport, n, a, w = connect_pair(sn)
+    for sec in range(4):
+        # start each burst just after a wall-clock second boundary
+        time.sleep(1.0 - (time.time() % 1.0) + 0.02)
+        b = netstat()
+        for k in range(300):
+            forge(CLI, cport, SRV, PORT, n + 1 + k, 0, RST, b"")
+        time.sleep(0.2)
+        print(f"   burst {sec+1}: 300 in-window RSTs -> TCPChallengeACK+{netstat()['TCPChallengeACK'] - b['TCPChallengeACK']}")
+    print("   server socket:", alive(s))
+
+def main():
+    import sys
+    which = int(sys.argv[1])
+    sn = Sniffer(); sn.start(); time.sleep(0.1)
+    if which == 0:
+        print("kernel", os.uname().release,
+              "| tcp_challenge_ack_limit =", open("/proc/sys/net/ipv4/tcp_challenge_ack_limit").read().strip(),
+              "| tcp_invalid_ratelimit =", open("/proc/sys/net/ipv4/tcp_invalid_ratelimit").read().strip(), "ms")
+    elif which == 10:
+        limiter(sn)
+    elif which == 11:
+        splice(sn, 500)
+    elif which == 12:
+        splice(sn, 600)
+    else:
+        title, build = SCENARIOS[which]
+        scenario(sn, f"{which}  {title}", build)
+
+if __name__ == "__main__":
+    main()
+```
+`run-lab.sh`:
+
+```bash
+#!/bin/sh
+# Every scenario gets its own network namespace, so counters cannot leak between them.
+# No root: unshare -urn maps the current user to root inside a new user namespace.
+cd "$(dirname "$0")"
+unshare -urn sh -c '
+  for n in 0 1 2 3 4 5 6 7 8 9 10; do
+    unshare -n sh -c "ip link set lo up; python3 blindtcp.py $n"
+    echo
+  done'
+```
+
+### Execution output
+```text
+kernel 6.12.94+ | tcp_challenge_ack_limit = 2147483647 | tcp_invalid_ratelimit = 500 ms
+
+== 1  RST with the exact expected sequence number
+   server expects seq (RCV.NXT) = 522997070, server SND.NXT = 2015317977, server advertised window field = 512
+   forge: RST seq=RCV.NXT
+      cli->srv R   seq=522997070 ack=0 len=0
+   counters: (no counter moved)
+   server socket: recv -> ECONNRESET
+
+== 2  RST inside the window but not exact (seq = RCV.NXT + 1000)
+   server expects seq (RCV.NXT) = 1877589099, server SND.NXT = 1053161857, server advertised window field = 512
+   forge: RST seq=RCV.NXT+1000
+      cli->srv R   seq=1877590099 ack=0 len=0
+      srv->cli .   seq=1053161857 ack=1877589099 len=0
+   counters: TCPChallengeACK+1
+   server socket: recv -> EAGAIN (connection still up, nothing to read)
+
+== 3  RST outside the window (seq = RCV.NXT + 10,000,000)
+   server expects seq (RCV.NXT) = 1665436686, server SND.NXT = 3449421672, server advertised window field = 512
+   forge: RST seq=RCV.NXT+10000000
+      cli->srv R   seq=1675436686 ack=0 len=0
+   counters: (no counter moved)
+   server socket: recv -> EAGAIN (connection still up, nothing to read)
+
+== 4  Three in-window RSTs 50 ms apart (per-socket limiter)
+   server expects seq (RCV.NXT) = 386102453, server SND.NXT = 176801462, server advertised window field = 512
+   forge: RST seq=RCV.NXT+100
+   forge: RST seq=RCV.NXT+200
+   forge: RST seq=RCV.NXT+300
+      cli->srv R   seq=386102553 ack=0 len=0
+      srv->cli .   seq=176801462 ack=386102453 len=0
+      cli->srv R   seq=386102653 ack=0 len=0
+      cli->srv R   seq=386102753 ack=0 len=0
+   counters: TCPChallengeACK+1 TCPACKSkippedChallenge+2
+   server socket: recv -> EAGAIN (connection still up, nothing to read)
+
+== 5  SYN on an established connection (seq in window)
+   server expects seq (RCV.NXT) = 2544937434, server SND.NXT = 1440226311, server advertised window field = 512
+   forge: SYN seq=RCV.NXT+5
+      cli->srv S   seq=2544937439 ack=0 len=0
+      srv->cli .   seq=1440226311 ack=2544937434 len=0
+   counters: TCPChallengeACK+1 TCPSYNChallenge+1
+   server socket: recv -> EAGAIN (connection still up, nothing to read)
+
+== 6  Data with exact seq and acceptable ACK (blind injection succeeds)
+   server expects seq (RCV.NXT) = 1438511175, server SND.NXT = 3042023116, server advertised window field = 512
+   forge: PSH|ACK seq=RCV.NXT ack=SND.NXT 'INJECTED'
+      cli->srv P.  seq=1438511175 ack=3042023116 len=8
+      srv->cli .   seq=3042023116 ack=1438511183 len=0
+   counters: (no counter moved)
+   server socket: recv -> b'INJECTED'
+
+== 7  Data with exact seq but ACK for bytes never sent (ack = SND.NXT + 100000)
+   server expects seq (RCV.NXT) = 1795327183, server SND.NXT = 3944862591, server advertised window field = 512
+   forge: PSH|ACK ack=SND.NXT+100000
+      cli->srv P.  seq=1795327183 ack=3944962591 len=8
+   counters: (no counter moved)
+   server socket: recv -> EAGAIN (connection still up, nothing to read)
+
+== 8  Data with exact seq but ACK far in the past (ack = SND.NXT - 1,000,000)
+   server expects seq (RCV.NXT) = 907190198, server SND.NXT = 1803433068, server advertised window field = 512
+   forge: PSH|ACK ack=SND.NXT-1000000
+      cli->srv P.  seq=907190198 ack=1802433068 len=8
+      srv->cli .   seq=1803433068 ack=907190198 len=0
+   counters: TCPChallengeACK+1
+   server socket: recv -> EAGAIN (connection still up, nothing to read)
+
+== 9  Data inside the window but not at RCV.NXT (seq = RCV.NXT + 500)
+   server expects seq (RCV.NXT) = 2826178415, server SND.NXT = 2995569504, server advertised window field = 512
+   forge: PSH|ACK seq=RCV.NXT+500 ack=SND.NXT
+      cli->srv P.  seq=2826178915 ack=2995569504 len=8
+      srv->cli .   seq=2995569504 ack=2826178415 len=0
+   counters: (no counter moved)
+   server socket: recv -> EAGAIN (connection still up, nothing to read)
+
+== 10 Host-wide limiter re-enabled: tcp_challenge_ack_limit=100, tcp_invalid_ratelimit=0
+   burst 1: 300 in-window RSTs -> TCPChallengeACK+97
+   burst 2: 300 in-window RSTs -> TCPChallengeACK+143
+   burst 3: 300 in-window RSTs -> TCPChallengeACK+71
+   burst 4: 300 in-window RSTs -> TCPChallengeACK+137
+   server socket: recv -> EAGAIN (connection still up, nothing to read)
+```
+
+---
+
+## Reading the output
+
+### Scenario 1: Exact Sequence RST
+
+In Scenario 1, the server socket expects sequence number `RCV.NXT = 522997070`. The forged segment is an `RST` with `seq = 522997070`. 
+
+Because `seq == RCV.NXT` exactly satisfies RFC 5961 §3, Linux accepts the reset immediately. No Challenge ACK is required, so `(no counter moved)` is recorded under SNMP counters. The server application calling `recv()` receives an immediate error `ECONNRESET`, confirming that the connection state was destroyed.
+
+### Scenario 2: In-Window Mismatched RST
+
+In Scenario 2, the server expects `RCV.NXT = 1877589099`, with `SND.NXT = 1053161857` and advertised window `512`. The injected `RST` specifies `seq = 1877590099` (`RCV.NXT + 1000`), which is inside the active receive window but does not match `RCV.NXT` exactly.
+
+Under RFC 5961 §3, Linux drops the `RST` and generates a Challenge ACK (`srv->cli . seq=1053161857 ack=1877589099`). The kernel increments `TCPChallengeACK` by 1. When the server application executes `recv()`, it returns `EAGAIN`, proving the connection remains fully intact and operational.
+
+### Scenario 3: Out-of-Window RST
+
+In Scenario 3, the server expects `RCV.NXT = 1665436686` with a window of `512`. The forged segment carries `seq = 1675436686` (`RCV.NXT + 10,000,000`), which lies completely outside the receive window.
+
+Linux silently drops out-of-window resets without generating a Challenge ACK. Thus, `(no counter moved)` is reported, and `recv()` returns `EAGAIN`.
+
+### Scenario 4: Per-Socket Rate Limiter Verification
+
+In Scenario 4, three forged in-window `RST` segments (`seq = RCV.NXT + 100`, `+200`, `+300`) are transmitted 50 milliseconds apart. The default per-socket limit `tcp_invalid_ratelimit` is 500 ms.
+
+- The first `RST` (`seq = 386102553`) triggers a Challenge ACK (`seq=176801462 ack=386102453`). `TCPChallengeACK` increments by 1.
+- The second and third `RST` segments arrive within the 500 ms suppression window. `__tcp_oow_rate_limited()` throttles them. No Challenge ACKs are transmitted for these two segments.
+- `TCPACKSkippedChallenge` increments by 2. The connection remains alive (`EAGAIN`).
+
+### Scenario 5: SYN Segment on Established Connection
+
+In Scenario 5, a `SYN` segment (`seq = RCV.NXT + 5 = 2544937439`) is sent to an established connection. 
+
+Under RFC 5961 §4, Linux rejects the `SYN`, preserves the socket state, and issues a Challenge ACK (`seq=1440226311 ack=2544937434`). The kernel increments both `TCPChallengeACK` (+1) and `TCPSYNChallenge` (+1). Application read operations return `EAGAIN`.
+
+### Scenario 6: Successful Blind Data Injection
+
+In Scenario 6, a forged `PSH|ACK` segment carries the payload `'INJECTED'`, matching `seq = RCV.NXT = 1438511175` exactly, alongside a valid acknowledgment number `ack = SND.NXT = 3042023116`.
+
+Because RFC 5961 does not authenticate payload data, Linux accepts the segment as valid in-order data. The server sends a standard TCP ACK (`ack=1438511183`) covering the 8 payload bytes. No challenge counters are moved. The application `recv()` call returns `b'INJECTED'`, demonstrating that RFC 5961 alone cannot protect against off-path data injection when sequence numbers are known.
+
+### Scenario 7: Unsent Data ACK Validation
+
+In Scenario 7, data is injected with exact sequence number matching `RCV.NXT = 1795327183`, but with `ack = SND.NXT + 100000` (acknowledging bytes the server never transmitted).
+
+Under RFC 5961 §5, an ACK for unsent data is invalid. Linux drops the segment. In this kernel version instance, no challenge ACK counter is moved, and `recv()` returns `EAGAIN`.
+
+### Scenario 8: Historical Old ACK Validation
+
+In Scenario 8, data arrives with valid `seq = RCV.NXT`, but `ack = SND.NXT - 1,000,000` (acknowledging data far behind the send unacknowledged pointer `SND.UNA`).
+
+Linux identifies the invalid ACK field according to RFC 5961 §5, drops the payload, and sends a Challenge ACK (`seq=1803433068 ack=907190198`). `TCPChallengeACK` increments by 1, and `recv()` returns `EAGAIN`.
+
+### Scenario 9: Out-of-Order Data Sequence
+
+In Scenario 9, a `PSH|ACK` segment arrives with `seq = RCV.NXT + 500` (`2826178915`). 
+
+Standard TCP queueing places out-of-order data into the socket reassembly queue without triggering RFC 5961 challenge mechanisms. The server transmits a standard duplicate ACK (`ack=2826178415`) requesting the missing bytes at `RCV.NXT`. No challenge counters move, and `recv()` returns `EAGAIN`.
+
+### Scenario 10: Host-Wide Limiter Side-Channel Demonstration
+
+Scenario 10 explicitly re-enables the legacy host-wide rate limiter configuration (`tcp_challenge_ack_limit = 100`, `tcp_invalid_ratelimit = 0`) to demonstrate the behavior analyzed in CVE-2016-5696.
+
+Four consecutive bursts of 300 in-window `RST` segments are injected:
+- Burst 1: Yields `TCPChallengeACK+97`
+- Burst 2: Yields `TCPChallengeACK+143`
+- Burst 3: Yields `TCPChallengeACK+71`
+- Burst 4: Yields `TCPChallengeACK+137`
+
+The observed Challenge ACK totals fluctuate around the nominal 100 limit (71, 97, 137, 143) rather than yielding exactly 100. This variability demonstrates the kernel's randomized bucket reset interval, implemented to mitigate the side-channel predictability exploited in CVE-2016-5696.
+
+---
+
+## In production
+
+### Inspecting Sysctl Rate Limit Parameters
+
+Operators can inspect current kernel RFC 5961 rate limits using `sysctl`:
+
+```bash
+sysctl net.ipv4.tcp_challenge_ack_limit net.ipv4.tcp_invalid_ratelimit
+```
+
+To set production values dynamically:
+
+```bash
+# Set challenge ACK limit to INT_MAX (Linux default post-CVE-2016-5696) (not run here)
+sysctl -w net.ipv4.tcp_challenge_ack_limit=2147483647
+
+# Set per-socket invalid rate limit to 500ms (Linux default) (not run here)
+sysctl -w net.ipv4.tcp_invalid_ratelimit=500
+```
+
+To make changes persistent across reboots, add the settings to `/etc/sysctl.d/99-tcp-rfc5961.conf`:
+
+```text
+# /etc/sysctl.d/99-tcp-rfc5961.conf (not run here)
+net.ipv4.tcp_challenge_ack_limit = 2147483647
+net.ipv4.tcp_invalid_ratelimit = 500
+```
+
+### Monitoring SNMP Challenge ACK Counters
+
+To view RFC 5961 counters across the system, use `nstat`:
+
+```bash
+nstat -az "TCP*Challenge*"
+```
+
+Sample output from an active host:
+
+```text
+#kernel
+TCPChallengeACK                 142                0.0
+TCPSYNChallenge                 12                 0.0
+TCPACKSkippedChallenge          1084               0.0
+```
+
+Alternatively, query `/proc/net/netstat` directly:
+
+```bash
+grep TcpExt /proc/net/netstat | cut -d' ' -f68-75
+```
+
+### Socket Inspection via `ss`
+
+Inspect active socket internals, including receive window structures and sequence numbers:
+
+```bash
+ss -ti item dst 192.0.2.1
+```
+
+### Cryptographic Protection for BGP Sessions
+
+Because RFC 5961 does not protect against data injection when sequence numbers are guessed, critical routing sessions (BGP) should be configured with TCP Authentication Option (TCP-AO) or TCP-MD5 in addition to GTSM (Generalized TTL Security Mechanism).
+
+Below is an example FRRouting (`frr.conf`) configuration applying TCP-MD5 and GTSM for a BGP peer:
+
+```text
+! /etc/frr/frr.conf (not run here)
+router bgp 64512
+ neighbor 192.0.2.2 remote-as 64513
+ neighbor 192.0.2.2 password SharedSecretKey123
+ neighbor 192.0.2.2 ttl-security hops 1
+```
+
+---
+
+## Gotchas
+
+- **RFC 5961 Is Not Authentication**: RFC 5961 prevents blind reset and SYN attacks by requiring exact sequence matching, but it does not authenticate packet contents. Off-path data injection remains possible if an attacker discovers valid sequence and acknowledgment numbers.
+- **`tcp_challenge_ack_limit` Should Remain `INT_MAX`**: Lowering `net.ipv4.tcp_challenge_ack_limit` to a small integer (such as the legacy default of 100) re-introduces host-wide shared state that can potentially be exploited as a side channel (CVE-2016-5696).
+- **Per-Socket Throttle Drops Challenge ACKs**: When `tcp_invalid_ratelimit` suppresses a challenge ACK (incrementing `TCPACKSkippedChallenge`), a legitimate peer that underwent a crash-restart may experience a delay in tearing down the old connection state.
+- **Middlebox Stripping and Interference**: Some aggressive stateful firewalls or WAN optimizers strip or modify unknown TCP flags or sequence ranges, occasionally triggering false positive Challenge ACKs or dropping Challenge ACKs entirely.
+- **Asymmetric Routing and Sequence Gaps**: Asymmetric paths that cause out-of-order segment arrival do not trigger Challenge ACKs; they are handled by standard TCP reassembly queues unless the segment ACK acknowledges unsent data.
+- **SNMP Counter Ambiguity**: High rates of `TCPChallengeACK` can indicate either an active off-path brute-force attack or a misconfigured network device generating duplicate/stale control frames. Inspect `TCPSYNChallenge` to differentiate SYN flood anomalies from RST injection attempts.
+- **Interaction with TCP Window Scaling**: Large window scaling factors expand the valid in-window sequence space under RFC 793, making RFC 5961 sequence validation mandatory on modern high-speed infrastructure.
+
+---
+
+## Exercises
+
+1. **Calculate RST Attack Probability**: Given a TCP connection with a receive window (`RCV.WND`) of 4 MiB ($4,194,304$ bytes) without RFC 5961 implementation, calculate the average number of forged RST packets an off-path attacker must transmit to guarantee a 50% chance of resetting the connection. Compare this with an RFC 5961 host requiring an exact match (`seq == RCV.NXT`).
+2. **Monitor Challenge Counters Under Load**: Use `nstat -az "TCP*Challenge*"` while running a packet generation tool (such as `nping` or Scapy) in a sandbox environment to send in-window RST packets. Verify that `TCPChallengeACK` increments up to the rate allowed by `tcp_invalid_ratelimit`, and `TCPACKSkippedChallenge` increments for suppressed packets.
+3. **Analyze CVE-2016-5696 Dynamics**: Set `sysctl net.ipv4.tcp_challenge_ack_limit=100` and `net.ipv4.tcp_invalid_ratelimit=0` in an isolated test environment. Send bursts of 200 in-window RST packets per second from two distinct source sockets and observe how the host-wide ceiling causes Challenge ACKs to be dropped across sockets. Reset sysctls to defaults afterwards.
+4. **Distinguish RST vs SYN Challenge Triggers**: Write a small Python script using raw sockets or Scapy to inject (a) an in-window RST segment and (b) an in-window SYN segment into an active test TCP connection. Compare the resulting delta between `TCPChallengeACK` and `TCPSYNChallenge` in `/proc/net/netstat`.
+5. **Formulate Defense-in-Depth for BGP**: Draft a network architecture policy specifying when RFC 5961 is sufficient (e.g., standard internal web services) and where TCP-AO / TCP-MD5 and GTSM must be deployed (e.g., external eBGP sessions). Justify the policy based on the data injection security boundary.
+
+---
+
+## Verification
+
+The concepts, sysctl mechanics, and counter behaviors described in this chapter were verified in a controlled Linux laboratory environment:
+
+- **Kernel Version**: Linux `6.12.94+` (x86_64).
+- **Environment**: Linux network namespaces (`unshare -urn`) running unprivileged isolation.
+- **Sysctl Parameters Verified**:
+  - `net.ipv4.tcp_challenge_ack_limit = 2147483647` (`INT_MAX`)
+  - `net.ipv4.tcp_invalid_ratelimit = 500` (ms)
+- **Execution Verification**: The raw packet injection test suite (`blindtcp.py` executed via `run-lab.sh`) was run directly against the Linux kernel network stack. Kernel SNMP counters (`TCPChallengeACK`, `TCPSYNChallenge`, `TCPACKSkippedChallenge`) were read directly from `/proc/net/netstat` before and after segment injections.
+- **Not Run**: Production sysctl modifications (`sysctl -w`) and FRRouting BGP daemon configuration files (`frr.conf`) included under "In production" are illustrative configuration snippets marked `(not run here)`.
+
+---
+
+## Sources
+
+- **RFC 5961**: *Improving TCP's Robustness to Blind In-Window Attacks*. IETF Proposed Standard (2010). <https://www.rfc-editor.org/rfc/rfc5961.html>
+- **RFC 793**: *Transmission Control Protocol*. IETF STD 7 (1981). <https://www.rfc-editor.org/rfc/rfc793.html>
+- **RFC 5925**: *The TCP Authentication Option*. IETF Proposed Standard (2010). <https://www.rfc-editor.org/rfc/rfc5925.html>
+- **RFC 5082**: *The Generalized TTL Security Mechanism (GTSM)*. IETF Proposed Standard (2007). <https://www.rfc-editor.org/rfc/rfc5082.html>
+- **CVE-2016-5696 Detail**: National Vulnerability Database (NVD). <https://nvd.nist.gov/vuln/detail/CVE-2016-5696>
+- **Linux Kernel Documentation**: *IP Sysctl Documentation*. Linux Kernel Organization. <https://docs.kernel.org/networking/ip-sysctl.html>
+- **Linux Kernel Source**: `net/ipv4/tcp_input.c` (functions `tcp_send_challenge_ack`, `__tcp_oow_rate_limited`, `tcp_validate_incoming`). <https://git.kernel.org/>
+- **Man Pages**: `tcp(7)` — *Linux IPv4 TCP protocol implementation*. <https://man7.org/linux/man-pages/man7/tcp.7.html>
