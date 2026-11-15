@@ -125,6 +125,7 @@ humanize_dir_title() {
     linear-algebra-advanced)    printf '%s\n' "Linear Algebra (Advanced)"; return ;;
     complexity-theory)          printf '%s\n' "Complexity Theory"; return ;;
     # Networking
+    ip-routing-services)        printf '%s\n' "IP Routing and Services"; return ;;
     lab-platform)               printf '%s\n' "Lab Platform"; return ;;
     networking-foundations)     printf '%s\n' "Networking Foundations"; return ;;
     layer-2)                    printf '%s\n' "Layer 2"; return ;;
@@ -133,8 +134,8 @@ humanize_dir_title() {
     ops-automation)             printf '%s\n' "Ops and Automation"; return ;;
     edge-and-services)          printf '%s\n' "Edge and Services"; return ;;
     policy-qos-hardening)       printf '%s\n' "Policy, QoS, and Hardening"; return ;;
-    overlays-tunnels)           printf '%s\n' "Overlays and Tunnels"; return ;;
-    fabrics-multi-area)         printf '%s\n' "Fabrics and Multi-Area"; return ;;
+    a-overlays-tunnels|overlays-tunnels)           printf '%s\n' "Overlays and Tunnels"; return ;;
+    b-fabrics-multi-area|fabrics-multi-area)         printf '%s\n' "Fabrics and Multi-Area"; return ;;
     bgp-security)               printf '%s\n' "BGP Security"; return ;;
     network-forensics)          printf '%s\n' "Network Forensics"; return ;;
     lab-host-track)             printf '%s\n' "Lab Host Track"; return ;;
@@ -256,7 +257,7 @@ emit_section() {
   } >> "$TMP_FILE"
 
   for sub in "$folder"/*; do
-    if [ -d "$sub" ] && [[ ! $(basename "$sub") == _* ]]; then
+    if [ -d "$sub" ] && [[ ! $(basename "$sub") == _* && ! $(basename "$sub") == *_files ]]; then
       has_nested=1
       sub_name="$(basename "$sub")"
       sub_rel="${rel}/${sub_name}"
@@ -303,7 +304,7 @@ process_directory() {
   done < <(find "$dir" -maxdepth 1 -type f \( -name "*.qmd" -o -name "*.md" \) -print0 2>/dev/null | sort -z)
 
   for subdir in "$dir"/*; do
-    if [ -d "$subdir" ] && [[ ! $(basename "$subdir") == _* ]]; then
+    if [ -d "$subdir" ] && [[ ! $(basename "$subdir") == _* && ! $(basename "$subdir") == *_files ]]; then
       emit_section "$subdir" "content/$(basename "$dir")/$(basename "$subdir")" "        "
     fi
   done

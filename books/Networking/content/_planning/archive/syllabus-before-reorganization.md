@@ -1,0 +1,312 @@
+# Networking Journey — Syllabus A (working)
+
+**Working title:** Networking from first principles to NetOps  
+
+A personal notebook on how to learn computer networking **from scratch to expert / NetOps practice**, using **open-source and freely available lab images** (especially via [Containerlab](https://containerlab.dev/)).  
+
+No vendor certification branding. No proprietary exam blueprints. Competence is defined by **what you can design, build, break, prove, and operate**.
+
+**Lab platform:** Containerlab + free/open network OS and endpoint images (e.g. FRR, Linux, Nokia SR Linux community images, SONiC, VyOS, and other kinds that do not require paid licenses).  
+
+**Published spine (2026-08-11):** lab platform → networking foundations → L2…fabrics. Models/mental-models archived under `content/_planning/archive/`.
+
+**Diagrams:** under `images/diagram-*.svg` — illustrated topology SVGs (light canvas) + monochrome conceptual figures. Style guide: `images/README.md`.
+
+---
+
+## 0. How a world-class path is taught
+
+### 0.1 Pedagogy
+
+1. **Lab platform first** — macOS/Linux host + Containerlab before deep protocols  
+2. **Foundations before features** — TCP/IP, packets, addressing intro, then L2/L3 depth  
+3. **Lab-as-code** — topologies in git; rebuild from nothing  
+4. **Failure is curriculum** — shut links, poison routes, break MTU  
+5. **Vendor-agnostic language** — concepts first; CLI is a dialect  
+6. **Open tools only** on the main path — paid images are optional footnotes later, never required  
+
+### 0.2 Definition of “expert” here
+
+You can:
+
+- Design a multi-site L2/L3 network with clear underlay/overlay roles  
+- Implement it in Containerlab with free images  
+- Diagnose control-plane vs data-plane failures with tables + captures  
+- Apply routing policy without creating loops  
+- Automate lab lifecycle and basic config/validation  
+- Operate services with observability and recovery habits  
+
+### 0.3 Open lab stack (default)
+
+| Role | Examples (free/open) |
+|------|----------------------|
+| Orchestration | Containerlab |
+| Routing NOS | FRR, SR Linux (community), SONiC, VyOS |
+| Endpoints | Alpine/Ubuntu/Debian containers |
+| Capture | tcpdump, tshark |
+| Traffic | iperf3, mtr, scapy (as needed) |
+| Automation | Ansible, Python (scrapli/netmiko-class tools), git |
+| CI | deploy topology smoke tests |
+
+---
+
+## Journey map
+
+```
+Lab platform (macOS / Linux + Containerlab)
+  → Networking foundations (TCP/IP, packets, addressing intro)
+  → Bridging domains (L2)
+  → Addressing & forwarding (L3)
+  → Interior routing
+  → Edge routing & policy
+  → Resilience & services
+  → Filtering, QoS intro, hardening
+  → Overlays & fabrics
+  → Automation & NetOps
+  → Capstones
+```
+
+![Learning path](../../images/diagram-learning-path.svg)
+
+---
+
+# Part 00 — Front matter
+
+### Ch 00 — Syllabus (this document + variants)
+### Ch 01 — How I learn networking
+- Note-taking, lab journal, when to stop and rebuild  
+### Ch 02 — Mental models that never expire
+- Planes, encapsulation, underlay/overlay  
+
+![Planes](../../images/diagram-network-planes.svg)  
+![Encapsulation](../../images/diagram-encapsulation.svg)  
+![Underlay vs overlay](../../images/diagram-underlay-overlay.svg)
+
+### Ch 03 — Verification culture
+- Predict → observe → fix → harden  
+
+![Verify loop](../../images/diagram-verify-loop.svg)
+
+---
+
+# Part 01 — Lab craft (Containerlab + Linux)
+
+### Ch 01 — Linux networking for lab hosts
+- namespaces, veth, bridges, routes, basic filtering  
+### Ch 02 — Containerlab fundamentals
+- topology YAML, kinds, links, mgmt network, lifecycle  
+### Ch 03 — Free image matrix & resources
+- what runs without licenses; RAM/CPU planning  
+### Ch 04 — Lab hygiene
+- addressing plans, naming, git layout, diagram habit  
+
+**Lab:** deploy/destroy a triangle of open routers; export a graph.  
+
+![Triangle lab](../../images/diagram-lab-triangle.svg)
+
+**Checkpoint:** topology-as-code is muscle memory.
+
+---
+
+# Part 02 — Bridging domains (layer-2)
+
+### Ch 01 — Ethernet & MAC learning
+### Ch 02 — VLANs & trunks
+### Ch 03 — Loop prevention (spanning tree family)
+### Ch 04 — Link aggregation
+### Ch 05 — L2 failure drills
+**Labs:** multi-switch VLAN/trunk; root failover; native-VLAN mismatch.
+
+**Checkpoint:** you can heal a broken multi-switch domain with evidence.
+
+---
+
+# Part 03 — Addressing & basic forwarding
+
+### Ch 01 — IPv4 structure, subnetting, summarization
+### Ch 02 — IPv6 essentials for dual-stack labs
+### Ch 03 — Static routing & floating statics
+### Ch 04 — Host vs router behavior (ARP/ND)
+**Labs:** dual-stack; summary black-hole; static failover.
+
+---
+
+# Part 04 — Interior routing
+
+### Ch 01 — Dynamic routing ideas (distance-vector vs link-state)
+### Ch 02 — Link-state IGP in one area (adjacency, flood, SPF)
+### Ch 03 — Multi-area link-state design
+### Ch 04 — IPv6 IGP notes
+### Ch 05 — Redistribution & loop prevention
+**Labs:** triangle IGP; cost change; multi-area; filtered redistribution.
+
+**Checkpoint:** reconvergence is predictable and documented.
+
+---
+
+# Part 05 — Edge routing & policy
+
+### Ch 01 — Inter-domain routing fundamentals
+### Ch 02 — Session types & path selection mental model
+### Ch 03 — Policy (prefix filters, attributes, route-maps as idea)
+### Ch 04 — Scaling internal meshes (route reflection concepts)
+### Ch 05 — Dual-homing & traffic engineering
+**Labs:** dual upstream; policy steer; session loss drill.
+
+---
+
+# Part 06 — Resilience & network services
+
+### Ch 01 — First-hop redundancy concepts
+### Ch 02 — Address assignment & relay
+### Ch 03 — Translation at edges (NAT family)
+### Ch 04 — Time, name, and log hygiene in labs
+**Labs:** active/standby first hop; NAT edge; DHCP relay.
+
+---
+
+# Part 07 — Policy enforcement, QoS intro, hardening
+
+### Ch 01 — Packet filters (ACL thinking, direction, implicit deny)
+### Ch 02 — Protecting the control plane (concepts)
+### Ch 03 — QoS vocabulary (classify, mark, queue, shape/police)
+### Ch 04 — Device & lab hardening checklist
+**Labs:** filter lockout/recovery; simple mark/class demo.
+
+---
+
+# Part 08 — Overlays, tunnels, multicast
+
+### Ch 01 — Tunneling ideas (why encapsulate)
+### Ch 02 — Site connectivity patterns
+### Ch 03 — DC overlay intro (VXLAN-class data plane)
+### Ch 03b — Head office and branch office (Tailscale underlay, VXLAN VNI across one subnet)
+### Ch 04 — EVPN-class control plane (conceptual + lab if free images allow)
+### Ch 05 — Multicast essentials
+**Labs:** point-to-point tunnel; mini overlay fabric with open NOS.
+
+---
+
+# Part 09 — Fabrics & multi-node design
+
+### Ch 01 — Clos / leaf-spine
+### Ch 02 — Underlay design choices
+### Ch 03 — Multi-implementation labs (FRR + SR Linux + Linux endpoints)
+**Labs:** small leaf-spine; break a leaf; watch convergence.
+
+---
+
+# Part 10 — NetOps, automation, observability
+
+### Ch 01 — Config as code against lab nodes
+### Ch 02 — Containerlab in CI (smoke deploy)
+### Ch 03 — Telemetry & captures as operations
+### Ch 04 — Runbooks & incident notes
+**Labs:** Ansible/Python push; CI deploy; intentional outage write-up.
+
+---
+
+# Part 11 — Capstones
+
+### C1 — Campus-style dual core (open images)
+### C2 — Dual-homed site to “provider” edge
+### C3 — Mini fabric with overlay
+### C4 — Incident week: break, detect, restore, prevent
+
+---
+
+# Part 99 — Appendices
+
+### A — Addressing plan templates  
+### B — Free image matrix & host sizing  
+### C — Verification cheatsheet (vendor-neutral show/intent)  
+### D — Diagram library index  
+### E — Resources (RFCs, Containerlab docs, free labs, manuals)  
+### F — Deliberate exclusions (wireless deep-dive, paid-only NOS, exam cram)
+
+---
+
+## Writing order (when content starts)
+
+1. Models + Containerlab craft + diagrams  
+2. L2 + single-area IGP (highest ROI)  
+3. Edge routing dual-home  
+4. Services & filters  
+5. Multi-area / policy depth  
+6. Overlay/fabric  
+7. NetOps/CI  
+
+---
+
+## Changelog
+
+| Date | Note |
+|------|------|
+| 2026-07-24 | Initial multi-syllabus exploration |
+| 2026-07-24 | Vendor-agnostic rewrite; open images only; expert pedagogy; diagrams |
+| 2026-10-30 | Expanded **part 11** (`content/11-bgp-security/`): A Deep Dive into BGP, RPKI, Routing Attacks and Global Internet Defense (Introduction + 29 chapters). |
+| 2026-10-31 | Published **part 12** (`content/12-network-forensics/`): Advanced Behavior-Based Network Forensics Using a Cyber-Behavioral Science Approach (Overview + 13 chapters across 6 parts). |
+
+---
+
+# Published part 11 — BGP Security: A Deep Dive into BGP, RPKI, Routing Attacks and Global Internet Defense
+
+Sidebar directory: `content/11-bgp-security/`.
+
+| File | Chapter |
+|------|---------|
+| `00-why-routing-security-is-harder-than-it-looks.qmd` | Introduction: Why Routing Security Is Harder Than It Looks |
+| `01-architecture-of-global-connectivity.qmd` | Chapter 1: The Architecture of Global Connectivity |
+| `02-interdomain-routing-fundamentals.qmd` | Chapter 2: Interdomain Routing Fundamentals |
+| `03-bgp-protocol-architecture.qmd` | Chapter 3: BGP Protocol Architecture |
+| `04-bgp-path-attributes-and-policy-expression.qmd` | Chapter 4: BGP Path Attributes and Policy Expression |
+| `05-bgp-decision-process-and-route-selection.qmd` | Chapter 5: The BGP Decision Process and Route Selection |
+| `06-convergence-stability-and-propagation-dynamics.qmd` | Chapter 6: Convergence, Stability and Propagation Dynamics |
+| `07-historical-design-decisions-and-security-consequences.qmd` | Chapter 7: Historical Design Decisions and Their Security Consequences |
+| `08-threat-landscape-accidents-and-attacks.qmd` | Chapter 8: The Threat Landscape: Accidents and Intentional Attacks |
+| `09-origin-hijacking-attacks-mechanics-impact-detection.qmd` | Chapter 9: Origin Hijacking Attacks: Mechanics, Impact and Detection |
+| `10-route-leaks-and-policy-abuse.qmd` | Chapter 10: Route Leaks and Policy Abuse |
+| `11-advanced-and-emerging-routing-threats.qmd` | Chapter 11: Advanced and Emerging Routing Threats |
+| `12-routing-registries-irrs-and-limitations.qmd` | Chapter 12: The Routing Registries: IRRs and Their Limitations |
+| `13-rpki-architecture-resource-certificates-and-trust-anchors.qmd` | Chapter 13: The RPKI Architecture: Resource Certificates and Trust Anchors |
+| `14-route-origin-authorizations-core-object.qmd` | Chapter 14: Route Origin Authorizations: The Core Authorization Object |
+| `15-rpki-validation-validators-vrps-relying-parties.qmd` | Chapter 15: RPKI Validation: Validators, VRPs and Relying Parties |
+| `16-rpki-to-router-rtr-and-route-origin-validation-rov.qmd` | Chapter 16: RPKI-to-Router (RTR) and Route Origin Validation (ROV) |
+| `17-operational-consequences-of-rov.qmd` | Chapter 17: Operational Consequences of ROV: Invalid, Valid, NotFound and Real-World Effects |
+| `18-scope-and-limits-of-rpki-and-rov.qmd` | Chapter 18: The Scope and Limits of RPKI and ROV |
+| `19-complementary-mechanisms-irr-prefix-aspath-filters.qmd` | Chapter 19: Complementary Mechanisms: IRR Filtering, Prefix Filters and AS_PATH Filters |
+| `20-route-leak-detection-and-prevention-mechanisms.qmd` | Chapter 20: Route Leak Detection and Prevention Mechanisms |
+| `21-bgpsec-architecture-guarantees-deployment-reality.qmd` | Chapter 21: BGPsec: Architecture, Security Guarantees and Deployment Reality |
+| `22-aspa-autonomous-system-provider-authorizations.qmd` | Chapter 22: ASPA: Autonomous System Provider Authorizations |
+| `23-designing-and-implementing-routing-security.qmd` | Chapter 23: Designing and Implementing Routing Security in Your Network |
+| `24-configuration-examples-vendor-specific-considerations.qmd` | Chapter 24: Configuration Examples and Vendor-Specific Considerations |
+| `25-troubleshooting-routing-security-controls.qmd` | Chapter 25: Troubleshooting Routing Security Controls |
+| `26-monitoring-measurement-and-testing.qmd` | Chapter 26: Monitoring, Measurement and Testing |
+| `27-case-studies-documented-routing-incidents.qmd` | Chapter 27: Case Studies: Documented Routing Incidents |
+| `28-economics-governance-human-dimension.qmd` | Chapter 28: Economics, Governance and the Human Dimension |
+| `29-current-state-and-future-of-internet-routing-security.qmd` | Chapter 29: The Current State and Future of Internet Routing Security |
+
+---
+
+# Published part 12 — Network Forensics: Advanced Behavior-Based Network Forensics Using a Cyber-Behavioral Science Approach
+
+**Cover Image:** © dem10/Getty Images
+
+Sidebar directory: `content/12-network-forensics/`.
+
+| File | Part / Chapter | Description |
+|------|----------------|-------------|
+| `00-advanced-behavior-based-network-forensics.qmd` | Front Matter & Descriptive Outline | Descriptive outline, urgency, preface, acronyms & key terms, 6-part syllabus map |
+| `01-introduction-to-advanced-network-forensics.qmd` | Part 1 — Chapter 1: Introduction to Advanced Network Forensics | Shift from reactive artifact forensics to behavior-based interdisciplinary models |
+| `02-fundamentals-of-network-forensics-and-log-analysis.qmd` | Part 1 — Chapter 2: Fundamentals of Network Forensics and Log Analysis | Packet, flow, and log forensics, capture, DPI, parsing, evidence preservation |
+| `03-building-a-network-forensics-lab-environment.qmd` | Part 1 — Chapter 3: Building a Network Forensics Lab Environment | Safe high-fidelity lab design, adversary emulation, traffic generation, defensible evidence |
+| `04-behavioral-analysis-in-cybersecurity.qmd` | Part 2 — Chapter 4: Behavioral Analysis in Cybersecurity | Forensic cyberpsychology, profiling, emotion, group dynamics, human factors |
+| `05-cyber-forensics-behavioral-analysis-cfba.qmd` | Part 2 — Chapter 5: Cyber Forensics Behavioral Analysis (CFBA) | CFBA model, digital forensics, ML-driven scoring (CBAM / CBS), predictive attribution |
+| `06-advanced-techniques-and-tools.qmd` | Part 3 — Chapter 6: Advanced Techniques and Tools | Deception networks, honeypots, DPI/NTA, insider threat analytics, threat hunting |
+| `07-machine-learning-and-artificial-intelligence-in-forensics.qmd` | Part 3 — Chapter 7: Machine Learning and Artificial Intelligence in Forensics | Unsupervised anomaly detection, time-series forecasting, MAESTRO, XAI |
+| `08-siem-configuration-for-behavioral-log-collection.qmd` | Part 4 — Chapter 8: SIEM Configuration for Behavioral Log Collection | SIEM/UEBA standardization (ECS/OCSF), streaming enrichment, ML baselines, SOAR |
+| `09-collecting-log-streams-enterprise-edge-honeypots-auth.qmd` | Part 4 — Chapter 9: Collecting Log Streams: Enterprise, Edge, Honeypots, and Auth | Hybrid log pipelines, enterprise/edge/identity/honeypot streams, tiered storage |
+| `10-correlation-and-investigation-within-siem.qmd` | Part 4 — Chapter 10: Correlation and Investigation within SIEM | AI correlation, UEBA, NLP on logs, automated SOAR triage, MTTD/MTTR reduction |
+| `11-specialized-forensics-by-domain.qmd` | Part 5 — Chapter 11: Specialized Forensics by Domain | Frameworks and behavioral indicators for ICS/SCADA, IoT, cloud, smart cities, healthcare |
+| `12-case-studies-in-advanced-behavior-based-network-forensics.qmd` | Part 5 — Chapter 12: Case Studies in Advanced Behavior-Based Network Forensics | Case studies showing CFBA, ABS, CBFM in action, dwell time reduction |
+| `13-the-future-of-network-forensics-and-cyberpsychology.qmd` | Part 6 — Chapter 13: The Future of Network Forensics and Cyberpsychology | AI evidence processing, adaptive deception (SPADE), cognitive forensics, quantum, ethics |
