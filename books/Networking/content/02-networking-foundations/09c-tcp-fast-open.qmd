@@ -7,64 +7,318 @@ author:
 
 # TCP Fast Open
 
-## Thesis
+A new TCP connection costs one round trip before the client may send a byte: SYN, SYN-ACK, then data. For a 2 ms LAN that is noise. For a 150 ms mobile path and a 1 KB request, it is half the latency of the whole exchange. **TCP Fast Open** (TFO, RFC 7413) lets a client that has talked to a server before put data in the SYN itself, and lets the server hand that data to the application before the handshake completes. The price is a cookie the server must manage, an application that must accept the same request twice, and networks that sometimes drop SYNs that carry data. This chapter shows every one of those moving parts on Linux, in a rootless namespace lab with real counters and a packet decoder, and ends with when to turn it on.
 
-**TCP Fast Open (TFO)** lets a client send data in the first SYN (with a cookie) so short RPCs avoid a full handshake RTT. Linux exposes it via `net.ipv4.tcp_fastopen` bits: client=1, server=2, both=3. This chapter reads the sysctl from procfs.
+## Learning goals
 
-## Mental model
+- Explain the TFO cookie exchange and which connection actually saves the round trip
+- Read and set `net.ipv4.tcp_fastopen`, and know which side each bit enables
+- Use `MSG_FASTOPEN` (or `TCP_FASTOPEN_CONNECT`) on a client and `TCP_FASTOPEN` on a listener
+- Prove TFO happened with `TCP_INFO`, `TcpExt` counters, `ip tcp_metrics` and the SYN on the wire
+- Rotate the server key without failing every cached cookie
+- Say why TFO data must be idempotent and why middleboxes still matter
+
+**Version note.** The labs ran on 2026-11-13 on Linux **6.12.94+**, iproute2 **6.15.0** and Python **3.13.5**, as an unprivileged user inside `unshare -rn` (a new user and network namespace with only `lo`). The `tcp_fastopen*` sysctls are per network namespace, so they can be changed there without root on the host. `tcpdump` is not installed on the writing host, so a 50-line `AF_PACKET` decoder shows the SYNs instead. Every listing below is pasted from those runs.
+
+## How the cookie exchange works
+
+TFO adds one TCP option, kind **34** (RFC 7413 4.1.1). The first connection to a server is a normal handshake that also *asks* for a cookie; later connections present it:
 
 ```text
-  first connection: SYN + cookie request
-  later: SYN + data + cookie
+  connection 1 (no cookie cached)                 connection 2+ (cookie cached)
+
+  C ── SYN, TFO(empty) ───────────► S             C ── SYN, TFO(cookie), DATA ──► S
+  C ◄── SYN-ACK, TFO(cookie) ─────── S              S validates cookie, hands DATA
+  C ── ACK ───────────────────────► S                to the app *now*
+  C ── DATA ──────────────────────► S             C ◄── SYN-ACK (acks DATA) ───── S
+                                                  C ◄── response (can be in the
+  1 RTT before the server sees data                     same flight as SYN-ACK)
+                                                  C ── ACK ──────────────────────► S
+
+                                                  0 RTT before the server sees data
 ```
 
-| Value | Meaning |
-|-------|---------|
-| 0 | off |
-| 1 | client |
-| 2 | server |
-| 3 | client+server |
+The cookie is a MAC the server computes over the client's IP address with a secret key (Linux uses SipHash, keyed by `tcp_fastopen_key`). It proves the client recently received a packet at that address, which is what stops an attacker from spoofing source addresses to make a server do work for SYNs with data. The client caches the cookie per server address. Only connection 2 and later save the round trip.
 
-## Worked examples
+Three rules follow from the design and explain most production surprises:
 
+1. **The server may get the SYN data twice.** A retransmitted or duplicated SYN carries the same data, and RFC 7413 section 6 is explicit that the server application must tolerate it. Only idempotent requests belong in the SYN.
+2. **Falling back is always allowed.** If the cookie is wrong, missing, or the server does not support TFO, the server ignores the data and completes a normal handshake; the client retransmits the data after the handshake. Correctness does not depend on TFO; latency does.
+3. **The cookie is tied to the client address.** NAT rebinding, a new Wi-Fi network, or a load balancer that hashes to a different server with a different key means "no valid cookie" again.
+
+## The Linux knobs
+
+| Setting | Scope | Meaning |
+|---|---|---|
+| `net.ipv4.tcp_fastopen` bit `0x1` | netns | Client may send data in SYN (via `MSG_FASTOPEN` / `TCP_FASTOPEN_CONNECT`). Default value is `1`. |
+| bit `0x2` | netns | Server side enabled for listeners that set `TCP_FASTOPEN` |
+| bit `0x4` | netns | Client sends data in SYN even without a cookie (testing only) |
+| bit `0x200` | netns | Server accepts SYN data without a cookie (testing; removes the spoofing defence) |
+| bit `0x400` | netns | Server TFO on every listener, without the socket option |
+| `net.ipv4.tcp_fastopen_key` | netns | Primary key, optionally `,backup` key. Format: four 8-digit hex groups |
+| `net.ipv4.tcp_fastopen_blackhole_timeout_sec` | netns | After a detected TFO blackhole, disable active TFO for this long (doubling on repeats). `0` disables the mechanism |
+| `setsockopt(TCP_FASTOPEN, qlen)` | listener | Turn on server TFO for this socket; `qlen` caps pending TFO requests not yet through the handshake |
+| `sendto(..., MSG_FASTOPEN, addr)` | client | `connect()` + `send()` in one call |
+| `setsockopt(TCP_FASTOPEN_CONNECT, 1)` | client | Keep the usual `connect()`; the first `write()` goes in the SYN (Linux 4.11+) |
+
+The value is a bitmask, so `3` means client and server. Server TFO is opt-in **twice**: the sysctl bit and the listener's socket option. Phase D below shows what happens when only the first one is set.
+
+## Lab: one client, one server, five phases
+
+The test program runs a TFO-enabled listener on `127.0.0.1:8443` in a thread, makes `N` client connections with `MSG_FASTOPEN`, and prints for each one whether the SYN-ACK acknowledged the data the client put in the SYN (`TCPI_OPT_SYN_DATA`, bit `0x20` of `tcpi_options` in `struct tcp_info`). It finishes with the change in every `TcpExt: TCPFastOpen*` counter from `/proc/net/netstat`.
+
+```python
+# tfo.py: TCP Fast Open cookie request, then data-in-SYN, inside one netns on lo.
+# Usage: tfo.py [server_qlen]   (run inside unshare -rn after writing tcp_fastopen)
+import socket, sys, time, threading
+
+def tfo_counters():
+    lines = open("/proc/net/netstat").read().splitlines()
+    hdr, val = [l.split() for l in lines if l.startswith("TcpExt:")]
+    return {k: int(v) for k, v in zip(hdr[1:], val[1:]) if k.startswith("TCPFastOpen")}
+
+PORT = 8443
+qlen = int(sys.argv[1]) if len(sys.argv) > 1 else 16
+srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+if qlen:
+    srv.setsockopt(socket.IPPROTO_TCP, socket.TCP_FASTOPEN, qlen)
+srv.bind(("127.0.0.1", PORT)); srv.listen(16)
+
+def serve():
+    while True:
+        c, _ = srv.accept()
+        data = c.recv(100)
+        c.sendall(b"pong:" + data); c.close()
+threading.Thread(target=serve, daemon=True).start()
+
+before = tfo_counters()
+N = int(sys.argv[2]) if len(sys.argv) > 2 else 3
+for i in range(1, N + 1):
+    cli = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    # MSG_FASTOPEN = connect + send in one call; data rides in the SYN if a cookie is cached
+    cli.sendto(b"ping%d" % i, socket.MSG_FASTOPEN, ("127.0.0.1", PORT))
+    reply = cli.recv(100)
+    info = cli.getsockopt(socket.IPPROTO_TCP, socket.TCP_INFO, 256)
+    opts = info[5]                       # tcpi_options (byte 5 of struct tcp_info)
+    # TCPI_OPT_SYN_DATA (0x20): the SYN-ACK acknowledged data carried in our SYN
+    print(f"conn {i}: reply={reply!r:16} tcpi_options=0x{opts:02x} "
+          f"syn_data_acked={'yes' if opts & 0x20 else 'no'}")
+    cli.close()
+    time.sleep(0.1)
+after = tfo_counters()
+print("TcpExt deltas:", {k: after[k] - before[k] for k in after if after[k] != before[k]})
 ```
-=== /proc/sys net.ipv4.tcp_fastopen ===
-1
-/proc/sys/net/ipv4/tcp_fastopen
-/proc/sys/net/ipv4/tcp_fastopen_blackhole_timeout_sec
-/proc/sys/net/ipv4/tcp_fastopen_key
-/proc/sys/net/ipv4/tcp_fastopen=1
-/proc/sys/net/ipv4/tcp_fastopen_blackhole_timeout_sec=0
-/proc/sys/net/ipv4/tcp_fastopen_key=
-=== ss ===
-State  Recv-Q Send-Q Local Address:Port  Peer Address:Port
-LISTEN 0      128        127.0.0.1:8791       0.0.0.0:*   
-LISTEN 0      100          0.0.0.0:6080       0.0.0.0:*   
-LISTEN 0      100          0.0.0.0:6081       0.0.0.0:*   
-LISTEN 0      32         127.0.0.1:5904       0.0.0.0:*   
-LISTEN 0      32         127.0.0.1:5900       0.0.0.0:*   
-LISTEN 0      32         127.0.0.1:5902       0.0.0.0:*   
-LISTEN 0      5            0.0.0.0:2375       0.0.0.0:*   
-6.12.94+
+
+```sh
+#!/bin/sh
+# Run as: unshare -rn ./lab.sh   (unprivileged user + net namespace; no sudo)
+cd "$(dirname "$0")"; ip link set lo up
+echo "== A. netns defaults"
+for f in tcp_fastopen tcp_fastopen_blackhole_timeout_sec; do
+  echo "$f=$(cat /proc/sys/net/ipv4/$f)"; done
+echo "== B. tcp_fastopen=1 (client only): the cookie request is never answered"
+python3 tfo.py 16 2
+echo "== C. tcp_fastopen=3, listener with TCP_FASTOPEN qlen 16"
+echo 3 > /proc/sys/net/ipv4/tcp_fastopen
+python3 tfo.py 16 3
+echo "-- client cookie cache (ip tcp_metrics)"
+ip tcp_metrics show 127.0.0.1 | sed 's/fo_cookie [0-9a-f]*/fo_cookie <8 bytes>/'
+echo "== D. same sysctl, but the listener never sets TCP_FASTOPEN"
+python3 tfo.py 0 2
+echo "== E. server key rotated: cached cookie no longer validates"
+python3 tfo.py 16 1 >/dev/null     # make sure a valid cookie is cached
+echo 00000000-00000000-00000000-0000abcd > /proc/sys/net/ipv4/tcp_fastopen_key
+python3 tfo.py 16 2
+echo "== F. rotate properly: new primary key, old key kept as backup"
+python3 tfo.py 16 1 >/dev/null     # cookie under the current key ...abcd
+echo "00000000-00000000-00000000-0000beef,00000000-00000000-00000000-0000abcd" > /proc/sys/net/ipv4/tcp_fastopen_key
+cat /proc/sys/net/ipv4/tcp_fastopen_key
+python3 tfo.py 16 2
 ```
 
-This guest has **`tcp_fastopen=1`** (client enabled).
+### A–B. Defaults: the client asks, nobody answers
 
-## Trap
+```text
+$ unshare -rn ./lab.sh
+== A. netns defaults
+tcp_fastopen=1
+tcp_fastopen_blackhole_timeout_sec=0
+== B. tcp_fastopen=1 (client only): the cookie request is never answered
+conn 1: reply=b'pong:ping1'    tcpi_options=0x07 syn_data_acked=no
+conn 2: reply=b'pong:ping2'    tcpi_options=0x07 syn_data_acked=no
+TcpExt deltas: {'TCPFastOpenCookieReqd': 2}
+```
 
-**Enabling server TFO without measuring.** Some middleboxes blackhole TFO (`tcp_fastopen_blackhole_timeout_sec`).
+A fresh namespace has `tcp_fastopen=1`: client side only. The client asks for a cookie on every connection (`TCPFastOpenCookieReqd: 2`), the server side is off, so no cookie comes back and every connection is a normal handshake. Nothing breaks, nothing is faster. This is the state of most Linux hosts.
+
+### C. Both sides on
+
+```text
+== C. tcp_fastopen=3, listener with TCP_FASTOPEN qlen 16
+conn 1: reply=b'pong:ping1'    tcpi_options=0x07 syn_data_acked=no
+conn 2: reply=b'pong:ping2'    tcpi_options=0x27 syn_data_acked=yes
+conn 3: reply=b'pong:ping3'    tcpi_options=0x27 syn_data_acked=yes
+TcpExt deltas: {'TCPFastOpenActive': 2, 'TCPFastOpenPassive': 2, 'TCPFastOpenCookieReqd': 1}
+-- client cookie cache (ip tcp_metrics)
+127.0.0.1 age 0.104sec cwnd 10 rtt 44us rttvar 46us fo_mss 65495 fo_cookie <8 bytes> source 127.0.0.1
+```
+
+Connection 1 requests a cookie (`CookieReqd: 1`) and pays the round trip. Connections 2 and 3 send their data in the SYN, the server accepts it (`TCPFastOpenPassive: 2`), and `tcpi_options` gains bit `0x20`. The low bits `0x07` are timestamps, SACK and window scaling. The client's cookie cache is the TCP metrics table, keyed by destination; the script masks the cookie value. `fo_mss` is cached with it so the client knows how much data fits in the next SYN.
+
+### What the SYNs look like
+
+Run the decoder alongside two connections:
+
+```python
+# syns.py SECONDS: print every TCP SYN / SYN-ACK on lo with its options and payload size.
+import socket, struct, sys, time
+s = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(0x0003))
+s.bind(("lo", 0)); s.settimeout(0.2)
+end = time.time() + float(sys.argv[1])
+NAMES = {2: "MSS", 3: "WS", 4: "SACKOK", 8: "TS", 34: "TFO"}
+while time.time() < end:
+    try:
+        pkt, addr = s.recvfrom(65535)
+    except socket.timeout:
+        continue
+    if addr[2] == socket.PACKET_OUTGOING:          # lo shows each frame twice
+        continue
+    ip = pkt[14:]
+    if ip[0] >> 4 != 4 or ip[9] != 6:
+        continue
+    ihl = (ip[0] & 0xF) * 4; tot = struct.unpack("!H", ip[2:4])[0]
+    tcp = ip[ihl:tot]
+    sport, dport, seq, ack, off_flags = struct.unpack("!HHIIH", tcp[:14])
+    doff = (off_flags >> 12) * 4; flags = off_flags & 0x3F
+    if not flags & 0x02:
+        continue
+    opts, i, o = [], 20, tcp[20:doff]
+    i = 0
+    while i < len(o):
+        k = o[i]
+        if k == 0: break
+        if k == 1: i += 1; continue
+        ln = o[i + 1]
+        name = NAMES.get(k, str(k))
+        opts.append(f"{name}({ln - 2}B)" if k == 34 else name)
+        i += ln
+    kind = "SYN-ACK" if flags & 0x10 else "SYN    "
+    print(f"{kind} {sport:>5} -> {dport:<5} payload={len(tcp) - doff:>2}B  opts={','.join(opts)}")
+```
+
+```sh
+#!/bin/sh
+# Run as: unshare -rn ./cap.sh
+cd "$(dirname "$0")"; ip link set lo up
+echo 3 > /proc/sys/net/ipv4/tcp_fastopen
+python3 syns.py 2 & sleep 0.5
+python3 tfo.py 16 2
+wait
+```
+
+```text
+$ unshare -rn ./cap.sh
+conn 1: reply=b'pong:ping1'    tcpi_options=0x07 syn_data_acked=no
+conn 2: reply=b'pong:ping2'    tcpi_options=0x27 syn_data_acked=yes
+TcpExt deltas: {'TCPFastOpenActive': 1, 'TCPFastOpenPassive': 1, 'TCPFastOpenCookieReqd': 1}
+SYN     35170 -> 8443  payload= 0B  opts=MSS,SACKOK,TS,WS,TFO(0B)
+SYN-ACK  8443 -> 35170 payload= 0B  opts=MSS,SACKOK,TS,WS,TFO(8B)
+SYN     35176 -> 8443  payload= 5B  opts=MSS,SACKOK,TS,WS,TFO(8B)
+SYN-ACK  8443 -> 35176 payload= 0B  opts=MSS,SACKOK,TS,WS
+```
+
+The first SYN carries an **empty** TFO option: the cookie request. The SYN-ACK answers with an 8-byte cookie. The second SYN carries the cookie **and 5 bytes of payload** (`ping2`), which a normal SYN never does. Its SYN-ACK has no TFO option at all; acknowledging the data is the confirmation. If you capture with `tcpdump` on a real host, look for `tfo cookiereq`, `tfo cookie <hex>` and a non-zero `length` on a `[S]` packet.
+
+### D. The sysctl is on, the listener is not
+
+```text
+== D. same sysctl, but the listener never sets TCP_FASTOPEN
+conn 1: reply=b'pong:ping1'    tcpi_options=0x07 syn_data_acked=no
+conn 2: reply=b'pong:ping2'    tcpi_options=0x07 syn_data_acked=no
+TcpExt deltas: {'TCPFastOpenActiveFail': 2}
+```
+
+The client still had a cookie from phase C, so it sent SYN+data. This server process never called `setsockopt(TCP_FASTOPEN)`, so the kernel ignored the data and completed a normal handshake. The client noticed the data was not acknowledged (`TCPFastOpenActiveFail: 2`) and sent it again after the handshake. The replies are identical; only latency changed. Turning on `tcp_fastopen=3` fleet-wide does nothing for an application that does not opt in, unless you also set `0x400`.
+
+### E. Key rotation that breaks every cookie
+
+```text
+== E. server key rotated: cached cookie no longer validates
+conn 1: reply=b'pong:ping1'    tcpi_options=0x07 syn_data_acked=no
+conn 2: reply=b'pong:ping2'    tcpi_options=0x27 syn_data_acked=yes
+TcpExt deltas: {'TCPFastOpenActive': 1, 'TCPFastOpenActiveFail': 1, 'TCPFastOpenPassive': 1, 'TCPFastOpenPassiveFail': 1}
+```
+
+Writing a single new key replaces the old one. The client's cached cookie no longer validates: the server counts `TCPFastOpenPassiveFail`, the client counts `TCPFastOpenActiveFail`, the request is delivered after a full handshake, and the SYN-ACK carries a new cookie. Connection 2 is fast again. On one host that is one slow connection. Across a fleet behind a load balancer, rotating keys independently on each backend, or giving each backend its own random key, means a client almost never presents a cookie the backend it lands on can validate.
+
+### F. Key rotation that does not
+
+```text
+== F. rotate properly: new primary key, old key kept as backup
+00000000-00000000-00000000-0000beef,00000000-00000000-00000000-0000abcd
+conn 1: reply=b'pong:ping1'    tcpi_options=0x27 syn_data_acked=yes
+conn 2: reply=b'pong:ping2'    tcpi_options=0x27 syn_data_acked=yes
+TcpExt deltas: {'TCPFastOpenActive': 2, 'TCPFastOpenPassive': 2, 'TCPFastOpenPassiveAltKey': 1}
+```
+
+The key file takes `primary,backup`. Cookies are issued with the primary key and accepted under either. The old cookie validated against the backup (`TCPFastOpenPassiveAltKey: 1`), so even the first connection after rotation saved its round trip. Rotate in two steps: push `new,old` everywhere, wait longer than your clients' cookie lifetime, then push `new` alone. Every server behind one VIP must share the same keys.
+
+## Counters to watch in production
+
+| `TcpExt` counter (`nstat -az 'TcpExtTCPFastOpen*'`) | Rises when |
+|---|---|
+| `TCPFastOpenActive` | This host sent SYN data and it was acknowledged |
+| `TCPFastOpenActiveFail` | This host sent SYN data and it was not acknowledged (server ignored it, middlebox stripped it) |
+| `TCPFastOpenPassive` | A listener here accepted SYN data |
+| `TCPFastOpenPassiveFail` | A client presented a cookie that did not validate |
+| `TCPFastOpenPassiveAltKey` | A cookie validated against the backup key |
+| `TCPFastOpenListenOverflow` | More pending TFO requests than the listener's `qlen` |
+| `TCPFastOpenCookieReqd` | A client asked for a cookie |
+| `TCPFastOpenBlackhole` | Active TFO disabled after a suspected blackhole |
+
+A healthy TFO server has `Passive` much larger than `PassiveFail`. A client fleet whose `ActiveFail` tracks `Active` is talking to servers or paths that do not honour TFO, and is paying a retransmission for it.
+
+## Where TFO is worth it, and where it is not
+
+| Good fit | Poor fit |
+|---|---|
+| Short request/response over high RTT (RPC to a remote region, DNS over TCP/DoT to a fixed resolver) | Long-lived connections: one saved RTT per hour is nothing |
+| Clients and servers you both control, one network path | The open internet through unknown firewalls and NATs |
+| Requests that are naturally idempotent (GET, lookups) | Anything with side effects in the first bytes (non-idempotent RPC, POST) |
+| Servers behind one VIP with shared keys | Backends with independent keys behind consistent-hash LBs |
+
+On the public web, TLS already needs its own round trip, and TLS 1.3 0-RTT and QUIC 0-RTT give the same "data in the first flight" benefit with replay rules designed at the application layer (see [TLS 1.3 0-RTT and replay](../07-edge-and-services/12-tls13-0rtt-replay.qmd)). Middlebox interference is also why browsers ship with TFO off. TFO remains a sound tool inside a data centre, between your own services, and for DNS-over-TCP to resolvers you run.
+
+## Gotchas
+
+- **Two switches on the server.** `tcp_fastopen` bit `0x2` *and* `setsockopt(TCP_FASTOPEN)` (or bit `0x400`). Missing either looks like phase D.
+- **The first connection is never faster.** Benchmarks that open one connection per process measure only cookie requests.
+- **SYN data can arrive twice.** Make the first request idempotent, or do not send it in the SYN.
+- **Single-key rotation fails every cached cookie.** Use `new,old`, then `new`.
+- **Per-backend keys defeat TFO behind a load balancer.** Share keys across the pool.
+- **Cookies follow the client IP.** Clients behind changing NAT or roaming between networks fall back often.
+- **`0x200` (no cookie required) is a test switch.** It turns TFO into an amplification aid for spoofed SYNs.
+- **A blackhole timer of `0` means no automatic back-off.** If you run active TFO across networks you do not control, consider a non-zero `tcp_fastopen_blackhole_timeout_sec`.
 
 ## Boring rule
 
-Keep client TFO on if the distro default says so. Turn on server TFO only behind metrics and with app support.
+Leave the client bit on. Turn on the server side only for listeners whose first request is idempotent, behind a shared key that you rotate with a backup, and only after `TcpExtTCPFastOpenPassive` versus `PassiveFail` tells you clients are actually using it.
 
 ## Try this
 
-1. Compare app docs for `TCP_FASTOPEN`.
-2. Watch TCPFastOpen counters under load.
-3. Read RFC 7413.
+1. Repeat phase C with `tcp_fastopen=0x5` on the client side only and the server at `1`. What does the server do with data in a SYN that carries no cookie?
+2. Set the listener `qlen` to `1` and open ten TFO connections concurrently with threads. Which counter moves?
+3. Replace `MSG_FASTOPEN` in `tfo.py` with `TCP_FASTOPEN_CONNECT` (`setsockopt(IPPROTO_TCP, 30, 1)`, then `connect()` and `send()`). Confirm the SYN still carries the payload with `syns.py`.
+4. Send 2000 bytes in the SYN instead of 5. How much ends up in the SYN on `lo`, and what does `fo_mss` have to do with it?
+5. Design a key rotation runbook for ten backends behind one VIP: order of pushes, wait time, and the counters you check at each step.
 
 ## Sources
 
-- RFC 7413
-- `tcp(7)`
+- RFC 7413, TCP Fast Open: <https://www.rfc-editor.org/rfc/rfc7413>
+- Linux kernel, IP sysctl (`tcp_fastopen`, `tcp_fastopen_key`, `tcp_fastopen_blackhole_timeout_sec`): <https://docs.kernel.org/networking/ip-sysctl.html>
+- Linux kernel, SNMP counters (TcpExt TCPFastOpen*): <https://docs.kernel.org/networking/snmp_counter.html>
+- `tcp(7)` (`TCP_FASTOPEN`, `TCP_FASTOPEN_CONNECT`, `MSG_FASTOPEN`, `TCP_INFO`): <https://man7.org/linux/man-pages/man7/tcp.7.html>
+- `ip-tcp_metrics(8)`: <https://man7.org/linux/man-pages/man8/ip-tcp_metrics.8.html>
+- Radhakrishnan et al., "TCP Fast Open", CoNEXT 2011 (the original design and measurements)
+- Linux UAPI `include/uapi/linux/tcp.h` (`TCPI_OPT_SYN_DATA`): <https://github.com/torvalds/linux/blob/master/include/uapi/linux/tcp.h>
