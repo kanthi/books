@@ -1,0 +1,627 @@
+---
+title: "EVPN Multihoming: Ethernet Segments, DF Election, Split Horizon and Aliasing"
+author:
+  - name: "K19G"
+  - name: "grok-bot"
+---
+
+# EVPN Multihoming: Ethernet Segments, DF Election, Split Horizon and Aliasing
+
+Earlier in this part, the EVPN control-plane introduction showed how BGP EVPN replaces flood-and-learn with Type 2 MAC/IP and Type 3 inclusive multicast routes, while leaving multihoming Ethernet segments out of scope. This chapter is that deep dive. Here the single-homed VXLAN fabric grows a second leg: a server or switch bonded to two or more leaves, coordinated by standards-based EVPN all-active multihoming instead of a vendor MLAG peer link.
+
+MLAG solves dual-homing at the access layer by making two switches pretend to be one LACP partner over a dedicated inter-chassis peer link. That peer link is a single-vendor state-sync protocol, a split-brain hazard, and a hard ceiling of two switches. EVPN multihoming throws the peer link away. Each leaf (PE) keeps its own unique VTEP IP address, runs standard BGP EVPN to the spine route reflectors, and coordinates redundancy with its peers through four interlocking mechanisms: Ethernet Segment Identifiers (ESIs), Designated Forwarder (DF) election, split-horizon filtering, and aliasing with mass withdrawal.
+
+If you understand those four mechanisms, you can run dual-homed, three-way, or four-way active-active server attachments across mixed NOS vendors without a single proprietary sync protocol. If you miss one detail—a mismatched DF timer, a missing uplink tracker, or an accidental duplicate ESI—the failure mode is silent traffic duplication or a silent black hole.
+
+## Learning goals
+
+- Encode and read 10-octet Ethernet Segment Identifiers (Types 0 through 5) and understand how ES-Import route targets scope Type 4 routes.
+- Distinguish All-Active from Single-Active multihoming using EVPN Type 1 (Ethernet A-D per-ES and per-EVI), Type 2, and Type 4 routes.
+- Compute Designated Forwarder (DF) ownership under modulo service carving (RFC 7432), Highest Random Weight (RFC 8584), and Preference-based DF election (RFC 9785), including capability fallback rules.
+- Trace BUM traffic through MPLS ESI-label split horizon and VXLAN Local Bias so that loops and duplicate frames are prevented without an inter-switch peer link.
+- Explain how Ethernet A-D per-EVI and per-ES routes enable remote ECMP aliasing and single-route mass withdrawal on link failure.
+- Configure and verify EVPN multihoming in FRR while avoiding the operational traps that cause black holes, silent merges, and BGP route fragmentation.
+
+## Why EVPN replaces MLAG and anycast VTEPs
+
+In an MLAG pair, two leaves share a virtual VTEP IP (anycast VTEP) and synchronize MAC tables, ARP/ND entries, and port-channel state over a proprietary peer link. That design works until it does not:
+
+- **Two-node limit:** MLAG only scales to two leaves. A storage rack or high-availability appliance that needs three or four top-of-rack connections cannot use a single MLAG domain.
+- **Vendor lock-in:** Switch A and Switch B must run the same NOS—often the exact same minor release—because the peer-link state machine is proprietary.
+- **Anycast VTEP blind spots:** Because both leaves advertise the same loopback as their VTEP IP, the underlay cannot tell them apart. If Leaf 1 loses its server-facing bond, remote VTEPs still ECMP traffic to the anycast IP; Leaf 1 must bounce that traffic across the peer link to Leaf 2.
+- **Split-brain risk:** If the peer link dies while both leaves keep their uplinks up, both leaves think the other is dead and both forward BUM traffic onto the LAG, duplicating frames or triggering LACP flaps.
+
+EVPN multihoming (RFC 7432 and RFC 8365) eliminates the peer link and the shared VTEP IP:
+
+```text
+   MLAG / Anycast VTEP                  EVPN All-Active Multihoming
+  +--------------------+                +--------------------+
+  |  Remote VTEP / PE3 |                |  Remote VTEP / PE3 |
+  +---------+----------+                +---------+----------+
+            |                                     |
+       Underlay ECMP                         Underlay ECMP
+    to shared Anycast IP                 to PE1 IP and PE2 IP
+       /            \                        /            \
+  +---+---+      +---+---+              +---+---+      +---+---+
+  |  PE1  |======|  PE2  |              |  PE1  |      |  PE2  |
+  | (VTEP | Peer | (VTEP |              |VTEP .1|      |VTEP .2|
+  |  .99) | Link |  .99) |              |       |      |       |
+  +---+---+      +---+---+              +---+---+      +---+---+
+       \            /                        \            /
+        \  LACP    /                          \  LACP    /
+         \  LAG   /                            \  LAG   /
+          +------+                              +------+
+          |  CE1 |                              |  CE1 |
+          +------+                              +------+
+```
+
+In EVPN multihoming, `PE1` and `PE2` keep distinct VTEP addresses (`192.0.2.11` and `192.0.2.12`, for instance). They still present a single LACP partner identity to `CE1`—matching LACP System ID and admin key—so `CE1` hashes flows across both uplinks as a normal 802.3ad LAG. Above the leaves, however, the underlay and BGP control plane see two independent PEs attached to the same Ethernet Segment.
+
+## Ethernet Segments and the 10-octet ESI
+
+An **Ethernet Segment (ES)** is the set of links connecting a customer site or dual-homed host (`CE1`) to one or more PEs. Every Ethernet Segment is identified by a 10-octet **Ethernet Segment Identifier (ESI)** defined in RFC 7432 Section 5.
+
+Two special values are reserved:
+
+- **All zeros (`00:00:00:00:00:00:00:00:00:00`):** Indicates a single-homed attachment circuit. Remote PEs treat MACs with ESI 0 as reachable only via the advertising PE; no aliasing, no DF election, and no split-horizon suppression apply.
+- **MAX-ESI (`ff:ff:ff:ff:ff:ff:ff:ff:ff:ff`):** Reserved by RFC 7432 and MUST NOT be assigned to an actual segment.
+
+For every multihomed segment, the ESI MUST be unique across the entire EVPN network. If a CE is unmanaged or does not run a signalling protocol that derives the ESI automatically, you MUST configure a unique ESI on the PEs sharing that segment.
+
+The first octet of the ESI encodes its **Type** (0–5), and the remaining 9 octets hold the type-specific value:
+
+```text
+  0                   1                   9
+  0 1 2 3 4 5 6 7 8 9 0 ...               9
+ +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+ |  Type (1B)    |   ESI Value (9 octets)  |
+ +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+```
+
+| ESI Type | Source | 9-Octet Value Layout | Typical Use Case |
+| :--- | :--- | :--- | :--- |
+| **Type 0** | Operator-configured | Arbitrary 9-octet value | Explicit manual assignment (`00:...` prefix) |
+| **Type 1** | LACP-derived | CE LACP System MAC (6B) + CE Port Key (2B) + `0x00` (1B) | Auto-derived from CE LACPDU on managed CEs |
+| **Type 2** | MSTP-derived | MSTP Root Bridge MAC (6B) + Root Priority (2B) + `0x00` (1B) | Legacy bridged access rings running MSTP |
+| **Type 3** | MAC-based | System MAC (6B) + Local Discriminator (3B) | FRR `evpn mh es-sys-mac` + `es-id` |
+| **Type 4** | Router-ID-based | Router-ID (4B) + Local Discriminator (4B) + `0x00` (1B) | Auto-derived from PE loopback + local index |
+| **Type 5** | AS-based | Autonomous System (4B) + Local Discriminator (4B) + `0x00` (1B) | Inter-AS or ASN-scoped segment allocation |
+
+Notice how **Type 3** works in FRR: you configure a shared system MAC with `evpn mh es-sys-mac` and a 24-bit integer with `evpn mh es-id <1-16777215>` on each PE facing the same CE. FRR packs those into `03:<6B sys-mac>:<3B es-id>`. Alternatively, FRR accepts a full 10-octet Type-0 ESI string. Regardless of whether you use Type 0, Type 1, or Type 3, the rule is absolute: every PE connected to `CE1` MUST arrive at the exact same 10-octet ESI, and no two unrelated CEs may ever share one.
+
+## Redundancy modes and the EVPN route types
+
+EVPN supports two multihoming redundancy modes, signalled via the **Single-Active** bit in the ESI Label Extended Community (RFC 7432 Section 7.5):
+
+- **All-Active (`Single-Active = 0`):** The CE runs an LACP LAG across all attached PEs. All PEs in the ES forward known unicast traffic to and from the CE. Remote PEs can ECMP known unicast across every PE on the ES.
+- **Single-Active (`Single-Active = 1`):** Only one PE forwards unicast and BUM traffic for a given `<ES, VLAN>` at a time; the remaining PEs act as warm standbys (backup paths). Used when the CE cannot run a single LAG across PEs (for example, active/standby firewall pairs or legacy switches).
+
+To coordinate both modes without a peer link, PEs exchange three EVPN BGP route types (AFI 25 / SAFI 70):
+
+| Route Type | Name | Scope | Purpose in Multihoming |
+| :--- | :--- | :--- | :--- |
+| **Type 1** | Ethernet Auto-Discovery (A-D) per-ES | Per `<RD, ESI>` (Ethernet Tag = `MAX-ET` `0xFFFFFFFF`) | Carries ESI Label Ext-Comm (Single-Active flag + MPLS ESI label) and all EVI Route Targets; used for **mass withdrawal** and split-horizon label distribution. |
+| **Type 1** | Ethernet Auto-Discovery (A-D) per-EVI | Per `<RD, ESI, Ethernet Tag>` | Advertised per EVI/VLAN once the local attachment circuit is up; enables **aliasing** (All-Active ECMP) and **backup path** (Single-Active). |
+| **Type 2** | MAC/IP Advertisement | Per `<RD, EVI, MAC, IP>` | Carries the **10-octet ESI** of the segment where the MAC was learned, binding the MAC to the ES rather than only to one PE. |
+| **Type 4** | Ethernet Segment | Per `<RD, ESI, Originating Router IP>` | Discovers peer PEs on the same ES and drives **DF election**. Carries the **ES-Import Route Target** derived from the ESI. |
+
+Two routing details matter operationally:
+
+1. **ES-Import Route Target (Type 4):** For ESI types 1, 2 and 3, a PE derives the 6-octet ES-Import Route Target automatically from the high-order 6 octets of the 9-octet ESI value (the MAC address part) and attaches it to its Type 4 route. Only PEs configured with that same ESI automatically import that Type 4 route. Remote PEs that are not attached to the ES drop the Type 4 route at ingress, keeping DF election state strictly local to the PEs sharing the segment.
+2. **Type 1 per-ES Route Target fan-out:** Because a Type 1 per-ES route applies to *all* EVIs active on that Ethernet Segment, the advertising PE attaches the Route Target of every EVI on the segment to that single BGP update. If a trunk port carries 2,000 VLANs mapped to 2,000 EVIs, a single Type 1 per-ES NLRI carries 2,000 extended communities—which can exceed BGP's 4096-octet UPDATE size limit unless fragmented (see the FRR `ead-es-frag` knob and the Gotchas section).
+
+## Designated Forwarder (DF) election
+
+In All-Active mode, both `PE1` and `PE2` forward known unicast frames to `CE1`. But consider what happens when `PE3` (a remote leaf) sends a **BUM** frame—Broadcast, Unknown unicast, or Multicast—into the VXLAN or MPLS core. Under EVPN ingress replication (Type 3 IMET routes), `PE3` sends a copy of that BUM frame to *both* `PE1` and `PE2`. If both `PE1` and `PE2` forwarded that frame down to `CE1`, `CE1` would receive duplicate copies of every broadcast and ARP request.
+
+EVPN solves this with **Designated Forwarder (DF) election**. For each `<ES, Ethernet Tag>` (where the Ethernet Tag is the VLAN ID, or the lowest VLAN ID in a VLAN-aware bundle), the PEs on that ES elect exactly one PE as the **DF**.
+
+- The **DF** forwards BUM traffic arriving from the overlay core toward the CE.
+- Every **non-DF** applies the **non-DF filter**: it drops BUM traffic arriving from the core destined for that `<ES, VLAN>`.
+
+Crucially, DF election *only* governs multi-destination (BUM) traffic arriving from the core toward the CE. Known unicast traffic from the core is never subject to the DF filter; any PE on an All-Active ES forwards known unicast to the CE.
+
+### DF Algorithm 0: Modulo service carving (RFC 7432)
+
+The baseline algorithm in RFC 7432 Section 8.5 is called **service carving** (DF Alg 0):
+
+1. When an ES comes up on a PE, the PE advertises a Type 4 Ethernet Segment route containing its Originating Router's IP address and starts a **DF Wait timer** (default **3 seconds**; RFC 7432 says the value should be the same on every PE on the ES).
+2. When the timer expires, each PE collects all Type 4 routes for that ESI (including its own) and sorts the Originating Router IPs in ascending numerical order, assigning ordinals `0, 1, ..., N - 1`.
+3. For a VLAN `V` (or the lowest VLAN in a VLAN-aware bundle), the PE with ordinal `i` is elected DF when:
+   $$V \bmod N = i$$
+4. Whenever a PE joins, leaves, or loses its ES link (withdrawing its Type 4 route), `N` changes and every PE re-runs the modulo calculation.
+
+Service carving is simple and requires zero coordination beyond the Type 4 route, which is why it was the original default. It also has three well-documented pathologies, catalogued in RFC 8584 Section 1.3.1:
+
+1. **Uneven distribution on non-contiguous VLANs:** If you have two PEs (`N = 2`) and your network uses only even VLAN IDs (2, 4, 6, ...), then `V mod 2` is always `0`. Ordinal 0 (`PE1`) becomes the DF for 100% of VLANs, while `PE2` sits idle for BUM traffic.
+2. **Correlated fate across ESes:** Because the formula depends only on `V` and `N`, if `PE1` and `PE2` share 50 Ethernet Segments with the same VLANs, `PE1` is DF for the exact same VLANs on *all 50 segments*.
+3. **Needless disruption on failure:** Suppose three PEs (`N = 3`) share 200 VLANs, and `PE3` loses its ES link (`N` drops to `2`). Under `V mod N`, roughly two-thirds of *all* VLANs change their DF—including VLANs that were previously owned by `PE1` and `PE2` and had nothing to do with `PE3`.
+
+### DF Algorithm 1: Highest Random Weight and AC-DF (RFC 8584)
+
+RFC 8584 fixes all three pathologies by introducing the **DF Election Extended Community** (BGP Extended Community Type `0x06`, Subtype `0x06`) on Type 4 routes and defining **DF Alg 1: Highest Random Weight (HRW)**.
+
+The 8-octet DF Election Extended Community layout is:
+
+```text
+  0                   1                   2                   3
+  0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
+ +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+ | Type = 0x06   | SubType=0x06  | RSV | DF Alg  |    Bitmap     ~
+ +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+ ~    Bitmap     |              Reserved (3 octets)              |
+ +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+```
+
+- **DF Alg (5 bits):** `0` = default modulo, `1` = HRW.
+- **Bitmap (2 octets, spanning octets 3 and 4):** Bit 1 (the second most significant bit of the first Bitmap octet, so `0x40`) is **AC-DF** (Attachment Circuit-influenced DF). When AC-DF is set, a PE is not eligible to be DF for a VLAN until its **Ethernet A-D per-EVI** route for that `<ES, VLAN>` has been received—meaning its local attachment circuit for that VLAN is actually up. Without AC-DF, a PE with an active ES port but a down VLAN/subinterface could win DF and black-hole BUM traffic.
+- **Fallback rule:** Every PE on the ES inspects the DF Election Extended Community on all peer Type 4 routes. If *any* PE omits the extended community or advertises a different DF Alg, the PEs fall back to **DF Alg 0** (modulo) with no capabilities (RFC 8584 Section 2.2.1). A capability such as AC-DF is used only when every PE advertises it.
+
+When all PEs agree on HRW, each PE computes a pseudo-random weight for every candidate PE `Si` and `(V, Es)` pair using RFC 8584 Section 3.2:
+
+$$\text{Wrand}(V, Es, Si) = \big(1103515245 \cdot ((1103515245 \cdot Si + 12345) \oplus D(V, Es)) + 12345\big) \bmod 2^{31}$$
+
+where `D(V, Es)` is the 31-bit digest of the 14-octet stream (4-octet Ethernet Tag followed by the 10-octet ESI, network byte order): its CRC-32 with the most significant bit discarded. `Si` is the candidate PE's address; only the low-order 31 bits matter once the result is reduced mod 2^31.
+
+- The PE with the **highest weight** is elected **DF**.
+- The PE with the **second-highest weight** is elected **Backup DF (BDF)**.
+- Ties are broken by **lowest PE IP address**.
+
+Look at what HRW buys you over modulo:
+1. Even-only VLANs hash across all PEs roughly 50/50.
+2. Because the 10-octet `ESI` is inside the CRC-32 input `D(V, Es)`, the same VLAN hashes to different DFs on different Ethernet Segments.
+3. When a PE fails, *only* the VLANs for which the failed PE was DF move—and every one of them moves deterministically to the **BDF** for that `(V, Es)`. VLANs owned by surviving PEs do not move at all.
+
+### DF Algorithm 2 and 3: Preference-based DF election (RFC 9785)
+
+HRW gives you uniform statistical load balancing, which is ideal for most data-centre fabrics. Sometimes, however, an operator wants deterministic *control* over which PE is DF—for example, to steer BUM traffic onto a higher-capacity leaf, or to drain a leaf cleanly before a software upgrade without bouncing links.
+
+RFC 9785 (published June 2025, updating RFC 8584) standardizes **Preference-based DF election** by repurposing the trailing octets of the DF Election Extended Community:
+
+```text
+  0                   1                   2                   3
+  0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
+ +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+ | Type = 0x06   | SubType=0x06  | RSV | DF Alg  |D|A|  Bitmap   ~
+ +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+ ~    Bitmap     |   Reserved    |   DF Preference (2 octets)    |
+ +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+```
+
+- **DF Alg:** `2` = **Highest-Preference**, `3` = **Lowest-Preference**. All PEs on the ES must agree on Alg 2 or all agree on Alg 3; mixing Highest-Preference and Lowest-Preference falls back to DF Alg 0.
+- **D bit (Bitmap bit 0, `0x80` in the first Bitmap octet):** **Don't Preempt** (non-revertive mode). When set, an existing DF keeps its role even if a higher-preference PE recovers, avoiding a second failover hit when a repaired leaf comes back online.
+- **DF Preference (2 octets):** Unsigned integer `0–65535`, default `32767`.
+- **Tie-breaking:** If two PEs have the same winning preference, prefer the PE with the **D** bit set first; if still tied, prefer the **lowest PE IP address** (with IPv4 addresses sorting lower than IPv6 addresses).
+
+To drain `PE1` for maintenance under Alg 2 (Highest-Preference), you lower `PE1`'s preference (say from `500` to `50`). BGP updates the Type 4 route, `PE2` seamlessly takes over DF for all VLANs on that ES, and `PE1` can be reloaded with zero BUM black-holing. Note the trade-off: RFC 9785 makes the preference a per-Ethernet-Segment setting, so the winner is DF for *every* Ethernet Tag on that ES. You spread BUM load by giving different ESes different winners, not by VLAN.
+
+| Algorithm | RFC | Election Rule | Per-ES Spread | Disruption on Failure | Operator Drain Knob |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **Alg 0 (Modulo)** | RFC 7432 | `V mod N = ordinal` | No (identical across ESes) | High (surviving PEs swap VLANs) | None |
+| **Alg 1 (HRW)** | RFC 8584 | Max `Wrand(V, Es, Si)` | Yes (ESI in hash) | Minimal (only failed PE's VLANs move to BDF) | None (unless AC-DF) |
+| **Alg 2 / 3 (Pref)** | RFC 9785 | Max / Min 16-bit Preference | Per ES, chosen by the operator | Minimal with `D` bit (non-revertive) | Lower/raise `DF Preference` |
+
+## Split horizon: MPLS ESI labels vs VXLAN Local Bias
+
+DF election stops BUM loops coming *from* the core *to* the CE. Now consider the reverse direction: a BUM frame sent *by* `CE1` into the fabric.
+
+Suppose `CE1` hashes an ARP broadcast onto its link to `PE1`. `PE1` floods that ARP broadcast across the overlay to `PE2` and `PE3`. Both `PE2` and `PE3` receive it. `PE2` might even be the DF for that VLAN on `CE1`'s Ethernet Segment! If `PE2` forwarded that ARP broadcast down its link to `CE1`, `CE1` would receive its own broadcast back on the other leg of its LAG—creating a forwarding loop and corrupting `CE1`'s MAC table.
+
+EVPN prevents this with **split-horizon filtering**, and the data-plane mechanism depends on the encapsulation:
+
+### MPLS split horizon (RFC 7432 Section 8.3)
+
+In an MPLS EVPN fabric, every PE allocates an **ESI Label** for each local ES and advertises it in the ESI Label Extended Community of its Type 1 per-ES route. When `PE1` receives a BUM frame from `CE1` on ES-1 and floods it to `PE2`, `PE1` pushes `PE2`'s **ESI Label for ES-1** at the bottom of the MPLS label stack. When `PE2` pops the outer transport/IMET label and sees an ESI label matching ES-1, `PE2` drops the frame for every egress port belonging to ES-1, while still forwarding it to any single-homed hosts or other ESes on `PE2`.
+
+### VXLAN Local Bias (RFC 8365 Section 8.3.1)
+
+VXLAN headers do not have an MPLS label stack, so there is no field to carry an ESI label. Instead, VXLAN EVPN uses **Local Bias**:
+
+1. Every VTEP (NVE) tracks which remote VTEP IPs share each local ES (learned from Type 4 and Type 1 per-ES routes).
+2. When `PE2` receives a BUM frame from the VXLAN overlay, it checks the **outer source IP** of the VXLAN tunnel. If that source VTEP IP shares an ES with `PE2`, `PE2` **does not forward** the frame out of any local port on that shared ES—regardless of whether `PE2` is the DF.
+3. Because `PE2` will suppress *every* BUM frame coming from `PE1` (even if `PE1` was only flooding from a single-homed host `H1` attached to `PE1`), `PE1` cannot rely on `PE2` to deliver `H1`'s BUM traffic to `CE1`. Therefore, the ingress VTEP (`PE1`) **always** floods BUM frames locally to all its directly attached ESes, **regardless of DF state**.
+
+```text
+  Case A: CE1 sends broadcast -> PE1 (non-DF)
+    CE1 --(BUM)--> PE1 --(local)--> [other local ports]
+                    \--(VXLAN src=PE1)--> PE2 (DF) --X (dropped by Local Bias)
+                    \--(VXLAN src=PE1)--> PE3      --> [remote hosts]
+
+  Case B: Single-homed H1 on PE1 sends broadcast -> PE1 (non-DF)
+    H1  --(BUM)--> PE1 --(local)--> CE1 (forwarded despite non-DF!)
+                    \--(VXLAN src=PE1)--> PE2 (DF) --X (dropped by Local Bias)
+
+  Case C: Remote host on PE3 sends broadcast
+    PE3 --(VXLAN src=PE3)--> PE1 (non-DF) --X (dropped by non-DF filter)
+        \--(VXLAN src=PE3)--> PE2 (DF)    --> CE1 (exactly 1 copy!)
+```
+
+Notice the hard interoperability rule from RFC 8365: **MPLS ESI-label PEs and VXLAN Local-Bias PEs MUST NOT be mixed on the same Ethernet Segment.** A VXLAN PE would expect the MPLS PE to flood locally regardless of DF, while the MPLS PE would expect the DF to handle overlay-delivered BUM, resulting in either dropped traffic or duplicate frames.
+
+## Aliasing, backup path, and mass withdrawal
+
+Suppose `CE1` is dual-homed to `PE1` and `PE2` in All-Active mode, and `CE1` has 2,000 servers behind it (or 2,000 MACs). Because `CE1` hashes LACP flows deterministically, it is common for `CE1` to send all ARP/GARP frames for a given MAC `M` up the link to `PE1` only. `PE1` learns `M`, advertises a Type 2 MAC/IP route with `ESI = ES-1`, and `PE2` never sees a frame from `M` in the data plane.
+
+Without aliasing, `PE3` (a remote leaf) would see only `PE1`'s Type 2 route for `M` and send 100% of traffic for `M` to `PE1`, leaving the `PE3 -> PE2 -> CE1` path completely unused.
+
+**Aliasing** (RFC 7432 Section 8.4) solves this in the control plane:
+
+1. `PE1` and `PE2` both advertise **Type 1 Ethernet A-D per-EVI** routes for `<ES-1, EVI-100>` and **Type 1 Ethernet A-D per-ES** routes for `ES-1` with `Single-Active = 0`.
+2. When `PE3` receives `PE1`'s Type 2 route for `M` carrying non-zero `ESI = ES-1`, `PE3` does *not* bind `M` solely to `PE1`. Instead, `PE3` resolves `M` against the set of PEs that have advertised **both** a Type 1 A-D per-EVI route for `<ES-1, EVI-100>` **and** a Type 1 A-D per-ES route for `ES-1` with `Single-Active = 0`.
+3. `PE3` installs an ECMP next-hop list `[PE1, PE2]` for `M` (and for all 2,000 MACs on `ES-1`), even though `PE2` never advertised a single Type 2 route for them.
+
+RFC 7432 Section 8.4 enforces a strict ordering rule here: a remote PE **MUST NOT** use an A-D per-EVI route for forwarding until the corresponding A-D per-ES route(s) have also arrived, because the per-ES route is what carries the `Single-Active` flag and ESI label. In Single-Active mode (`Single-Active = 1`), the exact same A-D per-EVI and per-ES routes tell `PE3` which PE is the **backup path** rather than an ECMP peer.
+
+Now look at what happens when `PE1`'s link to `CE1` fails:
+
+- Without mass withdrawal, `PE1` would have to withdraw 2,000 individual Type 2 MAC/IP routes over BGP while `PE3` continued black-holing traffic to `PE1`.
+- With **mass withdrawal** (RFC 7432 Section 8.2), `PE1` immediately withdraws its **single Type 1 Ethernet A-D per-ES route** for `ES-1`.
+- The moment `PE3` processes that one BGP withdrawal, `PE3` removes `PE1` from the resolution set of `ES-1`, shifting all 2,000 MACs onto `[PE2]` in a single control-plane operation.
+
+## FRR configuration and verification
+
+FRRouting (`frr.conf`, zebra + bgpd) implements EVPN all-active multihoming as a standards-based replacement for MLAG and anycast VTEPs. Each leaf keeps a unique VTEP loopback IP, and FRR programs L2 ECMP via Linux layer-2 nexthop groups. Note that FRR implements preference-based DF election (citing the `draft-ietf-bess-evpn-pref-df` specification that became RFC 9785), and **IPv6 VTEP addresses are not supported with EVPN multihoming in FRR**.
+
+Here is a minimal configuration snippet (**from the FRR docs, not run**):
+
+```text
+! From the FRR docs, not run
+interface bond1
+ evpn mh es-id 1
+ evpn mh es-sys-mac 44:38:39:ff:ff:01
+ evpn mh es-df-pref 50000
+exit
+!
+interface swp1
+ evpn mh uplink
+exit
+```
+
+The key operational knobs in FRR's EVPN multihoming implementation (**from the FRR docs, not run**) are:
+
+- `evpn mh es-id <(1-16777215)|ESINAME>` and `evpn mh es-sys-mac <MAC>`: Generate a Type-3 ESI on the bond interface (or configure a full Type-0 ESI directly).
+- `evpn mh es-df-pref (1-16777215)`: Set the local DF preference on the ES for preference-based DF election. FRR documents this wider range even though the RFC 9785 field is 16 bits; stay within 0–65535 if you interoperate with other vendors.
+- `evpn mh uplink`: Enable uplink/core tracking on spine-facing interfaces. If all `evpn mh uplink` interfaces go down, FRR automatically places the local ES bonds into `protodown` so the CE shifts traffic to the surviving PE instead of black-holing into an isolated leaf.
+- `evpn mh startup-delay <0-3600>`: Hold ES bonds `protodown` after a leaf reboot until BGP EVPN and underlay sessions have converged.
+- `evpn mh mac-holdtime` and `evpn mh neigh-holdtime`: Control how long proxy MAC/IP and neighbour entries are held during ES transitions.
+- `disable-ead-evi-rx` / `disable-ead-evi-tx`: Interoperability knobs for third-party NOSes that do not send or process Type 1 A-D per-EVI routes.
+- `ead-es-frag evi-limit <1-1000>`: Fragment Type 1 A-D per-ES routes when a single ES carries more EVIs than fit in one BGP UPDATE.
+
+To inspect the local ES state, per-EVI DF election, and BGP EVPN Type 1/Type 4 tables on FRR, use these verification commands (**from the FRR docs, not run**):
+
+```text
+show evpn es
+show evpn es-evi
+show bgp l2vpn evpn es
+show bgp l2vpn evpn route type ead
+show bgp l2vpn evpn route type es
+```
+
+## The lab
+
+Rather than spinning up a full containerlab or FRR topology (which requires root privileges and NOS images), we can verify every bit-level encoding, DF election algorithm, Local Bias rule, and aliasing/mass-withdrawal state machine with a deterministic Python model (`evpn-mh.py`) using only the Python standard library. The script implements RFC 7432 ESI encoding, RFC 8584 HRW and extended communities, RFC 9785 preference DF election, RFC 8365 Local Bias forwarding rules, and Type 1/Type 2 route resolution.
+
+```{.python filename="evpn-mh.py"}
+#!/usr/bin/env python3
+"""EVPN multihoming model: ESI encodings, DF Election extended community,
+modulo (RFC 7432), HRW (RFC 8584) and preference (RFC 9785) DF election,
+local-bias split horizon (RFC 8365) and aliasing / mass withdrawal (RFC 7432)."""
+import ipaddress, struct, zlib, sys
+
+# ---------- 1. ESI encodings (RFC 7432 section 5) ----------
+def esi_type0(value9: bytes) -> bytes:
+    assert len(value9) == 9
+    return b"\x00" + value9
+
+def esi_type1_lacp(ce_sys_mac: str, ce_port_key: int) -> bytes:
+    mac = bytes.fromhex(ce_sys_mac.replace(":", ""))
+    return b"\x01" + mac + struct.pack("!H", ce_port_key) + b"\x00"
+
+def esi_type3_mac(sys_mac: str, discr: int) -> bytes:
+    mac = bytes.fromhex(sys_mac.replace(":", ""))
+    return b"\x03" + mac + discr.to_bytes(3, "big")
+
+def fmt_esi(e: bytes) -> str:
+    return ":".join(f"{b:02x}" for b in e)
+
+# ---------- 2. DF Election extended community (RFC 8584 2.2, RFC 9785 3) ----------
+def df_ext_comm(alg: int, ac_df=False, dont_preempt=False, pref=None) -> bytes:
+    # octet 2: RSV(3 bits) | DF Alg (5 bits)
+    b2 = alg & 0x1F
+    bitmap = 0
+    if dont_preempt: bitmap |= 0x8000   # bitmap bit 0 (D)
+    if ac_df:        bitmap |= 0x4000   # bitmap bit 1 (A)
+    tail = struct.pack("!BH", 0, pref) if pref is not None else b"\x00\x00\x00"
+    return bytes([0x06, 0x06, b2]) + struct.pack("!H", bitmap) + tail
+
+def parse_df_ext_comm(c: bytes):
+    alg = c[2] & 0x1F
+    bitmap = struct.unpack("!H", c[3:5])[0]
+    pref = struct.unpack("!H", c[6:8])[0]
+    return dict(alg=alg, D=bool(bitmap & 0x8000), A=bool(bitmap & 0x4000), pref=pref)
+
+# ---------- 3. DF election algorithms ----------
+def ipint(a): return int(ipaddress.ip_address(a))
+
+def df_modulo(pes, vlan):
+    ordered = sorted(pes, key=ipint)
+    return ordered[vlan % len(ordered)]
+
+def crc31(data: bytes) -> int:
+    return zlib.crc32(data) & 0x7FFFFFFF        # CRC-32, MSB discarded
+
+def wrand(vlan: int, esi: bytes, pe: str) -> int:
+    d = crc31(struct.pack("!I", vlan) + esi)   # 4-octet tag + 10-octet ESI
+    si = ipint(pe) & 0x7FFFFFFF                 # low-order 31 bits matter
+    return (1103515245 * ((1103515245 * si + 12345) ^ d) + 12345) % (2 ** 31)
+
+def df_hrw(pes, vlan, esi):
+    ranked = sorted(pes, key=lambda p: (-wrand(vlan, esi, p), ipint(p)))
+    return ranked[0], (ranked[1] if len(ranked) > 1 else None)
+
+def df_pref(cands, highest=True):
+    """cands: list of (pe, pref, dont_preempt). RFC 9785 4.1 e tie-breakers."""
+    best = max if highest else min
+    top = best(c[1] for c in cands)
+    tied = [c for c in cands if c[1] == top]
+    dp = [c for c in tied if c[2]]
+    pool = dp if dp else tied
+    return min(pool, key=lambda c: ipint(c[0]))[0]
+
+def effective_alg(advertised):
+    """advertised: {pe: (alg, ac_df_bit)}. Mismatch -> default (RFC 8584 2.2)."""
+    vals = set(advertised.values())
+    return vals.pop() if len(vals) == 1 else (0, False)
+
+def tally(assign):
+    out = {}
+    for pe in assign.values(): out[pe] = out.get(pe, 0) + 1
+    return dict(sorted(out.items(), key=lambda kv: ipint(kv[0])))
+
+def section(t): print(f"\n=== {t} ===")
+
+def main():
+    section("1. ESI encodings (RFC 7432 s5)")
+    e0 = esi_type0(bytes.fromhex("000000000000000a01"))
+    e1 = esi_type1_lacp("44:38:39:ff:00:01", 0x0001)
+    e3 = esi_type3_mac("44:38:39:be:ef:aa", 1)
+    for name, e in [("type0 operator", e0), ("type1 LACP", e1), ("type3 MAC+discr", e3)]:
+        print(f"  {name:16s} {fmt_esi(e)}  len={len(e)}")
+    print(f"  {'ESI 0 single':16s} {fmt_esi(bytes(10))}")
+    print(f"  {'MAX-ESI':16s} {fmt_esi(b'\xff' * 10)}")
+
+    section("2. DF Election extended community bytes")
+    for label, c in [("Alg0 default", df_ext_comm(0)),
+                     ("Alg1 HRW + AC-DF", df_ext_comm(1, ac_df=True)),
+                     ("Alg2 HighPref 32767", df_ext_comm(2, pref=32767)),
+                     ("Alg2 HighPref 500 DP", df_ext_comm(2, dont_preempt=True, pref=500))]:
+        print(f"  {label:22s} {c.hex(' ')}  -> {parse_df_ext_comm(c)}")
+
+    esi = e0
+    pes2 = ["192.0.2.11", "192.0.2.12"]
+    pes3 = ["192.0.2.11", "192.0.2.12", "192.0.2.13"]
+    even_vlans = list(range(100, 1100, 100)) + list(range(2000, 2020, 2))   # 20 even tags
+    all_vlans = list(range(100, 300))                                       # 200 tags
+
+    section("3. Modulo with two PEs and only even VLANs (RFC 8584 s1.3.1)")
+    m = {v: df_modulo(pes2, v) for v in even_vlans}
+    print("  modulo:", tally(m))
+    h = {v: df_hrw(pes2, v, esi)[0] for v in even_vlans}
+    print("  HRW   :", tally(h))
+
+    section("4. Balance over 200 consecutive VLANs, three PEs")
+    m3 = {v: df_modulo(pes3, v) for v in all_vlans}
+    h3 = {v: df_hrw(pes3, v, esi)[0] for v in all_vlans}
+    print("  modulo:", tally(m3))
+    print("  HRW   :", tally(h3))
+
+    section("5. PE 192.0.2.13 loses its ES link: how many VLANs change DF?")
+    survivors = pes3[:2]
+    m_after = {v: df_modulo(survivors, v) for v in all_vlans}
+    h_after = {v: df_hrw(survivors, v, esi)[0] for v in all_vlans}
+    def moved(before, after):
+        needless = sum(1 for v in all_vlans if before[v] != after[v] and before[v] != "192.0.2.13")
+        total = sum(1 for v in all_vlans if before[v] != after[v])
+        return total, needless
+    t, n = moved(m3, m_after); print(f"  modulo: {t} VLANs changed DF, {n} of them were NOT on the failed PE")
+    t, n = moved(h3, h_after); print(f"  HRW   : {t} VLANs changed DF, {n} of them were NOT on the failed PE")
+    bdf_ok = all(df_hrw(pes3, v, esi)[1] == h_after[v] for v in all_vlans if h3[v] == "192.0.2.13")
+    print(f"  HRW backup DF predicted every new DF for the failed PE's VLANs: {bdf_ok}")
+
+    section("6. Same VLANs on a second ES: HRW spreads by ESI, modulo cannot")
+    esi_b = esi_type0(bytes.fromhex("000000000000000a02"))
+    same = sum(1 for v in all_vlans if df_hrw(pes3, v, esi)[0] == df_hrw(pes3, v, esi_b)[0])
+    print(f"  modulo: same DF on both ESes for {sum(1 for v in all_vlans if df_modulo(pes3, v) == df_modulo(pes3, v))}/200 VLANs (ESI is not an input)")
+    print(f"  HRW   : same DF on both ESes for {same}/200 VLANs")
+
+    section("7. Algorithm agreement (RFC 8584 s2.2)")
+    print("  all HRW+AC-DF      ->", effective_alg({"192.0.2.11": (1, True), "192.0.2.12": (1, True)}))
+    print("  one PE sends Alg 0 ->", effective_alg({"192.0.2.11": (1, True), "192.0.2.12": (0, False)}))
+    print("  HighPref vs LowPref ->", effective_alg({"192.0.2.11": (2, False), "192.0.2.12": (3, False)}))
+
+    section("8. Preference election (RFC 9785 s4.1)")
+    cases = [
+        ("PE1 500 vs PE2 255, highest", [("192.0.2.11", 500, False), ("192.0.2.12", 255, False)], True),
+        ("same, lowest", [("192.0.2.11", 500, False), ("192.0.2.12", 255, False)], False),
+        ("500/DP=0 vs 500/DP=1", [("192.0.2.11", 500, False), ("192.0.2.12", 500, True)], True),
+        ("500 vs 500, no DP", [("192.0.2.12", 500, False), ("192.0.2.11", 500, False)], True),
+        ("maintenance: PE1 drops to 50", [("192.0.2.11", 50, False), ("192.0.2.12", 255, False)], True),
+    ]
+    for label, c, hi in cases:
+        print(f"  {label:30s} -> DF {df_pref(c, hi)}")
+
+    section("9. BUM forwarding with local bias (RFC 8365 s8.3.1)")
+    # PE1 and PE2 share ES1 (CE1) ; PE1 also has single-homed host H1 ; PE3 is remote
+    es_members = {"ES1": {"PE1", "PE2"}}
+    df_es1 = "PE2"   # say PE2 is DF for this VLAN
+    def egress_decision(pe, port_es, ingress, from_overlay):
+        if port_es is None:
+            return "forward (single-homed port)"
+        if not from_overlay:
+            return "forward (local bias: ingress PE always floods to its own ESes)"
+        if ingress in es_members[port_es]:
+            return "DROP (split horizon: ingress VTEP shares this ES)"
+        return "forward (DF)" if pe == df_es1 else "DROP (non-DF filter)"
+    flows = [
+        ("CE1 broadcast enters PE1 via ES1", "PE1",
+         [("PE1", "H1", None, False), ("PE2", "CE1", "ES1", True)]),
+        ("H1 broadcast enters PE1", "PE1",
+         [("PE1", "CE1", "ES1", False), ("PE2", "CE1", "ES1", True)]),
+        ("remote host broadcast enters PE3", "PE3",
+         [("PE1", "CE1", "ES1", True), ("PE2", "CE1", "ES1", True), ("PE1", "H1", None, True)]),
+    ]
+    for label, ingress, legs in flows:
+        print(f"  {label}:")
+        for pe, port, port_es, ov in legs:
+            print(f"    {pe} -> {port:3s}: {egress_decision(pe, port_es, ingress, ov)}")
+    copies = sum(1 for pe, port, port_es, ov in flows[2][2] if port == "CE1" and egress_decision(pe, port_es, "PE3", ov).startswith("forward"))
+    print(f"  copies of the remote broadcast delivered to CE1: {copies}")
+
+    section("10. Aliasing and mass withdrawal at remote PE3 (RFC 7432 s8.2, s8.4)")
+    macs = [f"02:00:00:00:{i >> 8:02x}:{i & 0xff:02x}" for i in range(2000)]
+    # CE1 hashes every source MAC to PE1, so only PE1 advertises MAC/IP routes (ESI=ES1)
+    mac_routes = {m: ("PE1", "ES1") for m in macs}
+    ead_per_es = {"ES1": {"PE1", "PE2"}}            # Ethernet A-D per ES, single-active bit 0
+    ead_per_evi = {"ES1": {"PE1", "PE2"}}           # Ethernet A-D per EVI
+    def nexthops(m):
+        adv_pe, es = mac_routes[m]
+        per_es = ead_per_es.get(es)
+        if per_es is None:                 # ES never discovered: MAC route only
+            return [adv_pe]
+        alias = per_es & ead_per_evi.get(es, set())
+        return sorted(alias | ({adv_pe} if adv_pe in per_es else set()))
+    print(f"  MAC/IP routes received: {len(mac_routes)}, all from PE1")
+    print(f"  next hops for {macs[0]}: {nexthops(macs[0])}")
+    saved = ead_per_es.pop("ES1")
+    print(f"  A-D per EVI present, A-D per ES not yet received -> {nexthops(macs[0])} (no aliasing until per-ES arrives)")
+    ead_per_es["ES1"] = saved
+    # PE1's ES link fails: PE1 withdraws its A-D per ES route (one BGP withdrawal)
+    ead_per_es["ES1"].discard("PE1"); ead_per_evi["ES1"].discard("PE1")
+    updates = 1
+    print(f"  after PE1 withdraws 1 A-D per ES route: {macs[0]} -> {nexthops(macs[0])}, {macs[-1]} -> {nexthops(macs[-1])}")
+    print(f"  BGP messages needed to repair {len(macs)} MACs: {updates} (vs {len(macs)} MAC/IP withdrawals without EAD-per-ES)")
+
+if __name__ == "__main__":
+    main()
+```
+
+Run it with `python3 evpn-mh.py` (Python 3.10 or newer, standard library only). The output below is pasted unedited from a run on 2026-11-16:
+```text
+
+=== 1. ESI encodings (RFC 7432 s5) ===
+  type0 operator   00:00:00:00:00:00:00:00:0a:01  len=10
+  type1 LACP       01:44:38:39:ff:00:01:00:01:00  len=10
+  type3 MAC+discr  03:44:38:39:be:ef:aa:00:00:01  len=10
+  ESI 0 single     00:00:00:00:00:00:00:00:00:00
+  MAX-ESI          ff:ff:ff:ff:ff:ff:ff:ff:ff:ff
+
+=== 2. DF Election extended community bytes ===
+  Alg0 default           06 06 00 00 00 00 00 00  -> {'alg': 0, 'D': False, 'A': False, 'pref': 0}
+  Alg1 HRW + AC-DF       06 06 01 40 00 00 00 00  -> {'alg': 1, 'D': False, 'A': True, 'pref': 0}
+  Alg2 HighPref 32767    06 06 02 00 00 00 7f ff  -> {'alg': 2, 'D': False, 'A': False, 'pref': 32767}
+  Alg2 HighPref 500 DP   06 06 02 80 00 00 01 f4  -> {'alg': 2, 'D': True, 'A': False, 'pref': 500}
+
+=== 3. Modulo with two PEs and only even VLANs (RFC 8584 s1.3.1) ===
+  modulo: {'192.0.2.11': 20}
+  HRW   : {'192.0.2.11': 10, '192.0.2.12': 10}
+
+=== 4. Balance over 200 consecutive VLANs, three PEs ===
+  modulo: {'192.0.2.11': 66, '192.0.2.12': 67, '192.0.2.13': 67}
+  HRW   : {'192.0.2.11': 73, '192.0.2.12': 60, '192.0.2.13': 67}
+
+=== 5. PE 192.0.2.13 loses its ES link: how many VLANs change DF? ===
+  modulo: 134 VLANs changed DF, 67 of them were NOT on the failed PE
+  HRW   : 67 VLANs changed DF, 0 of them were NOT on the failed PE
+  HRW backup DF predicted every new DF for the failed PE's VLANs: True
+
+=== 6. Same VLANs on a second ES: HRW spreads by ESI, modulo cannot ===
+  modulo: same DF on both ESes for 200/200 VLANs (ESI is not an input)
+  HRW   : same DF on both ESes for 60/200 VLANs
+
+=== 7. Algorithm agreement (RFC 8584 s2.2) ===
+  all HRW+AC-DF      -> (1, True)
+  one PE sends Alg 0 -> (0, False)
+  HighPref vs LowPref -> (0, False)
+
+=== 8. Preference election (RFC 9785 s4.1) ===
+  PE1 500 vs PE2 255, highest    -> DF 192.0.2.11
+  same, lowest                   -> DF 192.0.2.12
+  500/DP=0 vs 500/DP=1           -> DF 192.0.2.12
+  500 vs 500, no DP              -> DF 192.0.2.11
+  maintenance: PE1 drops to 50   -> DF 192.0.2.12
+
+=== 9. BUM forwarding with local bias (RFC 8365 s8.3.1) ===
+  CE1 broadcast enters PE1 via ES1:
+    PE1 -> H1 : forward (single-homed port)
+    PE2 -> CE1: DROP (split horizon: ingress VTEP shares this ES)
+  H1 broadcast enters PE1:
+    PE1 -> CE1: forward (local bias: ingress PE always floods to its own ESes)
+    PE2 -> CE1: DROP (split horizon: ingress VTEP shares this ES)
+  remote host broadcast enters PE3:
+    PE1 -> CE1: DROP (non-DF filter)
+    PE2 -> CE1: forward (DF)
+    PE1 -> H1 : forward (single-homed port)
+  copies of the remote broadcast delivered to CE1: 1
+
+=== 10. Aliasing and mass withdrawal at remote PE3 (RFC 7432 s8.2, s8.4) ===
+  MAC/IP routes received: 2000, all from PE1
+  next hops for 02:00:00:00:00:00: ['PE1', 'PE2']
+  A-D per EVI present, A-D per ES not yet received -> ['PE1'] (no aliasing until per-ES arrives)
+  after PE1 withdraws 1 A-D per ES route: 02:00:00:00:00:00 -> ['PE2'], 02:00:00:00:07:cf -> ['PE2']
+  BGP messages needed to repair 2000 MACs: 1 (vs 2000 MAC/IP withdrawals without EAD-per-ES)
+```
+
+Walk through the verified numbers from the model run:
+
+1. **ESI encodings:** Type 0 (`00:00:00:00:00:00:00:00:0a:01`), Type 1 derived from CE LACP system MAC `44:38:39:ff:00:01` and port key `1` (`01:44:38:39:ff:00:01:00:01:00`), and Type 3 derived from FRR-style `es-sys-mac` + `es-id` (`03:44:38:39:be:ef:aa:00:00:01`).
+2. **DF Election Extended Community wire bytes:**
+   - Alg 0 (modulo): `06 06 00 00 00 00 00 00`
+   - Alg 1 (HRW + AC-DF): `06 06 01 40 00 00 00 00`
+   - Alg 2 (Highest-Pref, default `32767`): `06 06 02 00 00 00 7f ff`
+   - Alg 2 (Highest-Pref `500` with Don't Preempt bit set): `06 06 02 80 00 00 01 f4`
+3. **All-even VLANs (2 PEs, 20 even VLANs):** Modulo elects `192.0.2.11` as DF for all 20 VLANs (`20/0`), leaving `192.0.2.12` idle. HRW splits them `10/10`.
+4. **3-PE balance (200 consecutive VLANs):** Modulo distributes `66/67/67`; HRW distributes `73/60/67`.
+5. **Failure disruption (`192.0.2.13` loses its ES link):** Modulo changes the DF for **134** VLANs—and **67** of those were not even on the failed PE! HRW changes **67** VLANs (only those on `.13`), with **0** needless moves, and HRW's precomputed BDF predicted every single new DF.
+6. **Multi-ES correlation (second ES with the same 200 VLANs):** Modulo elects the exact same DF on **200/200** VLANs; HRW matches on only **60/200** (close to the `1/3` random expectation), spreading BUM load across PEs.
+7. **Capability agreement:** When all PEs advertise HRW + AC-DF, HRW is selected. If even one PE advertises Alg 0, everyone falls back to default modulo. Mixing Highest-Preference (Alg 2) and Lowest-Preference (Alg 3) also falls back to default modulo.
+8. **Preference-based DF (RFC 9785):** With preferences `500` (`.11`) and `255` (`.12`), Highest-Preference elects `.11` and Lowest-Preference elects `.12`. On an equal `500/500` tie with `D` (Don't Preempt) set on `.12`, `.12` wins; with equal `500/500` and no `D` bit, the lowest IP `.11` wins. Lowering `PE1` from `500` to `50` during maintenance cleanly moves DF to `.12`.
+9. **VXLAN Local Bias:** A broadcast from `CE1` arriving at `PE1` is dropped by `PE2` toward `CE1` (split horizon). A broadcast from single-homed `H1` on `PE1` is flooded locally by `PE1` to `CE1` regardless of DF state (Local Bias) and dropped by `PE2`. A remote broadcast from `PE3` is dropped by non-DF `PE1` and forwarded by DF `PE2`, delivering **exactly 1 copy** to `CE1`.
+10. **Aliasing and mass withdrawal:** With 2,000 MACs all learned and advertised by `PE1`, `PE3` resolves every MAC to `[PE1, PE2]` once both Type 1 A-D per-EVI and A-D per-ES routes are present. Before `PE2`'s A-D per-ES route arrives, `PE3` restricts next hops to `[PE1]` only. When `PE1` fails and withdraws **1** Type 1 A-D per-ES route, all 2,000 MACs shift to `[PE2]` immediately—1 BGP withdrawal instead of 2,000.
+
+## Gotchas
+
+- **The trap: Duplicate ESI on unrelated PEs.** If you copy-paste an interface stanza and accidentally assign the same non-zero ESI to two different racks or CEs, BGP merges them into one logical Ethernet Segment. `PE-Rack1` and `PE-Rack2` will exchange Type 4 routes, elect a single DF across unrelated switches, and drop each other's BUM traffic via Local Bias split horizon.
+- **The trap: DF Wait timer mismatch.** RFC 7432 asks for the same timer on every PE of the ES. If `PE1` uses a 3-second DF timer and `PE2` uses 1 second, `PE2` runs its election before `PE1`'s Type 4 route arrives and briefly assumes it is DF for *all* VLANs, causing transient duplicate BUM frames on every link bring-up.
+- **The trap: One PE left on default DF Alg 0.** Under RFC 8584 and RFC 9785, capability negotiation is unanimous. If three PEs run HRW and you add a fourth PE (or forget a stanza on one leaf) that advertises Alg 0, *all four PEs* silently fall back to modulo service carving.
+- **The trap: All-even VLAN numbering with modulo.** Many enterprise VLAN plans use even numbers for data or odd numbers for voice. With 2 PEs and DF Alg 0, `V mod 2` puts 100% of BUM traffic on one leaf. Always verify the elected DF distribution or enable HRW.
+- **The trap: Mismatched LACP System ID or admin key.** EVPN synchronizes BGP state, not LACP PDUs. If `PE1` and `PE2` do not present the exact same LACP System ID (and port/admin key where required) to `CE1`, `CE1` sees two different partners, suspends half its bundle, and drops into single-homed or error-disabled state.
+- **The trap: Missing uplink tracking (`evpn mh uplink`).** If `PE1` loses all its spine uplinks (`swp1`, `swp2`) while `bond1` to `CE1` stays physically up, `CE1` keeps hashing 50% of its outbound flows into `PE1`, which silently black-holes them. Always pair EVPN multihoming with uplink tracking and a `startup-delay` so isolated or booting leaves hold their ES bonds `protodown`.
+- **The trap: Vendors omitting Type 1 A-D per-EVI.** Some platforms omit A-D per-EVI routes by default or require a knob to emit them. Without A-D per-EVI, remote PEs cannot alias across the ES and send 100% of unicast to whichever PE happened to learn the MAC. In FRR, check `disable-ead-evi-rx` / `disable-ead-evi-tx` only when interoperating with such a peer.
+- **The trap: Mixing MPLS ESI-label and VXLAN Local-Bias PEs on one ES.** RFC 8365 explicitly forbids mixing MPLS and VXLAN PEs on the same Ethernet Segment because their split-horizon and local-flooding contracts are opposites.
+- **The trap: IPv6 VTEPs in FRR EVPN-MH.** FRR documents that IPv6 VTEP addresses are not supported with EVPN multihoming; keep your VTEP loopbacks IPv4 even if the tenant overlay carries IPv6.
+- **The trap: Type 1 A-D per-ES BGP UPDATE fragmentation.** Because a single Type 1 A-D per-ES route carries the Route Target of every EVI on that ES, scaling to thousands of EVIs can overflow a BGP UPDATE packet. Tune `ead-es-frag evi-limit` in FRR (or equivalent vendor fragmentation knobs) before hitting high EVI counts.
+
+## The boring rule
+
+Every PE on an Ethernet Segment must agree on four things before you put traffic on the wire: the exact 10-octet ESI, the LACP partner identity, the DF election algorithm and timer, and the encapsulation split-horizon mode. Check those four in `show evpn es` and `show bgp l2vpn evpn route type es` before debugging anything above Layer 2.
+
+## Exercises
+
+1. **Manual ESI decoding:** Decode the following three 10-octet ESIs into their Type, source fields, and operational meaning:
+   - `00:11:22:33:44:55:66:77:88:99`
+   - `01:02:00:5e:00:01:00:0a:00`. Count the octets first: why is this string invalid, and what is the correct Type 1 ESI for CE LACP system MAC `02:00:5e:00:01:00` and port key `10`?
+   - `03:44:38:39:be:ef:aa:00:00:01`
+2. **Modulo vs HRW failure math:** Three PEs (`192.0.2.11`, `192.0.2.12`, `192.0.2.13`) share an ES carrying VLANs `100` through `111`. Compute the DF for each VLAN under DF Alg 0 (modulo). Now fail `192.0.2.13` and recompute. How many VLANs changed DF, and how many of those were *not* on `192.0.2.13`? Explain why HRW avoids those unnecessary moves.
+3. **Extended community debugging:** During a maintenance window you see one leaf advertising `06 06 02 80 00 00 01 f4` and its peer advertising `06 06 03 00 00 00 00 64` on the same ES. Decode both extended communities (Alg, D bit, AC-DF bit, Preference) and state which DF algorithm the two PEs will actually run.
+4. **Local Bias trace:** Draw the packet path for an ARP request sent by a single-homed server `H1` on `PE1` when `PE1` is **non-DF** and `PE2` is **DF** for VLAN 100 on `ES-1` (shared by `PE1` and `PE2` facing `CE1`), with `PE3` also in VLAN 100. Which PE delivers the ARP request to `CE1`, and why does `PE2` drop the copy it receives from `PE1`?
+5. **Aliasing and mass withdrawal:** A remote leaf `PE3` receives a Type 2 MAC/IP route for `00:11:22:33:44:55` with `ESI = ES-1` from `PE1`, plus a Type 1 A-D per-EVI route for `<ES-1, EVI 10>` from both `PE1` and `PE2`. `PE2`'s Type 1 A-D per-ES route has not arrived yet. What next-hop list may `PE3` install, and why? What changes when `PE2`'s A-D per-ES route arrives with `Single-Active = 0` versus `Single-Active = 1`?
+6. **Uplink black-hole scenario:** `PE1` and `PE2` are in All-Active mode facing `CE1`. You forget `evpn mh uplink` on `PE1`'s spine interfaces, and both spines lose their BGP/underlay links to `PE1`. Trace what happens to both north-south traffic from `CE1` and south-north BUM traffic from `PE3` if `PE1` was DF for VLAN 200.
+
+## Sources
+
+- [RFC 7432 — BGP MPLS-Based Ethernet VPN](https://datatracker.ietf.org/doc/html/rfc7432)
+- [RFC 8365 — A Network Virtualization Overlay Solution Using Ethernet VPN (EVPN)](https://datatracker.ietf.org/doc/html/rfc8365)
+- [RFC 8584 — Framework for Ethernet VPN Designated Forwarder Election Extensibility](https://datatracker.ietf.org/doc/html/rfc8584)
+- [RFC 9785 — Preference-Based EVPN Designated Forwarder (DF) Election](https://datatracker.ietf.org/doc/html/rfc9785)
+- [RFC 7209 — Requirements for Ethernet VPN (EVPN)](https://datatracker.ietf.org/doc/html/rfc7209)
+- [FRRouting BGP Documentation — EVPN Multihoming](https://docs.frrouting.org/en/latest/bgp.html#evpn-multihoming)
