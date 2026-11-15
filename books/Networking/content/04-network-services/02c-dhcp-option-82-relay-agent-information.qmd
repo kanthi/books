@@ -1,0 +1,566 @@
+---
+title: "DHCP Option 82: Relay Agent Information, Circuit IDs and the Renewal Gap"
+author:
+  - name: "K19G"
+  - name: "grok-bot"
+---
+
+# DHCP Option 82: Relay Agent Information, Circuit IDs and the Renewal Gap
+
+A DHCPv4 client identifies itself with a MAC address and optionally a Client Identifier (option 61). Both belong to the endpoint. Anyone on an access port can spoof a MAC address, swap a NIC, or plug a different device into the same jack, and the DHCP server has no way to tell whether a request came from port 7 on floor 2 or port 14 in the lobby. When you run a campus network or a broadband IPoE access plant, you often care less about *which MAC* is asking and more about *which physical port, VLAN, or subscriber circuit* the packet arrived on.
+
+RFC 3046 solves this by letting a trusted device in the path—either the DHCP relay agent itself or a Layer 2 snooping switch downstream of it—stamp topology metadata into the packet as DHCP option 82, the Relay Agent Information (RAI) option. The server reads that metadata to pin an IP address to a port, pick a subscriber profile, or feed an accounting record, and then echoes the entire option back so the relay can strip it before the client ever sees it.
+
+That design works cleanly during initial address acquisition (DORA), because broadcasts must cross the relay. It breaks at T1, halfway through the lease, when the client unicasts its `DHCPREQUEST` directly to the server's IP address and bypasses the relay altogether. Understanding option 82 means understanding both how the relay stamps and polices those sub-options and how you close that renewal gap without weakening your trust boundary.
+
+## Learning goals
+
+By the end of this chapter, you will be able to:
+
+- Decode DHCP option 82's sub-option container format and identify the core IANA-registered sub-options used in campus and ISP networks.
+- Explain the RFC 3046 trust model: why relays drop packets arriving with option 82 on untrusted ports, why `giaddr` spoofing is rejected, and why enabling DHCP snooping breaks DHCP if upstream trust is missing.
+- Configure (or audit) DHCPv4 server policies that match on `circuit-id`, `remote-id`, and raw `relay4[CODE].hex` expressions in Kea DHCPv4.
+- Decouple relay return routing from subnet selection using RFC 3527 Link Selection (sub-option 5) when `giaddr` is a loopback or management address.
+- Diagnose the T1 renewal gap and choose between RFC 5107 Server Identifier Override (sub-option 11) and server-side stashing (`stash-agent-options`) to keep renewals working.
+
+## Why Option 82 exists and where it sits
+
+As covered in the DHCP relay and NAT chapter, a DHCP relay's baseline job is simple: listen for client broadcasts on UDP port 67, populate `giaddr` with its own interface IP address, increment `hops`, and unicast the packet to the central DHCP server. Without option 82, the server knows only which Layer 3 subnet the client sits in (from `giaddr`) and whatever the client chose to put in `chaddr` and option 61.
+
+Option 82 turns the access layer into a witness. Typical deployments use it for five jobs:
+
+- **Per-port address pinning:** A lab bench, point-of-sale terminal, or industrial controller gets the same IPv4 address regardless of which hardware is plugged into a specific switch port, because the reservation keys on the port's `circuit-id` rather than its MAC address.
+- **Subscriber identification for IPoE:** In broadband access networks, customers connect over Ethernet without PPPoE. The DSLAM, OLT, or BNG inserts a `circuit-id` or `subscriber-id` so the DHCP server maps the lease to a billing account.
+- **Per-port rate plans via RADIUS:** A relay or server can pass subscriber attributes (or use RFC 4014 RADIUS Attributes) so policing and QoS templates follow the physical circuit.
+- **Location for emergency services and abuse handling:** Mapping a leased IP back to a switch, slot, port, and VLAN gives you physical location without chasing MAC tables that may have aged out weeks ago.
+- **DHCP snooping bindings:** A Layer 2 switch running DHCP snooping inspects option 82 on the way out and validates the echoed option on the way back to build its IP-to-MAC-to-port binding table.
+
+On the wire, option 82 is a standard DHCP option inside the variable-length options field after the magic cookie (`99.130.83.99`). Its value is a sequence of nested Type-Length-Value (TLV) sub-options, each with a 1-octet code and a 1-octet length:
+
+```text
+ 0                   1                   2                   3
+ 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|  Option = 82  |  Total Length | SubOpt Code 1 |  SubOpt Len 1 |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                    SubOpt 1 Value (N octets)                  |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+| SubOpt Code 2 |  SubOpt Len 2 |    SubOpt 2 Value (M octets)  |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                              ...                              |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|   End = 255   |
++-+-+-+-+-+-+-+-+
+```
+
+Note that sub-options inside option 82 do **not** have their own End (`255`) marker; the outer `Total Length` bounds the entire container, and the outer End (`255`) option terminates the DHCP options field right after option 82.
+
+The IANA BOOTP/DHCP parameters registry defines the sub-option codes. You do not need to memorize every historical assignment, but you should recognize the ones you will meet in packet captures and server configs:
+
+| Sub-option | Name | Reference | Primary purpose |
+| --- | --- | --- | --- |
+| 1 | Agent Circuit ID | RFC 3046 | Identifies the local circuit (switch port, VLAN, PVC) on the relay or snooping switch. |
+| 2 | Agent Remote ID | RFC 3046 | Identifies the remote host or access device (often switch MAC, hostname, or modem ID). |
+| 4 | DOCSIS Device Class | RFC 3256 | Classifies cable modem / CPE device type in DOCSIS plants. |
+| 5 | Link Selection | RFC 3527 | Specifies the subnet address to allocate from, independent of `giaddr`. |
+| 6 | Subscriber-ID | RFC 3993 | Carries an explicit, operator-assigned subscriber string independent of physical port. |
+| 7 | RADIUS Attributes | RFC 4014 | Embeds selected RADIUS attributes (such as `Framed-Pool`) for the DHCP server. |
+| 8 | Authentication | RFC 4030 | Carries an HMAC-SHA1/keyed digest authenticating the option 82 payload. |
+| 9 | Vendor-Specific | RFC 4243 | Enterprise-number-keyed vendor sub-options inside option 82. |
+| 10 | Relay Agent Flags | RFC 5010 | Bit flags; bit 0 (`U`) tells the server the relay received the client packet as unicast. |
+| 11 | Server Identifier Override | RFC 5107 | Tells the server to put the relay's client-facing IP in option 54 instead of its own IP. |
+| 12 | Relay Agent Identifier | RFC 6925 | Unique identifier for the relay agent itself (useful for bulk leasequery or HA). |
+| 19 | Relay Source Port | RFC 8357 | Zero-length flag: the relay sent from a non-standard UDP source port, so the reply goes back to that port (taken from the UDP header). |
+| 151 | Virtual Subnet Selection | RFC 6607 | Identifies the VRF or VPN context for overlapping address spaces. |
+| 152 | Virtual Subnet Selection Control | RFC 6607 | Control flag paired with sub-option 151 to signal VSS processing. |
+
+## Circuit IDs, Remote IDs, and opaque strings
+
+RFC 3046 deliberately leaves the internal format of sub-option 1 (Agent Circuit ID) and sub-option 2 (Agent Remote ID) unspecified. To the protocol, both are opaque octet strings. The server is expected to treat them as raw bytes—comparing them for exact equality or logging them in hex—rather than assuming a universal grammar.
+
+In practice, every switch, router, and BNG vendor formats these strings differently by default. One access switch encodes sub-option 1 as a 4-byte binary tuple (`0x0004` + 2-byte VLAN ID + 1-byte module + 1-byte port); another encodes an ASCII string like `sw-acc-07 eth1/0/7:120`; a third includes the chassis MAC in sub-option 2 while a fourth puts the system hostname there. Many platforms let you override the template with a format string, which is useful when you run a mixed-vendor access layer and want consistent reservations.
+
+```text
+Same physical port, two default encodings:
+
+Vendor A (binary):  01 06  00 04  00 78  01 07
+                    ^^ ^^  ^^^^^  ^^^^^  ^^^^^
+                    |  len type   vlan   slot/port
+
+Vendor B (ASCII):   01 16  73 77 2d 61 63 63 ... ("sw-acc-07 eth1/0/7:120")
+```
+
+Two operational consequences follow directly from this:
+
+1. Never write server-side parsers that slice bytes out of `circuit-id` based on offsets you observed on one NOS release. If you need structured fields, configure an explicit format template on the access devices or match on the full opaque value.
+2. Always capture a real `DHCPDISCOVER` at the DHCP server before writing host reservations or client classes. Guessing whether a switch sends `Gi1/0/7:120`, `GigabitEthernet1/0/7`, or 6 raw binary bytes wastes hours.
+
+## Relay rules, trust boundaries, and the snooping switch
+
+Option 82 is only useful if the DHCP server can trust that the relay—and not the client—wrote it. If any host on an access port could craft a `DHCPDISCOVER` containing `circuit-id = "executive-suite-port-1"` and have the relay forward it untouched, option 82 would be worse than useless; it would be a trivial privilege-escalation vector.
+
+RFC 3046 section 2.1 locks down the relay's behaviour with strict rules:
+
+- **Off by default:** Adding option 82 SHOULD be configurable on the relay and disabled by default.
+- **Placement:** When the relay adds option 82, it SHALL append it as the **last** option in the packet, immediately before the End (`255`) option.
+- **MTU and packet size:** If inserting option 82 would push the DHCP message past the relay's configured maximum packet size, the packet shall be forwarded **without** option 82 and an error counter SHOULD be incremented. With no such setting, the relay SHALL NOT grow the packet past the outgoing interface MTU. It does not fragment or drop the client's request just because metadata didn't fit.
+- **Stripping on reply:** When a reply (`DHCPOFFER`, `DHCPACK`, `DHCPNAK`) returns from the server, the relay (or the trusted Layer 2 element that inserted option 82) MUST remove the echoed option 82 before forwarding the packet to the client. Clients are never supposed to see relay metadata.
+- **Unicast exemption:** Relays are NOT required to intercept client-to-server unicast packets, including the `DHCPREQUEST` sent during the `RENEWING` state.
+
+The trust boundary rests on two drop rules in RFC 3046 sections 2.1 and 2.1.1:
+
+```text
+Client / Access Port              Relay Agent                     DHCP Server
+--------------------              -----------                     -----------
+1. Untrusted port:
+   DISCOVER (giaddr=0, opt82) --> [ DROP + count error ]
+
+2. Trusted port (L2 snooping switch inserted opt82):
+   DISCOVER (giaddr=0, opt82) --> [ Keep opt82, set giaddr ] ---> DISCOVER (giaddr=R, opt82)
+
+3. Any port, spoofed giaddr:
+   DISCOVER (giaddr=R_ip)     --> [ DROP + count error ]
+
+4. Valid upstream relay:
+   DISCOVER (giaddr=other)    --> [ Forward unchanged ] --------> DISCOVER (giaddr=other, ...)
+```
+
+Look closely at cases 1 and 2. Suppose you have a Layer 2 access switch performing DHCP snooping between the host and your Layer 3 distribution router (the DHCP relay). The snooping switch cannot set `giaddr` because it is bridging at Layer 2, not routing at Layer 3. It intercepts the client's broadcast `DHCPDISCOVER`, inserts option 82 (`circuit-id` + `remote-id`), and forwards the frame up its trunk port with `giaddr = 0.0.0.0`.
+
+When that packet hits the Layer 3 relay on the distribution router, the relay sees `giaddr == 0` **and** option 82 already present. By RFC 3046 section 2.1:
+
+- If the relay considers that ingress interface **untrusted** (the usual default on routers), it assumes a rogue client forged option 82. It **SHALL discard the packet** and increment an error counter. Every client behind the snooping switch loses DHCP.
+- If you mark the ingress interface (or circuit) **trusted** on the relay, the relay accepts the existing option 82, does **not** add a second option 82, fills in `giaddr` with its own interface IP, and forwards the packet to the server.
+
+Section 2.1.1 adds the complementary `giaddr` anti-spoofing rule: if a relay configured to add option 82 receives a packet with a **non-zero** `giaddr` that matches one of the relay's own IP addresses, it **SHALL discard** the packet. Otherwise—when `giaddr` is non-zero and belongs to some other downstream relay—the relay forwards the packet without touching `giaddr` and without adding a second option 82. Only the first Layer 3 relay hop (or a trusted Layer 2 insertion point ahead of it) stamps option 82.
+
+## Server behaviour and Kea DHCPv4
+
+Under RFC 3046 section 2.2, a DHCP server that understands option 82 **SHALL echo the entire option 82**—verbatim, every sub-option intact—in all replies (`DHCPOFFER`, `DHCPACK`, `DHCPNAK`), and SHOULD place it as the last option before End (`255`). Servers that do not understand option 82 simply ignore it, which breaks relays that rely on the echoed `circuit-id` to know which access port or VLAN to send the unicast/broadcast reply down.
+
+Section 2.2 also states an important rule for renewals: servers SHOULD be prepared to handle option 82 in unicast messages, **but MUST NOT expect it to always be there**, because RFC 3046 does not require relays to see unicast traffic from clients. And if a server cannot fit the full option into a reply, it SHALL send the reply without it and SHOULD count the event.
+
+Modern DHCPv4 servers like ISC Kea expose option 82 sub-options directly in subnet selection, host reservations, and client classification. According to the Kea ARM ("The DHCPv4 Server"), Kea understands these RAI sub-options natively:
+
+- `circuit-id` (1): Used for host reservations when `circuit-id` is listed in `host-reservation-identifiers`.
+- `remote-id` (2) and `subscriber-id` (6): Usable for reservations and identification via the `flex-id` hook library.
+- `link-selection` (5): Overrides `giaddr` for subnet selection (unless disabled with the compatibility knob `ignore-rai-link-selection`).
+- `server-id-override` (11): Accepted as the Server Identifier (option 54) in replies and matched on incoming `DHCPREQUEST` packets.
+- `relay-id` (12) and `relay-port` (19): Parsed and tracked for relay identification and non-standard relay ports.
+
+For any sub-option—including vendor-specific ones or raw byte matches—Kea's client classification expression language exposes `relay4[CODE].hex`. For example, to classify packets whose `remote-id` (sub-option 2) equals `0x01020304` and pin a reservation by `circuit-id`, your Kea configuration looks like this (from the Kea ARM, not run):
+
+```json
+{
+  "Dhcp4": {
+    "host-reservation-identifiers": [ "circuit-id", "hw-address" ],
+    "client-classes": [
+      {
+        "name": "matched-remote",
+        "test": "relay4[2].hex == 0x01020304"
+      }
+    ],
+    "subnet4": [
+      {
+        "id": 1,
+        "subnet": "10.20.30.0/24",
+        "pools": [ { "pool": "10.20.30.100 - 10.20.30.199" } ],
+        "reservations": [
+          {
+            "circuit-id": "'sw-acc-07 eth1/0/7:120'",
+            "ip-address": "10.20.30.77"
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+Notice the ordering in `host-reservation-identifiers`: putting `"circuit-id"` before `"hw-address"` tells Kea to check for a `circuit-id` match first and fall back to MAC-based reservations only if no `circuit-id` reservation matches.
+
+## Splitting giaddr with Link Selection (RFC 3527)
+
+In a basic relayed topology, `giaddr` does two unrelated jobs at the same time:
+
+1. **Routing:** It is the destination IP address to which the DHCP server sends its reply.
+2. **Pool selection:** It tells the DHCP server which subnet the client belongs to.
+
+That coupling breaks as soon as the relay cannot—or should not—use the client-facing subnet's gateway IP as `giaddr`. Common examples include:
+
+- The relay is a BNG or router using **unnumbered** subscriber interfaces or a single **loopback** (`10.255.0.1/32`) as its source/relay address across dozens of access VLANs.
+- Security policy forbids routing to or from the client-facing SVI, so the relay sets `giaddr` to a reachable management or core loopback address.
+- Overlapping or secondary subnets sit on the same interface, and `giaddr` only names the primary address.
+
+If the relay puts `10.255.0.1` in `giaddr` without any extra hint, the DHCP server looks up `10.255.0.1` in its subnet table, finds no matching pool, and silently drops the packet.
+
+RFC 3527 fixes this with sub-option 5, **Link Selection**. The relay keeps its reachable loopback or management IP in `giaddr` so the server knows where to send the UDP reply, and puts the target client subnet address (for example, `10.20.30.0`) inside option 82 sub-option 5:
+
+```text
+Relay (loopback 10.255.0.1)                     DHCP Server (10.99.0.10)
+-----------------------------                     ------------------------
+giaddr        = 10.255.0.1   <-- where to reply
+opt 82 sub 5  = 10.20.30.0   <-- which pool to allocate from
+                 |
+                 +---> Server allocates 10.20.30.77,
+                       sends OFFER to 10.255.0.1:67
+```
+
+RFC 3527 explicitly calls out a security dependency here: because sub-option 5 directly steers IP pool selection, a relay **must** enforce the RFC 3046 rule that discards zero-`giaddr` packets arriving with option 82 from untrusted circuits. Otherwise, a client could forge sub-option 5 and request an address from an arbitrary subnet.
+
+If you migrate from an older setup where a server ignored sub-option 5 (or if a downstream device inserts a broken Link Selection sub-option), Kea provides the boolean `ignore-rai-link-selection` flag to revert to plain `giaddr` matching.
+
+## The renewal gap: T1 unicast, Server ID Override, and stashing
+
+Now look at what happens halfway through a normal DHCPv4 lease. During initial DORA (`DISCOVER`, `OFFER`, `REQUEST` in `SELECTING`, `ACK`), the client has no IP address yet, so it broadcasts to `255.255.255.255`. The relay intercepts those broadcasts, inserts option 82, and forwards them to the server.
+
+When the client's T1 timer expires (typically 50% of the lease time), the client enters `RENEWING`. It already has an IP address (`ciaddr`), and it knows the server's IP address from option 54 (**Server Identifier**) in the original `DHCPACK`. By RFC 2131, the client **unicasts** its `DHCPREQUEST` directly to the server's IP:
+
+```text
+T = 0 (DORA):
+  Client ---[bcast]---> Relay (+opt82, +giaddr) ---> Server (sees opt82)
+
+T = T1 (RENEWING):
+  Client ---[unicast directly to Server-ID 10.99.0.10]---> Server
+            (bypasses relay: giaddr = 0, NO option 82!)
+```
+
+Because the client unicasts straight to `10.99.0.10`, the packet is routed normally across the network. It never hits the DHCP relay's UDP/67 broadcast listener. It arrives at the DHCP server with `giaddr = 0.0.0.0` and **no option 82**.
+
+Look at what breaks when your server policy depends on option 82:
+
+- **Policy rejections / NAKs:** If your server classifies clients into a pool only when `circuit-id` or `remote-id` is present, the `RENEWING` request fails classification. Depending on configuration, the server either ignores it (forcing the client to wait until T2 `REBINDING` at 87.5% of the lease to broadcast again) or sends a `DHCPNAK`, kicking the user offline immediately.
+- **Lost reservations:** A `circuit-id`-pinned reservation may fail to match at T1 if `hw-address` isn't also bound, or may conflict with dynamic pool checks.
+- **Accounting and logging gaps:** Subscriber session records or RADIUS interim updates tied to `circuit-id` lose their circuit context on every renewal.
+
+You have three ways to handle the renewal gap, and they represent different operational trade-offs:
+
+1. **Server tolerance (the RFC 3046 baseline):** Follow RFC 3046 section 2.2 literally—use option 82 during DORA to pick the subnet, class, and initial IP, and allow `RENEWING` unicasts to renew the existing lease by `ciaddr` + `chaddr` without requiring option 82. This is simple, but it means you cannot re-verify port location at T1.
+2. **RFC 5107 Server Identifier Override (sub-option 11):** The relay inserts sub-option 11 containing its **own client-facing IP address** (e.g., `10.20.30.1`). A supporting server writes that override address—instead of its own `10.99.0.10`—into option 54 (`Server Identifier`) of the `DHCPOFFER` and `DHCPACK`. When T1 arrives, the client unicasts its `DHCPREQUEST` to `10.20.30.1` (the relay). The relay receives the unicast on port 67, inserts option 82 again, sets `giaddr`, and forwards it to the real server `10.99.0.10` (which accepts the request even though option 54 doesn't match its own IP). Optionally, the relay can also set the `U` bit in **RFC 5010 Relay Agent Flags** (sub-option 10) to tell the server the client sent that message as unicast.
+3. **Server-side stashing (`stash-agent-options` in Kea):** Added in Kea 2.5.8, the global parameter `stash-agent-options` tells the server to record the option 82 sub-options from the client's initial `DHCPREQUEST` (in `SELECTING`) and behave as if those same sub-options were present on subsequent `RENEWING` requests that arrive without option 82. Here is how you enable it (from the Kea ARM, not run):
+
+```json
+{
+  "Dhcp4": {
+    "stash-agent-options": true
+  }
+}
+```
+
+Option 2 (RFC 5107) keeps the relay in the path at T1 so you get fresh `circuit-id` verification—for instance, if a subscriber moved ports mid-lease—at the cost of requiring relay and server support for sub-option 11 and keeping the relay in the renewal path. Option 3 (`stash-agent-options`) works even when the relay cannot do RFC 5107, because the server remembers the original circuit metadata for the life of the lease.
+
+## A brief note on DHCPv6
+
+DHCPv6 does not have option 82. Instead, when a DHCPv6 relay forwards a client message, it wraps the entire client packet inside a `Relay-Forw` message (RFC 8415). The relay attaches its own metadata as top-level DHCPv6 options on the `Relay-Forw` wrapper—principally **Interface-Id** (option 18, RFC 8415, analogous to `circuit-id`) and **Remote-Id** (option 37, RFC 4649, analogous to `remote-id`). Because DHCPv6 relays wrap messages in layers rather than appending options to a flat buffer, multiple relays can nest `Relay-Forw` envelopes cleanly without colliding over a single option code.
+
+## The lab
+
+This lab runs inside an isolated network namespace (`unshare -rn`) using real UDP ports 67 and 68 on the loopback interface, with a client, a relay, and a toy Kea-like DHCPv4 server running as threads over Python's standard library. Broadcasts are replaced by unicast to the relay's client-facing address (`10.20.30.1`), and the toy server enforces a subscriber policy requiring a `circuit-id` with a static reservation (`10.20.30.77`) for `"sw-acc-07 eth1/0/7:120"`. The seven scenarios verify: (1) normal DORA via the relay, including reservation matching and option 82 stripping before the client; (2) a T1 unicast `RENEW` straight to server `10.99.0.10` with `giaddr=0` and no option 82 failing with a `NAK`; (3) the same `RENEW` succeeding with `stash-agent-options` enabled; (4) `server-id-override` (`10.20.30.1`) routing the `RENEW` back through the relay with option 82; (5) untrusted-port forged option 82 drops (`dropped-untrusted-82=1`), trusted-port snooping-switch passthrough (`10.20.30.100`), and `giaddr` spoof drops (`dropped-giaddr-spoof=1`); (6) a loopback `giaddr` (`10.255.0.1`) without `link-selection` being silently ignored; and (7) the same loopback `giaddr` succeeding when `link-selection` (`10.20.30.0`) is present.
+
+```{.python filename="relay82.py"}
+#!/usr/bin/env python3
+"""DHCPv4 relay agent information (option 82) lab. Run inside `unshare -rn`.
+Real UDP 67/68 sockets on lo with lab addresses; client, relay and a toy
+server run as threads. Broadcasts are replaced by unicast to the relay's
+client-facing address so the lab needs no raw sockets."""
+import ipaddress, socket, struct, threading, time, subprocess
+
+def sh(c): subprocess.run(c, shell=True, check=True)
+sh("ip link set lo up")
+for a in ("10.20.30.1/24", "10.20.30.200/24", "10.20.30.201/24", "10.255.0.1/32", "10.99.0.10/32"):
+    sh(f"ip addr add {a} dev lo")
+
+COOKIE = b"\x63\x82\x53\x63"
+DISCOVER, OFFER, REQUEST, ACK, NAK = 1, 2, 3, 5, 6
+NAMES = {1: "DISCOVER", 2: "OFFER", 3: "REQUEST", 5: "ACK", 6: "NAK"}
+
+def build(op, xid, mac, mtype, ciaddr="0.0.0.0", yiaddr="0.0.0.0", giaddr="0.0.0.0", opts=()):
+    hdr = struct.pack("!BBBBIHH4s4s4s4s16s64s128s", op, 1, 6, 0, xid, 0, 0x8000,
+                      socket.inet_aton(ciaddr), socket.inet_aton(yiaddr), b"\0" * 4,
+                      socket.inet_aton(giaddr), mac + b"\0" * 10, b"", b"")
+    body = bytes([53, 1, mtype]) + b"".join(bytes([c, len(v)]) + v for c, v in opts)
+    return hdr + COOKIE + body + b"\xff"
+
+def parse(p):
+    op, _, _, hops, xid = struct.unpack("!BBBBI", p[:8])
+    ciaddr, yiaddr, _, giaddr = (socket.inet_ntoa(p[i:i + 4]) for i in (12, 16, 20, 24))
+    opts, i = [], 240
+    while i < len(p) and p[i] != 255:
+        if p[i] == 0: i += 1; continue
+        opts.append((p[i], p[i + 2:i + 2 + p[i + 1]])); i += 2 + p[i + 1]
+    return dict(op=op, xid=xid, ciaddr=ciaddr, yiaddr=yiaddr, giaddr=giaddr, mac=p[28:34], opts=opts)
+
+def opt(d, code): return next((v for c, v in d["opts"] if c == code), None)
+def subopts(v):
+    out, i = {}, 0
+    while i < len(v): out[v[i]] = v[i + 2:i + 2 + v[i + 1]]; i += 2 + v[i + 1]
+    return out
+def fmt82(v):
+    names = {1: "circuit-id", 2: "remote-id", 5: "link-selection", 11: "server-id-override"}
+    parts = []
+    for k, x in subopts(v).items():
+        s = socket.inet_ntoa(x) if k in (5, 11) else (x.decode() if all(32 <= b < 127 for b in x) else x.hex(":"))
+        parts.append(f"{k}:{names.get(k, k)}={s}")
+    return ", ".join(parts)
+def without(opts, code): return [(c, v) for c, v in opts if c != code]
+def reencode(p, d, giaddr=None, opts=None):
+    g = socket.inet_aton(giaddr) if giaddr else p[24:28]
+    body = b"".join(bytes([c, len(v)]) + v for c, v in (opts if opts is not None else d["opts"]))
+    return p[:24] + g + p[28:240] + body + b"\xff"
+
+# ---------------- toy server (Kea-like behaviour, documented in the chapter) ----------------
+class Server:
+    def __init__(self, stash=False):
+        self.stash, self.leases, self.stashed, self.log = stash, {}, {}, []
+        self.pools = {"10.20.30.0/24": iter(f"10.20.30.{i}" for i in range(100, 150))}
+        self.reservations = {b"sw-acc-07 eth1/0/7:120": "10.20.30.77"}   # host-reservation by circuit-id
+        self.s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); self.s.bind(("10.99.0.10", 67))
+    def select_subnet(self, d, rai):
+        sel = rai.get(5)
+        key = socket.inet_ntoa(sel) if sel else (d["giaddr"] if d["giaddr"] != "0.0.0.0" else d["ciaddr"])
+        for net in self.pools:
+            if ipaddress.ip_address(key) in ipaddress.ip_network(net): return net, key
+        return None, key
+    def serve(self):
+        while True:
+            p, src = self.s.recvfrom(4096)
+            if p == b"stop": return
+            d = parse(p); mtype = opt(d, 53)[0]; o82 = opt(d, 82)
+            rai = subopts(o82) if o82 else {}
+            if not o82 and self.stash and mtype == REQUEST and d["ciaddr"] in self.stashed:
+                o82 = self.stashed[d["ciaddr"]]; rai = subopts(o82)
+                self.log.append(f"server: RENEW from {d['ciaddr']} had no option 82; using stashed copy")
+            net, key = self.select_subnet(d, rai)
+            self.log.append(f"server: {NAMES[mtype]} giaddr={d['giaddr']} ciaddr={d['ciaddr']} "
+                            f"opt82={'['+fmt82(o82)+']' if o82 else 'absent'} -> subnet {net} (selected by {key})")
+            cid = rai.get(1)
+            if net is None:
+                continue                                    # no subnet: silently ignored
+            if mtype == DISCOVER:
+                ip = self.reservations.get(cid) or next(self.pools[net]); reply = OFFER
+            else:
+                want = opt(d, 50); ip = socket.inet_ntoa(want) if want else d["ciaddr"]
+                if not cid:
+                    reply = NAK                              # policy: subscriber subnet requires circuit-id
+                    self.log.append("server: subscriber subnet requires circuit-id -> NAK")
+                else:
+                    reply = ACK; self.leases[ip] = cid
+                    if self.stash and d["ciaddr"] == "0.0.0.0": self.stashed[ip] = o82
+            sid = rai.get(11) or socket.inet_aton("10.99.0.10")   # RFC 5107: use override as server-id
+            opts = [(54, sid)] + ([(1, b"\xff\xff\xff\x00"), (51, struct.pack("!I", 3600))] if reply != NAK else [])
+            if o82 and d["giaddr"] != "0.0.0.0": opts.append((82, o82))   # RFC 3046 2.2: echo as last option
+            out = build(2, d["xid"], d["mac"], reply, yiaddr=ip if reply != NAK else "0.0.0.0", giaddr=d["giaddr"], opts=opts)
+            dst = (d["giaddr"], 67) if d["giaddr"] != "0.0.0.0" else (d["ciaddr"], 68)
+            self.s.sendto(out, dst)
+
+# ---------------- relay agent ----------------
+class Relay:
+    def __init__(self, link_selection=False, sid_override=False, giaddr="10.20.30.1"):
+        self.ls, self.sido, self.giaddr = link_selection, sid_override, giaddr
+        self.counters, self.log = {"dropped-untrusted-82": 0, "dropped-giaddr-spoof": 0}, []
+        self.s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); self.s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.s.bind(("0.0.0.0", 67))                         # client side 10.20.30.1, server side giaddr
+        self.trusted = {"10.20.30.201"}                      # port behind a snooping switch
+        self.mine = {"10.20.30.1", "10.255.0.1"}
+        self.clients, self.port_by_mac = {}, {}
+    PORTS = {"10.20.30.200": b"sw-acc-07 eth1/0/7:120", "10.20.30.201": b"sw-acc-09 eth1/0/2:120"}
+    def circuit(self, src, mac):
+        # a real relay knows the arrival port; the lab maps source address -> port and remembers it per MAC
+        if src[0] in self.PORTS: self.port_by_mac[mac] = self.PORTS[src[0]]
+        return self.port_by_mac[mac]
+    def serve(self):
+        while True:
+            p, src = self.s.recvfrom(4096)
+            if p == b"stop": return
+            d = parse(p)
+            if d["op"] == 2: self.from_server(p, d); continue
+            o82 = opt(d, 82)
+            if d["giaddr"] in self.mine:
+                self.counters["dropped-giaddr-spoof"] += 1
+                self.log.append(f"relay: drop {NAMES[opt(d,53)[0]]} from {src[0]}: giaddr {d['giaddr']} is one of mine")
+                continue
+            if o82 and d["giaddr"] == "0.0.0.0" and src[0] not in self.trusted:
+                self.counters["dropped-untrusted-82"] += 1
+                self.log.append(f"relay: drop {NAMES[opt(d,53)[0]]} from {src[0]}: option 82 present, giaddr 0, untrusted circuit")
+                continue
+            opts = d["opts"]
+            if not o82:
+                cid = self.circuit(src, d["mac"])
+                sub = bytes([1, len(cid)]) + cid + bytes([2, 6]) + bytes.fromhex("02005e00aa07")
+                if self.ls: sub += bytes([5, 4]) + socket.inet_aton("10.20.30.0")
+                if self.sido: sub += bytes([11, 4]) + socket.inet_aton("10.20.30.1")
+                opts = opts + [(82, sub)]                    # last option, before END
+            else:
+                self.log.append(f"relay: option 82 from trusted {src[0]} kept, no second copy added")
+            self.clients[d["xid"]] = src
+            self.s.sendto(reencode(p, d, giaddr=self.giaddr, opts=opts), ("10.99.0.10", 67))
+            if d["ciaddr"] != "0.0.0.0": self.log.append(f"relay: RENEW from {d['ciaddr']} arrived at the relay; forwarded with option 82")
+    def from_server(self, p, d):
+        stripped = reencode(p, d, opts=without(d["opts"], 82))   # RFC 3046 2.1: remove before client
+        self.s.sendto(stripped, self.clients[d["xid"]])
+
+def client_xchg(src, dst, pkt, port=68):
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s.bind((src, port)); s.settimeout(0.6); s.sendto(pkt, dst)
+    try: r = parse(s.recvfrom(4096)[0])
+    except socket.timeout: r = None
+    s.close(); return r
+
+def show(tag, r):
+    if r is None: print(f"  {tag:46s} -> (no reply)"); return
+    print(f"  {tag:46s} -> {NAMES[opt(r,53)[0]]} yiaddr={r['yiaddr']} server-id={socket.inet_ntoa(opt(r,54))} option82-seen-by-client={opt(r,82) is not None}")
+
+def run(title, relay_kw, server_kw, steps):
+    print(f"\n=== {title} ===")
+    srv = Server(**server_kw); rl = Relay(**relay_kw)
+    ts = [threading.Thread(target=f, daemon=True) for f in (srv.serve, rl.serve)]
+    for t in ts: t.start()
+    steps(srv, rl)
+    for l in srv.log + rl.log: print(f"    | {l}")
+    print(f"    | relay counters: {rl.counters}")
+    for addr in (("10.99.0.10", 67), ("10.20.30.1", 67)):
+        socket.socket(socket.AF_INET, socket.SOCK_DGRAM).sendto(b"stop", addr)
+    time.sleep(0.1)
+    for s in (srv.s, rl.s): s.close()
+
+MAC = bytes.fromhex("020000c0ffee")
+
+def dora(src="10.20.30.200", extra=()):
+    def f(srv, rl):
+        o = client_xchg(src, ("10.20.30.1", 67), build(1, 0x1001, MAC, DISCOVER, opts=extra)); show("DISCOVER via relay", o)
+        if o:
+            a = client_xchg(src, ("10.20.30.1", 67), build(1, 0x1002, MAC, REQUEST, opts=[(50, socket.inet_aton(o["yiaddr"])), (54, opt(o, 54))] + list(extra)))
+            show("REQUEST (SELECTING) via relay", a)
+            return a
+    return f
+
+def renew_direct(srv, rl, lease, sid):
+    # RENEWING: unicast from the client's address straight to the server identifier
+    dst = (socket.inet_ntoa(sid), 67)
+    via = "relay" if dst[0] == "10.20.30.1" else "server directly"
+    r = client_xchg(lease, dst, build(1, 0x1003, MAC, REQUEST, ciaddr=lease))
+    show(f"RENEW unicast to {dst[0]} ({via})", r)
+
+def scen_basic(srv, rl):
+    a = dora()(srv, rl)
+
+def scen_renew(srv, rl):
+    a = dora()(srv, rl)
+    if a: sh(f"ip addr add {a['yiaddr']}/32 dev lo"); renew_direct(srv, rl, a["yiaddr"], opt(a, 54)); sh(f"ip addr del {a['yiaddr']}/32 dev lo")
+
+def scen_spoof(srv, rl):
+    fake = bytes([1, 22]) + b"sw-acc-07 eth1/0/7:120"
+    show("DISCOVER with forged option 82, untrusted", client_xchg("10.20.30.200", ("10.20.30.1", 67), build(1, 0x2001, MAC, DISCOVER, opts=[(82, fake)])))
+    snoop = bytes([1, 22]) + b"sw-acc-09 eth1/0/2:120"
+    show("DISCOVER with option 82 from trusted switch", client_xchg("10.20.30.201", ("10.20.30.1", 67), build(1, 0x2002, MAC, DISCOVER, opts=[(82, snoop)])))
+    show("DISCOVER carrying the relay's own giaddr", client_xchg("10.20.30.200", ("10.20.30.1", 67), build(1, 0x2003, MAC, DISCOVER, giaddr="10.20.30.1")))
+
+run("1. DORA through the relay; reservation by circuit-id", {}, {}, scen_basic)
+run("2. RENEW bypasses the relay (no option 82)", {}, {}, scen_renew)
+run("3. Same, server stashes agent options (Kea stash-agent-options)", {}, {"stash": True}, scen_renew)
+run("4. Same, relay adds server-id-override (RFC 5107)", {"sid_override": True}, {}, scen_renew)
+run("5. Untrusted, trusted and spoofed giaddr inputs (RFC 3046 2.1)", {}, {}, scen_spoof)
+run("6. Relay giaddr on a loopback (10.255.0.1), no link-selection", {"giaddr": "10.255.0.1"}, {}, scen_basic)
+run("7. Relay giaddr on a loopback, with link-selection 10.20.30.0 (RFC 3527)", {"giaddr": "10.255.0.1", "link_selection": True}, {}, scen_basic)
+```
+
+Run it as an unprivileged user inside a throwaway user and network namespace, so it can bind ports 67 and 68 and add loopback addresses without root on the host: `unshare -rn python3 relay82.py`. (If your distribution disables unprivileged user namespaces, this command fails; nothing else needs changing.) Output, pasted unedited from a run on 2026-11-16:
+```text
+=== 1. DORA through the relay; reservation by circuit-id ===
+  DISCOVER via relay                             -> OFFER yiaddr=10.20.30.77 server-id=10.99.0.10 option82-seen-by-client=False
+  REQUEST (SELECTING) via relay                  -> ACK yiaddr=10.20.30.77 server-id=10.99.0.10 option82-seen-by-client=False
+    | server: DISCOVER giaddr=10.20.30.1 ciaddr=0.0.0.0 opt82=[1:circuit-id=sw-acc-07 eth1/0/7:120, 2:remote-id=02:00:5e:00:aa:07] -> subnet 10.20.30.0/24 (selected by 10.20.30.1)
+    | server: REQUEST giaddr=10.20.30.1 ciaddr=0.0.0.0 opt82=[1:circuit-id=sw-acc-07 eth1/0/7:120, 2:remote-id=02:00:5e:00:aa:07] -> subnet 10.20.30.0/24 (selected by 10.20.30.1)
+    | relay counters: {'dropped-untrusted-82': 0, 'dropped-giaddr-spoof': 0}
+
+=== 2. RENEW bypasses the relay (no option 82) ===
+  DISCOVER via relay                             -> OFFER yiaddr=10.20.30.77 server-id=10.99.0.10 option82-seen-by-client=False
+  REQUEST (SELECTING) via relay                  -> ACK yiaddr=10.20.30.77 server-id=10.99.0.10 option82-seen-by-client=False
+  RENEW unicast to 10.99.0.10 (server directly)  -> NAK yiaddr=0.0.0.0 server-id=10.99.0.10 option82-seen-by-client=False
+    | server: DISCOVER giaddr=10.20.30.1 ciaddr=0.0.0.0 opt82=[1:circuit-id=sw-acc-07 eth1/0/7:120, 2:remote-id=02:00:5e:00:aa:07] -> subnet 10.20.30.0/24 (selected by 10.20.30.1)
+    | server: REQUEST giaddr=10.20.30.1 ciaddr=0.0.0.0 opt82=[1:circuit-id=sw-acc-07 eth1/0/7:120, 2:remote-id=02:00:5e:00:aa:07] -> subnet 10.20.30.0/24 (selected by 10.20.30.1)
+    | server: REQUEST giaddr=0.0.0.0 ciaddr=10.20.30.77 opt82=absent -> subnet 10.20.30.0/24 (selected by 10.20.30.77)
+    | server: subscriber subnet requires circuit-id -> NAK
+    | relay counters: {'dropped-untrusted-82': 0, 'dropped-giaddr-spoof': 0}
+
+=== 3. Same, server stashes agent options (Kea stash-agent-options) ===
+  DISCOVER via relay                             -> OFFER yiaddr=10.20.30.77 server-id=10.99.0.10 option82-seen-by-client=False
+  REQUEST (SELECTING) via relay                  -> ACK yiaddr=10.20.30.77 server-id=10.99.0.10 option82-seen-by-client=False
+  RENEW unicast to 10.99.0.10 (server directly)  -> ACK yiaddr=10.20.30.77 server-id=10.99.0.10 option82-seen-by-client=False
+    | server: DISCOVER giaddr=10.20.30.1 ciaddr=0.0.0.0 opt82=[1:circuit-id=sw-acc-07 eth1/0/7:120, 2:remote-id=02:00:5e:00:aa:07] -> subnet 10.20.30.0/24 (selected by 10.20.30.1)
+    | server: REQUEST giaddr=10.20.30.1 ciaddr=0.0.0.0 opt82=[1:circuit-id=sw-acc-07 eth1/0/7:120, 2:remote-id=02:00:5e:00:aa:07] -> subnet 10.20.30.0/24 (selected by 10.20.30.1)
+    | server: RENEW from 10.20.30.77 had no option 82; using stashed copy
+    | server: REQUEST giaddr=0.0.0.0 ciaddr=10.20.30.77 opt82=[1:circuit-id=sw-acc-07 eth1/0/7:120, 2:remote-id=02:00:5e:00:aa:07] -> subnet 10.20.30.0/24 (selected by 10.20.30.77)
+    | relay counters: {'dropped-untrusted-82': 0, 'dropped-giaddr-spoof': 0}
+
+=== 4. Same, relay adds server-id-override (RFC 5107) ===
+  DISCOVER via relay                             -> OFFER yiaddr=10.20.30.77 server-id=10.20.30.1 option82-seen-by-client=False
+  REQUEST (SELECTING) via relay                  -> ACK yiaddr=10.20.30.77 server-id=10.20.30.1 option82-seen-by-client=False
+  RENEW unicast to 10.20.30.1 (relay)            -> ACK yiaddr=10.20.30.77 server-id=10.20.30.1 option82-seen-by-client=False
+    | server: DISCOVER giaddr=10.20.30.1 ciaddr=0.0.0.0 opt82=[1:circuit-id=sw-acc-07 eth1/0/7:120, 2:remote-id=02:00:5e:00:aa:07, 11:server-id-override=10.20.30.1] -> subnet 10.20.30.0/24 (selected by 10.20.30.1)
+    | server: REQUEST giaddr=10.20.30.1 ciaddr=0.0.0.0 opt82=[1:circuit-id=sw-acc-07 eth1/0/7:120, 2:remote-id=02:00:5e:00:aa:07, 11:server-id-override=10.20.30.1] -> subnet 10.20.30.0/24 (selected by 10.20.30.1)
+    | server: REQUEST giaddr=10.20.30.1 ciaddr=10.20.30.77 opt82=[1:circuit-id=sw-acc-07 eth1/0/7:120, 2:remote-id=02:00:5e:00:aa:07, 11:server-id-override=10.20.30.1] -> subnet 10.20.30.0/24 (selected by 10.20.30.1)
+    | relay: RENEW from 10.20.30.77 arrived at the relay; forwarded with option 82
+    | relay counters: {'dropped-untrusted-82': 0, 'dropped-giaddr-spoof': 0}
+
+=== 5. Untrusted, trusted and spoofed giaddr inputs (RFC 3046 2.1) ===
+  DISCOVER with forged option 82, untrusted      -> (no reply)
+  DISCOVER with option 82 from trusted switch    -> OFFER yiaddr=10.20.30.100 server-id=10.99.0.10 option82-seen-by-client=False
+  DISCOVER carrying the relay's own giaddr       -> (no reply)
+    | server: DISCOVER giaddr=10.20.30.1 ciaddr=0.0.0.0 opt82=[1:circuit-id=sw-acc-09 eth1/0/2:120] -> subnet 10.20.30.0/24 (selected by 10.20.30.1)
+    | relay: drop DISCOVER from 10.20.30.200: option 82 present, giaddr 0, untrusted circuit
+    | relay: option 82 from trusted 10.20.30.201 kept, no second copy added
+    | relay: drop DISCOVER from 10.20.30.200: giaddr 10.20.30.1 is one of mine
+    | relay counters: {'dropped-untrusted-82': 1, 'dropped-giaddr-spoof': 1}
+
+=== 6. Relay giaddr on a loopback (10.255.0.1), no link-selection ===
+  DISCOVER via relay                             -> (no reply)
+    | server: DISCOVER giaddr=10.255.0.1 ciaddr=0.0.0.0 opt82=[1:circuit-id=sw-acc-07 eth1/0/7:120, 2:remote-id=02:00:5e:00:aa:07] -> subnet None (selected by 10.255.0.1)
+    | relay counters: {'dropped-untrusted-82': 0, 'dropped-giaddr-spoof': 0}
+
+=== 7. Relay giaddr on a loopback, with link-selection 10.20.30.0 (RFC 3527) ===
+  DISCOVER via relay                             -> OFFER yiaddr=10.20.30.77 server-id=10.99.0.10 option82-seen-by-client=False
+  REQUEST (SELECTING) via relay                  -> ACK yiaddr=10.20.30.77 server-id=10.99.0.10 option82-seen-by-client=False
+    | server: DISCOVER giaddr=10.255.0.1 ciaddr=0.0.0.0 opt82=[1:circuit-id=sw-acc-07 eth1/0/7:120, 2:remote-id=02:00:5e:00:aa:07, 5:link-selection=10.20.30.0] -> subnet 10.20.30.0/24 (selected by 10.20.30.0)
+    | server: REQUEST giaddr=10.255.0.1 ciaddr=0.0.0.0 opt82=[1:circuit-id=sw-acc-07 eth1/0/7:120, 2:remote-id=02:00:5e:00:aa:07, 5:link-selection=10.20.30.0] -> subnet 10.20.30.0/24 (selected by 10.20.30.0)
+    | relay counters: {'dropped-untrusted-82': 0, 'dropped-giaddr-spoof': 0}
+```
+
+Read the server lines, not just the client lines. Scenario 2's RENEW reaches the server with `giaddr=0.0.0.0` and `opt82=absent`, and the NAK follows from policy, not from any protocol error. Scenario 3 is the same packet, rescued by the stashed copy. Scenario 4 shows the RENEW arriving at the relay (`ciaddr=10.20.30.77`, `giaddr=10.20.30.1`) with option 82 intact, because the client was told the relay was its server. Scenarios 6 and 7 differ by one sub-option: the same loopback `giaddr` gets nothing without link selection and a reserved address with it.
+
+## Gotchas
+
+- **The trap: "DHCP broke when we enabled snooping."** You turn on DHCP snooping on a Layer 2 access switch. The switch dutifully inserts option 82 into client `DHCPDISCOVER` packets, leaving `giaddr = 0.0.0.0`. The upstream Layer 3 router running the DHCP relay receives a packet with `giaddr == 0` and option 82 already set on an untrusted interface, obeys RFC 3046 section 2.1, and drops every single packet. You either have to trust the snooping switch's uplink on the relay or disable option 82 insertion on the Layer 2 switch.
+- **The trap: Renewals fail at T1.** Everything works during your initial rollout because DORA crosses the relay. Half a lease time later, clients unicast `RENEW` directly to the server without option 82. Policy-gated pools return `NAK` or drop the renewal, `circuit-id` reservations miss, and RADIUS/IPoE accounting loses port identity. Either enable `stash-agent-options` on the server, deploy RFC 5107 Server Identifier Override on the relay, or ensure your renewal policy does not require option 82.
+- **The trap: Unaware servers drop option 82 on replies.** If a DHCP server ignores option 82 instead of echoing it back in `DHCPOFFER` and `DHCPACK`, relays or snooping switches that rely on the echoed `circuit-id` to identify the egress port/VLAN cannot deliver the reply—or drop it as a snooping violation.
+- **The trap: Vendor-specific `circuit-id` drift.** Because `circuit-id` and `remote-id` are opaque strings, a NOS upgrade, line-card swap, or port renumbering changes the string format (or switches from `Gi1/0/7` to `Eth1/0/7`). Any host reservation or client class keyed on the old string silently stops matching.
+- **The trap: Silent option 82 omission near MTU.** When a client sends a packed `DHCPDISCOVER` with long parameter request lists or vendor options, adding option 82 can exceed the relay's max DHCP size or interface MTU. By RFC 3046, the relay forwards the packet **without** option 82 (and should increment a counter). Clients fall into a fallback pool or fail admission with no obvious error in the client packet.
+- **The trap: Treating option 82 as cryptographic authentication.** Option 82 is only as trustworthy as the physical and Layer 2 boundary around the insertion point. RFC 4030 defines an Authentication sub-option (code 8), but it is rarely deployed in practice. Never accept option 82 from an untrusted port.
+- **The trap: Multiple relays in series.** If a packet crosses a second Layer 3 relay (`giaddr != 0`), RFC 3046 section 2.1.1 forbids the second relay from adding another option 82 or overwriting `giaddr`. Only the first hop (or a trusted Layer 2 snooping switch ahead of it) stamps option 82.
+
+## The boring rule
+
+Trust option 82 only from ports you physically control, and decide before going live how T1 renewals will survive without it.
+
+## Exercises
+
+1. **Diagnose a snooping outage:** A campus deploys DHCP snooping with option 82 on all access switches. Immediately, clients stop getting IP addresses. You capture packets on the distribution router's SVI facing the access switch and see `DHCPDISCOVER` frames arriving with `giaddr = 0.0.0.0` and option 82 containing `circuit-id`. What exact RFC 3046 rule is the distribution router triggering, what counter should you check on the router, and what are your two configuration fixes?
+2. **Trace the renewal gap:** A client receives `10.20.30.77/24` with a 1-hour lease, `Server Identifier = 10.99.0.10`, and a `circuit-id` reservation. At T = 30 minutes, the client loses connectivity. Packet capture at `10.99.0.10` shows an incoming `DHCPREQUEST` with `ciaddr = 10.20.30.77`, `giaddr = 0.0.0.0`, and no option 82, followed by a `DHCPNAK`. Explain why the packet lacked option 82, and compare how RFC 5107 (`server-id-override`) and Kea's `stash-agent-options` each resolve the failure.
+3. **Design a loopback-relayed pool:** An ISP BNG relays subscriber `DHCPDISCOVER` packets using its management loopback `10.255.0.1` as `giaddr` toward a central Kea server at `10.99.0.10`, while subscribers belong to `10.20.30.0/24`. Why does the server silently drop the `DISCOVER` initially? Which option 82 sub-option fixes this, what value goes in `giaddr` vs. that sub-option, and why must the BNG still enforce RFC 3046's untrusted-port drop rule?
+4. **Build a Kea classification rule:** Using the Kea ARM conventions shown in this chapter, write a minimal Kea `Dhcp4` snippet that (a) enables `circuit-id` host reservations before `hw-address`, (b) defines a client class matching `remote-id` equal to `0x02005e00aa07`, and (c) enables stashing of relay agent options across renewals.
+5. **Audit a multi-relay path:** A packet leaves a client, passes through a Layer 2 snooping switch (adds option 82), hits Router A (`10.20.30.1`, trusted), and then transits Router B (`10.50.0.1`, also configured as a DHCP relay with option 82 enabled) on its way to server `10.99.0.10`. State the exact values of `giaddr` and the number of option 82 containers present at each hop, citing the RFC 3046 rules that prevent Router B from modifying either field.
+6. **Inspect an oversized `DISCOVER`:** A PXE/UEFI client sends a 560-byte DHCPv4 `DISCOVER` toward a relay whose configured maximum DHCP message size is 576 bytes, and the relay's option 82 payload would add 28 bytes. Under RFC 3046 section 2.1, does the relay drop the packet, fragment it, truncate `circuit-id`, or forward it without option 82? Explain the downstream effect if the server requires `circuit-id` for pool assignment.
+
+## Sources
+
+- [RFC 2131: Dynamic Host Configuration Protocol](https://datatracker.ietf.org/doc/html/rfc2131)
+- [RFC 3046: DHCP Relay Agent Information Option](https://datatracker.ietf.org/doc/html/rfc3046)
+- [RFC 3527: Link Selection sub-option for the Relay Agent Information Option for DHCPv4](https://datatracker.ietf.org/doc/html/rfc3527)
+- [RFC 5010: The Dynamic Host Configuration Protocol Version 4 (DHCPv4) Relay Agent Flags Suboption](https://datatracker.ietf.org/doc/html/rfc5010)
+- [RFC 5107: DHCP Server Identifier Override Suboption](https://datatracker.ietf.org/doc/html/rfc5107)
+- [RFC 6607: Virtual Subnet Selection Options for DHCPv4 and DHCPv6](https://datatracker.ietf.org/doc/html/rfc6607)
+- [RFC 8357: Generalized UDP Source Port for DHCP Relay](https://datatracker.ietf.org/doc/html/rfc8357)
+- [RFC 4649: Dynamic Host Configuration Protocol for IPv6 (DHCPv6) Relay Agent Remote-ID Option](https://datatracker.ietf.org/doc/html/rfc4649)
+- [IANA BOOTP and DHCP Parameters Registry](https://www.iana.org/assignments/bootp-dhcp-parameters/)
+- [ISC Kea Administrator Reference Manual: The DHCPv4 Server](https://kea.readthedocs.io/en/latest/arm/dhcp4-srv.html)
