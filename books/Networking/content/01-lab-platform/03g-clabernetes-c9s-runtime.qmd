@@ -1,0 +1,263 @@
+---
+title: "Clabernetes (c9s): Running Containerlab Topologies on Kubernetes"
+author:
+  - name: "K19G"
+  - name: "grok-bot"
+---
+
+# Clabernetes (c9s): Running Containerlab Topologies on Kubernetes
+
+Containerlab runs a topology on one machine. That machine's memory is the ceiling: the lab host in this book fits two cEOS nodes and one SR Linux node before it starts swapping. Clabernetes, or c9s, takes the same topology file and schedules it across the workers of a Kubernetes cluster, one pod per network node, with the links stretched between pods. Since Containerlab 0.80 you drive it with the same `containerlab` command and a different runtime: `--runtime c9s`.
+
+This chapter is for the day a lab outgrows the host, or several people need labs on shared hardware. It explains what c9s builds, what it needs from the cluster, which Containerlab habits carry over and which do not, and how to run, inspect, capture and tear down a lab on it.
+
+## Learning goals
+
+By the end of this chapter you can:
+
+- Explain how a Containerlab topology becomes c9s `Topology`, `Node`, `Link` and `NodeProfile` resources and one pod per network node
+- Check that a cluster meets c9s's requirements before you install anything
+- Validate a topology for c9s and emit its manifests without touching a cluster
+- Deploy, inspect, exec, capture, stop, start, save and destroy a lab with `containerlab --runtime c9s`
+- Predict which topology features c9s rejects, and what happens to saved device state on destroy
+
+**Version note.** Nothing in this chapter was run on the writing host. It has no Kubernetes cluster, no Docker, and no Containerlab, and nothing could be installed. Every command and behaviour is taken from the Containerlab c9s runtime documentation (containerlab.dev, describing Containerlab 0.80 and later) and the c9s documentation at c9s.run, read on 2026-11-13. The c9s runtime needs a Clabernetes release with Node run state and the clabwire capture contract, which the Containerlab docs give as **0.11 or newer**; the direct-runtime API it relies on arrived in c9s 0.9. Older guides that mention launcher pods, nested Docker, `LauncherProfile` or `clabverter` describe the incompatible pre-0.9 design. Do not follow them.
+
+## What c9s builds
+
+```text
+ topo.clab.yml ──containerlab --runtime c9s deploy──> Topology (c9s.run/v1alpha1)
+                                                         │  compiled by the c9s manager
+                          ┌──────────────────────────────┼─────────────────────────┐
+                          v                              v                         v
+                    NodeProfile                     Node  (one per node)       Link (one per wire)
+              (expose, resources,                        │
+               scheduling, probes)                       v
+                                               Deployment ─> Pod
+                                               ├─ device container (the NOS image itself)
+                                               ├─ clabwire connectivity sidecar (links, mgmt)
+                                               └─ planner init container (file staging)
+```
+
+| Resource | Holds |
+|----------|-------|
+| `Topology` | The rendered Containerlab definition, stored in the cluster |
+| `Node` | One network node: kind, image, run state, readiness, management address |
+| `Link` | One point-to-point wire between two node interfaces |
+| `NodeProfile` | Reusable Kubernetes policy: how nodes are exposed, resources, scheduling, probes, management subnets |
+
+Three design choices explain most of c9s's behaviour:
+
+- **The NOS runs as an ordinary container in an ordinary pod.** There is no Docker inside the pod and no launcher. `kubectl exec` and `kubectl logs` against the device pod reach the network OS directly.
+- **A connectivity sidecar wires the links.** Each pod runs `clabwire`, which builds the lab links as veth interfaces inside the pod and carries each wire to the far pod as plain UDP between sidecars. That is why a link can join nodes on different workers with no special CNI.
+- **Management is routed, not bridged.** Every node still gets a management address from the topology's `mgmt` subnet, but the shared management network is a routed mesh between pods (VXLAN inside the pods, with proxy ARP and IPv6 neighbour discovery), not one L2 segment. From outside the cluster you reach nodes through Kubernetes Services, a LoadBalancer by default.
+
+By default `containerlab deploy` creates a `Topology` and lets the c9s manager compile it. With `--no-topology-cr`, Containerlab compiles client-side and creates the `NodeProfile`, `Link` and `Node` resources itself. Both produce the same lab. The second suits GitOps pipelines that apply generated manifests.
+
+## What the cluster must provide
+
+Check these before installing. Each one is a requirement stated in the c9s installation and runtime documentation.
+
+| Requirement | Why |
+|-------------|-----|
+| Kubernetes 1.31 or newer | c9s relies on restartable init containers (native sidecars) and server-side field selectors |
+| Privileged pods allowed in lab namespaces | Every device pod runs a privileged connectivity init-sidecar. With Pod Security Admission, label lab namespaces `pod-security.kubernetes.io/enforce=privileged` |
+| VXLAN and nftables in the worker kernel | The management mesh is kernel VXLAN inside pods; management translation uses an nftables table in each pod's namespace |
+| Pod-to-pod UDP 14789 and 14790, kubelet to TCP 14791 | Management mesh, link wires, and the sidecar readiness probe. NetworkPolicies must allow them |
+| `/dev/kvm` on workers | Only for VM-backed (vrnetlab) kinds |
+| A default dynamically provisioned storage class | Per-node persistent volumes for saved device state (unless you deploy with `--no-persistence`) |
+| A LoadBalancer implementation (MetalLB on bare metal) | To reach node management from outside the cluster |
+| Registry access | Private images use ordinary `imagePullSecrets`; mirrors are configured on the workers' container runtime |
+
+The licensing rule from the image matrix still applies: a vendor image you imported on your lab host must be pushed to a **private** registry the cluster can pull from, and only if your licence allows it.
+
+### Installing c9s
+
+From the c9s documentation, with Helm, into an existing cluster:
+
+```bash
+helm upgrade --install --create-namespace --namespace c9s \
+    clabernetes oci://ghcr.io/clabernetes/clabernetes/clabernetes
+kubectl -n c9s get pods     # manager pods must be Running
+```
+
+The chart also installs two ClusterRoles for lab users, `clabernetes-lab-viewer` and `clabernetes-lab-editor`. To try c9s without a cluster, the clabernetes repository's `make try-c9s` target builds a disposable single-node KinD cluster with MetalLB and a sample SR Linux plus Network Multitool lab. The c9s quickstart says 8 GB of RAM and 4 CPUs should be enough, which the lab host has.
+
+## The workflow
+
+Selecting the runtime is one flag or one environment variable:
+
+```bash
+containerlab --runtime c9s deploy -t topo.clab.yml
+# or
+export CLAB_RUNTIME=c9s
+containerlab deploy -t topo.clab.yml
+```
+
+Containerlab picks the cluster from `CLAB_KUBECONFIG` if set, otherwise from the normal kubeconfig rules, and the context from `CLAB_KUBE_CONTEXT`.
+
+### 1. Validate and look before you deploy
+
+These commands use the same compiler as deploy:
+
+```bash
+containerlab --runtime c9s validate -t topo.clab.yml
+containerlab --runtime c9s deploy --emit-crs -t topo.clab.yml > topo-crs.yaml
+containerlab --runtime c9s deploy --dry-run -t topo.clab.yml
+```
+
+- `validate` reports whether c9s can represent the topology. It never contacts the cluster and works without a usable kubeconfig, so it belongs in CI (see Containerlab in CI). Compilation is fail-closed: every construct c9s cannot preserve is reported with its field and line, all in one pass.
+- `deploy --emit-crs` prints the Namespace, ConfigMaps and `Topology` (or `NodeProfile`/`Link`/`Node` with `--no-topology-cr`) as YAML, without contacting the cluster. Read it once. It is the clearest picture of what c9s will create.
+- `deploy --dry-run` does contact the cluster and prints the exact create, update and delete plan. An empty change list means the lab already matches the file.
+
+### 2. Deploy
+
+```bash
+containerlab --runtime c9s deploy -t topo.clab.yml
+```
+
+Containerlab stages local files (startup configs, licences, bind sources) into per-node ConfigMaps, creates the resources, and waits until every node is ready, streaming each node's phase: planning, file preparation, image pull, connectivity, container start-up. The default wait is ten minutes because large NOS images take time; change it with the global `--timeout`. Each lab lands in its own namespace, `c9s-<lab-name>`, unless you pass `--namespace` (which must already exist).
+
+Two things differ from local Containerlab:
+
+- **Readiness is process-level by default.** A node is ready when its containers run and pass any healthcheck the image defines. A NOS that is still booting services can be "ready". Use an image healthcheck or a c9s TCP/SSH probe if your checks need application-level readiness, or poll protocol state as the CI chapter does.
+- **Staged files are snapshots.** Editing a startup config on your laptop changes nothing until you deploy again. Each staged file is limited to 950 KB.
+
+### 3. Inspect and reach nodes
+
+```bash
+containerlab --runtime c9s inspect -t topo.clab.yml
+containerlab --runtime c9s inspect --all
+containerlab --runtime c9s inspect -t topo.clab.yml --format json
+```
+
+The address `inspect` prints is the node's LoadBalancer address when one exists, otherwise its allocated management address. JSON output adds `namespace`, `pod`, `container`, `node_uid`, `exposed_ports` and `load_balancer_address`, and `container_id` becomes `<namespace>/<lab>/<node>`, for example `c9s-clos/clos/srl1`. Scripts that used Docker container names should switch to these fields.
+
+```bash
+containerlab --runtime c9s exec -t topo.clab.yml --cmd 'ip addr'
+containerlab --runtime c9s logs -t topo.clab.yml -n srl1 --tail 100
+```
+
+`exec` uses Kubernetes pod exec into the device container. The machine running `containerlab` does not need Docker at all, only cluster access. **`docker ps` on that machine shows nothing for a c9s lab, and that is normal.** The cluster is the source of truth:
+
+```bash
+kubectl -n c9s-<lab> get node.c9s.run,link.c9s.run,nodeprofile.c9s.run,deploy,pod,svc,cm,pvc \
+  -l c9s.run/topologyOwner=<lab>
+```
+
+### 4. Capture
+
+```bash
+containerlab -r c9s capture -t topo.clab.yml \
+  --target srl1:e1-1 --target srl2:e1-1 --duration 30s -w srl.pcapng
+containerlab -r c9s capture --name clos --target srl1:e1-1 -w - | wireshark -k -i -
+containerlab -r c9s capture --name clos --list
+```
+
+Capture runs inside each target pod's `clabwire` sidecar and merges the streams into one pcapng file, one interface block per `node:interface`. Interface names are the names inside the node, or the topology's alias (`e1-1` or `ethernet-1/1` on SR Linux). The management interface cannot be captured. This replaces the host-side `ip netns exec ... tcpdump` habit, which has no equivalent here because the lab's namespaces are on cluster workers.
+
+### 5. Stop, start, restart, save
+
+```bash
+containerlab --runtime c9s stop -t topo.clab.yml -n srl1
+containerlab --runtime c9s start -t topo.clab.yml -n srl1
+containerlab --runtime c9s save -t topo.clab.yml --copy ./startup-configs
+```
+
+Stop and start patch the node's `spec.runState`; they never touch Deployments directly. A stopped node keeps its `Node`, Services, links and saved state. Its links go carrier-down on every peer, like an unplugged cable, which makes `stop` a clean way to run a link-failure drill. `save --copy` runs each kind's normal save inside the device and copies the result back to your machine in the usual Containerlab layout.
+
+### 6. Destroy, and where saved state lives
+
+By default deploy gives every node a PersistentVolumeClaim with reclaim policy `Retain`. Saved device configuration lives there, so a pod restart or eviction never reverts saved work.
+
+| Command | Persistent claims |
+|---------|-------------------|
+| `destroy` | Kept, with the `c9s-<lab>` namespace; the next deploy boots from them |
+| `destroy --cleanup` | Deleted, then the namespace |
+| `redeploy` | Kept |
+| `redeploy --cleanup`, `deploy --reconfigure` | Deleted before redeploying |
+
+This is the c9s equivalent of the lab directory that Persistent State in Containerlab Labs discusses: a plain `destroy` does not give you a clean slate. Use `--cleanup` when you want one. Deploy with `--no-persistence` for labs that should factory-reset on every pod replacement.
+
+## Names, namespaces and RBAC
+
+Kubernetes object names are lowercase DNS labels. Containerlab rewrites names that do not fit instead of rejecting them: lower-case, every character outside `a-z`, `0-9` and `-` becomes `-`, a leading digit gets a `clab-` prefix, and long names are truncated with a hash. `R1` becomes `r1` and `PE_1` becomes `pe-1`. The original name is kept in a `c9s.run/originalNodeName` label. Two nodes that differ only by such characters (`R1` and `r1`) are an error. The lab name must fit in 59 characters so that `c9s-<lab>` stays within 63.
+
+For shared clusters, bind the shipped roles per namespace instead of handing out cluster-admin:
+
+```bash
+kubectl create rolebinding alice-lab-editor -n team-a \
+  --clusterrole clabernetes-lab-editor --user alice
+containerlab --runtime c9s --namespace team-a deploy -t topo.clab.yml
+```
+
+`clabernetes-lab-editor` covers creating and changing lab resources, exec, port-forward and deleting the lab's claims. It does not include creating namespaces, which is why the example deploys into a pre-created `team-a`. `inspect`, `events` and `logs` work with `clabernetes-lab-viewer`.
+
+## What does not carry over
+
+The c9s runtime rejects, with a named error and before creating anything, every field it cannot preserve. The ones you are most likely to hit:
+
+| Local Containerlab feature | Under c9s |
+|----------------------------|-----------|
+| `bridge`, `ovs-bridge`, `host`, `ext-container` pseudo-nodes | Rejected |
+| `mgmt-net:` and `macvlan` link endpoints | Rejected |
+| `stages` (boot ordering between nodes) | Rejected; `startup-delay` per node is honoured |
+| `cpu-set`, per-node `runtime`, `auto-remove` | Rejected; `cpu` and `memory` become Kubernetes limits |
+| `deploy --node-filter`, `destroy --node-filter` | Rejected; deploy the whole lab, then use filters on `start`, `stop`, `exec`, `save` |
+| `deploy --graph`, `--export-template`, `--restore` | Rejected |
+| `containerlab tools ...` | Rejected |
+| `graph` reading running containers | Rejected; `graph --mermaid`, `--dot`, `--drawio` from the file still work |
+| Host-side `tc`/netem on lab links | Not available the same way; the links live on cluster workers |
+| `mgmt.network`, `mgmt.bridge`, `mgmt.mtu`, `mgmt.external-access` | Accepted with a warning; they have no Kubernetes meaning |
+| Pinned host ports such as `8080:80` | The node-side port is kept, the host half is dropped, with a warning |
+| Point-to-point links at any MTU, startup configs, exec, save, inspect | Supported as on local Containerlab |
+
+The practical consequence for this book's labs: the point-to-point FRR, SR Linux and cEOS topologies carry over unchanged. Labs that hang hosts off a Linux `bridge` node, or rely on `tc netem` from the host (as the DSCP and delay chapter does), need rework: replace the bridge with a switch NOS node, and run netem inside a Linux node instead of on the host.
+
+## Lab: one topology, two runtimes (not run on the writing host)
+
+This lab uses the KinD quickstart cluster on the lab host, so it costs nothing beyond memory. It was not run on the writing host.
+
+1. **Build the cluster.** In a clone of `github.com/clabernetes/clabernetes`, run `make try-c9s`. Predict: the run ends by printing SSH, gNMI and NETCONF addresses for an SR Linux node. Ping 192.0.2.1 from SR Linux as the quickstart describes, then keep the cluster.
+2. **Validate a book lab.** Take the single-node topology from Reading SR Linux with gNMI, or any point-to-point lab from the lab host track. Run `containerlab --runtime c9s validate -t <file>`. Predict: it passes. Now add a `bridge` node and validate again. Predict: a named error for the bridge, with its line.
+3. **Read the manifests.** Remove the bridge and run `deploy --emit-crs`. Find the `Topology`, the `c9s.run/topologyOwner` label, and the ConfigMap holding the startup config.
+4. **Deploy, inspect, compare.** Deploy with `--runtime c9s`. Run `inspect --format json` and note `pod`, `namespace` and `container_id`. Run `docker ps` on the lab host and explain why the NOS containers are not there (they run under KinD's container runtime inside the KinD node).
+5. **Link failure drill.** Start a `capture --target <node>:<intf>` on one end of a link. `stop` the node at the other end. Predict: the interface goes `lower-layer-down` on the peer, `containerlab --runtime c9s events` reports it, and routing on the surviving node withdraws the peer's routes. `start` the node and watch it recover.
+6. **Destroy twice.** Save a config change, `destroy`, deploy again. Predict: the change is still there, from the retained claim. Then `destroy --cleanup` and deploy. Predict: back to the startup config.
+7. Clean up with `make try-c9s-clean`.
+
+## Gotchas
+
+- **Old guides.** Anything mentioning launcher pods, nested Docker, `LauncherProfile`, `clabverter` or `disableExpose` is pre-0.9 and incompatible.
+- **`docker ps` is empty.** Expected. Use `containerlab --runtime c9s inspect` or `kubectl`.
+- **`destroy` keeps saved state.** Use `destroy --cleanup` for a clean slate.
+- **Pod Security Admission** blocks the privileged sidecar unless lab namespaces are labelled privileged.
+- **NetworkPolicies** must allow UDP 14789/14790 between device pods and TCP 14791 from the kubelet, or links never come up and nodes never go ready.
+- **Ready is not converged.** Without an image healthcheck or probe, ready means the processes run. Check protocol state before you trust a lab.
+- **Name rewriting.** `PE_1` becomes `pe-1` in everything Containerlab reports. Scripts that match on the original name should use the `c9s.run/originalNodeName` label.
+- **Vendor images and registries.** Push licensed images only to private registries, and give the cluster pull credentials through `imagePullSecrets`.
+
+## Boring rule
+
+Validate and read the emitted manifests before you deploy, treat the cluster as the source of truth, and destroy with `--cleanup` unless you mean to keep the lab's saved state.
+
+## Try this
+
+1. Write a topology with nodes named `R1`, `PE_1` and `9core`, and predict the c9s names before running `deploy --emit-crs`. Expected: `r1`, `pe-1` and a `clab-` prefixed name.
+2. Add `stages` to one node and run `validate`. Expected: a fail-closed error naming the field; `startup-delay` instead is accepted.
+3. Deploy the same lab twice with different `--namespace` values. Expected: two independent labs, as long as both namespaces already exist; Containerlab does not create or delete namespaces you name explicitly.
+4. Run `containerlab --runtime c9s inspect --format json` and write a one-line `jq` filter that prints `name` and `load_balancer_address` for every node.
+5. Bind `clabernetes-lab-viewer` to a test user in one namespace and try `deploy` as that user. Expected: refused. `inspect` and `logs` work.
+
+## Sources
+
+- Containerlab, Clabernetes (c9s) overview: <https://containerlab.dev/manual/clabernetes/>
+- Containerlab, C9s runtime (workflow, requirements, limitations, RBAC, troubleshooting): <https://containerlab.dev/manual/clabernetes/runtime/>
+- Containerlab 0.80 release notes (c9s runtime introduced): <https://containerlab.dev/rn/0.80/>
+- Containerlab `deploy` command, runtime selection: <https://containerlab.dev/cmd/deploy/>
+- c9s documentation, Installation and cluster requirements: <https://c9s.run/docs/installation>
+- c9s documentation, Quickstart (`make try-c9s`): <https://c9s.run/docs/quickstart>
+- c9s documentation, Differences from containerlab: <https://c9s.run/docs/concepts/containerlab-differences>
+- c9s documentation, Architecture: <https://c9s.run/docs/architecture>
+- Clabernetes source: <https://github.com/clabernetes/clabernetes>
+- Kubernetes Pod Security Admission: <https://kubernetes.io/docs/concepts/security/pod-security-admission/>
