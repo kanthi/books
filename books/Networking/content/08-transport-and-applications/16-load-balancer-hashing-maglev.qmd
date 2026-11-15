@@ -1,0 +1,442 @@
+---
+title: "Load Balancer Hashing: Modulo, Rings, Rendezvous and Maglev"
+author:
+  - name: "K19G"
+  - name: "grok-bot"
+---
+
+# Load Balancer Hashing: Modulo, Rings, Rendezvous and Maglev
+
+At Layer 4 (L4), a network load balancer forwards incoming TCP and UDP packets to a pool of backend servers. To prevent breaking active connections, all packets belonging to a single TCP stream or UDP flow must land on the exact same backend server for the entire duration of that session. 
+
+Every serious L4 load balancer keeps a per-flow table, but that table is local to one LB instance. Behind Equal-Cost Multi-Path (ECMP) routing there are several instances, and an instance can restart, be drained, or stop receiving a flow because the router's ECMP set changed. A flow that arrives at an instance with no state for it must still reach the same backend. So the backend choice has to be a *deterministic function of the packet*, the same on every instance, and it has to stay mostly the same when the set of backends changes. That function is a hash, and which hash you use decides how many connections break when you add or remove one server.
+
+This chapter explores how L4 load balancing hashing operates, evaluates four key algorithms—Modulo, Consistent Hashing Rings, Rendezvous Hashing (HRW), and Maglev Hashing—and measures their balance, disruption, and computational complexity.
+
+## Learning goals
+
+- Understand why stateless Layer 4 load balancing requires deterministic 5-tuple hashing to maintain flow stickiness across ECMP router fabrics.
+- Compare four major load balancing hash algorithms: Modulo, Consistent Hashing Ring with virtual nodes, Rendezvous (HRW), and Maglev.
+- Analyze how backend pool membership churn affects existing flows across each hashing strategy.
+- Measure build overhead, lookup latency, and hash distribution balance through practical Python benchmarking.
+- Examine real-world production implementations including Linux IPVS `mh`, Meta Katran, Cilium eBPF, and Envoy Proxy.
+
+**Version note.** The three scripts ran on 2026-11-13 with Python 3.13.5 (stdlib only, blake2b as the hash) on Linux 6.12.94+. No IPVS, XDP, Katran or Cilium on the writing host (no root, no installs), so the production sections are written from their documentation and marked not run.
+
+## The problem: per-flow stickiness without per-flow state
+
+When a client communicates with a load-balanced service, IP routing delivers the client's packets to a L4 load balancer cluster sharing a virtual IP address (VIP). Routers typically distribute incoming traffic across the load balancer instances using Equal-Cost Multi-Path (ECMP) routing based on a 5-tuple hash of the packet headers:
+
+```text
+5-tuple = (source IP, source port, destination IP, destination port, protocol)
+```
+
+Because ECMP operates statelessly, any packet of a given flow will always hash to the same L4 load balancer instance, provided the network topology and active router paths remain stable.
+
+```text
+                               +-------------------+
+                               |   Border Router   |
+                               |    (ECMP Hashing) |
+                               +---------+---------+
+                                         |
+                +------------------------+------------------------+
+                |                        |                        |
+        +-------v-------+        +-------v-------+        +-------v-------+
+        |  LB Instance  |        |  LB Instance  |        |  LB Instance  |
+        |     LB-01     |        |     LB-02     |        |     LB-03     |
+        +-------+-------+        +-------+-------+        +-------+-------+
+                |                        |                        |
+  ==============+========================+========================+==============
+  (Every LB instance must map the same 5-tuple to the same Backend Server)
+  ==============+========================+========================+==============
+                |                        |                        |
+        +-------v-------+        +-------v-------+        +-------v-------+
+        | Backend be01  |        | Backend be02  | ...    | Backend be10  |
+        +---------------+        +---------------+        +---------------+
+```
+
+For this architecture to work:
+1. **Consistency across LBs**: Every LB instance must reach the exact same mapping decision for any given 5-tuple without communicating with other LB instances.
+2. **Per-flow stickiness**: A flow's packets must consistently route to the target backend server. If a packet lands on a different backend mid-stream, the receiving backend will not recognize the TCP sequence numbers or connection state and will respond with a TCP Reset (`RST`), tearing down the connection.
+3. **Resilience to churn**: When a load balancer dies, or when a backend server is added or removed, the hash mapping must minimize disruption to unrelated flows.
+
+While connection tracking (conntrack) tables can remember flow assignments locally, relying *solely* on connection tracking fails when an LB instance dies or when an ECMP topology change causes an existing flow to land on a different LB instance. If the new LB instance lacks state for that flow, its hash must pick the original backend for as many flows as possible. If connection IDs are present (e.g. QUIC traffic), specific routing mechanisms can be used instead; see [QUIC load balancing with nftables](08-quic-load-balancing-with-nftables.qmd).
+
+## Four algorithms
+
+To solve the stickiness problem statelessly, network software engineers use one of four primary hashing techniques.
+
+### 1. Modulo Hashing (`hash % N`)
+
+Modulo hashing computes a 5-tuple hash and takes the remainder when divided by the number of active backends N: `backend = backends[hash(5-tuple) % N]`.
+
+While simple and fast (O(1) lookup), modulo hashing suffers from catastrophic disruption when the pool size N changes. Removing or adding a single backend changes the divisor for every lookup. Consequently, almost all active flows are reassigned to different backends, triggering massive connection resets across the fleet.
+
+### 2. Consistent Hashing Ring (Karger et al., 1997)
+
+Consistent hashing maps both backend servers and client flows onto the same circular hash space (here 64 bits).
+
+To avoid hot spots caused by uneven spacing, each physical backend is given V "virtual nodes" (vnodes) spread around the ring.
+1. Each virtual node key (e.g., `be01#0`, `be01#1`) is hashed to a position on the ring. The ring maintains a sorted array of all virtual node hash values.
+2. When a flow packet arrives, its 5-tuple is hashed to a position on the ring.
+3. The load balancer performs a binary search (O(log(N·V))) to find the first virtual node key greater than or equal to the flow's hash.
+
+When a backend is removed, only the flows assigned to its virtual nodes are reassigned to adjacent downstream nodes. All other flows remain untouched.
+
+### 3. Rendezvous Hashing / Highest Random Weight (Thaler & Ravishankar, 1998)
+
+Rendezvous hashing (also called Highest Random Weight, or HRW) scores every backend for the flow key K, `score(K, b) = hash(K || b)`, and picks the backend with the highest score.
+
+HRW has optimal disruption: when a backend is removed, only the flows that were on it move; when one is added, only the flows it now wins move. But finding the maximum means scoring all N backends for every new flow, so lookups are O(N).
+
+### 4. Maglev Hashing (Eisenbud et al., NSDI 2016)
+
+Maglev is Google's software load balancer, and its paper's hashing scheme has become the default for L4 load balancers. It builds a lookup table of fixed prime size M, much larger than N. The lookup table is populated ahead of time using a deterministic permutation generation step for each backend.
+
+#### Step 1: Permutation Generation
+For each backend i, Maglev computes an `offset` and a `skip` from two independent hashes of the backend's name: `offset = h1(name) % M` and `skip = h2(name) % (M - 1) + 1`. Backend i's preference list of table slots is then `perm[j] = (offset + j * skip) % M` for j = 0, 1, 2, ...
+
+Because M is prime and `skip` is between 1 and M−1, `skip` and M share no factor, so each backend's permutation visits every slot exactly once.
+
+#### Step 2: Table Population Loop
+Maglev fills the M-entry table by letting the backends take turns:
+
+1. Maintain an array `nxt[i]` tracking the next position in backend i's permutation.
+2. Iterate through backends in round-robin order (i = 0, 1, ..., N−1).
+3. Backend i looks at its next preferred slot `c = perm_i[nxt[i]]`.
+4. If slot c is empty (`entry[c] == -1`), backend i claims it (`entry[c] = i`), advances its pointer `nxt[i] += 1`, and increments `filled`.
+5. If slot c is already taken, backend i increments `nxt[i]` and checks the next candidate slot in its permutation until it finds an unassigned slot.
+6. The process repeats until all M entries are assigned (`filled == M`).
+
+Because every backend gets one slot per round, each ends up with M/N slots, give or take one. Because each backend's preferences depend only on its own name, removing one backend mostly just hands its slots to others; the other backends' early choices are unchanged.
+
+#### Step 3: O(1) flow lookup
+Once built, picking a backend is one hash and one array read: `backend = table[hash(K) % M]`.
+
+## Lab: measure balance and disruption
+
+The following Python benchmarks compare Modulo, Consistent Ring (100 vnodes per backend), Rendezvous, and Maglev (M = 65537) across 200,000 synthetic flows.
+
+Here is `lbhash.py`:
+
+```python
+# lbhash.py: four ways to map a flow key to a backend.
+import bisect, hashlib
+
+def h(data, seed=0):
+    return int.from_bytes(hashlib.blake2b(data, digest_size=8, salt=seed.to_bytes(16, "little")).digest(), "big")
+
+class Modulo:
+    def __init__(self, backends): self.b = list(backends)
+    def pick(self, key): return self.b[h(key) % len(self.b)]
+
+class Ring:                                    # consistent hashing with virtual nodes
+    def __init__(self, backends, vnodes=100):
+        self.points = sorted((h(f"{b}#{i}".encode()), b) for b in backends for i in range(vnodes))
+        self.keys = [p for p, _ in self.points]
+    def pick(self, key):
+        i = bisect.bisect(self.keys, h(key)) % len(self.keys)
+        return self.points[i][1]
+
+class Rendezvous:                              # highest random weight (HRW)
+    def __init__(self, backends): self.b = list(backends)
+    def pick(self, key): return max(self.b, key=lambda b: h(key + b.encode()))
+
+class Maglev:                                  # Eisenbud et al., NSDI 2016, Pseudocode 1
+    def __init__(self, backends, M=65537):
+        self.b = sorted(backends); n = len(self.b); self.M = M
+        offset = [h(b.encode(), 1) % M for b in self.b]
+        skip = [h(b.encode(), 2) % (M - 1) + 1 for b in self.b]
+        nxt = [0] * n; entry = [-1] * M; filled = 0
+        while True:
+            for i in range(n):
+                c = (offset[i] + nxt[i] * skip[i]) % M
+                while entry[c] >= 0:
+                    nxt[i] += 1; c = (offset[i] + nxt[i] * skip[i]) % M
+                entry[c] = i; nxt[i] += 1; filled += 1
+                if filled == M:
+                    self.table = entry; return
+    def pick(self, key): return self.b[self.table[h(key) % self.M]]
+```
+
+Here is `compare.py`:
+
+```python
+# compare.py: modulo vs ring vs rendezvous vs Maglev on the same 200k flows.
+import random, statistics, time
+from lbhash import Maglev, Modulo, Rendezvous, Ring
+
+random.seed(7)
+flows = [f"198.51.{random.randrange(256)}.{random.randrange(256)}:{random.randrange(1024, 65536)}"
+         f"->203.0.113.10:443/tcp".encode() for _ in range(200_000)]
+B = [f"be{i:02}" for i in range(1, 11)]
+print(f"{len(flows)} flows, {len(B)} backends; remove be05, then add be11\n")
+print(f"{'algorithm':12} {'build ms':>9} {'max/mean':>9} {'stdev %':>8} {'moved -be05':>12} {'moved +be11':>12} {'ideal':>9}")
+for name, cls in [("modulo", Modulo), ("ring x100", Ring), ("rendezvous", Rendezvous), ("maglev", Maglev)]:
+    t = time.perf_counter(); lb = cls(B); build = (time.perf_counter() - t) * 1000
+    before = [lb.pick(f) for f in flows]
+    counts = [before.count(b) for b in B]
+    mean = len(flows) / len(B)
+    lb_rm, lb_add = cls([b for b in B if b != "be05"]), cls(B + ["be11"])
+    after_rm = [lb_rm.pick(f) for f in flows]
+    moved_rm = sum(a != b for a, b in zip(before, after_rm)) / len(flows)
+    after_add = [lb_add.pick(f) for f in flows]
+    moved_add = sum(a != b for a, b in zip(before, after_add)) / len(flows)
+    print(f"{name:12} {build:9.1f} {max(counts) / mean:9.3f} {statistics.pstdev(counts) / mean * 100:8.2f} "
+          f"{moved_rm:12.2%} {moved_add:12.2%} {'10% / 9%':>9}")
+
+print("\nflows that moved off a *surviving* backend when be05 was removed:")
+for name, cls in [("modulo", Modulo), ("ring x100", Ring), ("rendezvous", Rendezvous), ("maglev", Maglev)]:
+    lb, lb2 = cls(B), cls([b for b in B if b != "be05"])
+    sample = flows[:50_000]
+    bad = 0
+    for f in sample:
+        a = lb.pick(f)
+        if a != "be05" and a != lb2.pick(f):
+            bad += 1
+    print(f"  {name:12} {bad / len(sample):7.2%}")
+```
+
+Running `python3 compare.py` produces the following exact output:
+
+```text
+200000 flows, 10 backends; remove be05, then add be11
+
+algorithm     build ms  max/mean  stdev %  moved -be05  moved +be11     ideal
+modulo             0.0     1.013     0.86       89.98%       91.03%  10% / 9%
+ring x100          1.0     1.172     9.71       10.11%        9.25%  10% / 9%
+rendezvous         0.1     1.011     0.70       10.02%        9.12%  10% / 9%
+maglev            43.7     1.007     0.52       10.33%        9.29%  10% / 9%
+
+flows that moved off a *surviving* backend when be05 was removed:
+  modulo        79.96%
+  ring x100      0.00%
+  rendezvous     0.00%
+  maglev         0.25%
+```
+
+### Analyzing the results
+
+- **Build Time (`build ms`)**: Modulo and Rendezvous build instantly because they perform no pre-computation. The Ring algorithm takes 1.0 ms to hash 1,000 vnodes and sort them. Maglev takes 43.7 ms in Python to compute permutations and execute its round-robin filling loop across M = 65537 table entries. That build happens only when the backend set changes, not per packet.
+- **Load Distribution (`max/mean` and `stdev %`)**: 
+  - Ideal balance yields a `max/mean` ratio of 1.000.
+  - Modulo, Rendezvous, and Maglev provide near-perfect load balance (`max/mean` 1.007 to 1.013, `stdev %` < 1%).
+  - The Consistent Hashing Ring with 100 vnodes displays significant variance (`max/mean` of 1.172 and standard deviation of 9.71%). Achieving tight balance on a Ring requires thousands of virtual nodes per backend, which increases memory footprint and binary search lookup overhead.
+- **Total Disruption on Churn (`moved -be05` and `moved +be11`)**:
+  - When removing 1 backend out of 10, the theoretical ideal number of affected flows is 1/10 = 10.00%. When adding an 11th backend, the ideal is 1/11 = 9.09%.
+  - Modulo hashing fails completely: removing `be05` shifts **89.98%** of all flows, and adding `be11` shifts **91.03%** of flows.
+  - Ring, Rendezvous, and Maglev closely track the minimum (about 10% on removal, about 9% on addition).
+- **Surviving Backend Disruption**:
+  - The critical metric for L4 stability is whether flows assigned to a *surviving* backend (e.g., `be01`..`be04`, `be06`..`be10`) are disturbed when `be05` is removed.
+  - Modulo shifts **79.96%** of surviving flows to different backends.
+  - Consistent Ring and Rendezvous move **0.00%** of surviving flows.
+  - Maglev moves **0.25%** of surviving flows. This minor disruption happens because filling the lookup table relies on relative permutation races; removing one backend allows remaining backends to claim permutation slots slightly earlier in the round-robin process. As documented in the NSDI 2016 paper, Maglev deliberately trades this small extra disruption for O(1) lookups and near-perfect balance.
+
+## Lab: lookup cost and table size
+
+Here is `scale.py`, which measures how lookup cost scales with the backend count N, and how Maglev's table size M affects balance:
+
+```python
+# scale.py: lookup cost vs backend count, and Maglev table size vs balance.
+import random, statistics, time
+from lbhash import Maglev, Rendezvous, Ring
+
+random.seed(7)
+flows = [random.randbytes(13) for _ in range(50_000)]
+print("lookup cost per flow (pure Python, so compare ratios, not absolute ns)")
+for n in (10, 100, 1000):
+    B = [f"be{i:04}" for i in range(n)]
+    row = []
+    for cls in (Ring, Rendezvous, Maglev):
+        lb = cls(B) if cls is not Maglev else cls(B, M=65537)
+        t = time.perf_counter()
+        for f in flows: lb.pick(f)
+        row.append((time.perf_counter() - t) / len(flows) * 1e9)
+    print(f"  {n:5} backends: ring {row[0]:7.0f} ns  rendezvous {row[1]:9.0f} ns  maglev {row[2]:6.0f} ns")
+
+print("\nMaglev table size M vs balance, 100 backends")
+B = [f"be{i:03}" for i in range(100)]
+for M in (251, 1021, 16381, 65537):
+    lb = Maglev(B, M=M)
+    share = [lb.table.count(i) for i in range(len(B))]
+    print(f"  M={M:6}  entries/backend min {min(share):4} max {max(share):4}  "
+          f"(max/min {max(share) / min(share):.2f})")
+```
+
+Running `python3 scale.py` produces the following exact output:
+
+```text
+lookup cost per flow (pure Python, so compare ratios, not absolute ns)
+     10 backends: ring    1452 ns  rendezvous      7503 ns  maglev    640 ns
+    100 backends: ring     946 ns  rendezvous     69499 ns  maglev    634 ns
+   1000 backends: ring    1248 ns  rendezvous    660033 ns  maglev    693 ns
+
+Maglev table size M vs balance, 100 backends
+  M=   251  entries/backend min    2 max    3  (max/min 1.50)
+  M=  1021  entries/backend min   10 max   11  (max/min 1.10)
+  M= 16381  entries/backend min  163 max  164  (max/min 1.01)
+  M= 65537  entries/backend min  655 max  656  (max/min 1.00)
+```
+
+### Key takeaways from lookup scaling
+
+Note that pure-Python timing nanoseconds are useful only for comparing relative performance ratios, not absolute performance in compiled C/eBPF environments.
+
+1. **Rendezvous (O(N))**: Lookup cost grows linearly with the backend count. At 10 backends, Rendezvous requires 7,503 ns per lookup; at 1,000 backends, lookup cost scales up to 660,033 ns (a ~88x slowdown). This makes Rendezvous unsuitable for large backend pools at high packet rates.
+2. **Ring (O(log(N·V)))**: Binary search over all virtual nodes. Cost stays roughly flat here (about 950–1450 ns, with noise), but the ring grows with N·V entries, which costs memory and cache locality.
+3. **Maglev (O(1))**: Lookup cost stays flat (about 630–690 ns) regardless of whether there are 10 or 1,000 backends. It consists solely of a single hash operation, a modulo by M, and an array index lookup.
+
+### Table size M vs load balance
+
+The Maglev paper picks M larger than 100 × N, so that backends' shares of the hash space differ by at most about 1%:
+- At N = 100 and M = 251 (about 2.5 × N), each backend gets 2 or 3 slots: some backends receive 50% more new flows than others (`max/min` 1.50).
+- At M = 1021 (about 10 × N), the ratio improves to 1.10.
+- At M = 16381 (about 160 × N), allocation is virtually uniform (`max/min` 1.01). This is Cilium's default table size.
+- At M = 65537 (about 655 × N), 655 or 656 slots each: 1.00. This is the default in Katran and Envoy.
+
+## Why disruption still matters: connection tracking on top
+
+In production L4 load balancers like Meta's Katran or Google's Maglev, consistent hashing does not operate alone; it works in tandem with a fast **connection tracking (conntrack) table**:
+
+```text
+  +-------------------------------------------------------------------+
+  | Incoming Flow Packet (5-tuple)                                    |
+  +----------------------------------+--------------------------------+
+                                     |
+                                     v
+                  +----------------------------------+
+                  |  LRU Connection Tracking Table   |
+                  +------------------+---------------+
+                                     |
+                     +---------------+---------------+
+                     | Hit                           | Miss / Expired
+                     v                               v
+         +-----------------------+       +-----------------------+
+         | Route to Recorded     |       | Compute Hash Pick     |
+         | Backend Destination   |       | (Maglev / HRW / Ring) |
+         +-----------------------+       +-----------+-----------+
+                                                     |
+                                                     v
+                                         +-----------------------+
+                                         | Populate LRU Table &  |
+                                         | Forward Packet        |
+                                         +-----------------------+
+```
+
+1. **Established Flows**: Packets matching an entry in the local LRU connection tracking table are forwarded directly to the designated backend server, ignoring the consistent hash lookup completely.
+2. **New Flows or Missing State**: When a packet arrives with no active conntrack entry (such as a new `SYN` packet, or any flow arriving after an LB restart or ECMP route update), the load balancer executes the consistent hash function to choose a backend, then stores that mapping in its LRU table.
+
+Under this two-tier model:
+- The **0.25% extra disruption** measured for Maglev only hits established flows that *also* lost their connection-table entry: the LB instance restarted, or an ECMP change moved the flow to an instance that never saw it. Everyone else stays put because of the table, whatever the hash says.
+- **Graceful Backend Draining**: When taking a backend offline for maintenance, operators mark its weight as 0 or remove it from the active hash pool while preserving its existing entries in the connection tracking table. New connections hash to alternative healthy backends, while established connections continue uninterrupted until they complete naturally.
+
+## In production (from docs, not run)
+
+Production operating systems, kernel frameworks, and service proxies provide built-in support for consistent load balancing hash algorithms.
+
+### 1. Linux IPVS (`mh` Scheduler)
+
+Linux IPVS has had a Maglev hashing scheduler, `mh`, since kernel 4.18. By default it hashes the source address only. Two scheduler flags change that:
+- `mh-fallback`: if the chosen real server is unavailable (weight 0 or overloaded), try another instead of dropping.
+- `mh-port`: include the source port in the hash, so different connections from one client spread across servers.
+
+```bash
+# Set up a Virtual IP using the Maglev Hashing (mh) scheduler
+ipvsadm -A -t 203.0.113.10:443 -s mh -b mh-port
+
+# Add real backend servers to the virtual service pool
+ipvsadm -a -t 203.0.113.10:443 -r 10.0.0.11:443 -m
+ipvsadm -a -t 203.0.113.10:443 -r 10.0.0.12:443 -m
+```
+
+**Not run.** Written from `ipvsadm(8)`; it needs root, the `ip_vs` and `ip_vs_mh` modules and the `ipvsadm` tool, none of which are available on the writing host.
+
+### 2. Meta Katran
+
+Meta’s open-source XDP/eBPF load balancer, Katran, uses Maglev consistent hashing as its primary forwarding algorithm.
+- Default Maglev ring size 65537.
+- Encapsulates routed packets using Generic UDP Encapsulation (GUE) or IPIP tunnels to pass packets to backends across Layer 3 boundaries.
+- Operates in Direct Server Return (DSR) mode, allowing backend servers to respond directly to clients, bypassing the load balancer on return paths.
+
+### 3. Cilium eBPF Load Balancer
+
+Cilium can replace `kube-proxy` in Kubernetes clusters using eBPF-based load balancing. Cilium supports Maglev hashing for service traffic distribution:
+
+```yaml
+# Helm values excerpt for Cilium Maglev configuration
+kubeProxyReplacement: true
+loadBalancer:
+  algorithm: maglev
+maglev:
+  tableSize: 16381 # bpf-lb-maglev-table-size
+```
+
+### 4. Envoy Proxy
+
+Envoy implements `MAGLEV` and `RING_HASH` for upstream clusters. Both only make sense with a **hash policy on the route** (for example a header, a cookie or the source IP): without one, Envoy has no key to hash and the choice is effectively random. The Katran, Cilium and Envoy snippets are written from their documentation and were not run here.
+
+```yaml
+# Envoy Cluster Configuration snippet using Maglev
+clusters:
+  - name: backend_service
+    connect_timeout: 0.25s
+    type: STRICT_DNS
+    lb_policy: MAGLEV
+    maglev_lb_config:
+      table_size: 65537
+    load_assignment:
+      cluster_name: backend_service
+      endpoints:
+        - lb_endpoints:
+            - endpoint:
+                address:
+                  socket_address:
+                    address: 10.0.0.11
+                    port_value: 8080
+```
+
+## Choosing
+
+The following table summarizes the characteristics of each algorithm:
+
+| Algorithm | Lookup Complexity | Memory Overhead | Load Distribution Balance | Disruption on Backend Removal | Supports Server Weights? | Recommended Use Case |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **Modulo** | O(1) | O(N) | Excellent | Catastrophic (about 90%) | No | Pools that never change; sharding where you control re-sharding |
+| **Consistent ring** | O(log(N·V)) | O(N·V) | Fair to good (needs large V) | Minimal (1/N) | Yes (more vnodes per backend) | Caches, storage placement, L7 proxies |
+| **Rendezvous (HRW)** | O(N) | O(N) | Excellent | Minimal (1/N) | Yes (weighted score) | Small pools, client-side selection, cache clusters |
+| **Maglev** | O(1) | O(M) | Excellent (M > 100 × N) | Near-minimal (slightly above 1/N) | Yes (extra turns while filling) | Packet-rate L4 load balancers (Katran, IPVS `mh`, Cilium) |
+
+## Gotchas
+
+1. **Hashing Inappropriate Header Fields**: Ensure the hash key contains only immutable 5-tuple fields. Never include TTL, TCP Window size, TCP Flags, or IP TOS/DSCP bits, as these change hop-by-hop or packet-by-packet within the same flow.
+2. **ICMP Messages and Packet Fragments**: Path MTU Discovery ICMP packets and fragmented IP packets lack L4 TCP/UDP port headers. If an L4 load balancer cannot extract ports, it falls back to a 2-tuple (Source IP, Dest IP) hash, which can cause fragments to land on a different backend unless handled by specialized reassembly or ICMP payload parsing.
+3. **IPv6 flow label**: RFC 7098 describes hashing the 20-bit IPv6 flow label (with the addresses) so LBs need not parse extension headers to find ports. But Linux deliberately *changes* a socket's flow label after retransmission timeouts to try a different ECMP path (`net.core.txrehash`). An LB that hashes on the flow label without a connection table can therefore move exactly the connections that are already struggling.
+4. **Instances out of sync**: For LB instances behind ECMP to pick the same backend, they need the same backend list (names, not just counts), the same hash seeds and the same M. Roll configuration changes to all instances together, or keep the old and new tables both available during the change.
+5. **Rebuild cost under churn**: Lookups are O(1), but filling the table takes expected O(M log M) work and gets slower as the table fills. A flapping health check that rebuilds the table every second wastes CPU and reshuffles that small fraction of flows each time. Dampen health-check flaps and build new tables off the packet path.
+6. **Weight Adjustments in Maglev**: Supporting weighted backends in Maglev requires larger backends to claim extra entries during the round-robin allocation phase, which increases lookup table fill times and slightly degrades disruption properties.
+7. **Non-prime M**: If M is not prime, a backend's `skip` can share a factor with M, its permutation then cycles through only part of the table, and the fill loop can spin forever once those slots are taken.
+
+## Boring rule
+
+For an L4 load balancer: Maglev with a prime table larger than 100 × the backend count, a per-flow connection table on top, identical configuration on every instance, and backend removal done by draining (weight 0, keep existing entries) rather than deleting. Use rendezvous hashing when the pool is small or the selection happens in clients, and never use plain modulo for anything whose membership changes.
+
+## Try this
+
+1. Modify `lbhash.py` to implement weighted backend support in `Maglev` by allowing backends with higher weights to claim multiple contiguous turns in the round-robin lookup table build loop.
+2. Run `compare.py` with different random seeds. Observe whether Maglev's surviving-backend disruption stays around 0.25%.
+3. Change the table size M in `scale.py` to a composite number (for example 65536) and run it under `timeout 60`. Does the build finish? Print each backend's `skip` and its greatest common divisor with M to explain what you see.
+4. Increase the number of virtual nodes in `lbhash.py`'s `Ring` class from 100 to 1000. Benchmark how the standard deviation percentage improves in `compare.py` versus the increased lookup time in `scale.py`.
+5. Implement a simple LRU cache wrapper around `Rendezvous` in Python. Measure the cache hit rate required for Rendezvous to match Maglev's lookup cost at 1000 backends.
+
+## Sources
+
+- **Maglev Paper (Google, NSDI 2016)**: Eisenbud et al., *Maglev: A Fast and Reliable Software Network Load Balancer*. [Google Research Publication](https://research.google/pubs/maglev-a-fast-and-reliable-software-network-load-balancer/) and [USENIX NSDI '16 Proceedings](https://www.usenix.org/conference/nsdi16/technical-sessions/presentation/eisenbud)
+- **Consistent Hashing (STOC 1997)**: Karger et al., *Consistent Hashing and Random Trees: Distributed Caching Protocols on the World Wide Web*. STOC '97.
+- **Rendezvous / HRW Hashing (IEEE/ACM ToN 1998)**: Thaler & Ravishankar, *Using Name-Based Mappings to Increase Hit Rates*. IEEE/ACM Transactions on Networking.
+- **RFC 2992**: *Analysis of an Equal-Cost Multi-Path Algorithm* (hash-threshold ECMP): <https://www.rfc-editor.org/rfc/rfc2992>
+- **RFC 7098**: *Using the IPv6 Flow Label for Load Balancing in Server Farms*: <https://www.rfc-editor.org/rfc/rfc7098>
+- Linux kernel, `net.core.txrehash` and IPv6 flow label sysctls: <https://docs.kernel.org/admin-guide/sysctl/net.html>
+- **Linux ipvsadm(8) Manual**: [ipvsadm(8) man page](https://man7.org/linux/man-pages/man8/ipvsadm.8.html)
+- **Meta Katran Source & Architecture**: [Katran GitHub Repository](https://github.com/facebookincubator/katran)
+- **Cilium Maglev Documentation**: [Cilium Kubernetes Proxy-Free Consistent Hashing Guide](https://docs.cilium.io/en/stable/network/kubernetes/kubeproxy-free/#maglev-consistent-hashing)
+- **Envoy Load Balancing Architecture**: [Envoy Proxy Architecture - Load Balancers](https://www.envoyproxy.io/docs/envoy/latest/intro/arch_overview/upstream/load_balancing/load_balancers)

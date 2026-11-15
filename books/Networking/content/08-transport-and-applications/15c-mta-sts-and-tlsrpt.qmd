@@ -1,0 +1,854 @@
+---
+title: "MTA-STS and TLSRPT: Enforcing TLS for Mail Without DNSSEC"
+author:
+  - name: "K19G"
+  - name: "grok-bot"
+---
+
+# MTA-STS and TLSRPT: Enforcing TLS for Mail Without DNSSEC
+
+The DANE chapter showed DANE/TLSA (RFC 7672) as a mechanism to secure SMTP connections against active man-in-the-middle attacks, cleartext downgrades, and DNS MX spoofing. DANE provides cryptographic guarantees for transport layer security directly via DNS. However, its operation strictly depends on DNSSEC. Many mail domains are not signed, and the largest mail providers' MX zones are among them (the DANE chapter's survey found `gmail.com` with an insecure MX RRset).
+
+SMTP Mail Transfer Agent Strict Transport Security (MTA-STS, RFC 8461) and SMTP TLS Reporting (TLSRPT, RFC 8460) were created to provide MTA-to-MTA TLS enforcement and visibility without requiring DNSSEC. By anchoring trust in standard Web PKI certificates and serving enforcement policies over HTTPS, MTA-STS allows domain owners to declare that incoming mail MUST be delivered over encrypted TLS connections to verified hostnames.
+
+## Learning goals
+
+- Understand the architecture of RFC 8461 (MTA-STS) and how HTTPS-based policy distribution bypasses the need for DNSSEC.
+- Analyze the Trust-On-First-Use (TOFU) security model and its trade-offs compared to DANE.
+- Parse and validate `_mta-sts` TXT records and HTTPS policy files using exact RFC 8461 syntax rules.
+- Evaluate RFC 8460 TLSRPT structure, URI schemas, media types, and aggregate reporting JSON payloads.
+- Observe real-world MTA-STS deployment patterns across major email providers.
+- Implement server-side policy hosting (Nginx) and client-side policy resolution architecture (`postfix-mta-sts-resolver`).
+- Identify critical deployment edge cases, caching pitfalls, and operational failures.
+
+## Version note
+
+The lab ran on the book's build box as an unprivileged user: Linux 6.12, OpenSSL 3.5.7 and Python 3.13 with the standard library only. Nothing was installed. The toy policy hosts are real HTTPS servers on 127.0.0.1 with a private CA. Live DNS answers come from Google Public DNS over its DoH JSON API, and live policies were fetched over HTTPS from the real `mta-sts.<domain>` hosts on 2026-11-14 (IST). Outbound port 25 is blocked from the build box, so no SMTP session was made; the MX TLS outcomes in section 4 of the lab are given as data. The nginx, DNS, Postfix and `postfix-mta-sts-resolver` snippets are **not run here**.
+
+## How MTA-STS works
+
+MTA-STS (RFC 8461) relies on two distinct protocols to establish TLS enforcement: DNS for signaling policy presence and updates, and HTTPS for serving the actual policy definition.
+
+```text
++-------------------+             1. TXT Query _mta-sts.example.com
+|                   | --------------------------------------------------------> +------------+
+|                   | <-------------------------------------------------------- | DNS Server |
+|                   |             "v=STSv1; id=20261114T0900Z;"                 +------------+
+|  Sending Mail     |
+|  Transfer Agent   |             2. HTTPS GET /.well-known/mta-sts.txt
+|     (MTA)         | --------------------------------------------------------> +------------------------+
+|                   | <-------------------------------------------------------- | https://mta-sts.example|
+|                   |             version: STSv1                                +------------------------+
+|                   |             mode: enforce ...
+|                   |
+|                   |             3. Authenticated TLS SMTP Session
+|                   | --------------------------------------------------------> +------------+
+|                   |                                                           | Mail Exch. |
++-------------------+                                                           +------------+
+```
+
+### DNS Discovery Record
+
+A domain supporting MTA-STS publishes a DNS TXT record at `_mta-sts.<domain>`. According to RFC 8461 Section 3.1, this record must adhere to specific formatting rules:
+
+1. The value must begin with `v=STSv1;`.
+2. Exactly one `v=STSv1` record must be present at `_mta-sts.<domain>`. If multiple STSv1 records are found, the sending MTA MUST treat the domain as having no valid MTA-STS policy.
+3. The record must contain an `id` field formatted as 1 to 32 alphanumeric characters (`[A-Za-z0-9]{1,32}`). This ID serves as a policy version tracker.
+4. Multiple character strings in a single TXT record must be concatenated without spaces during parsing.
+5. CNAME records are explicitly permitted for delegating the `_mta-sts` record to third-party providers.
+
+### HTTPS Policy File Fetch
+
+When a sending MTA detects a new or updated `id` in the DNS TXT record, it issues an HTTPS GET request to:
+
+`https://mta-sts.<domain>/.well-known/mta-sts.txt`
+
+The HTTPS request and response must obey these strict operational bounds (RFC 8461 Section 3.3):
+- **TLS Validation:** The server certificate presented at `mta-sts.<domain>` MUST be valid according to standard Web PKI rules (X.509 chain of trust to a public CA, matching SAN/CN).
+- **HTTP Status Code:** Only an `HTTP 200 OK` response indicates success.
+- **No Redirects:** HTTP redirects (301, 302, 307, 308) **MUST NOT** be followed. Any redirect response must be treated as a policy fetch error.
+- **No HTTP caching:** Sending MTAs MUST NOT use HTTP caching (RFC 7234) for the fetch. How long a policy lives is set only by its `max_age` field.
+- **Media Type:** Senders SHOULD check that the media type is `text/plain`, so that a web server which lets users upload HTML or images under arbitrary paths cannot be used to plant a policy. The lab treats any other media type as invalid.
+- **Resource Limits:** Implementations SHOULD enforce a timeout (suggested 1 minute) and limit the maximum response body read (suggested 64 KiB) to prevent denial-of-service vectors.
+
+### Policy File Syntax and Fields
+
+The policy file uses key-value formatting separated by colons (`:`), with lines delimited by LF or CRLF (RFC 8461 Section 3.2). Key parsing follows a "first copy wins" rule for non-`mx` fields:
+
+- `version`: Must be `STSv1`.
+- `mode`: Must be one of `enforce`, `testing`, or `none`.
+- `max_age`: Lifetime of the policy in seconds (max allowed value is `31557600`, approximately 1 year).
+- `mx`: One or more domain patterns specifying valid receiving MX hosts. Required for `enforce` and `testing` modes; optional/ignored for `none`.
+
+`mx` pattern matching rules (Section 4.1) permit wildcarding:
+- A leading `*.` wildcard matches exactly one left-most domain label (e.g., `*.example.com` matches `mail.example.com`, but does NOT match `example.com` or `a.b.example.com`).
+- Explicit hostnames match exact string representations (case-insensitive).
+
+### Policy Modes and Cache Semantics
+
+The three operational modes defined in RFC 8461 Section 5 govern MTA delivery behavior:
+
+- **`enforce`**: Sending MTAs MUST verify that the destination MX host matches an `mx` field in the policy AND that the MX presents a valid Web PKI TLS certificate matching its hostname. If TLS cannot be negotiated or validation fails, delivery **MUST NOT** proceed over cleartext; messages must be deferred/queued.
+- **`testing`**: Sending MTAs attempt TLS negotiation and validation. If verification fails, the failure is recorded for TLSRPT reporting, but the mail is still delivered over unauthenticated TLS or cleartext.
+- **`none`**: Senders treat the domain as having no active policy. This mode exists so a domain can switch MTA-STS off cleanly (section 8.3) and senders can tell an opt-out from an attack.
+
+Section 3.3 outlines sender caching semantics:
+1. **Valid Cache Available:** Senders apply the cached policy without re-fetching over HTTPS for every mail transaction, provided `max_age` has not elapsed.
+2. **Fetch Failure with Valid Cache:** If DNS or HTTPS policy fetches fail, but a valid, non-expired cache exists, the cached policy **MUST** continue to be applied.
+3. **Fetch Failure with No Cache:** If no cache exists and the policy fetch fails (or no valid TXT record exists), the message is delivered normally as if MTA-STS were not supported by the domain.
+4. **Proactive Refresh:** Senders SHOULD refresh cached policies before they expire, about once a day, and alert an administrator when refreshes keep failing (sections 3.3 and 10.2).
+5. **No bounce without a recheck:** Per section 5.1, a message that cannot be delivered because of an `enforce` policy must not be failed permanently until the sender has checked the TXT record for a new policy `id`.
+6. **Subdomain Isolation:** MTA-STS policies do not automatically apply to subdomains. A policy for `example.com` does not protect `sub.example.com` unless `sub.example.com` explicitly publishes its own `_mta-sts.sub.example.com` DNS record (Section 3.4).
+
+## Trust on first use
+
+The core structural weakness of MTA-STS is its reliance on Trust-On-First-Use (TOFU), detailed in RFC 8461 Section 10.2.
+
+Because initial policy discovery depends on unauthenticated DNS queries (`_mta-sts.<domain>`) and cleartext network paths prior to TLS establishment, an active network adversary can intercept a sender's initial contact with a domain. The attacker can strip the `_mta-sts` TXT record or block the HTTPS fetch to `mta-sts.<domain>`. Under standard behavior, a sender experiencing initial fetch failure simply falls back to standard SMTP delivery without enforcement.
+
+```text
+Initial Uncached Contact:
+Sender ------------------ TXT Query? ------------------> Unsigned DNS (Vulnerable to MITM stripping)
+Sender ------------------ HTTPS Fetch? ----------------> mta-sts.domain (can be blocked)
+
+Subsequent Contacts (Active Cache Valid):
+Sender ------------------ Enforces Policy ---------------> TLS to an MX that matches the policy, cert checked
+```
+
+To mitigate TOFU vulnerabilities, domain operators specify large `max_age` values (e.g., several weeks or months). Once a sending MTA successfully fetches a policy, that policy is pinned locally. While an `enforce` policy is cached, an attacker who controls DNS can no longer downgrade the connection or redirect it to a forged MX; the most they can do is delay mail. They can still try again at refresh time, which is why section 10.2 asks senders to refresh daily and long before expiry, so an attacker has to block every refresh for the whole `max_age`.
+
+By contrast, DANE/TLSA (RFC 7672) does not rely on TOFU. Every connection attempt using DANE dynamically validates TLSA records authenticated via DNSSEC signatures. DANE protects the very first connection attempt without requiring warmup caches or secondary HTTPS servers, provided the sender performs DNSSEC validation. However, MTA-STS trades this instant first-use guarantee for ease of deployment on standard Web PKI infrastructure.
+
+## TLSRPT
+
+SMTP TLS Reporting (TLSRPT, RFC 8460) works alongside MTA-STS and DANE by giving domain owners visibility into transport security failures occurring during mail delivery.
+
+### Reporting Discovery Record
+
+Domains declare where senders should submit automated aggregate reports by publishing a DNS TXT record at `_smtp._tls.<domain>`:
+
+```text
+_smtp._tls.example.com. IN TXT "v=TLSRPTv1; rua=mailto:tlsrpt@example.com,https://tlsrpt.example.com/submit"
+```
+
+The `rua` parameter accepts a comma-separated list of reporting endpoints using either `mailto:` or `https:` URI schemas.
+
+### Delivery and Formats
+
+Sending MTAs aggregate diagnostic events over a 24-hour period and generate a JSON document. Reports are transmitted via HTTPS POST or email (`mailto:`). 
+
+- **Media Types:**
+  - Standard JSON: `application/tlsrpt+json`
+  - Compressed JSON: `application/tlsrpt+gzip`
+
+By mail, the report is an attachment with a recommended file name of the form `sender!policy-domain!begin-timestamp!end-timestamp!unique-id.json.gz`, and the message carries `TLS-Report-Domain` and `TLS-Report-Submitter` header fields so receivers can sort reports automatically (RFC 8460 section 5.3).
+
+### Standard Result Types
+
+RFC 8460 defines explicit result type strings covering both MTA-STS and DANE failure modes:
+
+- `starttls-not-supported`: Target MX did not announce `STARTTLS` capability.
+- `certificate-host-mismatch`: MX certificate identity does not match the expected hostname or policy patterns.
+- `certificate-expired`: MX certificate timestamp is outside its validity window.
+- `certificate-not-trusted`: a catch-all for chain problems (unknown CA, name constraints, chain errors); senders SHOULD add a `failure-reason-code`.
+- `validation-failure`: a failure that fits none of the other types; again with a `failure-reason-code`.
+- `tlsa-invalid`: none of the records in the TLSA RRset were found to be valid.
+- `dnssec-invalid`: no valid records were returned from the recursive resolver.
+- `dane-required`: the sender is configured to require DANE for this destination, but the MX host had no DNSSEC-validated TLSA records.
+- `sts-policy-fetch-error`: Could not retrieve the MTA-STS policy over HTTPS (connect timeout, DNS failure, 404/500 HTTP code).
+- `sts-policy-invalid`: Policy file contents failed RFC 8461 syntax parsing.
+- `sts-webpki-invalid`: HTTPS certificate presented by `mta-sts.<domain>` failed Web PKI trust checks.
+
+## The lab
+
+Six files. `mkpki.sh` makes a private CA and two policy-host certificates. `mtasts.py` holds the parsers, the MX pattern matcher and a policy fetcher that follows section 3.3. `policyhost.py` serves nine kinds of policy host over real HTTPS on 127.0.0.1. `sender.py` is a small sending MTA with a policy cache and TLSRPT counters. `lab.py` drives sections 1 to 5, and `survey.py` asks the real Internet.
+
+### A private CA for the policy hosts
+
+```{.bash filename="mkpki.sh"}
+#!/bin/sh
+# Private CA, one policy-host certificate covering the lab domains, one with the wrong name.
+set -e
+mkdir -p pki && cd pki
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -keyout ca.key -out ca.pem \
+  -days 30 -subj "/CN=STS Lab CA" -addext basicConstraints=critical,CA:TRUE \
+  -addext keyUsage=critical,keyCertSign,cRLSign 2>/dev/null
+cert() { # cert <name> <subjectAltName>
+  openssl req -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -keyout "$1.key" -subj "/CN=$1" \
+    -addext "subjectAltName=$2" -out "$1.csr" 2>/dev/null
+  openssl x509 -req -in "$1.csr" -CA ca.pem -CAkey ca.key -CAcreateserial -days 30 \
+    -copy_extensions copy -out "$1.pem" 2>/dev/null
+}
+SANS=""
+for d in good testing none redirect html missing dupmode bigage nomx; do
+  SANS="$SANS${SANS:+,}DNS:mta-sts.$d.example"
+done
+cert policyhost "$SANS"
+cert wrongname "DNS:www.unrelated.example"
+openssl x509 -in policyhost.pem -noout -ext subjectAltName | tail -1 | tr ',' '\n' | wc -l | sed 's/^/policyhost SAN entries: /'
+```
+
+```text
+policyhost SAN entries: 9
+```
+
+### Parsing, matching and fetching
+
+```{.python filename="mtasts.py"}
+"""MTA-STS (RFC 8461) and TLSRPT (RFC 8460) building blocks. Standard library only."""
+import http.client, json, re, socket, ssl, urllib.request
+
+MAX_AGE_LIMIT = 31557600            # RFC 8461 section 3.2: about one year
+
+def doh(name, rtype):
+    with urllib.request.urlopen(f"https://dns.google/resolve?name={name}&type={rtype}", timeout=10) as r:
+        return json.load(r)
+
+def txt_records(name):
+    ans = doh(name, "TXT").get("Answer", [])
+    # A TXT record may hold several strings; RFC 8461 says join them without spaces.
+    return ["".join(re.findall(r'"((?:[^"\\]|\\.)*)"', a["data"])) or a["data"]
+            for a in ans if a["type"] == 16]
+
+def parse_sts_txt(records):
+    """Section 3.1: keep records starting with v=STSv1; exactly one must remain and carry an id."""
+    cand = [r for r in records if re.match(r"v=STSv1\s*;", r)]
+    if len(cand) != 1:
+        return None, f"{len(cand)} v=STSv1 record(s) -> no policy"
+    fields = dict(f.strip().split("=", 1) for f in cand[0].split(";") if "=" in f)
+    sid = fields.get("id", "")
+    if not re.fullmatch(r"[A-Za-z0-9]{1,32}", sid):
+        return None, f"bad id {sid!r} -> no policy"
+    return sid, "ok"
+
+def parse_policy(body, content_type="text/plain"):
+    """Section 3.2: key: value lines, LF or CRLF; first copy of a non-mx key wins."""
+    if content_type.split(";")[0].strip().lower() != "text/plain":
+        return None, f"media type {content_type!r} is not text/plain"
+    pol = {"mx": []}
+    for line in body.replace("\r\n", "\n").split("\n"):
+        if ":" not in line:
+            continue
+        k, v = (x.strip() for x in line.split(":", 1))
+        if k == "mx":
+            pol["mx"].append(v.lower())
+        elif k not in pol:
+            pol[k] = v
+    if pol.get("version") != "STSv1":
+        return None, "version is not STSv1"
+    if pol.get("mode") not in ("enforce", "testing", "none"):
+        return None, f"bad mode {pol.get('mode')!r}"
+    if not re.fullmatch(r"\d{1,10}", pol.get("max_age", "")) or int(pol["max_age"]) > MAX_AGE_LIMIT:
+        return None, f"bad max_age {pol.get('max_age')!r}"
+    if pol["mode"] != "none" and not pol["mx"]:
+        return None, "no mx lines"
+    pol["max_age"] = int(pol["max_age"])
+    return pol, "ok"
+
+def mx_match(pattern, host):
+    """Section 4.1: '*.' matches exactly one left-most label."""
+    host, pattern = host.lower().rstrip("."), pattern.lower().rstrip(".")
+    if pattern.startswith("*."):
+        head, _, rest = host.partition(".")
+        return bool(head) and rest == pattern[2:]
+    return host == pattern
+
+def fetch_policy(domain, connect_to=None, port=443, cafile=None, timeout=10):
+    """Section 3.3: HTTPS GET, certificate valid for mta-sts.<domain>, only 200 counts,
+    redirects are NOT followed. connect_to lets the lab dial 127.0.0.1 while still
+    verifying the real policy host name. Returns (policy or None, reason)."""
+    host = f"mta-sts.{domain}"
+    ctx = ssl.create_default_context(cafile=cafile)
+    conn = http.client.HTTPConnection(host, port, timeout=timeout)
+    try:
+        raw = socket.create_connection((connect_to or host, port), timeout=timeout)
+        conn.sock = ctx.wrap_socket(raw, server_hostname=host)
+        conn.putrequest("GET", "/.well-known/mta-sts.txt", skip_host=True)
+        conn.putheader("Host", host)
+        conn.endheaders()
+        r = conn.getresponse()
+        body = r.read(65536).decode("utf-8", "replace")      # 64 KiB cap, section 3.3
+    except ssl.SSLCertVerificationError as e:
+        return None, f"sts-webpki-invalid: {e.verify_message}"
+    except (OSError, http.client.HTTPException) as e:
+        return None, f"sts-policy-fetch-error: {type(e).__name__}"
+    finally:
+        conn.close()
+    if r.status != 200:
+        loc = r.getheader("Location")
+        return None, f"sts-policy-fetch-error: HTTP {r.status}" + (f", redirect to {loc} not followed" if loc else "")
+    pol, why = parse_policy(body, r.getheader("Content-Type", ""))
+    return (pol, "ok") if pol else (None, f"sts-policy-invalid: {why}")
+
+def tlsrpt_record(domain):
+    cand = [r for r in txt_records(f"_smtp._tls.{domain}") if re.match(r"v=TLSRPTv1\s*;", r)]
+    if len(cand) != 1:
+        return None
+    m = re.search(r"rua=([^;]+)", cand[0])
+    return m.group(1).strip() if m else None
+```
+
+`fetch_policy()` connects with a normal `ssl.create_default_context()`, so the policy host's certificate is checked exactly like a web browser would check it, against the name `mta-sts.<domain>`. The `connect_to` argument lets the lab dial 127.0.0.1 while still verifying the real name. Redirects are reported, never followed, and the body is capped at 64 KiB.
+
+### Nine policy hosts on loopback
+
+```{.python filename="policyhost.py"}
+"""Toy MTA-STS policy hosts on 127.0.0.1, one behaviour per Host header."""
+import http.server, ssl, sys, threading
+
+POLICIES = {
+    "good":     ("200", "text/plain", "version: STSv1\r\nmode: enforce\r\nmx: mx1.good.example\r\n"
+                                      "mx: *.backup.good.example\r\nmax_age: 1209600\r\n"),
+    "testing":  ("200", "text/plain; charset=utf-8", "version: STSv1\nmode: testing\nmx: mx.testing.example\nmax_age: 86400\n"),
+    "none":     ("200", "text/plain", "version: STSv1\nmode: none\nmax_age: 86400\n"),
+    "redirect": ("301", "text/plain", ""),
+    "html":     ("200", "text/html", "<html>version: STSv1<br>mode: enforce</html>"),
+    "missing":  ("404", "text/plain", "not found\n"),
+    "dupmode":  ("200", "text/plain", "version: STSv1\nmode: testing\nmode: enforce\nmx: mx.dupmode.example\nmax_age: 86400\n"),
+    "bigage":   ("200", "text/plain", "version: STSv1\nmode: enforce\nmx: mx.bigage.example\nmax_age: 63115200\n"),
+    "nomx":     ("200", "text/plain", "version: STSv1\nmode: enforce\nmax_age: 86400\n"),
+}
+
+class H(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        dom = self.headers["Host"].removeprefix("mta-sts.").removesuffix(".example")
+        code, ctype, body = POLICIES.get(dom, ("404", "text/plain", ""))
+        self.send_response(int(code))
+        self.send_header("Content-Type", ctype)
+        if code == "301":
+            self.send_header("Location", "https://evil.example/.well-known/mta-sts.txt")
+        self.end_headers()
+        self.wfile.write(body.encode())
+    def log_message(self, *a):
+        pass
+
+def serve(port, cert, key):
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.load_cert_chain(cert, key)
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", port), H)
+    srv.socket = ctx.wrap_socket(srv.socket, server_side=True)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv
+```
+
+### A sender with a policy cache
+
+```{.python filename="sender.py"}
+"""A sending MTA's MTA-STS logic (RFC 8461 sections 3.3, 5, 5.1) with a policy cache and
+TLSRPT counters (RFC 8460). DNS, HTTPS and the MX TLS handshakes are passed in as data,
+so every case is reproducible; the parsing and matching are the real functions."""
+import collections, mtasts
+
+class Sender:
+    def __init__(self):
+        self.cache = {}                                   # domain -> (policy, id, fetched_at)
+        self.ok = collections.Counter()
+        self.fail = collections.Counter()   # (domain, result-type, mx, reason) -> sessions
+
+    def refresh(self, domain, now, txt, fetch):
+        sid, _ = mtasts.parse_sts_txt(txt)
+        cached = self.cache.get(domain)
+        fresh = cached and now - cached[2] < cached[0]["max_age"]
+        if sid and not (fresh and cached[1] == sid):
+            pol, why = fetch()
+            if pol:
+                self.cache[domain] = (pol, sid, now)
+                return f"fetched policy id={sid} mode={pol['mode']}"
+            if not (fresh and cached[0]["mode"] == "none"):
+                self.fail[(domain, why.split(":")[0], None, why.split(": ", 1)[1])] += 1
+            return f"fetch failed ({why})" + ("; keeping cached policy" if fresh else "")
+        if not sid:
+            return "no usable TXT" + ("; cached policy still valid" if fresh else "")
+        return f"TXT id={sid} unchanged; cached policy valid"
+
+    def deliver(self, domain, now, mxs, tls):
+        """mxs: MX hosts in preference order; tls: host -> 'ok' or an RFC 8460 result type."""
+        cached = self.cache.get(domain)
+        pol = cached[0] if cached and now - cached[2] < cached[0]["max_age"] else None
+        mode = pol["mode"] if pol else "none"
+        for mx in mxs:
+            if mode == "none":
+                how = "TLS" if tls[mx] == "ok" else "CLEARTEXT/unauthenticated"
+                return f"delivered to {mx} via {how} (no active policy)"
+            problem, code = None, None
+            if not any(mtasts.mx_match(p, mx) for p in pol["mx"]):
+                problem = "validation-failure"   # RFC 8460 has no MX-specific type
+                code = "mx host not in policy"
+            elif tls[mx] != "ok":
+                problem = tls[mx]
+            if problem is None:
+                self.ok[domain] += 1
+                return f"delivered to {mx} via authenticated TLS ({mode})"
+            self.fail[(domain, problem, mx, code)] += 1
+            if mode == "testing":
+                return f"delivered to {mx} despite {problem} (testing: reported only)"
+        return "deferred: no MX passed the enforce policy; recheck TXT before bouncing"
+
+    def report(self, domain, org="sender.example", day="2026-11-14"):
+        pol = self.cache[domain][0]
+        details = []
+        for (d, rt, mx, code), n in sorted(self.fail.items(), key=str):
+            if d != domain:
+                continue
+            item = {"result-type": rt}
+            if mx:
+                item["receiving-mx-hostname"] = mx
+            item["failed-session-count"] = n
+            if code:
+                item["failure-reason-code"] = code
+            details.append(item)
+        return {
+            "organization-name": org,
+            "date-range": {"start-datetime": f"{day}T00:00:00Z", "end-datetime": f"{day}T23:59:59Z"},
+            "contact-info": f"tlsrpt@{org}",
+            "report-id": f"{day}-{domain}",
+            "policies": [{
+                "policy": {"policy-type": "sts",
+                           "policy-string": [f"version: STSv1", f"mode: {pol['mode']}"]
+                                            + [f"mx: {m}" for m in pol["mx"]] + [f"max_age: {pol['max_age']}"],
+                           "policy-domain": domain, "mx-host": pol["mx"]},
+                "summary": {"total-successful-session-count": self.ok[domain],
+                            "total-failure-session-count": sum(n for k, n in self.fail.items() if k[0] == domain)},
+                "failure-details": details}]}
+```
+
+The sender takes DNS answers, HTTPS fetch results and the outcome of each MX TLS handshake as arguments. Outbound port 25 is blocked on the build box, so the MX handshakes in section 4 are **given as data** ("ok" or an RFC 8460 result type). The parsing, MX matching, cache expiry and mode logic are the real functions above.
+
+### Driving it
+
+```{.python filename="lab.py"}
+"""MTA-STS lab: TXT parsing, MX patterns, real HTTPS policy fetches on loopback, sender timeline."""
+import json, mtasts, policyhost
+from sender import Sender
+
+print("1. _mta-sts TXT records (section 3.1)")
+cases = {
+    "one good record":               ['v=STSv1; id=20261114T0900Z;'],
+    "split into two strings, joined": ['v=STSv1; id=2026111' + '4T0900Z;'],
+    "plus an unrelated TXT":          ['v=spf1 -all', 'v=STSv1; id=abc123'],
+    "two STSv1 records":              ['v=STSv1; id=one', 'v=STSv1; id=two'],
+    "id with a dash":                 ['v=STSv1; id=2026-11-14'],
+    "id of 33 characters":            ['v=STSv1; id=' + 'a' * 33],
+    "version not first":              ['id=abc; v=STSv1'],
+}
+for title, recs in cases.items():
+    sid, why = mtasts.parse_sts_txt(recs)
+    print(f"  {title:32} -> {'id=' + sid if sid else why}")
+
+print("\n2. mx patterns (section 4.1)")
+for pat, host in [("*.example.com", "mail.example.com"), ("*.example.com", "example.com"),
+                  ("*.example.com", "a.b.example.com"), ("mail.example.com", "MAIL.Example.COM."),
+                  ("*.mail.protection.outlook.com", "contoso-com.mail.protection.outlook.com")]:
+    print(f"  {pat:31} vs {host:42} -> {'match' if mtasts.mx_match(pat, host) else 'no match'}")
+
+print("\n3. HTTPS policy fetch against toy policy hosts on 127.0.0.1 (private CA)")
+policyhost.serve(8443, "pki/policyhost.pem", "pki/policyhost.key")
+policyhost.serve(8444, "pki/wrongname.pem", "pki/wrongname.key")
+for dom, port in [("good", 8443), ("testing", 8443), ("none", 8443), ("redirect", 8443), ("html", 8443),
+                  ("missing", 8443), ("dupmode", 8443), ("bigage", 8443), ("nomx", 8443), ("good", 8444)]:
+    pol, why = mtasts.fetch_policy(f"{dom}.example", connect_to="127.0.0.1", port=port, cafile="pki/ca.pem")
+    label = f"{dom}.example" + (" (wrong cert)" if port == 8444 else "")
+    got = f"mode={pol['mode']} max_age={pol['max_age']} mx={pol['mx']}" if pol else why
+    print(f"  {label:26} {got}")
+
+print("\n4. A sender over seventeen days (DNS, HTTPS and MX TLS results given as data)")
+DAY = 86400
+good_a = mtasts.parse_policy(policyhost.POLICIES["good"][2])[0]
+good_b = dict(good_a, mx=good_a["mx"] + ["mx2.newhost.example"])
+ok = lambda p: (lambda: (p, "ok"))
+down = lambda: (None, "sts-policy-fetch-error: timeout")
+s = Sender()
+steps = [
+    (0.0, "first contact", ['v=STSv1; id=A1'], ok(good_a),
+     ["mx1.good.example"], {"mx1.good.example": "ok"}),
+    (1.0, "attacker: TXT stripped, HTTPS blocked, MX forged", [], down,
+     ["evil.attacker.example"], {"evil.attacker.example": "starttls-not-supported"}),
+    (2.0, "operator adds mx2.newhost, policy NOT updated", ['v=STSv1; id=A1'], ok(good_a),
+     ["mx2.newhost.example"], {"mx2.newhost.example": "ok"}),
+    (2.1, "policy body updated, then TXT id=B2", ['v=STSv1; id=B2'], ok(good_b),
+     ["mx2.newhost.example"], {"mx2.newhost.example": "ok"}),
+    (3.0, "mx1 cert expired, backup is fine", ['v=STSv1; id=B2'], ok(good_b),
+     ["mx1.good.example", "mx9.backup.good.example"],
+     {"mx1.good.example": "certificate-expired", "mx9.backup.good.example": "ok"}),
+    (17.0, "policy expired (fetched day 2.1 + 14 d), HTTPS down", ['v=STSv1; id=B2'], down,
+     ["mx1.good.example"], {"mx1.good.example": "starttls-not-supported"}),
+]
+for day, title, txt, fetch, mxs, tls in steps:
+    print(f"  day {day:4}: {title}")
+    print(f"      refresh: {s.refresh('good.example', day * DAY, txt, fetch)}")
+    print(f"      deliver: {s.deliver('good.example', day * DAY, mxs, tls)}")
+
+testing = mtasts.parse_policy(policyhost.POLICIES["testing"][2])[0]
+print("  testing.example, STARTTLS stripped:")
+s.refresh("testing.example", 0, ['v=STSv1; id=T1'], ok(testing))
+print(f"      deliver: {s.deliver('testing.example', 0, ['mx.testing.example'], {'mx.testing.example': 'starttls-not-supported'})}")
+print("  fresh.example, never seen before, attacker strips the TXT record:")
+print(f"      refresh: {s.refresh('fresh.example', 0, [], down)}")
+print(f"      deliver: {s.deliver('fresh.example', 0, ['mx.fresh.example'], {'mx.fresh.example': 'starttls-not-supported'})}")
+
+print("\n5. The TLSRPT (RFC 8460) report this sender would send for good.example")
+print(json.dumps(s.report("good.example"), indent=1))
+```
+
+```text
+1. _mta-sts TXT records (section 3.1)
+  one good record                  -> id=20261114T0900Z
+  split into two strings, joined   -> id=20261114T0900Z
+  plus an unrelated TXT            -> id=abc123
+  two STSv1 records                -> 2 v=STSv1 record(s) -> no policy
+  id with a dash                   -> bad id '2026-11-14' -> no policy
+  id of 33 characters              -> bad id 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' -> no policy
+  version not first                -> 0 v=STSv1 record(s) -> no policy
+
+2. mx patterns (section 4.1)
+  *.example.com                   vs mail.example.com                           -> match
+  *.example.com                   vs example.com                                -> no match
+  *.example.com                   vs a.b.example.com                            -> no match
+  mail.example.com                vs MAIL.Example.COM.                          -> match
+  *.mail.protection.outlook.com   vs contoso-com.mail.protection.outlook.com    -> match
+
+3. HTTPS policy fetch against toy policy hosts on 127.0.0.1 (private CA)
+  good.example               mode=enforce max_age=1209600 mx=['mx1.good.example', '*.backup.good.example']
+  testing.example            mode=testing max_age=86400 mx=['mx.testing.example']
+  none.example               mode=none max_age=86400 mx=[]
+  redirect.example           sts-policy-fetch-error: HTTP 301, redirect to https://evil.example/.well-known/mta-sts.txt not followed
+  html.example               sts-policy-invalid: media type 'text/html' is not text/plain
+  missing.example            sts-policy-fetch-error: HTTP 404
+  dupmode.example            mode=testing max_age=86400 mx=['mx.dupmode.example']
+  bigage.example             sts-policy-invalid: bad max_age '63115200'
+  nomx.example               sts-policy-invalid: no mx lines
+  good.example (wrong cert)  sts-webpki-invalid: Hostname mismatch, certificate is not valid for 'mta-sts.good.example'.
+
+4. A sender over seventeen days (DNS, HTTPS and MX TLS results given as data)
+  day  0.0: first contact
+      refresh: fetched policy id=A1 mode=enforce
+      deliver: delivered to mx1.good.example via authenticated TLS (enforce)
+  day  1.0: attacker: TXT stripped, HTTPS blocked, MX forged
+      refresh: no usable TXT; cached policy still valid
+      deliver: deferred: no MX passed the enforce policy; recheck TXT before bouncing
+  day  2.0: operator adds mx2.newhost, policy NOT updated
+      refresh: TXT id=A1 unchanged; cached policy valid
+      deliver: deferred: no MX passed the enforce policy; recheck TXT before bouncing
+  day  2.1: policy body updated, then TXT id=B2
+      refresh: fetched policy id=B2 mode=enforce
+      deliver: delivered to mx2.newhost.example via authenticated TLS (enforce)
+  day  3.0: mx1 cert expired, backup is fine
+      refresh: TXT id=B2 unchanged; cached policy valid
+      deliver: delivered to mx9.backup.good.example via authenticated TLS (enforce)
+  day 17.0: policy expired (fetched day 2.1 + 14 d), HTTPS down
+      refresh: fetch failed (sts-policy-fetch-error: timeout)
+      deliver: delivered to mx1.good.example via CLEARTEXT/unauthenticated (no active policy)
+  testing.example, STARTTLS stripped:
+      deliver: delivered to mx.testing.example despite starttls-not-supported (testing: reported only)
+  fresh.example, never seen before, attacker strips the TXT record:
+      refresh: no usable TXT
+      deliver: delivered to mx.fresh.example via CLEARTEXT/unauthenticated (no active policy)
+
+5. The TLSRPT (RFC 8460) report this sender would send for good.example
+{
+ "organization-name": "sender.example",
+ "date-range": {
+  "start-datetime": "2026-11-14T00:00:00Z",
+  "end-datetime": "2026-11-14T23:59:59Z"
+ },
+ "contact-info": "tlsrpt@sender.example",
+ "report-id": "2026-11-14-good.example",
+ "policies": [
+  {
+   "policy": {
+    "policy-type": "sts",
+    "policy-string": [
+     "version: STSv1",
+     "mode: enforce",
+     "mx: mx1.good.example",
+     "mx: *.backup.good.example",
+     "mx: mx2.newhost.example",
+     "max_age: 1209600"
+    ],
+    "policy-domain": "good.example",
+    "mx-host": [
+     "mx1.good.example",
+     "*.backup.good.example",
+     "mx2.newhost.example"
+    ]
+   },
+   "summary": {
+    "total-successful-session-count": 3,
+    "total-failure-session-count": 4
+   },
+   "failure-details": [
+    {
+     "result-type": "certificate-expired",
+     "receiving-mx-hostname": "mx1.good.example",
+     "failed-session-count": 1
+    },
+    {
+     "result-type": "sts-policy-fetch-error",
+     "failed-session-count": 1,
+     "failure-reason-code": "timeout"
+    },
+    {
+     "result-type": "validation-failure",
+     "receiving-mx-hostname": "evil.attacker.example",
+     "failed-session-count": 1,
+     "failure-reason-code": "mx host not in policy"
+    },
+    {
+     "result-type": "validation-failure",
+     "receiving-mx-hostname": "mx2.newhost.example",
+     "failed-session-count": 1,
+     "failure-reason-code": "mx host not in policy"
+    }
+   ]
+  }
+ ]
+}
+```
+
+### The real Internet
+
+```{.python filename="survey.py"}
+"""Live: what a sender learns about MTA-STS and TLSRPT for real domains."""
+import mtasts
+
+DOMAINS = ["gmail.com", "outlook.com", "yahoo.com", "proton.me", "fastmail.com",
+           "posteo.de", "mailbox.org", "github.com", "ietf.org"]
+for d in DOMAINS:
+    sid, why = mtasts.parse_sts_txt(mtasts.txt_records(f"_mta-sts.{d}"))
+    rua = mtasts.tlsrpt_record(d)
+    tlsrpt = f"TLSRPT rua={rua}" if rua else "no TLSRPT"
+    if sid is None:
+        print(f"{d:13} TXT: {why}; {tlsrpt}")
+        continue
+    pol, why = mtasts.fetch_policy(d)
+    if pol is None:
+        print(f"{d:13} id={sid}: {why}; {tlsrpt}")
+        continue
+    mxs = sorted((int(a["data"].split()[0]), a["data"].split()[1].rstrip("."))
+                 for a in mtasts.doh(d, "MX").get("Answer", []) if a["type"] == 15)
+    bad = [h for _, h in mxs if not any(mtasts.mx_match(p, h) for p in pol["mx"])]
+    print(f"{d:13} id={sid} mode={pol['mode']} max_age={pol['max_age']} "
+          f"({pol['max_age'] / 86400:.0f} d) mx={','.join(pol['mx'])}")
+    print(f"{'':13} {len(mxs)} MX host(s), {len(mxs) - len(bad)} match the policy"
+          + (f", NOT matching: {', '.join(bad)}" if bad else "") + f"; {tlsrpt}")
+```
+
+```text
+gmail.com     id=20190429T010101 mode=enforce max_age=86400 (1 d) mx=smtp.google.com,gmail-smtp-in.l.google.com,*.gmail-smtp-in.l.google.com
+              5 MX host(s), 5 match the policy; TLSRPT rua=mailto:sts-reports@google.com
+outlook.com   id=20190225000000Z mode=enforce max_age=604800 (7 d) mx=*.olc.protection.outlook.com
+              1 MX host(s), 1 match the policy; TLSRPT rua=https://tlsrpt.azurewebsites.net/report
+yahoo.com     id=20161109010200Z mode=testing max_age=86400 (1 d) mx=*.am0.yahoodns.net,*.mail.gm0.yahoodns.net,*.mail.am0.yahoodns.net
+              3 MX host(s), 3 match the policy; TLSRPT rua=mailto:mta_sts.report@yahoo.com
+proton.me     id=190906205100Z mode=enforce max_age=604800 (7 d) mx=mail.protonmail.ch,mailsec.protonmail.ch
+              2 MX host(s), 2 match the policy; TLSRPT rua=https://reports.proton.me/reports/smtptls
+fastmail.com  id=20260728T132000 mode=testing max_age=86400 (1 d) mx=*.messagingengine.com
+              2 MX host(s), 2 match the policy; TLSRPT rua=mailto:e3936a44@inbox.ondmarc.com
+posteo.de     id=20251202110430Z mode=enforce max_age=1209600 (14 d) mx=mx01.posteo.de,mx02.posteo.de,mx03.posteo.de,mx04.posteo.de,posteo.de
+              4 MX host(s), 4 match the policy; TLSRPT rua=mailto:tlsrpt@posteo.de
+mailbox.org   id=2026201002 mode=enforce max_age=2419200 (28 d) mx=*.mailbox.org,mx1.mailbox.org,mx2.mailbox.org,mx3.mailbox.org,mx4.mailbox.org,mxtls1.mailbox.org,mxtls2.mailbox.org,mxtls3.mailbox.org,mxtls4.mailbox.org
+              5 MX host(s), 5 match the policy; TLSRPT rua=mailto:abuse@heinlein-support.de
+github.com    TXT: 0 v=STSv1 record(s) -> no policy; no TLSRPT
+ietf.org      TXT: 0 v=STSv1 record(s) -> no policy; no TLSRPT
+```
+
+## Reading the results
+
+The execution outputs highlight key aspects of MTA-STS parsing, state management, real-world deployment practices, and Python strict validation quirks.
+
+### Section 1: TXT Parsing Mechanics
+
+Section 1 demonstrates the string parsing rules from RFC 8461 Section 3.1:
+- `split into two strings, joined`: Demonstrates DNS TXT chunk concatenation. DNS responses splitting strings across 255-byte boundaries are joined seamlessly.
+- `two STSv1 records`: two `v=STSv1` TXT records mean no policy at all. RFC 8461 requires exactly one. A leftover record from a migration silently switches MTA-STS off for new senders.
+- `id with a dash`: Fails validation (`bad id '2026-11-14'`). RFC 8461 strictly limits the `id` field to alphanumeric characters (`[A-Za-z0-9]`). Dashes, underscores, or special characters render the TXT record invalid.
+- `version not first`: `id=abc; v=STSv1` fails because RFC 8461 dictates that `v=STSv1` must be the absolute first tag in the record.
+
+### Section 2: MX Wildcard Matching
+
+Matching tests verify Section 4.1 rule compliance:
+- `*.example.com` matches `mail.example.com` but fails against `example.com` (wildcard requires a left-most label) and `a.b.example.com` (wildcard matches exactly *one* label level).
+
+### Section 3: Toy Policy Host Verification
+
+Testing against HTTPS endpoints on `127.0.0.1` illustrates mandatory HTTP client checks:
+- `redirect.example`: Returns HTTP 301. MTA-STS fetch engines MUST NOT follow redirects. The fetch fails instantly (`HTTP 301... not followed`).
+- `html.example`: rejected because the `Content-Type` is `text/html`. Section 3.2 says senders SHOULD check for `text/plain`; the lab does.
+- `dupmode.example`: Demonstrates first-wins parsing logic. `mode: testing` followed by `mode: enforce` evaluates to `mode=testing`.
+- `bigage.example`: Fails parsing because `63115200` exceeds the maximum `max_age` cap of 31,557,600 seconds.
+- `missing.example`: a 404 is a fetch error. With no cached policy, the sender continues as if the domain had no MTA-STS at all.
+- `nomx.example`: an `enforce` policy without `mx` lines is invalid; only `mode: none` may omit them (`none.example` parses fine with `mx=[]`).
+- `good.example (wrong cert)`: the policy host presents a certificate for `www.unrelated.example`, and the fetch fails with `sts-webpki-invalid`. This is what happens when `mta-sts.<domain>` is a CNAME to a shared web host that has no certificate for that name.
+
+### Section 4: 17-Day Sender Timeline Dynamics
+
+The time-series simulation highlights caching state transitions over a 17-day period:
+- **Day 0.0 (First Contact):** Senders fetch policy `A1` and cache it (`mode=enforce`, `max_age=1209600` / 14 days). Mail is successfully delivered via authenticated TLS.
+- **Day 1.0 (Active Attack):** An attacker strips DNS TXT records and blocks HTTPS policy fetches while spoofing MX records to point to `evil.attacker.example`. Because the sender has a valid unexpired cache for `good.example`, it ignores the DNS/HTTPS failure, applies the cached policy, checks the forged MX against the policy `mx:` list, rejects `evil.attacker.example`, and defers message delivery.
+- **Day 2.0 (Operator Configuration Error):** The domain operator provisions a new MX host (`mx2.newhost.example`) but forgets to update the HTTPS policy file. Delivery to `mx2.newhost.example` fails because the host is not matched by the cached policy `mx:` patterns.
+- **Day 2.1 (Corrected Update):** Policy body is updated to include `mx2.newhost.example` and the TXT record `id` is incremented to `B2`. Senders fetch the updated policy and resume successful delivery.
+- **Day 3.0 (Primary MX Outage):** Primary host `mx1` presents an expired certificate. The sender seamlessly falls back to `mx9.backup.good.example` which matches the wildcard policy `*.backup.good.example`.
+- **Day 17.0 (Policy Expiration):** The policy fetched on day 2.1 has passed its 14-day `max_age`, and the HTTPS fetch fails. With no valid cached policy, protection lapses and mail goes out without authentication, here in cleartext. The toy sender only refetches when the TXT `id` changes or the cache has expired. A real sender should refresh daily in the background (section 10.2), so a refresh would have succeeded on some day between 3 and 16 and the policy would still be valid.
+- **Testing Mode Behavior:** For `testing.example`, STARTTLS stripping is logged as a failure for TLSRPT reporting, but the sender proceeds with delivery regardless.
+- **Uncached Attacker Interaction:** For `fresh.example` (never before seen), an attacker stripping TXT/HTTPS prevents policy pinning. Delivery falls back to cleartext without protection, highlighting TOFU exposure.
+
+### Section 5: TLSRPT Serialization
+
+The resulting JSON document summarizes delivery statistics. Note that RFC 8460 lacks a distinct result type for "MX host not explicitly listed in MTA-STS policy." The lab models this event using `validation-failure` supplemented by `failure-reason-code: "mx host not in policy"`.
+
+### Real-World Domain Survey Observations
+
+The live survey reveals distinct operational strategies:
+- **Gmail & Yahoo:** Set `max_age` to 86,400 seconds (1 day). This is significantly shorter than the "weeks or greater" expectation suggested in RFC 8461 Section 10.2. A short `max_age` reduces TOFU resistance but minimizes operational lock-out risks during infrastructure changes.
+- **Testing Status:** Yahoo (`yahoo.com`) and Fastmail (`fastmail.com`) publish `mode=testing`. They capture diagnostic TLSRPT telemetry without blocking unauthenticated sessions.
+- **Both mechanisms:** `posteo.de` and `mailbox.org` publish TLSA records (see the DANE chapter's survey) and an `enforce` MTA-STS policy, so senders get protection whichever mechanism they implement. Gmail's policy also lists `*.gmail-smtp-in.l.google.com`, so the `alt1` to `alt4` MX hosts match with one wildcard.
+- **No policy published:** `github.com` and `ietf.org` publish no `_mta-sts` record. `ietf.org` relies on DANE instead (TLSA `3 1 1` on `mx.ietf.org`).
+
+### Python 3.13 Standard Library Strictness
+
+During initial lab setup, Section 3 policy fetches failed for every local endpoint with the following error:
+
+```text
+sts-webpki-invalid: CA cert does not include key usage extension
+```
+
+Since Python 3.13, `ssl.create_default_context()` sets `VERIFY_X509_STRICT`, which asks OpenSSL to enforce RFC 5280 rules it otherwise tolerates, including that a CA certificate carries a `keyUsage` extension. The first version of `mkpki.sh` made the CA with only `basicConstraints`, and every fetch failed. Adding `-addext keyUsage=critical,keyCertSign,cRLSign` fixed it. Public CAs already comply; the trap is home-made lab and internal CAs.
+
+## Deploying MTA-STS
+
+Deploying MTA-STS on the receiving side requires setting up policy hosting, issuing Web PKI certificates, and configuring DNS records in a deliberate sequence.
+
+### 1. Web Server Configuration (Nginx)
+
+The policy file must be accessible via HTTPS at `https://mta-sts.<domain>/.well-known/mta-sts.txt`.
+
+nginx configuration (not run here). `default_type` sets the `Content-Type` for a file without a known extension mapping; do not also add a `Content-Type` header with `add_header`, or the response carries two:
+
+```{.nginx filename="mta-sts-nginx.conf"}
+server {
+    listen 443 ssl;
+    server_name mta-sts.example.com;
+
+    ssl_certificate /etc/letsencrypt/live/mta-sts.example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/mta-sts.example.com/privkey.pem;
+
+    location = /.well-known/mta-sts.txt {
+        default_type text/plain;
+        alias /var/www/mta-sts/mta-sts.txt;
+    }
+
+    location / {
+        return 404;
+    }
+}
+```
+
+### 2. Policy File Creation
+
+Create `/var/www/mta-sts/mta-sts.txt`:
+
+```text
+version: STSv1
+mode: testing
+mx: mail.example.com
+mx: *.backup.example.com
+max_age: 86400
+```
+
+### 3. DNS Records
+
+Publish the initial DNS records:
+
+```text
+_mta-sts.example.com.   IN TXT "v=STSv1; id=20261114T01;"
+_smtp._tls.example.com. IN TXT "v=TLSRPTv1; rua=mailto:tlsrpt@example.com;"
+```
+
+### 4. Operational Update Order (RFC 8461 Section 8.1)
+
+Section 8.1 says to update the HTTPS policy body before the TXT record, so a sender that sees the new `id` cannot fetch and cache the old body under it. In practice:
+
+1. **Adding an MX Host:** First, add the new MX hostname to the HTTPS policy file. Second, change the TXT record `id` so senders refetch. Third, wait at least the TXT record's TTL, and then change the MX records. Senders that recheck the TXT record only when delivery fails (section 5.1) will pick up the new policy; senders that cached the old policy without rechecking defer until they do (day 2.0 in the lab).
+2. **Changing Mode to Enforce:** Start in `mode: testing` with a low `max_age` (e.g., 86400) alongside TLSRPT monitoring. After reviewing reports and confirming zero certificate or mismatch errors, change `mode` to `enforce` in the HTTPS policy file, increment the TXT record `id`, and gradually scale `max_age` up to `1209600` (14 days) or `2419200` (28 days).
+3. **Decommissioning MTA-STS (Section 8.3):** Publish a policy with `mode: none` and a small `max_age` (for example one day), change the TXT `id`, and keep both until every previously served policy has expired (last time served plus its `max_age`, and older policies may have had a longer one). Then remove the TXT record and the HTTPS endpoint.
+4. **Delegation via CNAME (Section 8.2):** Organizations with many domains can delegate policy discovery using CNAME records:
+   ```text
+   _mta-sts.customer.example. IN CNAME _mta-sts.managedprovider.example.
+   ```
+   However, the HTTPS policy host (`mta-sts.customer.example`) must still serve a Web PKI certificate valid for `mta-sts.customer.example`.
+
+## Sending side
+
+Postfix does not natively contain built-in MTA-STS caching or parsing logic. In a Postfix production deployment, MTA-STS policy resolution is handled by an external daemon such as `postfix-mta-sts-resolver`.
+
+```text
++-------------------+                   +----------------------------+
+|  Postfix (smtp)   | -- SocketMap ---->| postfix-mta-sts-resolver   |
+|                   | <-- (secure/ta) --| (mta-sts-daemon)           |
++-------------------+                   +----------------------------+
+                                                    |
+                                          DNS TXT + HTTPS fetch
+                                                    v
+                                        +----------------------------+
+                                        |  Remote _mta-sts Domain    |
+                                        +----------------------------+
+```
+
+### Postfix Integration (`postfix-mta-sts-resolver`)
+
+The daemon runs as a local service listening on a TCP or Unix socket, implementing the Postfix `socketmap` protocol.
+
+Its configuration file (`/etc/mta-sts-daemon.yml`) is described in the project's man page; the defaults listen on 127.0.0.1 port 8461.
+
+Postfix configuration, from the project README (not run here):
+
+```{.ini filename="main.cf"}
+# /etc/postfix/main.cf (not run here)
+smtp_tls_policy_maps = socketmap:inet:127.0.0.1:8461:postfix
+smtp_tls_CAfile = /etc/ssl/certs/ca-certificates.crt
+smtp_tls_loglevel = 1
+```
+
+When Postfix routes mail for `destination.example`, it queries the socketmap service. The resolver checks its policy cache (fetching `_mta-sts.destination.example` and `https://mta-sts.destination.example/.well-known/mta-sts.txt` as needed). If an active `enforce` policy exists, the daemon returns a policy map instruction forcing Postfix to require TLS authentication (`secure match=...`).
+
+There is a catch if you also enable DANE. RFC 8461 section 2 says MTA-STS validation MUST NOT override a failing DANE validation. The resolver's README warns that, because of how Postfix policy tables work, a resolved MTA-STS policy *does* override Postfix's built-in DANE for that destination (the map answers `secure`, which replaces `dane`). If you run both, read that section of the README and decide which destinations get which policy.
+
+Other MTAs differ: some implement MTA-STS natively, some need a helper like this one. Check your MTA's documentation.
+
+## Gotchas
+
+1. **MX Record Switch Before Policy Update:** Adding a new MX host to DNS before adding it to the HTTPS policy file causes delivery deferrals for all senders with cached policies. Send retries will fail until those external caches reach their `max_age` expiration.
+2. **A TXT record without a working policy host protects nothing.** If `mta-sts.<domain>` does not resolve, returns 404 or 403, or presents an expired or wrong certificate, senders with no cached policy treat the domain as having no MTA-STS. Nothing fails visibly, so this can go unnoticed for years. Check the HTTPS endpoint from outside after every web or certificate change.
+3. **HTTP Redirect Misconfigurations:** Redirecting `https://mta-sts.example.com` to `https://www.example.com` or forcing HTTP-to-HTTPS redirects breaks compliance. Senders MUST NOT follow redirects when fetching `/.well-known/mta-sts.txt`.
+4. **Wrong Content-Type:** Serve the file as `text/plain`. Senders that follow the SHOULD in section 3.2 reject `text/html` or `application/octet-stream`.
+5. **Updating DNS TXT ID Before HTTPS Policy Body:** If the DNS TXT `id` is updated before the new policy body is uploaded to the HTTPS server, senders immediately fetch the *old* policy body under the *new* ID, caching obsolete rules under the new ID handle.
+6. **Short `max_age` Weakening TOFU Protection:** Setting `max_age` to 86400 (1 day) reduces operational risk during changes, but drastically weakens TOFU security against active network interdictions occurring between sending attempts.
+7. **Indefinite `testing` Mode:** Domains leaving MTA-STS in `mode: testing` indefinitely receive diagnostic reporting data but gain zero active protection against downgrade or interception attacks.
+8. **Single-Label Wildcard Match Limitations:** A policy listing `mx: *.example.com` matches `mail.example.com`, but will fail to match multi-label hosts such as `region1.smtp.example.com` or base domains like `example.com`.
+9. **Lack of MX-Specific TLSRPT Failure Codes:** RFC 8460 lacks a dedicated error string for "MX host not listed in MTA-STS policy." Operators must look for generic `validation-failure` codes paired with custom `failure-reason-code` strings.
+10. **Running DANE and MTA-STS through a Postfix helper:** see the sending-side note above; the helper's policy can replace Postfix's DANE check.
+11. **Backup MX Misconfigurations Hidden Until Primary Failure:** Backup MX servers that present invalid certificates or fail policy matches remain undetected during normal operations, failing only when primary MX servers go offline (RFC 8461 Section 8.4).
+
+## Exercises
+
+1. **DNS TXT Parser Edge Cases:** Modify `mtasts.py` to process a DNS TXT payload containing trailing spaces or multiple semi-colons (e.g., `v=STSv1; id=abc123;;`). Verify whether your parser rejects the record or normalizes it in compliance with RFC 8461 Section 3.1.
+2. **Wildcard Boundaries:** Feed `mx_match()` the pattern `*.*.example.com`. The policy ABNF allows only one leading `*.` followed by a domain. What does the lab's matcher do with it, and should `parse_policy()` reject the line instead?
+3. **HTTP Body Size Limit Enforcement:** Update `fetch_policy()` in `mtasts.py` to stream the HTTP response body and abort the request immediately if the payload exceeds 65,536 bytes (64 KiB). Test this against a mock server returning a 1 MB policy payload.
+4. **TLSRPT Aggregator Engine:** Extend `sender.py` to generate an aggregate report JSON combining delivery results across three distinct destination domains (`good.example`, `testing.example`, and `invalid.example`). Validate the output format against the RFC 8460 JSON Schema.
+5. **Proactive refresh:** Give `Sender` a daily background refresh that refetches the policy even when the TXT `id` is unchanged, as section 10.2 suggests. Rerun section 4 with HTTPS available on day 10. What happens on day 17 now?
+
+## Verification
+
+- Ran on the build box (Linux 6.12, OpenSSL 3.5.7, Python 3.13 stdlib, unprivileged, nothing installed): `mkpki.sh`, `lab.py` (with `mtasts.py`, `policyhost.py` and `sender.py`; the policy hosts are real HTTPS servers on 127.0.0.1 verified against the private CA) and `survey.py` (live DoH lookups and live HTTPS policy fetches). The output blocks are pasted from those runs on 2026-11-14 (IST). Live policies and `id` values will change.
+- The first `lab.py` run failed every fetch with `CA cert does not include key usage extension`; that is the genuine message quoted under "Reading the results".
+- Given as data, not measured: the MX TLS handshake outcomes in section 4 (outbound port 25 is blocked on the build box).
+- Not run: the nginx, DNS zone, Postfix and `postfix-mta-sts-resolver` snippets, and any real TLSRPT submission.
+
+## Sources
+
+- **RFC 8461:** SMTP MTA Strict Transport Security (MTA-STS). https://www.rfc-editor.org/rfc/rfc8461
+- **RFC 8460:** SMTP TLS Reporting (TLSRPT). https://www.rfc-editor.org/rfc/rfc8460
+- **RFC 6125:** Representation and Verification of Domain-Based Application Service Identity within PKI. https://www.rfc-editor.org/rfc/rfc6125
+- **RFC 7672:** SMTP Security via Opportunistic DANE TLS. https://www.rfc-editor.org/rfc/rfc7672
+- **Python Documentation:** `ssl` module (`create_default_context`, `VERIFY_X509_STRICT`, changed in 3.13). https://docs.python.org/3/library/ssl.html
+- **`postfix-mta-sts-resolver`** README (socketmap setup; the DANE override warning). https://github.com/Snawoot/postfix-mta-sts-resolver

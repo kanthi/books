@@ -1,0 +1,596 @@
+---
+title: "Choosing a Source Port: connect(), bind() and the Ephemeral Range"
+author:
+  - name: "K19G"
+  - name: "grok-bot"
+---
+
+# Choosing a Source Port: connect(), bind() and the Ephemeral Range
+
+When building high-throughput systems, reverse proxies, API gateways, and load-test engines, network operators often encounter socket allocation failures long before CPU or memory capacity limits are reached. A common operational crisis occurs when an outbound proxy or HTTP load generator suddenly begins throwing `EADDRNOTAVAIL` (Cannot assign requested address) or `EADDRINUSE` (Address already in use) errors while attempting to establish TCP connections.
+
+While these errors are frequently blamed on TCP `TIME-WAIT` socket accumulation (covered in the TIME-WAIT chapter of this part), system engineers frequently encounter port exhaustion in scenarios where `TIME-WAIT` plays no role at all. Active long-lived connections, rapid microservice fan-out, explicit IP binding in multi-homed systems, and misconfigured socket options can completely deplete the host's available local source port budget even when zero sockets reside in `TIME-WAIT`.
+
+Understanding how the Linux kernel selects local source ports during `connect()` and `bind()` system calls is critical for capacity planning and troubleshooting high-concurrency network services. The kernel relies on specific data structures, hashing strategies, and sysctl boundaries to enforce socket uniqueness across the system. Misinterpreting how `bind()` interacts with `connect()` can reduce an application's outbound connection budget from tens of thousands of concurrent streams down to a single socket pool per target service.
+
+This chapter details the low-level mechanics of source port selection in Linux, examines how socket state structures govern 4-tuple sharing, evaluates the performance impacts of socket options like `IP_BIND_ADDRESS_NO_PORT`, and demonstrates capacity planning calculations for edge gateways and service meshes.
+
+## Learning goals
+
+- Understand how the TCP 4-tuple enables source port reuse across distinct remote endpoints.
+- Differentiate between implicit port allocation via `connect()` and explicit port reservation via `bind()`.
+- Identify the root cause of `EADDRINUSE` vs. `EADDRNOTAVAIL` during outbound connection establishment.
+- Explain the Linux kernel's parity-based port allocation algorithm (`__inet_hash_connect` vs. `inet_csk_get_port`).
+- Evaluate the operational impact of socket options `IP_BIND_ADDRESS_NO_PORT`, `IP_LOCAL_PORT_RANGE`, and sysctl `net.ipv4.ip_autobind_reuse`.
+- Apply accurate capacity planning formulas for outgoing connections based on connection rate, duration, source IPs, and ephemeral range bounds.
+
+## Version note
+
+The kernel implementation details, parity split algorithms, and code paths discussed in this chapter are accurate as of Linux kernel version 6.12.94. `IP_BIND_ADDRESS_NO_PORT` arrived in Linux 4.2 and the per-socket `IP_LOCAL_PORT_RANGE` in Linux 6.3 (both per their man pages). The lab ran on 6.12.94 with Python 3.13.5 and iproute2 6.15.0.
+
+## Ephemeral Port Range and the TCP 4-Tuple
+
+Every active TCP connection on a Linux host is uniquely identified within the network stack by a 4-tuple structure:
+
+```text
++-----------------------------------------------------------------------+
+|                              TCP 4-Tuple                              |
+|                                                                       |
+|  [ Source IP ]  :  [ Source Port ]  <--->  [ Dst IP ]  :  [ Dst Port ] |
++-----------------------------------------------------------------------+
+```
+
+Because uniqueness is enforced across all four fields, a single local source IP address and source port combination can be reused simultaneously across multiple connections, provided each connection targets a distinct remote IP address or remote port.
+
+### The Ephemeral Range
+
+When an application creates a stream socket and initiates an outbound connection using `connect()` without explicitly specifying a local port, the Linux kernel automatically assigns an unused local port from the ephemeral port range. This range is defined by the sysctl parameter `net.ipv4.ip_local_port_range`.
+
+The default range is `32768` to `60999` inclusive: 28,232 ports. RFC 6335 assigns `49152`–`65535` (16,384 ports) as the IANA dynamic range, and RFC 6056 recommends that port selection use the whole `1024`–`65535` space. Linux defaults to a larger range than IANA's and leaves room above 61000 for services that listen there. The range must start at or above `net.ipv4.ip_unprivileged_port_start` (1024 by default).
+
+| Parameter / Standard | Range Start | Range End | Total Available Ports |
+| :--- | :--- | :--- | :--- |
+| **Linux Sysctl Default** | `32768` | `60999` | 28,232 |
+| **IANA Recommendation (RFC 6335)** | `49152` | `65535` | 16,384 |
+| **Widest allowed by default** | `1024` | `65535` | 64,512 |
+
+### Per-Destination Budgeting
+
+Because uniqueness depends on the full 4-tuple, an application issuing plain `connect()` calls can establish up to ~28,232 concurrent connections from a single local IP to target destination `192.168.1.100:443`. If the same application simultaneously connects to target destination `192.168.1.101:443`, the kernel can reuse the exact same set of 28,232 source ports. Thus, the outbound connection budget for plain `connect()` operations is **per destination endpoint** (Destination IP + Destination Port).
+
+```text
+Source: 10.0.0.1                         Destinations:
++----------------+                       +--------------------+
+|                |--- src port 40000 --->| 192.168.1.100:443  | (Tuple A)
+|  Local Client  |                       +--------------------+
+|                |                       +--------------------+
+|                |--- src port 40000 --->| 192.168.1.101:443  | (Tuple B)
++----------------+                       +--------------------+
+```
+
+## The `bind()` Trap and `IP_BIND_ADDRESS_NO_PORT`
+
+A common architecture in multi-homed hosts, egress gateways, and reverse proxies (such as NGINX, HAProxy, or Envoy) involves binding outbound sockets to a specific source IP address before establishing outbound connections. This is done to force outbound traffic onto specific egress interfaces or policy routes.
+
+### The `bind(src, 0)` Problem
+
+To select a source IP while allowing the kernel to auto-select a free port, applications call `bind()` with port `0` (e.g., `bind("10.0.0.1", 0)`) prior to calling `connect()`.
+
+Calling `bind(src, 0)` forces the kernel to immediately select and reserve a local port within the host's binding table *at the time `bind()` is executed*. However, at the moment `bind()` is invoked, the kernel does **not** know the remote destination IP or port, because `connect()` has not yet been called.
+
+```text
+Sequence for bind(src, 0) followed by connect():
+
+Step 1: bind(10.0.0.1, 0)
+        Kernel reserves port X globally for source IP 10.0.0.1.
+        Dest IP/Port are unknown. Port X cannot be bound again.
+
+Step 2: connect(192.168.1.100, 443)
+        Connection completes using local 10.0.0.1:X.
+```
+
+Because the kernel must guarantee that the bound address is usable for whatever `connect()` comes next, a port chosen by `bind(src, 0)` is taken out of the pool for **every destination**: later `bind(src, 0)` calls will not hand it out again (unless `SO_REUSEADDR` and `ip_autobind_reuse` are involved, see below). Consequently, the source port budget is transformed from a per-destination limit of 28,232 connections to a **global limit** of 28,232 connections across all combined destinations for that bound source IP.
+
+When all 28,232 ports are bound, subsequent calls to `bind(src, 0)` immediately fail with the error `EADDRINUSE` (Address already in use)—even if the application intends to connect to a completely new destination IP address.
+
+### Resolving the Trap: `IP_BIND_ADDRESS_NO_PORT`
+
+To solve this architectural issue, Linux 4.2 introduced the socket option `IP_BIND_ADDRESS_NO_PORT`. When this option is set on a socket before calling `bind(src, 0)`, it informs the kernel to bind the socket to the requested source IP address, but to **defer source port selection** until `connect()` is executed.
+
+```text
+Sequence with IP_BIND_ADDRESS_NO_PORT:
+
+Step 1: setsockopt(..., IP_BIND_ADDRESS_NO_PORT, 1)
+Step 2: bind(10.0.0.1, 0)
+        Kernel records source IP 10.0.0.1. No port is reserved yet.
+
+Step 3: connect(192.168.1.100, 443)
+        Kernel evaluates full 4-tuple and selects port X.
+        Port X is bound only in the context of destination 192.168.1.100:443.
+```
+
+Because port assignment occurs during `connect()`, the kernel evaluates the complete 4-tuple. This restores the outbound connection capacity back to ~28,232 connections per unique destination endpoint. If port allocation fails at `connect()` time because all 4-tuples for that specific destination are occupied, the kernel returns `EADDRNOTAVAIL` rather than `EADDRINUSE`.
+
+| Method | Port Selected At | Scope of Port Reservation | Failure Error Code |
+| :--- | :--- | :--- | :--- |
+| **Plain `connect()`** | `connect()` call | Per destination 4-tuple | `EADDRNOTAVAIL` |
+| **`bind(src, 0)` + `connect()`** | `bind()` call | Global across source IP | `EADDRINUSE` |
+| **`bind(src, 0)` + `IP_BIND_ADDRESS_NO_PORT` + `connect()`** | `connect()` call | Per destination 4-tuple | `EADDRNOTAVAIL` |
+
+## Kernel Port Allocation Mechanics
+
+The Linux kernel implements specific strategies in its networking subsystem to allocate ephemeral ports efficiently and avoid resource contention between active outgoing connections and listening services.
+
+### Parity Splitting (`__inet_hash_connect` vs `inet_csk_get_port`)
+
+Since 2016 (Eric Dumazet's "tcp/dccp: try to not exhaust ip_local_port_range in connect()"), the kernel uses a parity-based split to ensure that applications making automatic client connections (`connect()`) and applications explicitly binding local ports (`bind(0)`) do not exhaust each other's available port supplies.
+
+Internal kernel routines govern port selection based on the call path:
+- **`__inet_hash_connect()`**: Invoked during implicit port selection for outbound `connect()` calls.
+- **`inet_csk_get_port()` / `inet_csk_find_open_port()`**: Invoked when an application calls `bind(0)`.
+
+```text
+net.ipv4.ip_local_port_range = [ 40000 , 40009 ]  (Low end = 40000: EVEN)
+                                  |
+            +---------------------+---------------------+
+            |                                           |
+            v                                           v
+   __inet_hash_connect()                     inet_csk_get_port()
+     (Plain connect)                              (Explicit bind)
+            |                                           |
+            v                                           v
+Prefers EVEN Ports (40000, 40002...)       Prefers ODD Ports (40001, 40003...)
+```
+
+The algorithm evaluates the starting bound (the low end) of `net.ipv4.ip_local_port_range`:
+1. If the lower range bound is **even** (e.g., `32768` or `40000`), `__inet_hash_connect()` attempts to allocate **even** ports first. Conversely, `inet_csk_get_port()` attempts to allocate **odd** ports first.
+2. If the lower range bound is **odd** (e.g., `32769`), `__inet_hash_connect()` attempts to allocate **odd** ports first, while `inet_csk_get_port()` attempts to allocate **even** ports first.
+
+Because of this separation, Linux kernel sysctl documentation recommends that operators configure `net.ipv4.ip_local_port_range` such that the low and high bounds have different parities (e.g., an even low bound and an odd high bound like `32768 60999`).
+
+### Exclude Ports with `ip_local_reserved_ports`
+
+Systems often run control-plane applications or administrative daemons on known static ports inside the ephemeral port range (e.g., port `41000`). If an outbound `connect()` call automatically claims port `41000` as its local ephemeral source port, a subsequent attempt by a daemon to execute `bind()` on port `41000` will fail with `EADDRINUSE`.
+
+The sysctl parameter `net.ipv4.ip_local_reserved_ports` specifies a comma-separated list or range of ports to exclude from automatic selection:
+
+```text
+sysctl net.ipv4.ip_local_reserved_ports = 40000-40004
+```
+
+Ports listed in `ip_local_reserved_ports` are skipped by every automatic selection (`connect()` and `bind()` with port 0). Explicit calls such as `bind(src, 40002)` still succeed; the kernel documentation says "Explicit port allocation behavior is unchanged". The list must be cleared by writing a newline; writing an empty string does not clear it (we hit this in the lab).
+
+### UDP Autobind Behavior
+
+Unlike TCP, UDP is a connectionless transport protocol. While UDP sockets can invoke `connect()` to lock in a default remote destination address, the kernel's port allocation table does not support 4-tuple sharing for UDP sockets undergoing automatic port allocation (autobind).
+
+When a UDP socket calls `connect()` or `sendto()` without a prior `bind()`, the kernel autobinds it through `udp_lib_get_port()`, which looks only at the local port (and address), never at the destination. Each autobound UDP socket therefore consumes one port of the range. When the range is exhausted, autobind fails with `EAGAIN` no matter how many different destinations the sockets talk to.
+
+### `ip_autobind_reuse`
+
+The sysctl `net.ipv4.ip_autobind_reuse` (default `0`) controls whether `bind(0)` may hand out a port that is already bound, when the new socket and every socket on that port have `SO_REUSEADDR`. The kernel documentation says it "may break some applications", names `IP_BIND_ADDRESS_NO_PORT` as the preferred solution, and says it "should only be set by experts".
+
+Setting `net.ipv4.ip_autobind_reuse = 1` modifies `inet_csk_get_port()` to allow port sharing for sockets configured with `SO_REUSEADDR`. However, because `bind()` takes place without knowledge of the eventual destination IP and port, the kernel may assign a port whose resulting 4-tuple conflicts with an existing connection once `connect()` is subsequently invoked. Lab section 8 shows exactly that: the shared port is handed out again and `connect()` fails with `EADDRNOTAVAIL` once the 4-tuple is taken.
+
+### Per-Socket Ephemeral Range (`IP_LOCAL_PORT_RANGE`)
+
+Linux 6.3 introduced the `IP_LOCAL_PORT_RANGE` socket option, allowing individual user-space applications to override the global `net.ipv4.ip_local_port_range` sysctl on a per-socket basis.
+
+The value is one 32-bit integer: the upper bound in the high 16 bits, the lower bound in the low 16 bits (`hi << 16 | lo`); 0 for either half means "use the sysctl's bound". The effective range is the intersection with the sysctl range. In `__inet_hash_connect()` (v6.12) a per-socket range turns the parity split off:
+
+```c
+/* net/ipv4/inet_hashtables.c, Linux v6.12 (excerpt) */
+local_ports = inet_sk_get_local_port_range(sk, &low, &high);
+step = local_ports ? 1 : 2;
+...
+/* In first pass we try ports of @low parity.
+ * inet_csk_get_port() does the opposite choice.
+ */
+if (!local_ports)
+    offset &= ~1U;
+```
+
+With a per-socket range the scan starts at a hashed offset and walks every port (`step` 1) instead of every other one, which matters for small ranges: all of them are usable by `connect()` in one pass.
+
+## The lab
+
+The lab script `lab-ports.sh` executes Python script `ports.py` inside a private, unprivileged network namespace (`unshare -urn`). Network namespaces isolate sysctl settings, ensuring host configuration parameters remain completely untouched.
+
+Run it as `unshare -urn sh lab-ports.sh` (no root, nothing installed). Inside the namespace, all of `127.0.0.0/8` is local once `lo` is up, and the script adds `127.0.0.10` explicitly for section 4. TCP listeners are started on `127.0.0.2:80` and `127.0.0.3:80`. To trigger immediate port exhaustion without creating thousands of sockets, `net.ipv4.ip_local_port_range` is restricted inside the test namespace to `40000 40009` (a total budget of 10 ports). All client sockets configured in `ports.py` set `SO_LINGER` to `0` upon closure, forcing a TCP RST packet to bypass the `TIME-WAIT` state completely so residual sockets do not influence subsequent test steps.
+
+### Lab files
+
+The wrapper that enters the namespace:
+
+`lab-ports.sh`:
+
+```bash
+#!/bin/sh
+# Run as: unshare -urn sh lab-ports.sh   (private network namespace: the sysctls below are per-netns)
+ip link set lo up
+ip addr add 127.0.0.10/8 dev lo 2>/dev/null || true
+uname -r
+python3 "$(dirname "$0")/ports.py"
+```
+
+The experiments, one function call per section:
+
+`ports.py`:
+
+```python
+"""Source-port selection on Linux: connect() vs bind(0), IP_BIND_ADDRESS_NO_PORT, reserved ports, UDP."""
+import errno, socket, sys, time
+IP_BIND_ADDRESS_NO_PORT = getattr(socket, "IP_BIND_ADDRESS_NO_PORT", 24)
+P = "/proc/sys/net/ipv4/"
+def sysctl(name, value=None):
+    if value is not None:
+        open(P + name, "w").write(value)
+    return open(P + name).read().split()
+DST = [("127.0.0.2", 80), ("127.0.0.3", 80)]
+listeners = []
+for d in DST:
+    l = socket.create_server(d, backlog=200); listeners.append(l)
+held = []
+LINGER0 = (1).to_bytes(4, "little") + (0).to_bytes(4, "little")
+def close_all():
+    for s in held:                       # SO_LINGER 0: close with RST, so no TIME-WAIT keeps the port
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, LINGER0); s.close()
+    held.clear()
+def opener(dst, src=None, no_port=False, reuse=False):
+    s = socket.socket()
+    held.append(s)
+    if reuse: s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    if no_port: s.setsockopt(socket.IPPROTO_IP, IP_BIND_ADDRESS_NO_PORT, 1)
+    if src is not None: s.bind((src, 0))
+    s.connect(dst)
+    return s.getsockname()[1]
+def fill(label, dst, **kw):
+    ports, err = [], None
+    while True:
+        try:
+            ports.append(opener(dst, **kw))
+        except OSError as e:
+            err = errno.errorcode[e.errno]; break
+        if len(ports) > 100: break
+    print(f"  {label:52} {len(ports):3} connections, then {err}; ports {ports[:6]}{'...' if len(ports) > 6 else ''}")
+    return ports
+def part(t): print(f"\n== {t}")
+
+sysctl("ip_local_port_range", "40000 40009")
+print("ip_local_port_range =", " ".join(sysctl("ip_local_port_range")), "(10 ports)")
+
+part("1. plain connect(): the limit is per destination")
+a = fill("to 127.0.0.2:80", DST[0]); b = fill("to 127.0.0.3:80", DST[1])
+print(f"  same source ports reused toward both destinations: {sorted(a) == sorted(b)}"); close_all()
+
+part("2. bind(src, 0) before connect(): the port is reserved for every destination")
+fill("to 127.0.0.2:80, bind 127.0.0.1:0 first", DST[0], src="127.0.0.1")
+fill("to 127.0.0.3:80, bind 127.0.0.1:0 first", DST[1], src="127.0.0.1"); close_all()
+
+part("3. bind(src, 0) with IP_BIND_ADDRESS_NO_PORT: port chosen at connect() time")
+fill("to 127.0.0.2:80, bind + NO_PORT", DST[0], src="127.0.0.1", no_port=True)
+fill("to 127.0.0.3:80, bind + NO_PORT", DST[1], src="127.0.0.1", no_port=True); close_all()
+
+part("4. a second source address doubles the per-destination budget")
+fill("to 127.0.0.2:80 from 127.0.0.1 (NO_PORT)", DST[0], src="127.0.0.1", no_port=True)
+fill("to 127.0.0.2:80 from 127.0.0.10 (NO_PORT)", DST[0], src="127.0.0.10", no_port=True); close_all()
+
+part("5. parity: connect() starts on even ports, bind(0) on odd ones (20-port range)")
+sysctl("ip_local_port_range", "40000 40019")
+c = [opener(DST[0]) for _ in range(6)]
+bnd = []
+for _ in range(6):
+    s = socket.socket(); held.append(s); s.bind(("127.0.0.1", 0)); bnd.append(s.getsockname()[1])
+print(f"  connect() picked {sorted(c)}\n  bind(0)   picked {sorted(bnd)}")
+close_all()
+
+part("6. ip_local_reserved_ports: autoselection skips them, explicit bind still works")
+sysctl("ip_local_port_range", "40000 40009"); sysctl("ip_local_reserved_ports", "40000-40004")
+fill("to 127.0.0.2:80 with 40000-40004 reserved", DST[0])
+s = socket.socket(); held.append(s); s.bind(("127.0.0.1", 40002)); print(f"  explicit bind to reserved port 40002: ok, got {s.getsockname()[1]}")
+close_all(); sysctl("ip_local_reserved_ports", "\n")
+print("  ip_local_reserved_ports cleared:", sysctl("ip_local_reserved_ports") == [])
+
+part("7. UDP autobind has no 4-tuple sharing")
+socks, err = [], None
+while True:
+    u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        u.connect(DST[len(socks) % 2]); socks.append(u)
+    except OSError as e:
+        err = errno.errorcode[e.errno]; break
+print(f"  connected UDP sockets alternating between 2 destinations: {len(socks)}, then {err}")
+for u in socks: u.close()
+
+part("8. bind(0) with SO_REUSEADDR and net.ipv4.ip_autobind_reuse")
+for v in ("0", "1"):
+    try:
+        sysctl("ip_autobind_reuse", v)
+    except OSError as e:
+        print(f"  cannot set ip_autobind_reuse={v}: {e}"); continue
+    fill(f"ip_autobind_reuse={v}: SO_REUSEADDR + bind(0), to .2 then .3", DST[0], src="127.0.0.1", reuse=True)
+    fill(f"ip_autobind_reuse={v}:   (second destination)", DST[1], src="127.0.0.1", reuse=True)
+    close_all()
+sysctl("ip_autobind_reuse", "0")
+
+part("9. per-socket range with IP_LOCAL_PORT_RANGE (Linux 6.3+): 40100-40103 for this client only")
+IP_LOCAL_PORT_RANGE = getattr(socket, "IP_LOCAL_PORT_RANGE", 51)
+sysctl("ip_local_port_range", "40000 40999")
+got, err = [], None
+while True:
+    s = socket.socket(); held.append(s)
+    s.setsockopt(socket.IPPROTO_IP, IP_LOCAL_PORT_RANGE, ((40103 << 16) | 40100).to_bytes(4, "little"))  # hi<<16 | lo
+    try:
+        s.connect(DST[0]); got.append(s.getsockname()[1])
+    except OSError as e:
+        err = errno.errorcode[e.errno]; break
+print(f"  {len(got)} connections, then {err}; ports {sorted(got)} (system range is 40000-40999)")
+close_all()
+```
+
+### Execution output
+
+```text
+6.12.94+
+ip_local_port_range = 40000 40009 (10 ports)
+
+== 1. plain connect(): the limit is per destination
+  to 127.0.0.2:80                                       10 connections, then EADDRNOTAVAIL; ports [40000, 40002, 40004, 40006, 40008, 40007]...
+  to 127.0.0.3:80                                       10 connections, then EADDRNOTAVAIL; ports [40006, 40002, 40004, 40008, 40000, 40001]...
+  same source ports reused toward both destinations: True
+
+== 2. bind(src, 0) before connect(): the port is reserved for every destination
+  to 127.0.0.2:80, bind 127.0.0.1:0 first               10 connections, then EADDRINUSE; ports [40005, 40007, 40001, 40009, 40003, 40004]...
+  to 127.0.0.3:80, bind 127.0.0.1:0 first                0 connections, then EADDRINUSE; ports []
+
+== 3. bind(src, 0) with IP_BIND_ADDRESS_NO_PORT: port chosen at connect() time
+  to 127.0.0.2:80, bind + NO_PORT                       10 connections, then EADDRNOTAVAIL; ports [40004, 40008, 40006, 40000, 40002, 40005]...
+  to 127.0.0.3:80, bind + NO_PORT                       10 connections, then EADDRNOTAVAIL; ports [40000, 40002, 40004, 40006, 40008, 40001]...
+
+== 4. a second source address doubles the per-destination budget
+  to 127.0.0.2:80 from 127.0.0.1 (NO_PORT)              10 connections, then EADDRNOTAVAIL; ports [40004, 40002, 40006, 40008, 40000, 40005]...
+  to 127.0.0.2:80 from 127.0.0.10 (NO_PORT)             10 connections, then EADDRNOTAVAIL; ports [40008, 40002, 40000, 40004, 40006, 40005]...
+
+== 5. parity: connect() starts on even ports, bind(0) on odd ones (20-port range)
+  connect() picked [40000, 40002, 40006, 40008, 40014, 40018]
+  bind(0)   picked [40001, 40003, 40011, 40013, 40015, 40017]
+
+== 6. ip_local_reserved_ports: autoselection skips them, explicit bind still works
+  to 127.0.0.2:80 with 40000-40004 reserved              5 connections, then EADDRNOTAVAIL; ports [40006, 40008, 40005, 40007, 40009]
+  explicit bind to reserved port 40002: ok, got 40002
+  ip_local_reserved_ports cleared: True
+
+== 7. UDP autobind has no 4-tuple sharing
+  connected UDP sockets alternating between 2 destinations: 10, then EAGAIN
+
+== 8. bind(0) with SO_REUSEADDR and net.ipv4.ip_autobind_reuse
+  ip_autobind_reuse=0: SO_REUSEADDR + bind(0), to .2 then .3  10 connections, then EADDRINUSE; ports [40001, 40003, 40002, 40000, 40007, 40009]...
+  ip_autobind_reuse=0:   (second destination)            0 connections, then EADDRINUSE; ports []
+  ip_autobind_reuse=1: SO_REUSEADDR + bind(0), to .2 then .3  10 connections, then EADDRNOTAVAIL; ports [40001, 40003, 40002, 40000, 40009, 40005]...
+  ip_autobind_reuse=1:   (second destination)            1 connections, then EADDRNOTAVAIL; ports [40001]
+
+== 9. per-socket range with IP_LOCAL_PORT_RANGE (Linux 6.3+): 40100-40103 for this client only
+  4 connections, then EADDRNOTAVAIL; ports [40100, 40101, 40102, 40103] (system range is 40000-40999)
+```
+
+The program prints at most six ports per line, in the order they were handed out (sections 5 and 9 print them sorted).
+
+## Reading the output
+
+### Section 1: Plain `connect()` limits are per-destination
+
+In Section 1, `ports.py` creates plain TCP sockets and invokes `connect()` directly toward destination `127.0.0.2:80`. The ephemeral port range is set to `40000 40009` (10 ports total).
+
+The kernel establishes 10 connections; the first six ports are `40000`, `40002`, `40004`, `40006`, `40008` and then `40007`. All five **even** ports go first (the low end `40000` is even, so `__inet_hash_connect()` scans that parity first), and only then does the second pass hand out odd ones. On the 11th connection attempt to `127.0.0.2:80`, the kernel returns `EADDRNOTAVAIL` because all 10 local ports are actively used in 4-tuples targeting `127.0.0.2:80`.
+
+Next, `ports.py` immediately attempts outbound connections toward a *different* destination address: `127.0.0.3:80`. The kernel successfully establishes another 10 connections, reusing the same ten source ports (the first six shown are `40006`, `40002`, `40004`, `40008`, `40000`, `40001`). The test confirms `same source ports reused toward both destinations: True`. This proves that plain `connect()` evaluates uniqueness based on the full 4-tuple, providing a independent port budget per destination endpoint.
+
+### Section 2: `bind(src, 0)` reserves ports globally
+
+In Section 2, client sockets call `bind("127.0.0.1", 0)` prior to calling `connect()`.
+
+When connecting to `127.0.0.2:80`, the kernel successfully opens 10 connections. The first five ports are the **odd** ones (`40005`, `40007`, `40001`, `40009`, `40003`) and only then come even ports (`40004`): `bind(0)` goes through `inet_csk_find_open_port()`, which prefers the parity opposite to the low end. The 11th `bind()` fails with `EADDRINUSE`.
+
+Immediately following this, `ports.py` attempts to connect to the second destination, `127.0.0.3:80`, using `bind("127.0.0.1", 0)`. The result is **0 connections** established, terminating immediately with error `EADDRINUSE`. Because `bind()` reserved each port globally for source address `127.0.0.1` before the destination was known, the host ran out of bindable ports across all destinations.
+
+### Section 3: Deferring port selection with `IP_BIND_ADDRESS_NO_PORT`
+
+Section 3 enables `IP_BIND_ADDRESS_NO_PORT` via `setsockopt()` before calling `bind("127.0.0.1", 0)`.
+
+With this socket option set, binding to `127.0.0.1:0` no longer reserves a port globally at `bind()` time. When `connect()` is subsequently invoked, port selection occurs with full knowledge of the destination 4-tuple. As a result, the application opens 10 connections to `127.0.0.2:80` (failing with `EADDRNOTAVAIL` on the 11th) and then successfully opens another 10 connections to `127.0.0.3:80`.
+
+### Section 4: Multiplied budget via multiple source IP addresses
+
+Section 4 tests the effect of using distinct source IP addresses (`127.0.0.1` and `127.0.0.10`) targeting the same destination endpoint (`127.0.0.2:80`).
+
+Binding to `127.0.0.1` (with `IP_BIND_ADDRESS_NO_PORT`) yields 10 connections before `EADDRNOTAVAIL`. Binding to `127.0.0.10` yields another 10 to the very same destination. The source address is part of the 4-tuple, so the same ten ports are reused for the second address.
+
+### Section 5: Observing the parity split in a 20-port range
+
+Section 5 expands the local port range to 20 ports (`40000` through `40019`) to clearly demonstrate the parity separation between implicit `connect()` and explicit `bind(0)`.
+
+Six plain `connect()` calls all got even ports (`40000`, `40002`, `40006`, `40008`, `40014`, `40018`) and six `bind(0)` calls all got odd ones (`40001`, `40003`, `40011`, `40013`, `40015`, `40017`). Which ports within each parity are picked depends on a hash of the destination and a per-boot random table, so your exact numbers will differ; the parity will not.
+
+### Section 6: Filtering with `ip_local_reserved_ports`
+
+In Section 6, ports `40000` through `40004` are reserved via `sysctl net.ipv4.ip_local_reserved_ports`. Out of the 10 total ports in range `40000 40009`, 5 ports are now restricted.
+
+When plain `connect()` runs, it establishes exactly 5 connections using unreserved ports (`40006`, `40008`, `40005`, `40007`, `40009`) before returning `EADDRNOTAVAIL`. Next, an explicit `bind()` call targeting reserved port `40002` is issued (`bind("127.0.0.1", 40002)`). The explicit bind succeeds (`ok, got 40002`), demonstrating that reserved port sysctls only apply to automatic port selection algorithms.
+
+### Section 7: UDP autobind behavior
+
+Section 7 creates connected UDP sockets alternating between targets `127.0.0.2:80` and `127.0.0.3:80`.
+
+Because UDP autobind ignores the destination, the range is used up after 10 sockets in total across both destinations, and the 11th `connect()` fails with `EAGAIN`. The same program over TCP would have reached 20.
+
+### Section 8: `ip_autobind_reuse` failure modes
+
+Section 8 evaluates `net.ipv4.ip_autobind_reuse`. 
+- With `ip_autobind_reuse = 0`, sockets using `SO_REUSEADDR` + `bind(0)` fill all 10 ports on the first destination (`127.0.0.2:80`) and immediately fail with `EADDRINUSE` on the second destination (`127.0.0.3:80`).
+- With `ip_autobind_reuse = 1`, the first destination still gets 10 connections, but the failure changes: the 11th `bind(0)` now succeeds by handing out an already-bound port, and it is `connect()` that fails with `EADDRNOTAVAIL`, because that 4-tuple to `127.0.0.2:80` already exists. Toward the second destination the first reused port or two connect (1 in the run shown, 2 in a rerun), then a `bind()` again returns a port whose tuple is taken and `connect()` fails. One or two connections instead of ten: `IP_BIND_ADDRESS_NO_PORT` (section 3) got all ten.
+
+### Section 9: Per-socket custom ranges (`IP_LOCAL_PORT_RANGE`)
+
+Section 9 sets `IP_LOCAL_PORT_RANGE` on a socket to range `40100 40103` (4 ports), while the host sysctl is set to `40000 40999`.
+
+The client gets exactly 4 connections, on `40100`–`40103` (printed sorted), then `EADDRNOTAVAIL`. The per-socket range wins over the much wider sysctl range, and both parities are used, consistent with `step = 1` above.
+
+## In production
+
+### Capacity Planning Formulas
+
+To calculate the maximum sustainable outbound connection rate to a single destination endpoint (destination IP + destination port) from a single source IP address, apply the following formula:
+
+$$\text{Max Conns/Sec} = \frac{\text{Ephemeral Port Budget}}{\text{Average Connection Lifetime (seconds)} + \text{TIME-WAIT Duration (seconds)}}$$
+
+Where:
+- $\text{Ephemeral Port Budget} = \text{Range End} - \text{Range Start} + 1 - \text{Reserved Ports}$
+- $\text{TIME-WAIT Duration} = 60 \text{ seconds}$ if this host closes first, $0$ if the peer closes first. `tcp_tw_reuse` (default 2, loopback only) can shorten the effective hold for outgoing connections; see the TIME-WAIT chapter.
+
+#### Practical Capacity Calculation Example
+
+Consider a high-concurrency egress proxy node:
+- Local Ephemeral Range: `32768 60999` (28,232 ports)
+- Target: Single upstream API endpoint (`10.0.5.50:443`)
+- Single Source IP assigned to egress interface.
+- Connection pattern: Microservice opens connections, sends request, and actively closes socket (entering `TIME-WAIT` for 60 seconds). Connection duration = 0.1s.
+
+$$\text{Max Conns/Sec} = \frac{28,232}{0.1 + 60} = \frac{28,232}{60.1} \approx 469.7 \text{ conns/sec}$$
+
+At 1,000 new connections per second to that one destination, the 28,232 ports are gone in about 28 seconds, after which `connect()` returns `EADDRNOTAVAIL`.
+
+#### Scaling Egress Capacity
+
+To scale outbound capacity past this limit:
+1. **Enable HTTP Keep-Alive / Connection Pooling**: Reusing long-lived connections eliminates the per-request port allocation cost entirely.
+2. **Expand Source IP Pool**: Assign $N$ source IP addresses to the host egress interface. Multiplying source IPs multiplies the budget by $N$.
+3. **Expand Ephemeral Range**: widen `net.ipv4.ip_local_port_range` (up to `1024 65535`, 64,512 ports), but first list every port a local service listens on in `ip_local_reserved_ports`, or an outgoing connection may hold the port when the service restarts.
+4. **Spread over destinations**: the budget is per destination, so more backend IPs or ports multiply it too, as long as the client actually uses them.
+
+### Inspecting Socket State with `ss`
+
+To check the number of active established connections toward a specific destination port:
+
+```bash
+# Label: (not run here)
+ss -tan state established '( dport = :443 )' | wc -l
+```
+
+To display concise summary statistics of socket allocations across the kernel:
+
+```bash
+# Label: (not run here)
+ss -s
+```
+
+### Inspecting Sysctl Configuration
+
+To view current global sysctl values for ephemeral port management:
+
+```bash
+# Label: (not run here)
+sysctl net.ipv4.ip_local_port_range net.ipv4.ip_local_reserved_ports net.ipv4.ip_autobind_reuse
+```
+
+To dynamically set the ephemeral range and reserve static ports:
+
+```bash
+# Label: (not run here)
+sysctl -w net.ipv4.ip_local_port_range="10240 65535"
+sysctl -w net.ipv4.ip_local_reserved_ports="8080,9090,30000-30100"
+```
+
+### Configuring `IP_BIND_ADDRESS_NO_PORT` in C
+
+Applications binding to specific local source IPs should always configure `IP_BIND_ADDRESS_NO_PORT` via `setsockopt()` before calling `bind()`:
+
+```c
+// Label: (not run here)
+int fd = socket(AF_INET, SOCK_STREAM, 0);
+int optval = 1;
+
+if (setsockopt(fd, SOL_IP, IP_BIND_ADDRESS_NO_PORT, &optval, sizeof(optval)) < 0) {
+    perror("setsockopt IP_BIND_ADDRESS_NO_PORT failed");
+}
+
+struct sockaddr_in src_addr;
+memset(&src_addr, 0, sizeof(src_addr));
+src_addr.sin_family = AF_INET;
+src_addr.sin_addr.s_addr = inet_addr("10.0.0.1");
+src_addr.sin_port = 0; // Request automatic port assignment at connect() time
+
+if (bind(fd, (struct sockaddr *)&src_addr, sizeof(src_addr)) < 0) {
+    perror("bind failed");
+}
+
+// Port is assigned here during connect based on full 4-tuple
+if (connect(fd, (struct sockaddr *)&dst_addr, sizeof(dst_addr)) < 0) {
+    perror("connect failed");
+}
+```
+
+### Tracing Application Socket Calls with `strace`
+
+To verify whether a proxy or custom service sets `IP_BIND_ADDRESS_NO_PORT` when binding source addresses, monitor the system call execution using `strace`:
+
+```bash
+# Label: (not run here)
+strace -f -e trace=bind,connect,setsockopt -p <PID>
+```
+
+When checking reverse proxies like NGINX (`proxy_bind`), HAProxy (`source`), or Envoy (`upstream_bind_config`), inspect strace output to confirm that `setsockopt(..., SOL_IP, IP_BIND_ADDRESS_NO_PORT, [1], 4)` occurs prior to `bind()`.
+
+### Kubernetes SNAT and Cloud NAT Bottlenecks
+
+Source Network Address Translation (SNAT) gateways, Kubernetes egress gateways, and cloud provider NAT services (such as AWS NAT Gateway or Google Cloud NAT) operate under identical 4-tuple mathematical constraints. 
+
+When hundreds of backend pod instances route traffic through a shared NAT gateway toward a single external destination service (e.g., an external database or third-party API endpoint at `198.51.100.50:443`), the NAT gateway must translate all outgoing flows to use its public IP address. 
+
+```text
+Backend Pod A \
+Backend Pod B ---> [ Cloud NAT Gateway ] ===(< 64k 4-tuples)===> Target API
+Backend Pod C /   (Public IP: 203.0.113.5)                     (198.51.100.50:443)
+```
+
+The NAT gateway hits the same ceiling: at most one translated source port per flow per public IP toward that destination, and providers document per-destination limits in the tens of thousands per IP. If aggregate pod connection rates exceed gateway port availability, the NAT gateway will drop outgoing SYN packets or return connection errors, manifesting as intermittent connection timeouts across the entire cluster. Remediating cloud NAT exhaustion requires allocating multiple public IP addresses to the NAT gateway pool or implementing connection pooling within backend applications.
+
+## Gotchas
+
+- **Confusing `EADDRINUSE` and `EADDRNOTAVAIL`**: `EADDRINUSE` during outbound connections indicates port space exhaustion at `bind()` time (often caused by `bind(src, 0)` without `IP_BIND_ADDRESS_NO_PORT`). `EADDRNOTAVAIL` indicates exhaustion at `connect()` time when all valid 4-tuples for a specific destination are occupied.
+- **Assuming the Ephemeral Range is Global Across Destinations**: Plain `connect()` uses 4-tuple hashing. Ephemeral port limits apply per destination endpoint, not globally across the entire host.
+- **UDP Port Exhaustion**: Connected UDP sockets do not share local source ports across different destination IPs. UDP autobind allocates a unique local port per socket globally, returning `EAGAIN` when exhausted.
+- **Same-parity range bounds**: the kernel documentation asks for bounds of different parity (one even, one odd). The default `32768 60999` follows that; a range like `32768 61000` leaves an odd number of ports and an uneven split.
+- **`SO_REUSEADDR` widens bind(0) scans**: with `SO_REUSEADDR`, `inet_csk_find_open_port()` first scans half the range, so a `bind(0)`-heavy client can see different port patterns from one without it.
+- **Enabling `ip_autobind_reuse` in Production**: The sysctl `net.ipv4.ip_autobind_reuse` allows `bind(0)` to reuse `SO_REUSEADDR` ports without knowledge of the destination, leading to high rates of `EADDRNOTAVAIL` errors during subsequent `connect()` attempts.
+- **Ignoring Control Plane Port Conflicts**: Failing to add statically bound service ports to `net.ipv4.ip_local_reserved_ports` allows outbound `connect()` calls to claim those ports dynamically, causing subsequent service restarts to fail with `EADDRINUSE`.
+- **Misidentifying Ephemeral Exhaustion as `TIME-WAIT` Accumulation**: Troubleshooting port exhaustion by tuning `tcp_tw_reuse` or shortening TCP timers will fail to resolve `EADDRINUSE` errors caused by improper `bind(src, 0)` usage.
+
+## Exercises
+
+1. **Calculate Egress Gateway Capacity**: A proxy host uses default sysctl settings (`32768 60999`) and a single source IP. Upstream clients establish short-lived connections to a single destination backend (`10.0.0.50:80`). If the client closes connections (60-second `TIME-WAIT`) and average request latency is 50ms, calculate the maximum sustainable request-per-second (RPS) threshold before port exhaustion occurs.
+2. **Diagnose Proxy Failure**: An engineer reports that an NGINX proxy fails with `EADDRINUSE` errors when attempting to connect to backends. Describe the strace command line used to diagnose whether NGINX is invoking `IP_BIND_ADDRESS_NO_PORT`, and explain what output confirms proper configuration.
+3. **Write a C Socket Test**: Write a small C code snippet that creates a TCP socket, enables `IP_BIND_ADDRESS_NO_PORT`, binds to `127.0.0.1:0`, and connects to `127.0.0.2:80`. Verify error handling for both `bind()` and `connect()`.
+4. **Demonstrate UDP Autobind Limits**: Using Python's `socket` module inside an unshared network namespace with `ip_local_port_range` set to `40000 40009`, write a script that creates connected UDP sockets targeting alternating destination IP addresses. Verify how many sockets can be created before `EAGAIN` occurs.
+5. **Configure Port Reservation**: Write the exact `sysctl` commands required to configure an ephemeral range of `10240` to `65535` while reserving ports `8080`, `8443`, and the range `9000-9050` from automatic ephemeral assignment.
+6. **Evaluate Multi-IP Source Scaling**: Explain why adding 4 secondary IP addresses to an egress interface increases outbound 4-tuple connection capacity by 4x, whereas adding secondary IP addresses to the destination server does not scale client capacity unless the client actively load-balances requests across those destination IPs.
+
+## Verification
+
+Every lab section ran on the hosts below inside an unprivileged namespace. Every command in "In production" is marked not run; it would change host sysctls or attach to a live process. The lab ran several times. Sections 1–7 and 9 gave the same counts and errors every time; the specific ports within each parity changed from run to run, as expected from the hashed offset. Section 8 with `ip_autobind_reuse=1` gave 1 or 2 connections to the second destination depending on which already-bound port `bind()` picked.
+
+- **Kernel Version**: Linux 6.12.94+
+- **Python Version**: Python 3.13.5
+- **Network Tooling**: iproute2 6.15.0
+- **Execution Environment**: Private network namespace created via `unshare -urn` with isolated sysctl boundaries. Host configuration parameters were not modified.
+
+## Sources
+
+- **RFC 6056**: *Recommendations for Transport-Protocol Port Randomization*. https://www.rfc-editor.org/rfc/rfc6056
+- **RFC 6335**: *Internet Assigned Numbers Authority (IANA) Procedures for the Management of the Service Name and Transport Protocol Port Number Registry*. https://www.rfc-editor.org/rfc/rfc6335
+- **Linux ip(7) Man Page**: *Linux IPv4 protocol implementation*. https://man7.org/linux/man-pages/man7/ip.7.html
+- **Linux IP_BIND_ADDRESS_NO_PORT(2const) Man Page**: https://man7.org/linux/man-pages/man2/IP_BIND_ADDRESS_NO_PORT.2const.html
+- **Linux IP_LOCAL_PORT_RANGE(2const) Man Page**: https://man7.org/linux/man-pages/man2/IP_LOCAL_PORT_RANGE.2const.html
+- **Linux Kernel Documentation**: *IP Sysctl Parameters*. https://docs.kernel.org/networking/ip-sysctl.html
+- **Linux Kernel Source (`net/ipv4/inet_hashtables.c`)**: `__inet_hash_connect()` implementation. https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/net/ipv4/inet_hashtables.c
+- **Linux Kernel Source (`net/ipv4/inet_connection_sock.c`)**: `inet_csk_get_port()` implementation. https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/net/ipv4/inet_connection_sock.c
+- **Cloudflare Blog**: *How to stop running out of ephemeral ports and start to love long-lived connections* (2022). https://blog.cloudflare.com/how-to-stop-running-out-of-ephemeral-ports-and-start-to-love-long-lived-connections/

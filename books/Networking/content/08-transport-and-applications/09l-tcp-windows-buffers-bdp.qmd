@@ -1,0 +1,890 @@
+---
+title: "TCP Windows, Buffers and the Bandwidth-Delay Product: Autotuning, Buffer Caps and Unsent-Data Latency"
+author:
+  - name: "K19G"
+  - name: "grok-bot"
+---
+
+# TCP Windows, Buffers and the Bandwidth-Delay Product: Autotuning, Buffer Caps and Unsent-Data Latency
+
+When network engineering teams troubleshoot throughput bottlenecks, the immediate temptation is often to blame packet loss or hardware limitations. Yet in modern high-speed or long-distance networks, performance degradation frequently stems from transport-layer buffer constraints and misconfigured flow control parameters. Flow control is TCP's mechanism for ensuring a sender does not overwhelm a receiver's available memory. To achieve maximum throughput across any IP path, the sender must keep sufficient data "in flight"—transmitted but not yet acknowledged—to fully saturate the network pipeline.
+
+As a network operator, administrator, or systems architect, understanding the relationship between the Bandwidth-Delay Product (BDP), TCP receive and send socket buffers, and TCP window scaling is vital. Application developers often make manual `setsockopt()` calls like `SO_RCVBUF` or `SO_SNDBUF` under the assumption that manual tuning improves performance. In modern Linux kernels, manual socket buffer overrides disable kernel autotuning, clamping window sizes and severely limiting throughput across high-latency links.
+
+Furthermore, buffer sizing on the sender side directly impacts application-layer latency. When an application writes megabytes of data to a TCP socket, un-ACKed and unsent data accumulates in kernel queues. If an application needs to send an urgent control frame or interactive command over that same connection, that message must wait behind hundreds of kilobytes of queued TCP payload. Controlling sender-side queue depth using mechanisms like `TCP_NOTSENT_LOWAT` provides a vital tool for balancing throughput against latency.
+
+## Learning goals
+
+- Calculate the Bandwidth-Delay Product (BDP) for any network path and derive theoretical maximum throughput based on RTT and receive window limits.
+- Understand the mechanics of the 16-bit TCP Window header field and the TCP Window Scaling option (RFC 7323), including SYN-time negotiation constraints.
+- Explain Linux receive buffer autotuning (`tcp_moderate_rcvbuf`), sysctl limits (`net.ipv4.tcp_rmem`), and how much of a buffer becomes advertised window (`scaling_ratio`, and the obsolete `tcp_adv_win_scale`).
+- Analyze how explicit `SO_RCVBUF` and `SO_SNDBUF` socket options disable kernel autotuning, interact with `net.core.rmem_max`/`wmem_max`, and double user-requested values.
+- Diagnose sender-side buffer bloat using kernel telemetry (`ss -tmi`) and quantify unsent data queueing.
+- Mitigate application latency spikes caused by large send buffers using `TCP_NOTSENT_LOWAT` and `net.ipv4.tcp_notsent_lowat`.
+- Distinguish between receive-window-limited (`tcpi_rwnd_limited`), send-buffer-limited (`tcpi_sndbuf_limited`), and network-limited TCP states.
+
+## Version note
+
+The analysis and lab measurements in this chapter were conducted on a Linux kernel running version 6.12.94, with iproute2 version 6.15.0 and Python 3.13.5. The default TCP congestion control algorithm used throughout is CUBIC. The lab environment operates entirely within unprivileged user, network, and mount namespaces (`unshare -urnm`). Host-wide sysctl settings such as `net.core.rmem_max` are read-only within these containerized namespaces. No external traffic shapers (`tc`/`netem`) or benchmarking tools (`iperf3`) were executed in the lab environment; all synthetic delay, rate limiting, and telemetry logging are performed natively by custom test harnesses.
+
+## The Bandwidth-Delay Product and Flow Control Mechanics
+
+The Bandwidth-Delay Product (BDP) represents the maximum volume of data that can exist within a network link at any single point in time—effectively the physical volume of the "network pipe." It is calculated as the product of the bottleneck link rate (capacity) and the Round-Trip Time (RTT):
+
+$$\text{BDP (bytes)} = \text{Bottleneck Capacity (bits/sec)} \times \text{RTT (seconds)} \div 8$$
+
+To sustain the maximum achievable transmission rate, a TCP sender must maintain at least one full BDP worth of unacknowledged data in flight. If the sender's window drops below the path BDP, the sender exhausts its transmission quota and pauses, waiting for incoming Acknowledgments (ACKs) to free up space. Consequently, maximum throughput is strictly upper-bounded by:
+
+$$\text{Throughput} \le \frac{\text{Window Size}}{\text{RTT}}$$
+
+```text
+  Sender                                                             Receiver
+    |                                                                   |
+    |=== Data Packet 1 ===============================================> |
+    |=== Data Packet 2 ===============================================> |  ---
+    |=== Data Packet 3 (Pipe Full: Window = BDP) =====================> |   |
+    |                                                                   |   | RTT / 2
+    |                                                                   |   |
+    | <=============================================== ACK 1 ===========|  ---
+    | <=============================================== ACK 2 ===========|
+    v                                                                   v
+```
+
+Consider two operational scenarios demonstrating this relationship:
+
+1. **Lab Topology (20 Mbit/s over 100 ms RTT):**
+   $$\text{BDP} = 20\text{ Mbit/s} \times 0.100\text{ s} = 2,000,000\text{ bits} = 250,000\text{ bytes}$$
+   To saturate this 20 Mbit/s link, the TCP sender requires an active window of at least 250,000 bytes. If the window is restricted to 65,535 bytes (64 KiB), throughput cannot exceed:
+   $$\text{Throughput} = \frac{65,535 \times 8\text{ bits}}{0.100\text{ s}} = 5.24\text{ Mbit/s}$$
+
+2. **Long Fat Network / LFN (1 Gbit/s over 80 ms RTT):**
+   $$\text{BDP} = 1\text{ Gbit/s} \times 0.080\text{ s} = 80,000,000\text{ bits} = 10,000,000\text{ bytes } (\sim 10\text{ MB})$$
+   A 1 Gbit/s cross-country link requires a 10 MB TCP window to achieve full rate saturation. If flow control caps the window at 2 MB, the flow maxes out at 200 Mbit/s despite 800 Mbit/s of idle capacity.
+
+## The 16-Bit Window Header and Window Scaling (RFC 7323)
+
+The standard TCP header defines a 16-bit `Window Size` field, which communicates the sender's current receive window (`rcv_wnd`). Unmodified, a 16-bit field limits the maximum advertised receive window to $2^{16} - 1 = 65,535\text{ bytes}$ (64 KiB). On any connection where the path BDP exceeds 64 KiB, this 16-bit ceiling severely constrains throughput.
+
+To overcome this limitation, RFC 7323 defines the TCP Window Scale option (`WSCALE`). During the initial three-way handshake (`SYN` and `SYN-ACK` packets), each host can include an optional 3-byte TCP option containing a 1-byte scale factor shift count ($S$).
+
+```text
+ 0                   1                   2                   3
+ 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|   Kind = 3    |  Length = 3   | shift.cnt (S) |               |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+```
+
+When negotiated, the true advertised receive window is computed by left-shifting the 16-bit header field value by $S$ bits:
+
+$$\text{Effective Window} = \text{Header Window Value} \times 2^S$$
+
+The operational rules governing TCP Window Scaling are rigid:
+
+- **SYN-Only Negotiation:** Window Scaling can **only** be negotiated in `SYN` and `SYN-ACK` segments. If either peer omits the `WSCALE` option during the handshake, neither peer may perform window scaling for the life of that connection ($S = 0$).
+- **Shift Limits:** The legal shift count $S$ ranges from 0 to 14. A shift of 14 yields a maximum advertised receive window of $65,535 \times 2^{14} = 1,073,725,440\text{ bytes}$ ($\sim 1\text{ GB}$).
+- **Buffer-Based Scale Selection:** Linux picks its shift count when it builds the `SYN` or `SYN-ACK` (`tcp_select_initial_window()`). For an autotuned socket it sizes the shift for the largest buffer the socket could ever grow to, `max(tcp_rmem[2], net.core.rmem_max)`, halving that value until it fits in 16 bits: 6291456 needs a shift of 7, and 262144 needs 3 (lab scenarios 1 and 5). For a socket whose `SO_RCVBUF` was set explicitly, it sizes the shift for that fixed buffer.
+
+If an application calls `setsockopt(..., SO_RCVBUF, ...)` before `listen()` or `connect()` with a small value (say 64 KiB), the kernel picks a small shift ($S=1$ in the lab). The shift is fixed for the life of the connection, so the window can never exceed $65,535 \times 2^1 = 131,070$ bytes, whatever happens to the buffer later.
+
+## Linux Receive Buffer Autotuning and Advertised Windows
+
+Modern Linux kernels manage TCP memory dynamically using receive buffer autotuning (`tcp_moderate_rcvbuf`). Instead of forcing operators to statically configure buffer sizes, the kernel monitors the rate at which the application reads data from the socket and dynamically adjusts socket memory allocation to match path BDP.
+
+Receive buffer bounds are controlled via the `net.ipv4.tcp_rmem` sysctl vector, defined by three integer values (in bytes):
+
+```text
+net.ipv4.tcp_rmem = min  default  max
+```
+
+On the reference system, `net.ipv4.tcp_rmem = 4096 131072 6291456`.
+- **min (4096 bytes):** Minimum receive buffer allocated per TCP socket, guaranteed even under severe memory pressure.
+- **default (131072 bytes):** Initial receive buffer of a new socket. (The window scale is sized from the *max*, see above, so autotuning has room to grow.)
+- **max (6291456 bytes):** The absolute ceiling (6 MiB) to which autotuning can expand a socket's receive buffer.
+
+During a transfer the kernel measures how much the application read in one receiver-side RTT (`rcv_space`) and sizes the buffer to about twice that, up to `tcp_rmem[2]`. `rcv_ssthresh` is the current ceiling on the advertised window; it is raised as data arrives, so the window opens gradually instead of jumping to the full buffer.
+
+### Memory Overhead and Advertised Window Calculation
+
+A TCP socket buffer (`sk_buff` or `skb`) does not hold pure payload data exclusively; it must store kernel control structures, `skb` metadata, packet headers, and potential out-of-order queue structures. Consequently, the advertised receive window (`rcv_wnd`) is always a fraction of the total allocated socket memory (`SO_RCVBUF`).
+
+Older kernels used a fixed ratio, `net.ipv4.tcp_adv_win_scale`: with the default of 1, half of the buffer was treated as overhead and half was advertised. The kernel documentation marks that sysctl **obsolete since Linux 6.6**. Current kernels instead measure, per socket, how much payload actually fits in the memory each packet consumes (`scaling_ratio`), and advertise that fraction. In the lab the advertised window was about 61–62 % of the buffer: 80480 of 131072 in scenario 2, and 162400 of 262144 in scenario 5. The sysctl still shows `1` on this 6.12 host, but it no longer drives the calculation.
+
+## Explicit Socket Options: `SO_RCVBUF` and `SO_SNDBUF` Traps
+
+A frequent anti-pattern in network applications is manually invoking `setsockopt()` with `SO_RCVBUF` or `SO_SNDBUF`. Doing so disables kernel autotuning for that socket in the specified direction (`tcp(7)`).
+
+When an application explicitly sets a buffer size via `setsockopt(..., SOL_SOCKET, SO_RCVBUF, &val, ...)`:
+
+1. **Host max clamping:** the kernel first caps `val` at `net.core.rmem_max` (receive) or `net.core.wmem_max` (send).
+2. **Doubling:** it then doubles the result to allow for bookkeeping overhead (`socket(7)`): $\text{stored} = 2 \times \min(\text{val}, \text{rmem\_max})$. `getsockopt()` returns the doubled value.
+
+On the test host, `net.core.rmem_max = 212992`. If an application requests `SO_RCVBUF = 262144` (256 KiB):
+- The requested value (256 KiB) exceeds `rmem_max` (212,992 bytes).
+- The kernel clamps the value to `rmem_max` (212,992 bytes).
+- The kernel doubles the clamped value: $212,992 \times 2 = 425,984\text{ bytes}$.
+
+If the application requests `SO_RCVBUF = 524288` (512 KiB):
+- The requested value (512 KiB) is clamped to `rmem_max` (212,992 bytes).
+- The kernel doubles it to $425,984\text{ bytes}$.
+
+Both requests yield the exact same buffer allocation of 425,984 bytes.
+
+```text
+Application Request             Kernel Logic                             Final SO_RCVBUF
+-------------------             ------------                             ---------------
+SO_RCVBUF = 262144 ------> min(262144, rmem_max=212992) = 212992 ------> 212992 * 2 = 425984
+SO_RCVBUF = 524288 ------> min(524288, rmem_max=212992) = 212992 ------> 212992 * 2 = 425984
+```
+
+**`net.core.rmem_max` only caps explicit `SO_RCVBUF` requests.** Autotuning is not limited by it; autotuning stops at `net.ipv4.tcp_rmem[2]` (6,291,456 bytes here). The same applies to `wmem_max` and `tcp_wmem[2]` on the send side.
+
+## Sender Side Buffering and Unsent Data Latency (`TCP_NOTSENT_LOWAT`)
+
+Sender-side autotuning is governed by `net.ipv4.tcp_wmem = min default max` (on this system: `4096 16384 4194304`). When an application writes stream data to a socket, data moves from user space to the socket send buffer (`sk_buff` queue). Data in the send buffer belongs to one of two categories:
+
+1. **Sent, Unacknowledged Data:** Data transmitted on the wire for which no `ACK` has returned.
+2. **Unsent Data (`notsent`):** Data written by the application that remains queued in the sender's kernel, waiting for congestion window (`cwnd`) space or pacing timers before transmission.
+
+```text
++-----------------------------------------------------------------------+
+|                         TCP Socket Send Buffer                        |
++-----------------------------------------------------------------------+
+| Transmitted Data (Awaiting ACK)       | Unsent Queued Payload Data    |
++-----------------------------------------------------------------------+
+                                        ^
+                                        | Application writes add here
+```
+
+When send buffers scale up to several megabytes to support high BDP paths, the unsent queue can grow massive. If an application performs a single large `write()` (e.g., 500 KiB), that entire payload enters the `notsent` queue. If the application subsequently needs to issue a time-critical message (such as an HTTP/2 `RST_STREAM` frame or an interactive control flag), that urgent message is appended to the tail of the send buffer behind the 500 KiB of unsent data.
+
+This introduces application-layer head-of-line blocking inside the sender's kernel. The urgent message cannot be transmitted until the network drains the pre-existing unsent queue.
+
+### Controlling Queue Depth with `TCP_NOTSENT_LOWAT`
+
+To eliminate this buffer-bloat latency penalty, Linux provides the `TCP_NOTSENT_LOWAT` socket option (and system-wide `net.ipv4.tcp_notsent_lowat` sysctl, defaulting to `4294967295` / unlimited). 
+
+When `TCP_NOTSENT_LOWAT` is configured to a low threshold (e.g., 16 KiB):
+- The kernel reports the socket as writable (via `select()`, `poll()`, `epoll()`, or `asyncio`) **only** when the volume of unsent data queued in the send buffer drops below the `TCP_NOTSENT_LOWAT` threshold.
+- The application retains excess data in user-space buffers rather than dumping it prematurely into the kernel queue.
+- If an urgent message arises, the application can inject it immediately into its own user-space priority queue, ensuring it reaches the wire without waiting behind megabytes of bulk kernel data.
+
+An application write can still overshoot `TCP_NOTSENT_LOWAT` by the size of a single `write()` call. If the unsent queue holds 10 KiB and `LOWAT` is 16 KiB, the socket is writable. If the application writes 64 KiB, the total unsent queue increases to 74 KiB until transmitted data is cleared.
+
+## Telemetry and Diagnostics: `ss -tmi` and Kernel Chrono Stats
+
+`ss -tmi` from iproute2 prints the socket memory (`skmem`) and the kernel's `tcp_info` for each socket. The lab captures it 2.5 s into scenarios 1 and 2 from both ends. The fields below are explained with those genuine snapshots in "Reading the output".
+
+### Deciphering `skmem` Parameters
+
+- `rb`: receive buffer limit, i.e. the current `SO_RCVBUF` (6291456 on the autotuned receiver in scenario 1).
+- `tb`: send buffer limit, i.e. the current `SO_SNDBUF` (1617408 on the scenario 1 sender).
+- `r`: bytes queued for the application to read. `w`: memory queued for sending, including in-flight data that is not yet acknowledged. `t`: memory held by packets that are still in the qdisc or device. `f`: memory reserved but unused.
+
+### Key `tcp_info` Diagnostic Fields
+
+- `rcv_space`: the autotuner's estimate of how much the application reads in one RTT; the buffer is sized from it.
+- `rcv_ssthresh`: Receive window slow-start threshold; caps maximum advertised window during autotuning growth.
+- `snd_wnd`: Current TCP window size advertised by the remote peer.
+- `notsent`: Amount of payload data queued in the send buffer that has not yet been transmitted.
+- `rwnd_limited`: Cumulative time (and percentage of total busy time) spent unable to transmit because the receiver's advertised window (`snd_wnd`) was full.
+- `sndbuf_limited`: Cumulative time spent unable to transmit because the local send buffer (`SO_SNDBUF`) was full.
+- `app_limited`: a flag, not a timer. It means the last delivery-rate sample was limited by the application rather than by the network (the receiver in scenario 1 shows it because it sends almost nothing).
+
+### The `sndbuf_limited` Interpretation Trap
+
+A common diagnostic error is assuming that a value of `0.0%` for `sndbuf_limited` proves the send buffer was never a bottleneck. 
+
+As implemented in `net/ipv4/tcp_output.c` (within `tcp_cwnd_validate`), the Linux kernel updates `sndbuf_limited` statistics **only** when all of the following conditions are simultaneously met:
+1. the connection has just sent data,
+2. it is **not** limited by `cwnd`,
+3. its write queue is **empty** (everything the application gave it has been sent), and
+4. the application has hit the buffer limit (`SOCK_NOSPACE` is set).
+
+In other words, the clock only runs when the network could take more but the buffer is too small to hold it. A flow that is limited by the receive window or by `cwnd` never satisfies the conditions, even when the application is blocked on a full buffer.
+
+## Bufferbloat and Queue Inflation
+
+When TCP socket buffers scale up without bounds, or when network path queues are over-provisioned, bufferbloat occurs. If the receiver's advertised window expands significantly beyond the true path BDP, the sender transmits data at a rate matching `cwnd`. The bottleneck network link cannot process packets at this rate, forcing excess packets to accumulate in the bottleneck router's egress queue.
+
+```text
+Sender Transmits               Bottleneck Router Queue               Receiver
++---------------+              +-----------------------+             +---------------+
+| Window = 2 MB | -----------> | Packet 1 (Processing) | ----------> | Advertised    |
++---------------+              | Packet 2 (Queued)     |             | Window = 2 MB |
+                               | Packet 3 (Queued)     |             +---------------+
+                               | ... (Excess 1.75 MB)  |
+                               +-----------------------+
+```
+
+This queue accumulation causes three operational issues:
+1. **RTT Inflation:** Round-Trip Time increases dramatically as packets spend tens or hundreds of milliseconds sitting in buffer queues.
+2. **Burst Loss on Slow-Start Overshoot:** During TCP slow start, exponential `cwnd` expansion rapidly overfills the bottleneck buffer, triggering burst tail-drop losses and retransmissions.
+3. **Elevated Latency for Concurrent Flows:** All flows sharing the bottleneck queue experience high latency.
+
+Restricting receive windows to match true BDP prevents excess queue buildup at the bottleneck router, keeping RTT near the physical propagation minimum.
+
+## Practical Buffer Sizing Guidelines
+
+To maintain high throughput while avoiding bufferbloat and latency degradation, observe the following engineering guidelines:
+
+1. **Do Not Set `SO_RCVBUF` / `SO_SNDBUF` Explicitly in Application Code:**
+   Allow Linux receive and send autotuning to manage buffer dynamics automatically. Manual buffer configuration disables dynamic tuning, locks `WSCALE`, and breaks high-latency transfer performance.
+
+2. **Tune System-Wide Limits for Long Fat Networks:**
+   For high-speed links with large RTTs (e.g., 10 Gbit/s across 100 ms RTT, where $\text{BDP} \approx 125\text{ MB}$), raise default and maximum sysctl limits in `/etc/sysctl.conf`:
+   ```bash
+   # Enable maximum receive/send autotuning windows up to 128 MB for 10G+ LFNs
+   net.ipv4.tcp_rmem = 4096 131072 134217728
+   net.ipv4.tcp_wmem = 4096 65536 134217728
+   ```
+
+3. **Reserve `net.core.rmem_max` / `wmem_max` Adjustments for Legacy Applications:**
+   Raise `net.core.rmem_max` and `net.core.wmem_max` only for software that sets `SO_RCVBUF`/`SO_SNDBUF` itself, for example `iperf3 -w` or a daemon with a configured socket buffer size. For everything else they make no difference.
+   ```bash
+   net.core.rmem_max = 134217728
+   net.core.wmem_max = 134217728
+   ```
+
+4. **Enable `TCP_NOTSENT_LOWAT` on Ultra-Low Latency Services:**
+   For interactive applications, RPC frameworks, or HTTP/2 & HTTP/3 proxies, configure `TCP_NOTSENT_LOWAT` (e.g., 16 KiB to 64 KiB) to prevent unsent kernel queue buildup and maintain application control over packet scheduling.
+
+## The lab
+
+The lab environment establishes a rootless network topology using `unshare -urnm`. Two network namespaces (`c` for the client and `s` for the server) are connected across a synthetic link configured by `link.py`. 
+
+The network link enforces a 20 Mbit/s bottleneck bandwidth in the client-to-server direction, a 50 ms one-way delay in both directions (100 ms baseline RTT), and a fixed network queue depth of 250,000 bytes (1 BDP).
+
+```text
+[ netns c, tun0 ]  <--->  [ link.py bottleneck ]  <--->  [ netns s, tun0 ]
+ (10.9.0.1)                 20 Mbit/s, 100ms RTT           (10.9.0.2)
+                              Queue: 250,000 bytes
+```
+
+### Lab files
+
+The shell script creates network namespaces, virtual tun devices, and environment routing.
+`topo.sh`:
+
+```bash
+#!/bin/sh
+# Two namespaces, c (client, 10.9.0.1) and s (server, 10.9.0.2), joined only
+# by a TUN device in each and link.py in the middle.
+# Run inside: unshare -urnm sh ...   (no root, no installs)
+set -e
+mount -t tmpfs none /run 2>/dev/null || true
+mkdir -p /run/netns
+for n in c s; do
+  ip netns add $n
+  ip -n $n link set lo up
+  ip netns exec $n ip tuntap add dev tun0 mode tun
+done
+ip -n c addr add 10.9.0.1 peer 10.9.0.2 dev tun0
+ip -n s addr add 10.9.0.2 peer 10.9.0.1 dev tun0
+ip -n c link set tun0 up mtu 1500 txqueuelen 10000
+ip -n s link set tun0 up mtu 1500 txqueuelen 10000
+sc() { ip netns exec "$1" sh -c "echo $3 > /proc/sys/$(echo $2 | tr . /)"; }
+gc() { ip netns exec "$1" cat /proc/sys/$(echo $2 | tr . /); }
+```
+
+The Python link emulator handles packet forwarding, rate-limiting, delay simulation, and queueing.
+`link.py`:
+
+```python
+#!/usr/bin/env python3
+"""Userspace impaired link between two network namespaces.
+
+Opens one TUN device inside netns "c" and one inside netns "s" and moves
+IPv4 packets between them with a fixed one-way delay, an optional rate
+limit with a byte-limited queue, and scripted drops/delays of TCP data
+segments selected by their offset in the stream. Logs every scripted
+event and every retransmission it sees (same seq seen twice).
+"""
+import argparse, fcntl, heapq, json, os, select, struct, sys, time
+
+TUNSETIFF, IFF_TUN, IFF_NO_PI = 0x400454CA, 0x0001, 0x1000
+
+def open_tun(nspath, name):
+    here = os.open("/proc/self/ns/net", os.O_RDONLY)
+    fd_ns = os.open(nspath, os.O_RDONLY)
+    os.setns(fd_ns, os.CLONE_NEWNET)
+    fd = os.open("/dev/net/tun", os.O_RDWR)
+    fcntl.ioctl(fd, TUNSETIFF, struct.pack("16sH", name.encode(), IFF_TUN | IFF_NO_PI))
+    os.setns(here, os.CLONE_NEWNET)
+    os.close(here); os.close(fd_ns)
+    os.set_blocking(fd, False)
+    return fd
+
+def tcp_info(pkt):
+    if len(pkt) < 20 or pkt[0] >> 4 != 4 or pkt[9] != 6:
+        return None
+    ihl = (pkt[0] & 15) * 4
+    tot = struct.unpack("!H", pkt[2:4])[0]
+    sp, dp, seq, ack = struct.unpack("!HHII", pkt[ihl:ihl + 12])
+    doff = (pkt[ihl + 12] >> 4) * 4
+    flags = pkt[ihl + 13]
+    plen = tot - ihl - doff
+    return sp, dp, seq, ack, flags, plen
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--delay-ms", type=float, default=10.0, help="one-way delay, each direction")
+    ap.add_argument("--rate-mbit", type=float, default=0.0, help="c->s bottleneck, 0 = unlimited")
+    ap.add_argument("--queue-bytes", type=int, default=0, help="bottleneck queue limit")
+    ap.add_argument("--drop", default="", help="comma list of data segment indexes to drop (first transmission, c->s)")
+    ap.add_argument("--drop-again", default="", help="indexes whose first retransmission is dropped too")
+    ap.add_argument("--drop-tail", type=int, default=0, help="drop the first transmission of every segment that carries any of the last N stream bytes")
+    ap.add_argument("--total", type=int, default=300000, help="stream length in bytes (for --drop-tail)")
+    ap.add_argument("--hold-ms", default="", help="idx:ms reorder, e.g. 30:15 delays segment 30 by 15 ms extra")
+    ap.add_argument("--port", type=int, default=5001)
+    ap.add_argument("--log", default="")
+    a = ap.parse_args()
+
+    tc = open_tun("/run/netns/c", "tun0")
+    ts = open_tun("/run/netns/s", "tun0")
+    drop = {int(x) for x in a.drop.split(",") if x}
+    drop2 = {int(x) for x in a.drop_again.split(",") if x}
+    hold = dict((int(k), float(v)) for k, v in (x.split(":") for x in a.hold_ms.split(",") if x))
+    d = a.delay_ms / 1000
+    heap, n = [], 0                 # (due, n, fd, pkt)
+    seen = {}                       # seq -> times seen
+    isn = None
+    order = {}
+    log = []
+    t0 = None
+    link_free = 0.0                 # bottleneck: when the link finishes sending current packet
+    qdrops = 0
+    pending = []                    # bottleneck FIFO of (pkt) waiting to be serialized
+
+    def now():
+        return time.monotonic()
+
+    while True:
+        timeout = None
+        if heap:
+            timeout = max(0, heap[0][0] - now())
+        r, _, _ = select.select([tc, ts], [], [], timeout)
+        t = now()
+        for fd in r:
+            while True:
+                try:
+                    pkt = os.read(fd, 65535)
+                except BlockingIOError:
+                    break
+                out = ts if fd == tc else tc
+                extra = 0.0
+                info = tcp_info(pkt)
+                if fd == tc and info and info[1] == a.port:
+                    sp, dp, seq, ack, flags, plen = info
+                    if flags & 0x02:            # SYN
+                        isn = (seq + 1) & 0xffffffff
+                        t0 = t
+                    if plen and isn is not None:
+                        off = (seq - isn) & 0xffffffff
+                        if seq not in order:          # index = order of first transmission
+                            order[seq] = len(order)
+                        idx = order[seq]
+                        cnt = seen.get(seq, 0)
+                        seen[seq] = cnt + 1
+                        ms = round((t - t0) * 1000, 1)
+                        if cnt >= 1:
+                            log.append(f"{ms:9.1f} ms  retransmit seg {idx:4d} (seq+{off}, {plen} B, copy {cnt + 1})")
+                        if cnt == 0 and (idx in drop or (a.drop_tail and off + plen > a.total - a.drop_tail)):
+                            log.append(f"{ms:9.1f} ms  DROP       seg {idx:4d} (seq+{off}, {plen} B)")
+                            continue
+                        if cnt == 1 and idx in drop2:
+                            log.append(f"{ms:9.1f} ms  DROP again seg {idx:4d} (first retransmission)")
+                            continue
+                        if cnt == 0 and idx in hold:
+                            extra = hold[idx] / 1000
+                            log.append(f"{ms:9.1f} ms  HOLD       seg {idx:4d} +{hold[idx]:.0f} ms (reorder)")
+                    if flags & 0x01 and t0 is not None and seen.get(seq, 0) <= 1:
+                        log.append(f"{round((t - t0) * 1000, 1):9.1f} ms  FIN from client")
+                due = t + d + extra
+                if fd == tc and a.rate_mbit > 0:
+                    qbytes = max(0.0, link_free - t) * a.rate_mbit * 1e6 / 8
+                    if a.queue_bytes and qbytes + len(pkt) > a.queue_bytes:
+                        log.append(f"{round((t - (t0 or t)) * 1000, 1):9.1f} ms  QUEUE FULL drop ({int(qbytes)} B queued)")
+                        qdrops += 1
+                        continue
+                    start = max(t, link_free)
+                    link_free = start + len(pkt) * 8 / (a.rate_mbit * 1e6)
+                    due = link_free + d + extra
+                n += 1
+                heapq.heappush(heap, (due, n, out, pkt))
+        t = now()
+        while heap and heap[0][0] <= t:
+            _, _, out, pkt = heapq.heappop(heap)
+            try:
+                os.write(out, pkt)
+            except OSError:
+                pass
+        if a.log and log:
+            with open(a.log, "a") as f:
+                f.write("\n".join(log) + "\n")
+            log.clear()
+
+if __name__ == "__main__":
+    main()
+```
+
+The BDP test harness executes bulk data transfers (8,000,000 bytes) under varying socket and sysctl options, reporting socket memory and `tcp_info` metrics.
+`bdp.py`:
+
+```python
+#!/usr/bin/env python3
+"""Bulk transfer across the emulated long fat link, with the kernel's view.
+
+serve [--rcvbuf N]        sink on 10.9.0.2:5001; prints the receive-side numbers
+send BYTES [--sndbuf N]   source in netns c; prints goodput and what limited it
+SO_RCVBUF/SO_SNDBUF are set before listen()/connect(), which turns off the
+kernel's autotuning for that direction (see tcp(7), socket(7)).
+"""
+import socket, struct, sys, time
+
+def info(s):
+    b = s.getsockopt(socket.IPPROTO_TCP, socket.TCP_INFO, 232)
+    g = lambda fmt, off: struct.unpack_from(fmt, b, off)[0]
+    return {   # offsets from struct tcp_info, include/uapi/linux/tcp.h
+        "snd_wscale": b[6] & 15, "rcv_wscale": b[6] >> 4,
+        "rtt_ms": g("I", 68) / 1000, "snd_cwnd": g("I", 80),
+        "rcv_space": g("I", 96), "rcv_ssthresh": g("I", 64),
+        "busy_us": g("Q", 168), "rwnd_limited_us": g("Q", 176), "sndbuf_limited_us": g("Q", 184),
+        "total_retrans": g("I", 100),
+        "snd_wnd": g("I", 228) if len(b) >= 232 else None,
+    }
+
+def opt(name, default=0):
+    return int(sys.argv[sys.argv.index(name) + 1]) if name in sys.argv else default
+
+def serve():
+    l = socket.socket()
+    l.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    if opt("--rcvbuf"):
+        l.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, opt("--rcvbuf"))
+    l.bind(("10.9.0.2", 5001)); l.listen(1)
+    c, _ = l.accept()
+    rb0 = c.getsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF)
+    n = 0
+    while True:
+        d = c.recv(1 << 20)
+        if not d:
+            break
+        n += len(d)
+    i = info(c)
+    rb1 = c.getsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF)
+    print(f"  receiver: SO_RCVBUF at accept={rb0} at end={rb1} rcv_wscale={i['rcv_wscale']} "
+          f"rcv_space={i['rcv_space']} rcv_ssthresh={i['rcv_ssthresh']}", flush=True)
+    c.sendall(b"%d\n" % n); c.close()
+
+def send(nbytes):
+    s = socket.socket()
+    if opt("--sndbuf"):
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, opt("--sndbuf"))
+    s.connect(("10.9.0.2", 5001))
+    t0 = time.monotonic()
+    chunk = b"x" * 65536
+    left = nbytes
+    while left:
+        left -= s.send(chunk[:min(left, len(chunk))])
+    i = info(s)
+    sb = s.getsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF)
+    s.shutdown(socket.SHUT_WR); s.recv(64)
+    el = time.monotonic() - t0
+    busy = i["busy_us"] or 1
+    print(f"  sender:   goodput={nbytes * 8 / el / 1e6:5.2f} Mbit/s in {el:.2f} s  rtt={i['rtt_ms']:.1f} ms "
+          f"retrans={i['total_retrans']} cwnd={i['snd_cwnd']} snd_wnd={i['snd_wnd']} SO_SNDBUF={sb} snd_wscale={i['snd_wscale']}\n"
+          f"  sender:   time limited by receive window {100 * i['rwnd_limited_us'] / busy:4.1f}%, "
+          f"by send buffer {100 * i['sndbuf_limited_us'] / busy:4.1f}%  (busy {busy / 1e6:.2f} s)", flush=True)
+
+if __name__ == "__main__":
+    serve() if sys.argv[1] == "serve" else send(int(sys.argv[2]))
+```
+
+The LOWAT latency test harness measures arrival delays for urgent single-line messages transmitted behind bulk stream traffic.
+`lowat.py`:
+
+```python
+#!/usr/bin/env python3
+"""How long does an urgent message wait behind bulk data already in the kernel?
+
+serve        : reads everything; for each urgent message prints how long it
+               took from "the application decided to send it" to arrival
+send [LOWAT] : keeps the socket full of 16 KiB bulk chunks for 5 s; every
+               0.5 s from t=1 s it decides an urgent message must go next and
+               writes it at the next writable event. The message carries the
+               decision time (CLOCK_MONOTONIC is shared by both namespaces).
+               With LOWAT set, TCP_NOTSENT_LOWAT (tcp(7)) keeps unsent bytes
+               in the kernel below LOWAT and the rest waits in the application.
+"""
+import re, select, socket, struct, sys, time
+
+TCP_NOTSENT_LOWAT = getattr(socket, "TCP_NOTSENT_LOWAT", 25)
+
+def notsent(s):
+    b = s.getsockopt(socket.IPPROTO_TCP, socket.TCP_INFO, 232)
+    return struct.unpack_from("I", b, 144)[0]     # tcpi_notsent_bytes
+
+def serve():
+    l = socket.socket(); l.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    l.bind(("10.9.0.2", 5001)); l.listen(1)
+    c, _ = l.accept()
+    buf = b""; lat = []
+    while True:
+        d = c.recv(1 << 16)
+        if not d:
+            break
+        now = time.monotonic()
+        buf = buf[-64:] + d
+        for m in re.finditer(rb"<U(\d+)\|(\d+\.\d+)\|(\d+)>", buf):
+            i, t, ns = int(m.group(1)), float(m.group(2)), int(m.group(3))
+            if i >= len(lat):
+                lat.append((i, (now - t) * 1000, ns))
+    for i, ms, ns in lat:
+        print(f"  urgent #{i}: {ns:7d} unsent bytes ahead of it in the sender's kernel -> arrived {ms:6.1f} ms after the decision")
+    print(f"  mean {sum(x[1] for x in lat) / len(lat):.1f} ms over {len(lat)} urgent messages", flush=True)
+
+def send(lowat):
+    s = socket.socket()
+    if lowat:
+        s.setsockopt(socket.IPPROTO_TCP, TCP_NOTSENT_LOWAT, lowat)
+    s.connect(("10.9.0.2", 5001)); s.setblocking(False)
+    bulk = b"b" * 16384
+    t0 = time.monotonic(); k = 0; pending = None; peak = 0
+    while time.monotonic() - t0 < 5.0:
+        select.select([], [s], [], 0.01)
+        now = time.monotonic()
+        if pending is None and k < 8 and now - t0 >= 1.0 + 0.5 * k:
+            pending = b"<U%d|%.6f|%d>" % (k, now, notsent(s)); k += 1
+        try:
+            if pending is not None:
+                s.send(pending); pending = None      # tiny; fits whenever writable
+            else:
+                s.send(bulk)
+        except BlockingIOError:
+            pass
+        peak = max(peak, notsent(s))
+    print(f"  sender: peak unsent bytes in the kernel {peak}, TCP_NOTSENT_LOWAT={lowat or 'unset'}", flush=True)
+    s.setblocking(True); s.shutdown(socket.SHUT_WR); s.recv(1); s.close()
+
+if __name__ == "__main__":
+    serve() if sys.argv[1] == "serve" else send(int(sys.argv[2]) if len(sys.argv) > 2 else 0)
+```
+
+The driver script runs scenarios 1 to 8 and takes the `ss` snapshots.
+`lab-bdp.sh`:
+
+```bash
+#!/bin/sh
+# Window, buffer and BDP lab. Run as: unshare -urnm sh lab-bdp.sh  (no root, no installs)
+set -e
+cd "$(dirname "$0")"
+. ./topo.sh
+RATE=20; OWD=50; BYTES=8000000
+BDP=$((RATE * 1000000 / 8 * 2 * OWD / 1000))
+echo "link: ${RATE} Mbit/s bottleneck c->s, ${OWD} ms each way (RTT $((2*OWD)) ms), queue 1 BDP"
+echo "BDP = ${RATE} Mbit/s x $((2*OWD)) ms = $BDP bytes; transfer = $BYTES bytes"
+for n in c s; do for k in tcp_rmem tcp_wmem tcp_window_scaling tcp_moderate_rcvbuf tcp_adv_win_scale; do
+  [ $n = c ] && echo "default net.ipv4.$k = $(gc $n net.ipv4.$k)"; done; done
+echo "net.core.rmem_max = $(cat /proc/sys/net/core/rmem_max)  net.core.wmem_max = $(cat /proc/sys/net/core/wmem_max)  (host-wide, read-only here)"
+run() { # run "title" "netns:key=value ..." "server args" "client args"
+  echo; echo "=== $1"
+  for n in c s; do sc $n net.ipv4.tcp_rmem "4096 131072 6291456"; sc $n net.ipv4.tcp_wmem "4096 16384 4194304"; sc $n net.ipv4.tcp_window_scaling 1; done
+  for kv in $2; do ns=${kv%%:*}; kv=${kv#*:}; k=${kv%%=*}; v=$(echo "${kv#*=}" | tr , ' '); sc $ns net.ipv4.$k "$v"; echo "  $ns: net.ipv4.$k = $(gc $ns net.ipv4.$k)"; done
+  [ -n "$3" ] && echo "  server: $3"; [ -n "$4" ] && echo "  client: $4"
+  python3 link.py --delay-ms $OWD --rate-mbit $RATE --queue-bytes $BDP & LP=$!
+  ip netns exec s python3 bdp.py serve $3 & SP=$!
+  sleep 0.4
+  ip netns exec c python3 bdp.py send $BYTES $4 & CP=$!
+  if [ -n "$SNAP" ]; then
+    sleep 2.5
+    echo "  -- ss -tmi at t=2.5 s, receiver side:"; ip netns exec s ss -tmiH state established '( sport = :5001 )' | sed 's/^/     /'
+    echo "  -- ss -tmi at t=2.5 s, sender side:";   ip netns exec c ss -tmiH state established '( dport = :5001 )' | sed 's/^/     /'
+  fi
+  wait $CP; wait $SP; kill $LP; wait $LP 2>/dev/null || true
+}
+SNAP=1 run "1. defaults (autotuning on both ends)" "" "" ""
+SNAP=1 run "2. receiver SO_RCVBUF=65536 before listen (autotuning off)" "" "--rcvbuf 65536" ""
+run "3. receiver SO_RCVBUF=262144 before listen" "" "--rcvbuf 262144" ""
+run "4. receiver SO_RCVBUF=524288 before listen" "" "--rcvbuf 524288" ""
+run "5. receiver tcp_rmem max lowered to 262144 (autotuning on, capped)" "s:tcp_rmem=4096,131072,262144" "" ""
+run "6. window scaling off at the receiver" "s:tcp_window_scaling=0" "" ""
+lowat() { # lowat "title" LOWAT
+  echo; echo "=== $1"
+  for n in c s; do sc $n net.ipv4.tcp_rmem "4096 131072 6291456"; sc $n net.ipv4.tcp_wmem "4096 16384 4194304"; sc $n net.ipv4.tcp_window_scaling 1; done
+  python3 link.py --delay-ms $OWD --rate-mbit $RATE --queue-bytes $BDP & LP=$!
+  ip netns exec s python3 lowat.py serve & SP=$!
+  sleep 0.4
+  ip netns exec c python3 lowat.py send $2
+  wait $SP; kill $LP; wait $LP 2>/dev/null || true
+}
+lowat "7. urgent message behind bulk data, default (no TCP_NOTSENT_LOWAT)" 0
+lowat "8. urgent message behind bulk data, TCP_NOTSENT_LOWAT=16384" 16384
+```
+
+### Execution output
+
+```text
+link: 20 Mbit/s bottleneck c->s, 50 ms each way (RTT 100 ms), queue 1 BDP
+BDP = 20 Mbit/s x 100 ms = 250000 bytes; transfer = 8000000 bytes
+default net.ipv4.tcp_rmem = 4096	131072	6291456
+default net.ipv4.tcp_wmem = 4096	16384	4194304
+default net.ipv4.tcp_window_scaling = 1
+default net.ipv4.tcp_moderate_rcvbuf = 1
+default net.ipv4.tcp_adv_win_scale = 1
+net.core.rmem_max = 212992  net.core.wmem_max = 212992  (host-wide, read-only here)
+
+=== 1. defaults (autotuning on both ends)
+  -- ss -tmi at t=2.5 s, receiver side:
+     0      0      10.9.0.2:5001 10.9.0.1:43386
+     	 skmem:(r0,rb6291456,t0,tb46080,f0,w0,o0,bl0,d0) cubic wscale:7,7 rto:304 rtt:100.264/50.132 ato:40 mss:1448 pmtu:1500 rcvmss:1448 advmss:1448 cwnd:10 bytes_received:4873968 segs_out:2206 segs_in:3368 data_segs_in:3366 send 1.16Mbps lastsnd:2336 pacing_rate 2.31Mbps delivered:1 app_limited rcv_rtt:148.487 rcv_space:838392 rcv_ssthresh:2804231 minrtt:100.264 rcv_ooopack:546 snd_wnd:64256 rcv_wnd:2804352
+  -- ss -tmi at t=2.5 s, sender side:
+     0      1070072 10.9.0.1:43386 10.9.0.2:5001
+     	 skmem:(r0,rb131072,t0,tb1617408,f3720,w1188216,o0,bl0,d0) cubic wscale:7,7 rto:352 rtt:148.354/0.368 mss:1448 pmtu:1500 rcvmss:536 advmss:1448 cwnd:254 ssthresh:245 bytes_sent:5157776 bytes_retrans:26064 bytes_acked:4763921 segs_out:3564 segs_in:2131 data_segs_out:3562 send 19.8Mbps lastsnd:4 lastrcv:2396 lastack:4 pacing_rate 23.8Mbps delivery_rate 19.3Mbps delivered:3291 busy:2396ms unacked:254 retrans:0/18 rcv_space:14480 rcv_ssthresh:64088 notsent:702280 minrtt:100.29 snd_wnd:2584192 rcv_wnd:64256
+  receiver: SO_RCVBUF at accept=131072 at end=6291456 rcv_wscale=7 rcv_space=838392 rcv_ssthresh=3930720
+  sender:   goodput=17.14 Mbit/s in 3.73 s  rtt=167.1 ms retrans=18 cwnd=285 snd_wnd=3930752 SO_SNDBUF=1617408 snd_wscale=7
+  sender:   time limited by receive window  0.0%, by send buffer  0.0%  (busy 3.17 s)
+
+=== 2. receiver SO_RCVBUF=65536 before listen (autotuning off)
+  server: --rcvbuf 65536
+  -- ss -tmi at t=2.5 s, receiver side:
+     0      0      10.9.0.2:5001 10.9.0.1:49838
+     	 skmem:(r0,rb131072,t0,tb46080,f0,w0,o0,bl0,d0) cubic wscale:7,1 rto:372 rtt:100.359/50.179 ato:40 mss:1448 pmtu:1500 rcvmss:1448 advmss:1448 cwnd:10 bytes_received:1713856 segs_out:607 segs_in:1194 data_segs_in:1192 send 1.15Mbps lastsnd:2340 lastrcv:4 lastack:4 pacing_rate 2.31Mbps delivered:1 app_limited rcv_rtt:100.487 rcv_space:80480 rcv_ssthresh:80480 minrtt:100.359 snd_wnd:64256 rcv_wnd:80480
+  -- ss -tmi at t=2.5 s, sender side:
+     0      333616 10.9.0.1:49838 10.9.0.2:5001
+     	 skmem:(r0,rb131072,t0,tb516096,f1808,w362736,o0,bl0,d0) cubic wscale:1,7 rto:304 rtt:101.408/0.027 mss:1448 pmtu:1500 rcvmss:536 advmss:1448 cwnd:112 bytes_sent:1791440 bytes_acked:1710961 segs_out:1248 segs_in:607 data_segs_out:1246 send 12.8Mbps lastsnd:24 lastrcv:2392 lastack:24 pacing_rate 25.6Mbps delivery_rate 6.39Mbps delivered:1191 busy:2392ms rwnd_limited:2080ms(87.0%) unacked:56 rcv_space:14480 rcv_ssthresh:64088 notsent:253136 minrtt:100.549 snd_wnd:80480 rcv_wnd:64256
+  receiver: SO_RCVBUF at accept=131072 at end=131072 rcv_wscale=1 rcv_space=80480 rcv_ssthresh=80480
+  sender:   goodput= 6.18 Mbit/s in 10.35 s  rtt=101.5 ms retrans=0 cwnd=112 snd_wnd=80480 SO_SNDBUF=516096 snd_wscale=1
+  sender:   time limited by receive window 96.8%, by send buffer  0.0%  (busy 9.84 s)
+
+=== 3. receiver SO_RCVBUF=262144 before listen
+  server: --rcvbuf 262144
+  receiver: SO_RCVBUF at accept=425984 at end=425984 rcv_wscale=2 rcv_space=262140 rcv_ssthresh=264800
+  sender:   goodput=17.13 Mbit/s in 3.74 s  rtt=108.6 ms retrans=0 cwnd=251 snd_wnd=262140 SO_SNDBUF=1156608 snd_wscale=2
+  sender:   time limited by receive window 84.7%, by send buffer  0.0%  (busy 3.37 s)
+
+=== 4. receiver SO_RCVBUF=524288 before listen
+  server: --rcvbuf 524288
+  receiver: SO_RCVBUF at accept=425984 at end=425984 rcv_wscale=2 rcv_space=262140 rcv_ssthresh=264800
+  sender:   goodput=17.04 Mbit/s in 3.76 s  rtt=108.6 ms retrans=0 cwnd=251 snd_wnd=262140 SO_SNDBUF=1156608 snd_wscale=2
+  sender:   time limited by receive window 84.8%, by send buffer  0.0%  (busy 3.39 s)
+
+=== 5. receiver tcp_rmem max lowered to 262144 (autotuning on, capped)
+  s: net.ipv4.tcp_rmem = 4096	131072	262144
+  receiver: SO_RCVBUF at accept=131072 at end=262144 rcv_wscale=3 rcv_space=162400 rcv_ssthresh=162400
+  sender:   goodput=11.98 Mbit/s in 5.34 s  rtt=101.4 ms retrans=0 cwnd=226 snd_wnd=162400 SO_SNDBUF=1041408 snd_wscale=3
+  sender:   time limited by receive window 91.5%, by send buffer  0.0%  (busy 4.92 s)
+
+=== 6. window scaling off at the receiver
+  s: net.ipv4.tcp_window_scaling = 0
+  receiver: SO_RCVBUF at accept=131072 at end=667238 rcv_wscale=0 rcv_space=66983 rcv_ssthresh=416223
+  sender:   goodput= 5.08 Mbit/s in 12.60 s  rtt=101.5 ms retrans=0 cwnd=92 snd_wnd=65535 SO_SNDBUF=423936 snd_wscale=0
+  sender:   time limited by receive window 97.4%, by send buffer  0.0%  (busy 12.00 s)
+
+=== 7. urgent message behind bulk data, default (no TCP_NOTSENT_LOWAT)
+  sender: peak unsent bytes in the kernel 611283, TCP_NOTSENT_LOWAT=unset
+  urgent #0:  331984 unsent bytes ahead of it in the sender's kernel -> arrived  257.7 ms after the decision
+  urgent #1:  380529 unsent bytes ahead of it in the sender's kernel -> arrived  476.3 ms after the decision
+  urgent #2:  405770 unsent bytes ahead of it in the sender's kernel -> arrived  264.2 ms after the decision
+  urgent #3:  579219 unsent bytes ahead of it in the sender's kernel -> arrived  345.8 ms after the decision
+  urgent #4:  544476 unsent bytes ahead of it in the sender's kernel -> arrived  343.6 ms after the decision
+  urgent #5:  511637 unsent bytes ahead of it in the sender's kernel -> arrived  339.9 ms after the decision
+  urgent #6:  479790 unsent bytes ahead of it in the sender's kernel -> arrived  335.6 ms after the decision
+  urgent #7:  459527 unsent bytes ahead of it in the sender's kernel -> arrived  333.9 ms after the decision
+  mean 337.1 ms over 8 urgent messages
+
+=== 8. urgent message behind bulk data, TCP_NOTSENT_LOWAT=16384
+  sender: peak unsent bytes in the kernel 65160, TCP_NOTSENT_LOWAT=16384
+  urgent #0:    7520 unsent bytes ahead of it in the sender's kernel -> arrived  122.7 ms after the decision
+  urgent #1:    6455 unsent bytes ahead of it in the sender's kernel -> arrived  146.7 ms after the decision
+  urgent #2:   12870 unsent bytes ahead of it in the sender's kernel -> arrived  107.4 ms after the decision
+  urgent #3:    7542 unsent bytes ahead of it in the sender's kernel -> arrived  108.9 ms after the decision
+  urgent #4:    7013 unsent bytes ahead of it in the sender's kernel -> arrived  120.3 ms after the decision
+  urgent #5:    6484 unsent bytes ahead of it in the sender's kernel -> arrived  129.9 ms after the decision
+  urgent #6:    5955 unsent bytes ahead of it in the sender's kernel -> arrived  138.9 ms after the decision
+  urgent #7:    6144 unsent bytes ahead of it in the sender's kernel -> arrived  145.7 ms after the decision
+  mean 127.6 ms over 8 urgent messages
+```
+
+## Summary of scenarios 1–6
+
+The ceiling is window × 8 / RTT, using the window the sender saw (`snd_wnd`) and its final smoothed RTT. Where the window is far larger than the BDP, the 20 Mbit/s link is the ceiling.
+
+| # | Receiver configuration | `SO_RCVBUF` stored | `rcv_wscale` | `snd_wnd` (bytes) | Ceiling | Measured | rwnd-limited | srtt at end | Retrans |
+|---|---|---|---|---|---|---|---|---|---|
+| 1 | defaults (autotuning) | 131072 → 6291456 | 7 | 3930752 | link, 20 Mbit/s | 17.14 Mbit/s | 0.0 % | 167.1 ms | 18 |
+| 2 | `SO_RCVBUF=65536` | 131072 (fixed) | 1 | 80480 | 6.34 Mbit/s | 6.18 Mbit/s | 96.8 % | 101.5 ms | 0 |
+| 3 | `SO_RCVBUF=262144` | 425984 (fixed) | 2 | 262140 | 19.31 Mbit/s | 17.13 Mbit/s | 84.7 % | 108.6 ms | 0 |
+| 4 | `SO_RCVBUF=524288` | 425984 (fixed) | 2 | 262140 | 19.31 Mbit/s | 17.04 Mbit/s | 84.8 % | 108.6 ms | 0 |
+| 5 | `tcp_rmem` max 262144 | 131072 → 262144 | 3 | 162400 | 12.81 Mbit/s | 11.98 Mbit/s | 91.5 % | 101.4 ms | 0 |
+| 6 | `tcp_window_scaling=0` | 131072 → 667238 | 0 | 65535 | 5.17 Mbit/s | 5.08 Mbit/s | 97.4 % | 101.5 ms | 0 |
+
+## Reading the output
+
+### The defaults and the BDP
+
+The header lines give the numbers everything else is measured against. The BDP is 250000 bytes. The kernel defaults are `tcp_rmem = 4096 131072 6291456` and `tcp_wmem = 4096 16384 4194304`. `net.core.rmem_max` and `wmem_max` are 212992, which is host-wide and read-only inside the namespaces. `tcp_adv_win_scale` still reads 1 even though it is obsolete on this kernel.
+
+### Scenario 1: autotuning on both ends
+
+The receiver accepted the connection with a 131072-byte buffer and finished with 6291456, which is `tcp_rmem[2]`. It offered `wscale 7` from the first SYN-ACK because the shift is sized for the maximum. The sender saw a window of up to 3930752 bytes, 16 times the BDP, and the receive window never limited it (0.0 %). Goodput was 17.14 Mbit/s rather than 20 for two reasons, and both show in the snapshot taken at 2.5 s:
+
+- **Slow-start overshoot.** The sender shows `retrans:0/18` and `bytes_retrans:26064` (18 segments of 1448 bytes). CUBIC's exponential start overran the 250000-byte bottleneck queue and lost a burst, which cost time to repair.
+- **A full queue.** The sender's `rtt:148.354` at 2.5 s, and its smoothed RTT of 167.1 ms at the end, are well above the 100 ms path. Once the window is bigger than the BDP, the extra data waits in the bottleneck queue. The window does not limit the flow, but the RTT grows.
+
+The sender snapshot also shows the send side autotuning: `tb1617408` (the send buffer grew from 16384 towards `tcp_wmem[2]`), `notsent:702280` (700 KB written by the application but not yet sent), and `w1188216` of memory queued for sending. That unsent backlog is the problem scenarios 7 and 8 measure. On the receiver, `rcv_space:838392` is the autotuner's estimate of one RTT of reading, and `rcv_wnd:2804352` is the window it was advertising at that moment.
+
+### Scenario 2: `SO_RCVBUF=65536` before `listen()`
+
+The kernel stored 131072 (double the request) and never changed it, because setting the option turns autotuning off. The shift was sized for that small buffer: the receiver snapshot shows `wscale:7,1`, meaning the peer sends with scale 7 and this socket receives with scale 1. The usable window was 80480 bytes, 61 % of the buffer. The ceiling is 80480 × 8 / 0.1015 s = 6.34 Mbit/s, and the flow measured 6.18 Mbit/s. The sender snapshot names the cause: `rwnd_limited:2080ms(87.0%)` at 2.5 s, rising to 96.8 % by the end. The application had plenty of data waiting (`notsent:253136`). The RTT stayed at 101.5 ms and nothing was retransmitted, because a window this small never reaches the bottleneck queue.
+
+### Scenarios 3 and 4: the `rmem_max` cap
+
+A request for 262144 was first capped at `net.core.rmem_max` (212992) and then doubled to 425984. A request for 524288 went through the same two steps and produced the same 425984, so scenario 4 is scenario 3 again (17.13 and 17.04 Mbit/s). Asking for more than `rmem_max` silently gets you `rmem_max`.
+
+The window here is 262140 bytes, which is exactly 65535 × 2². The buffer could have backed a larger window, but with a shift of 2 the largest value the 16-bit field can express is 262140. It happens to sit just above the 250000-byte BDP. Window and BDP being nearly equal explains the other numbers: goodput matched scenario 1, the RTT was only 108.6 ms (the queue barely filled), there were no retransmissions, and the flow still counts as receive-window-limited for 84.7 % of the time, because it kept bumping against a window that only just fitted the pipe. A window close to the BDP gives you full throughput without the queue.
+
+### Scenario 5: autotuning capped by `tcp_rmem[2]`
+
+Autotuning stayed on but could only grow the buffer from 131072 to 262144. The shift was sized for that maximum (3). The advertised window reached 162400, which is 62 % of 262144, below the BDP. The ceiling is 162400 × 8 / 0.1014 = 12.81 Mbit/s; the flow got 11.98 Mbit/s and was receive-window-limited 91.5 % of the time. A distribution or container image with a low `tcp_rmem` maximum produces exactly this ceiling on every long path.
+
+### Scenario 6: no window scaling
+
+With `tcp_window_scaling=0` the receiver sent no window-scale option, so neither direction scales (`rcv_wscale=0`, `snd_wscale=0`). Autotuning still grew the buffer to 667238 bytes, and `rcv_ssthresh` reached 416223, but the 16-bit field cannot express more than 65535. `rcv_space` stayed near that limit (66983). The ceiling is 65535 × 8 / 0.1015 = 5.17 Mbit/s and the flow got 5.08 Mbit/s, receive-window-limited 97.4 % of the time. A middlebox that strips the option from SYNs has the same effect.
+
+### Scenarios 7 and 8: what the urgent message waits behind
+
+Without a low-water mark, the sender kernel held up to 611283 unsent bytes. The eight urgent messages found between 331984 and 579219 bytes ahead of them and arrived 257.7 to 476.3 ms after the application decided to send them, with a mean of 337.1 ms. Draining 400–580 kB at 20 Mbit/s takes 160–230 ms. Add the 50 ms one-way delay and the time spent in the bottleneck queue, and you get the measured values. The 476.3 ms outlier (#1) was most likely caught behind a loss-recovery period, since this run fills the queue as scenario 1 did.
+
+With `TCP_NOTSENT_LOWAT=16384`, the socket only reported writable when fewer than 16384 unsent bytes were queued. The peak of 65160 shows that a single 16 KiB write can still overshoot the mark. The urgent messages found 5955 to 12870 bytes ahead of them and arrived 107.4 to 146.7 ms after the decision, a mean of 127.6 ms against 337.1 ms. What remains, about 125 ms, is the 50 ms propagation delay plus the bottleneck queue inside the network. No sender-side socket option can remove that; only queue management on the bottleneck can.
+
+
+## In production
+
+### Diagnosing Active Sockets with `ss`
+
+To inspect socket buffer metrics, window scaling factors, and throttling constraints on live production servers, use `ss`:
+
+```bash
+# (not run here)
+# Display detailed TCP socket memory and tcp_info telemetry for established HTTP/HTTPS flows
+ss -tmi state established '( dport = :http or dport = :https )'
+```
+
+Inspect the output for critical diagnostic indicators:
+- `rwnd_limited`: Indicates performance is constrained by remote receive buffer size or `WSCALE` negotiation issues.
+- `sndbuf_limited`: Indicates local sender buffer exhaustion (`SO_SNDBUF` too small or autotuning capped by `tcp_wmem[2]`).
+- `notsent`: High values (e.g., > 100 KiB) indicate large amounts of un-transmitted data queued in kernel memory, causing high head-of-line blocking latency.
+
+### Benchmarking Path BDP with `iperf3`
+
+When performing path capacity tests, compare autotuned TCP throughput against explicitly restricted window sizes:
+
+```bash
+# (not run here)
+# Run standard autotuned parallel TCP test to measure true path capacity
+iperf3 -c 192.168.10.50 -P 4 -t 30
+
+# (not run here)
+# Force legacy socket buffer size (64 KB) to verify WSCALE impact
+iperf3 -c 192.168.10.50 -w 64K -t 30
+```
+
+### Tuning System-Wide TCP Buffers in `/etc/sysctl.conf`
+
+For core routers, storage nodes, or edge proxies attached to high-speed WAN links (10G/40G/100G with > 50 ms RTT), append the following parameters to `/etc/sysctl.conf`:
+
+```bash
+# (not run here)
+# Increase max TCP receive buffer to 128 MB (min, default, max)
+net.ipv4.tcp_rmem = 4096 131072 134217728
+
+# Increase max TCP send buffer to 128 MB (min, default, max)
+net.ipv4.tcp_wmem = 4096 65536 134217728
+
+# Optional: host-wide unsent-data limit. Only helps applications that write
+# when poll/epoll says the socket is writable; blocking writers just wake more often.
+net.ipv4.tcp_notsent_lowat = 131072
+
+# Ensure Window Scaling and Receive Autotuning remain enabled
+net.ipv4.tcp_window_scaling = 1
+net.ipv4.tcp_moderate_rcvbuf = 1
+```
+
+Apply configured sysctl changes immediately without rebooting:
+
+```bash
+# (not run here)
+sysctl -p /etc/sysctl.conf
+```
+
+### Configuring `TCP_NOTSENT_LOWAT` in Application Code
+
+In C/C++ services, set `TCP_NOTSENT_LOWAT` per socket:
+
+```c
+// (not run here)
+int lowat_val = 16384; // 16 KiB threshold
+if (setsockopt(sockfd, IPPROTO_TCP, TCP_NOTSENT_LOWAT, &lowat_val, sizeof(lowat_val)) < 0) {
+    perror("failed to set TCP_NOTSENT_LOWAT");
+}
+```
+
+In Python:
+
+```python
+# (not run here)
+import socket
+
+sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+# socket.TCP_NOTSENT_LOWAT where the module defines it; 25 is the Linux value
+sock.setsockopt(socket.IPPROTO_TCP, getattr(socket, "TCP_NOTSENT_LOWAT", 25), 16384)
+```
+
+## Gotchas
+
+- **Disabling Autotuning via `setsockopt`:** Calling `setsockopt()` with `SO_RCVBUF` or `SO_SNDBUF` permanently disables kernel autotuning for that direction on that socket.
+- **The Kernel Memory Doubling Rule:** Linux doubles whatever value you pass to `SO_RCVBUF` or `SO_SNDBUF` to reserve memory for `sk_buff` control headers. Asking for 128 KiB allocates 256 KiB of kernel memory.
+- **`net.core.rmem_max` Capping:** Manual `SO_RCVBUF` calls are hard-capped by `net.core.rmem_max`. Requesting a 1 MB buffer on a system with `rmem_max = 212992` silently caps your request to 212,992 bytes (doubled to 425,984 bytes). Autotuning ignores `rmem_max`.
+- **The Pre-Listen `WSCALE` Trap:** Setting `SO_RCVBUF` to a small value before calling `listen()` or `connect()` locks in a small `WSCALE` shift factor during the `SYN` handshake. That shift factor cannot be changed later, even if `SO_RCVBUF` is expanded.
+- **Unilateral `WSCALE` Disabling:** If a middlebox, firewall, or remote host omits `WSCALE` in its `SYN` or `SYN-ACK`, window scaling is disabled for both directions, restricting maximum window size to 65,535 bytes.
+- **Misinterpreting `sndbuf_limited = 0.0%`:** the kernel only runs that clock when the write queue is empty, the flow is not `cwnd`-limited and the application is blocked on the buffer. A value of `0.0%` does not prove the send buffer was big enough.
+- **`tcp_adv_win_scale` advice is out of date:** it is obsolete since Linux 6.6. Tuning guides that change it are describing older kernels.
+- **Over-estimating `TCP_NOTSENT_LOWAT` Granularity:** `TCP_NOTSENT_LOWAT` prevents application socket writability when unsent data exceeds the threshold, but a single large `write()` call can still overshoot the threshold by the size of that write block.
+- **Conflating `net.ipv4.tcp_rmem` with `net.core.rmem_max`:** `tcp_rmem[2]` dictates the max memory ceiling for dynamic receive autotuning. `net.core.rmem_max` dictates the max memory ceiling for manual `setsockopt(SO_RCVBUF)` calls.
+
+## Exercises
+
+1. Calculate the Bandwidth-Delay Product (BDP) in bytes for a 10 Gbit/s cross-country link with a 60 ms RTT. If `WSCALE` is disabled ($S=0$), what is the maximum achievable throughput across this path?
+2. An application developer sets `SO_RCVBUF` to `1048576` (1 MiB) on a host where `net.core.rmem_max = 212992`. Calculate the exact value stored in `sk_rcvbuf` by the kernel and explain the clamping/doubling sequence.
+3. Using `ss -tmi`, capture diagnostic telemetry from an active bulk download. Identify `rcv_space`, `snd_wnd`, `wscale`, `rtt`, and `rwnd_limited`. Calculate whether the flow is constrained by receive window or congestion window.
+4. Write a minimal Python script that creates a TCP listening socket, sets `SO_RCVBUF` to 32,768 bytes, and invokes `listen()`. Run `tcpdump` or `wireshark` to capture the `SYN-ACK` packet generated during an incoming connection. Extract the `WSCALE` option value and explain how it was derived.
+5. In an environment with an 80 ms RTT and a 50 Mbit/s bottleneck link, an application encounters severe head-of-line blocking when sending urgent RPC commands over a shared TCP connection. Explain how configuring `TCP_NOTSENT_LOWAT` reduces latency, and calculate the maximum unsent queue size recommended to maintain low latency without starving path throughput.
+6. Scenario 1 in the lab achieved 17.14 Mbit/s on a 20 Mbit/s link despite `rwnd_limited` reporting `0.0%`. Explain the root causes of this throughput shortfall, referencing packet retransmissions, RTT inflation, and slow-start overshoot.
+
+## Verification
+
+The experiments and telemetry data presented in this chapter were gathered using the following execution environment and tool versions:
+
+- **Operating System / Kernel:** Linux 6.12.94 (`x86_64`).
+- **Networking Tooling:** `iproute2` version 6.15.0 (`ss`, `ip netns`, `ip link`).
+- **Runtime Environment:** Python 3.13.5 (standard library `socket`, `struct`, `select`, `fcntl` modules).
+- **TCP Congestion Control:** CUBIC (default kernel module).
+- **Containerization / Isolation:** Unprivileged Linux namespaces (`unshare -urnm`). No root privileges were required.
+
+### Executed vs. Non-Executed Environment Elements
+
+- **Executed in Lab:** All topology generation (`topo.sh`), Python software rate-limiting and delay simulation (`link.py`), bulk socket transfers (`bdp.py`), and unsent queue latency probes (`lowat.py`) were executed directly inside unprivileged user/network namespaces.
+- **Not Run in Lab:** the commands in "In production" (`iperf3`, `sysctl -p` changes, the C snippet) and anything needing `tcpdump`. None of those tools are installed, and host-wide sysctls such as `net.core.rmem_max` are read-only inside the namespaces. A seventh scenario, a 64 KiB sender `SO_SNDBUF`, was dropped from the lab: it lost 141 segments in slow start, so its goodput could not be attributed to the send buffer alone.
+- **Repeatability:** earlier runs of the same script gave the same buffer, scale and window values. Goodput, retransmissions and latency vary a little from run to run, so the text quotes only the run shown above.
+
+## Sources
+
+- **RFC 7323:** TCP Extensions for High Performance (Window Scale Option, Timestamps). Available at: https://www.rfc-editor.org/rfc/rfc7323
+- **RFC 9293:** Transmission Control Protocol (TCP) Specification. Available at: https://www.rfc-editor.org/rfc/rfc9293
+- **Linux Manual Pages (`tcp(7)`):** Linux TCP socket interface and sysctl specifications. Available at: https://man7.org/linux/man-pages/man7/tcp.7.html
+- **Linux Manual Pages (`socket(7)`):** Linux socket interface and socket-level options (`SO_RCVBUF`, `SO_SNDBUF`). Available at: https://man7.org/linux/man-pages/man7/socket.7.html
+- **Linux Kernel Documentation:** IP Sysctl documentation (`tcp_rmem`, `tcp_wmem`, `tcp_notsent_lowat`). Available at: https://docs.kernel.org/networking/ip-sysctl.html
+- **LWN.net:** Controlling TCP queue sizes with `TCP_NOTSENT_LOWAT`. Available at: https://lwn.net/Articles/560082/
+- **ESnet Fasterdata Knowledge Base:** Host Tuning Guide for Linux high-speed transfers. Available at: https://fasterdata.es.net/host-tuning/linux/
+- **Linux source** v6.12: `tcp_select_initial_window()` and `tcp_cwnd_validate()` in `net/ipv4/tcp_output.c`. Available at: https://github.com/torvalds/linux/blob/v6.12/net/ipv4/tcp_output.c

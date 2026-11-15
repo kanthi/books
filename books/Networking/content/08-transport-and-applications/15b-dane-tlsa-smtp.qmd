@@ -1,0 +1,611 @@
+---
+title: "DANE and TLSA: Pinning TLS Keys in DNSSEC"
+author:
+  - name: "K19G"
+  - name: "grok-bot"
+---
+
+# DANE and TLSA: Pinning TLS Keys in DNSSEC
+
+Server-to-server mail has a weak spot that HTTPS does not. A sending mail server (an MTA) looks up the recipient domain's MX records, connects to port 25, and upgrades to TLS only if the server announces `STARTTLS` in its cleartext greeting. An attacker on the path can delete that one line, and the sender falls back to cleartext. An attacker who can forge DNS can do worse: hand out an MX record pointing at their own host. Even when the sender insists on TLS, it has no good way to know which certificate is right. Most MTAs accept any certificate on port 25, because insisting on a public CA certificate whose name matches the MX host would bounce a lot of legitimate mail.
+
+DANE (DNS-Based Authentication of Named Entities, RFC 6698) fixes this with DNSSEC. The receiving domain publishes a TLSA record that says "the TLS server at `_25._tcp.mx.example.net` uses this key". The record is signed, so a validating sender can trust it. If a signed TLSA record exists, the sender must use TLS and the server must present a matching key. Strip `STARTTLS` and delivery waits instead of going out in cleartext. Present the wrong key and the sender moves to another MX or keeps the message queued.
+
+DANE is deployed for SMTP: Postfix, Exim and several large mail providers implement it. For HTTPS it barely matters, because no mainstream browser validates TLSA records. This chapter therefore spends most of its time on SMTP (RFC 7672), with HTTPS servers used only as easy live examples.
+
+You will compute TLSA records by hand and with OpenSSL, run OpenSSL's own DANE verifier against toy STARTTLS servers, check real TLSA records on the Internet, walk through what a sending MTA decides for several real domains, and practise a key rollover that does not drop mail.
+
+## Learning goals
+
+- Read a TLSA record: owner name, certificate usage, selector, matching type and data.
+- Explain why `3 1 1` (DANE-EE, SPKI, SHA2-256) is the usual choice, and what `3 0 1` and `2 1 1` cost you.
+- Compute a TLSA record from a certificate and check it against a live TLS server.
+- Follow the RFC 7672 decision a sending MTA makes for each MX host: authenticated TLS, encrypted-only, opportunistic, or "do not deliver here".
+- Roll a server key without an outage, and lint a TLSA RRset against the chain the server serves now.
+- Configure DANE in Postfix and know which parts depend on a local validating resolver.
+
+## Version note
+
+Everything in the lab ran on the book's build box as an unprivileged user: Linux 6.12, OpenSSL 3.5.7 (9 Jun 2026) and Python 3.13 with the standard library only. Nothing was installed. The toy SMTP servers listen on 127.0.0.1. Live DNS answers come from Google Public DNS over its DoH JSON API (`https://dns.google/resolve`) on 2026-11-14 (IST); live TLS chains were fetched from port 443 with `openssl s_client`. Outbound port 25 is blocked from the build box, so no real MX host was contacted over SMTP. The Postfix, zone file and resolver snippets in the production section come from the Postfix documentation and the RFCs and are **not run here**.
+
+## The TLSA record
+
+A TLSA record (RR type 52) lives at a name built from the port, the transport and the server's host name:
+
+```text
+_25._tcp.mx1.example.net.   IN TLSA  3 1 1  cb66729efbc13da1...0f215767655
+ |    |    |                         | | |  |
+ port proto  TLS server host name    | | |  certificate association data (hex)
+                                     | | matching type: 0 Full, 1 SHA2-256, 2 SHA2-512
+                                     | selector:      0 Cert (whole certificate), 1 SPKI (public key only)
+                                     certificate usage: 0 PKIX-TA, 1 PKIX-EE, 2 DANE-TA, 3 DANE-EE
+```
+
+The acronyms come from RFC 7218 and are what logs and tools print. The four usages mean:
+
+| Usage | Name | What must match | Public CA validation? |
+|------:|------|-----------------|------------------------|
+| 0 | PKIX-TA | a CA certificate in the chain | yes, and the chain must also reach a CA the client trusts |
+| 1 | PKIX-EE | the server's own certificate | yes |
+| 2 | DANE-TA | a CA certificate the server sends; the chain is then validated up to it | no; the TLSA record *is* the trust anchor |
+| 3 | DANE-EE | the server's own certificate or key | no; names and validity dates are not checked (RFC 7671 section 5.1) |
+
+The selector chooses what gets hashed. Selector 0 hashes the whole DER certificate, so every renewal changes it, even when the key stays the same. Selector 1 hashes only the `SubjectPublicKeyInfo` (SPKI): the algorithm and the public key. Reissue the certificate on the same key and the SPKI hash does not move.
+
+RFC 7671 section 5.1 recommends `3 1 1` for most servers: pin the key, ignore the CA, survive renewals that keep the key. Two further rules matter for SMTP:
+
+- With DANE-TA (usage 2) the server must send the trust anchor certificate in its handshake. Clients do not fetch it from anywhere else.
+- RFC 7672 section 3.1.3 says SMTP *server operators* SHOULD NOT publish usages 0 and 1, and SMTP *clients* MAY treat them as unusable. There is no agreed set of public CAs for port 25, so a PKIX check has nothing to anchor to.
+
+## What a sending MTA decides
+
+RFC 7672 turns DNSSEC results into delivery actions. Every lookup ends in one of four states defined in RFC 4035: *secure* (validated), *insecure* (provably unsigned), *bogus* (signatures fail) or *indeterminate*. RFC 7672 section 2.1.1 treats bogus, indeterminate, SERVFAIL and timeouts all as one thing: a lookup failure. A secure or insecure "no such record" is not a failure; it is an answer.
+
+```text
+recipient domain example.net
+  |
+  |  MX lookup
+  |-- failure (bogus / SERVFAIL / timeout) ------------> defer delivery (section 2.1.2)
+  |-- insecure -----------------------------------------> pre-DANE opportunistic TLS for this domain
+  |                                                        (a client MAY still use TLSA records of the
+  |                                                         MX hosts it found, section 2.2.1)
+  |-- secure: for each MX host, in preference order
+        |
+        |  TLSA lookup at _25._tcp.<mx host>
+        |-- failure -----------------------------> skip this host; MUST NOT deliver through it
+        |-- insecure, or secure "no TLSA" -------> opportunistic TLS; cleartext allowed
+        |-- secure, all records unusable --------> TLS required, no authentication
+        |-- secure, at least one usable record --> TLS required AND the chain must match;
+                                                    on failure try the next MX or defer
+```
+
+Three consequences are easy to miss:
+
+1. **A failed TLSA lookup is not "no DANE".** If it were, an attacker would just drop TLSA queries. The host is treated as unreachable instead.
+2. **MX preference beats security.** Section 2.2.1 says an MX host with TLSA records must not jump ahead of a better-preference host without them. Protection is per host, so a domain is only as protected as its weakest MX.
+3. **A TLSA record is a promise to offer STARTTLS.** Section 2.2 says clients may read its presence as a commitment by the operator. Publish one for a server without TLS and DANE senders will stop delivering to it.
+
+## The lab
+
+Six files. `mkcerts.sh` makes a private CA and a set of certificates designed to hit each rule. `dane.py` computes and matches TLSA records with no crypto library. `lab.py` runs the matching cases, a rollover lint and a live check. `toysmtp.py` and `openssl-dane.sh` repeat the matching cases with OpenSSL's built-in DANE verifier over a real STARTTLS handshake. `smtp.py` walks the MTA decision for real domains.
+
+### A private CA and certificates that break the rules
+
+```{.bash filename="mkcerts.sh"}
+#!/bin/sh
+# A private CA, a leaf key and certificate, a renewed certificate on the SAME key, a next key,
+# an expired certificate and one with the wrong name. EC P-256 keeps the output short.
+set -e
+mkdir -p pki && cd pki
+o="openssl"
+$o req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -keyout ca.key -out ca.pem \
+   -days 3650 -subj "/CN=Lab Issuing CA" -addext basicConstraints=critical,CA:TRUE 2>/dev/null
+sign() { # sign <key> <cn> <out> <days-ago-start> <days>
+  $o req -new -key "$1" -subj "/CN=$2" -addext "subjectAltName=DNS:$2" -out "$3.csr" 2>/dev/null
+  $o x509 -req -in "$3.csr" -CA ca.pem -CAkey ca.key -CAcreateserial -out "$3.pem" \
+     -copy_extensions copy -not_before "$4" -not_after "$5" 2>/dev/null
+}
+$o genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -out cur.key 2>/dev/null
+$o genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -out next.key 2>/dev/null
+sign cur.key  mail.lab.example leaf      20261101000000Z 20270201000000Z
+sign cur.key  mail.lab.example renewed   20261114000000Z 20270214000000Z
+sign next.key mail.lab.example rotated   20261114000000Z 20270214000000Z
+sign cur.key  mail.lab.example expired   20260101000000Z 20260401000000Z
+sign cur.key  www.other.example wrongname 20261101000000Z 20270201000000Z
+echo "certificates: $(ls *.pem | tr '\n' ' ')"
+```
+
+```text
+certificates: ca.pem expired.pem leaf.pem renewed.pem rotated.pem wrongname.pem 
+```
+
+`renewed` reuses `cur.key`, `rotated` uses `next.key`, `expired` ended in April 2026 and `wrongname` is issued for a different host. EC P-256 keys keep the hashes and certificates short.
+
+### Computing and matching TLSA records
+
+```{.python filename="dane.py"}
+"""DANE TLSA (RFC 6698, RFC 7671): compute, look up and check TLSA records. Stdlib + openssl CLI."""
+import base64, hashlib, json, re, ssl, subprocess, tempfile, urllib.request
+
+USAGE = {0: "PKIX-TA", 1: "PKIX-EE", 2: "DANE-TA", 3: "DANE-EE"}
+SELECTOR = {0: "Cert", 1: "SPKI"}
+MTYPE = {0: "Full", 1: "SHA2-256", 2: "SHA2-512"}
+
+def _tlv(b, i):
+    """Return (tag, header_len, value_len) of the DER element at offset i."""
+    tag, l = b[i], b[i + 1]
+    if l < 0x80:
+        return tag, 2, l
+    n = l & 0x7F
+    return tag, 2 + n, int.from_bytes(b[i + 2:i + 2 + n], "big")
+
+def spki(cert_der):
+    """subjectPublicKeyInfo of an X.509 certificate, as DER bytes (no crypto library needed)."""
+    _, h, _ = _tlv(cert_der, 0)                  # Certificate ::= SEQUENCE
+    i = h
+    _, h, _ = _tlv(cert_der, i)                  # tbsCertificate ::= SEQUENCE
+    i += h
+    if cert_der[i] == 0xA0:                      # [0] version (optional)
+        _, h, l = _tlv(cert_der, i); i += h + l
+    for _ in range(5):                           # serial, signature, issuer, validity, subject
+        _, h, l = _tlv(cert_der, i); i += h + l
+    _, h, l = _tlv(cert_der, i)                  # subjectPublicKeyInfo
+    return cert_der[i:i + h + l]
+
+def association(cert_der, selector, mtype):
+    data = cert_der if selector == 0 else spki(cert_der)
+    return {0: lambda d: d, 1: lambda d: hashlib.sha256(d).digest(),
+            2: lambda d: hashlib.sha512(d).digest()}[mtype](data).hex()
+
+def tlsa(cert_der, usage=3, selector=1, mtype=1):
+    return (usage, selector, mtype, association(cert_der, selector, mtype))
+
+def pem_to_der(pem):
+    return [ssl.PEM_cert_to_DER_cert(m) for m in
+            re.findall(r"-----BEGIN CERTIFICATE-----.+?-----END CERTIFICATE-----", pem, re.S)]
+
+def doh_tlsa(name):
+    """TLSA lookup over DoH (JSON API). Returns (AD flag, [records])."""
+    url = f"https://dns.google/resolve?name={name}&type=TLSA"
+    with urllib.request.urlopen(url, timeout=10) as r:
+        d = json.load(r)
+    recs = []
+    for a in d.get("Answer", []):
+        if a["type"] == 52:
+            u, s, m, h = a["data"].split(" ", 3)
+            recs.append((int(u), int(s), int(m), h.replace(" ", "").lower()))
+    return d.get("AD", False), d["Status"], recs
+
+def server_chain(host, port, starttls=None):
+    cmd = ["openssl", "s_client", "-showcerts", "-connect", f"{host}:{port}", "-servername", host]
+    if starttls:
+        cmd += ["-starttls", starttls]
+    out = subprocess.run(cmd, input=b"", capture_output=True, timeout=15).stdout.decode(errors="replace")
+    return pem_to_der(out)
+
+def _pem(der):
+    return ssl.DER_cert_to_PEM_cert(der)
+
+def pkix_to(ta_der, chain, name):
+    """Does chain[0] verify up to ta_der (trusted as a partial chain) with the right name?"""
+    with tempfile.NamedTemporaryFile("w", suffix=".pem") as ta, \
+         tempfile.NamedTemporaryFile("w", suffix=".pem") as inter, \
+         tempfile.NamedTemporaryFile("w", suffix=".pem") as leaf:
+        ta.write(_pem(ta_der)); ta.flush()
+        inter.write("".join(_pem(c) for c in chain[1:]) or _pem(ta_der)); inter.flush()
+        leaf.write(_pem(chain[0])); leaf.flush()
+        r = subprocess.run(["openssl", "verify", "-partial_chain", "-trusted", ta.name,
+                            "-untrusted", inter.name, "-verify_hostname", name, leaf.name],
+                           capture_output=True, text=True)
+        lines = (r.stdout + r.stderr).strip().splitlines()
+        errs = [l.split("lookup: ")[-1] for l in lines if " depth lookup" in l]
+        return r.returncode == 0, "OK" if r.returncode == 0 else errs[0] if errs else lines[-1]
+
+def check(records, chain, name, ad=True):
+    """RFC 6698/7671 matching for DANE-EE(3) and DANE-TA(2). Returns (ok, reason)."""
+    if not ad:
+        return False, "TLSA answer not DNSSEC-validated (AD=0): DANE must not be used"
+    usable = [r for r in records if r[0] in (2, 3) and r[1] in SELECTOR and r[2] in MTYPE]
+    if not usable:
+        return False, "no usable TLSA records"
+    for u, s, m, h in usable:
+        if u == 3 and association(chain[0], s, m) == h:
+            return True, f"leaf matches {u} {s} {m} (DANE-EE: names and dates ignored)"
+    for u, s, m, h in usable:
+        if u == 2:
+            for c in chain[1:]:
+                if association(c, s, m) == h:
+                    ok, why = pkix_to(c, chain, name)
+                    return ok, f"TA matches {u} {s} {m}; chain to TA with name check: {why}"
+    return False, "no TLSA record matches the presented chain"
+
+def publisher_lint(records, chain):
+    """RFC 7671 section 8: every (usage, selector, mtype) combination must match the CURRENT chain."""
+    combos, out = {}, []
+    for u, s, m, h in records:
+        combos.setdefault((u, s, m), []).append(h)
+    for (u, s, m), hashes in sorted(combos.items()):
+        certs = chain[:1] if u in (1, 3) else chain[1:] or chain
+        live = {association(c, s, m) for c in certs}
+        matched = [x for x in hashes if x in live]
+        state = "OK" if matched else "BROKEN: only past/future keys"
+        out.append(f"{u} {s} {m}: {len(hashes)} record(s), {len(matched)} match current chain -> {state}")
+    return out
+```
+
+`spki()` walks the certificate's DER structure just far enough to cut out the `subjectPublicKeyInfo` element: certificate, then `tbsCertificate`, then skip the optional version, serial, signature algorithm, issuer, validity and subject. That is all a TLSA selector 1 needs. `check()` implements the client side for usages 2 and 3; `pkix_to()` hands DANE-TA chains to `openssl verify -partial_chain`, which accepts a non-root certificate as the trust anchor. `publisher_lint()` is the server-side check from RFC 7671 section 8, discussed below.
+
+```{.python filename="lab.py"}
+"""DANE lab: compute TLSA records, match chains, lint rollovers, then check live servers."""
+import subprocess, dane
+
+def der(name):
+    return dane.pem_to_der(open(f"pki/{name}.pem").read())[0]
+
+def show(title, records, chain, name="mail.lab.example"):
+    ok, why = dane.check(records, chain, name)
+    print(f"  {'PASS' if ok else 'FAIL'}  {title:46} {why}")
+
+ca, leaf = der("ca"), der("leaf")
+print("1. TLSA 3 1 1 for the leaf, two ways")
+cli = subprocess.run("openssl x509 -in pki/leaf.pem -noout -pubkey | openssl pkey -pubin -outform DER"
+                     " | openssl dgst -sha256 -r", shell=True, capture_output=True, text=True).stdout.split()[0]
+print(f"  openssl pipeline : {cli}")
+print(f"  dane.spki()      : {dane.association(leaf, 1, 1)}")
+for rec in [dane.tlsa(leaf, 3, 1, 1), dane.tlsa(leaf, 3, 0, 1), dane.tlsa(ca, 2, 1, 1)]:
+    u, s, m, h = rec
+    print(f"  _25._tcp.mail.lab.example. IN TLSA {u} {s} {m} {h[:16]}...   "
+          f"({dane.USAGE[u]} {dane.SELECTOR[s]} {dane.MTYPE[m]})")
+
+ee_spki = [dane.tlsa(leaf, 3, 1, 1)]
+ee_cert = [dane.tlsa(leaf, 3, 0, 1)]
+ta = [dane.tlsa(ca, 2, 1, 1)]
+print("\n2. Matching (chain = leaf + issuing CA, as the server sends it)")
+show("3 1 1, original cert", ee_spki, [leaf, ca])
+show("3 1 1, renewed cert on the same key", ee_spki, [der("renewed"), ca])
+show("3 0 1, renewed cert on the same key", ee_cert, [der("renewed"), ca])
+show("3 1 1, new key, TLSA not updated", ee_spki, [der("rotated"), ca])
+show("3 1 1, expired cert", ee_spki, [der("expired"), ca])
+show("3 1 1, cert for another name", ee_spki, [der("wrongname"), ca])
+show("2 1 1, new key from the same CA", ta, [der("rotated"), ca])
+show("2 1 1, expired cert", ta, [der("expired"), ca])
+show("2 1 1, cert for another name", ta, [der("wrongname"), ca])
+show("2 1 1, server forgot to send the CA", ta, [der("rotated")])
+ok, why = dane.check(ee_spki, [leaf, ca], "mail.lab.example", ad=False)
+print(f"  {'PASS' if ok else 'FAIL'}  {'3 1 1, but the answer had AD=0':46} {why}")
+
+print("\n3. Key rollover, RFC 7671 section 8 lint against what the server serves NOW")
+nxt = dane.tlsa(der("rotated"), 3, 1, 1)
+plans = {
+    "step 0: current only": (ee_spki, [leaf, ca]),
+    "step 1: current + next, old key still served": (ee_spki + [nxt], [leaf, ca]),
+    "step 2: new key deployed (>= 2 TTLs later)": (ee_spki + [nxt], [der("rotated"), ca]),
+    "step 3: old record removed": ([nxt], [der("rotated"), ca]),
+    "mistake: next only, old key still served": ([nxt], [leaf, ca]),
+    "mistake: added 3 0 1 for the next cert only": (ee_spki + [dane.tlsa(der("rotated"), 3, 0, 1)], [leaf, ca]),
+}
+for title, (recs, chain) in plans.items():
+    print(f"  {title}")
+    for line in dane.publisher_lint(recs, chain):
+        print(f"      {line}")
+
+print("\n4. Live: TLSA over DoH (AD = validated by the resolver), then the real chain")
+for host in ("www.huque.com", "www.nlnetlabs.nl", "www.freebsd.org", "www.ietf.org"):
+    ad, status, recs = dane.doh_tlsa(f"_443._tcp.{host}")
+    if not recs:
+        print(f"  {host:18} AD={ad} rcode={status} no TLSA -> DANE does not apply, plain WebPKI")
+        continue
+    chain = dane.server_chain(host, 443)
+    ok, why = dane.check(recs, chain, host, ad)
+    print(f"  {host:18} AD={ad} {len(recs)} TLSA, chain of {len(chain)}: {'PASS' if ok else 'FAIL'} {why}")
+```
+
+```text
+1. TLSA 3 1 1 for the leaf, two ways
+  openssl pipeline : cb66729efbc13da169811daaad01ec870538e2c3ccac2579dcc630f215767655
+  dane.spki()      : cb66729efbc13da169811daaad01ec870538e2c3ccac2579dcc630f215767655
+  _25._tcp.mail.lab.example. IN TLSA 3 1 1 cb66729efbc13da1...   (DANE-EE SPKI SHA2-256)
+  _25._tcp.mail.lab.example. IN TLSA 3 0 1 7ef1469ea953e2bf...   (DANE-EE Cert SHA2-256)
+  _25._tcp.mail.lab.example. IN TLSA 2 1 1 7bbeada201d92c56...   (DANE-TA SPKI SHA2-256)
+
+2. Matching (chain = leaf + issuing CA, as the server sends it)
+  PASS  3 1 1, original cert                           leaf matches 3 1 1 (DANE-EE: names and dates ignored)
+  PASS  3 1 1, renewed cert on the same key            leaf matches 3 1 1 (DANE-EE: names and dates ignored)
+  FAIL  3 0 1, renewed cert on the same key            no TLSA record matches the presented chain
+  FAIL  3 1 1, new key, TLSA not updated               no TLSA record matches the presented chain
+  PASS  3 1 1, expired cert                            leaf matches 3 1 1 (DANE-EE: names and dates ignored)
+  PASS  3 1 1, cert for another name                   leaf matches 3 1 1 (DANE-EE: names and dates ignored)
+  PASS  2 1 1, new key from the same CA                TA matches 2 1 1; chain to TA with name check: OK
+  FAIL  2 1 1, expired cert                            TA matches 2 1 1; chain to TA with name check: certificate has expired
+  FAIL  2 1 1, cert for another name                   TA matches 2 1 1; chain to TA with name check: hostname mismatch
+  FAIL  2 1 1, server forgot to send the CA            no TLSA record matches the presented chain
+  FAIL  3 1 1, but the answer had AD=0                 TLSA answer not DNSSEC-validated (AD=0): DANE must not be used
+
+3. Key rollover, RFC 7671 section 8 lint against what the server serves NOW
+  step 0: current only
+      3 1 1: 1 record(s), 1 match current chain -> OK
+  step 1: current + next, old key still served
+      3 1 1: 2 record(s), 1 match current chain -> OK
+  step 2: new key deployed (>= 2 TTLs later)
+      3 1 1: 2 record(s), 1 match current chain -> OK
+  step 3: old record removed
+      3 1 1: 1 record(s), 1 match current chain -> OK
+  mistake: next only, old key still served
+      3 1 1: 1 record(s), 0 match current chain -> BROKEN: only past/future keys
+  mistake: added 3 0 1 for the next cert only
+      3 0 1: 1 record(s), 0 match current chain -> BROKEN: only past/future keys
+      3 1 1: 1 record(s), 1 match current chain -> OK
+
+4. Live: TLSA over DoH (AD = validated by the resolver), then the real chain
+  www.huque.com      AD=True 5 TLSA, chain of 3: PASS leaf matches 3 1 1 (DANE-EE: names and dates ignored)
+  www.nlnetlabs.nl   AD=True 1 TLSA, chain of 4: PASS leaf matches 3 1 1 (DANE-EE: names and dates ignored)
+  www.freebsd.org    AD=True 2 TLSA, chain of 4: PASS leaf matches 3 1 1 (DANE-EE: names and dates ignored)
+  www.ietf.org       AD=True rcode=0 no TLSA -> DANE does not apply, plain WebPKI
+```
+
+### The same cases through OpenSSL's DANE verifier
+
+Section 2 above is my own matcher. To check it against an independent implementation, `openssl s_client` has DANE support built in (`-dane_tlsa_domain`, `-dane_tlsa_rrdata`). The toy server below speaks just enough SMTP to offer `STARTTLS` and then completes a real TLS handshake with whatever certificate chain it is given.
+
+```{.python filename="toysmtp.py"}
+"""A toy SMTP server that offers STARTTLS with a chosen certificate (loopback only)."""
+import socket, ssl, sys, threading
+
+def serve(port, cert, key):
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.load_cert_chain(cert, key)        # cert file = leaf + issuing CA
+    s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s.bind(("127.0.0.1", port)); s.listen()
+    def handle(c):
+        f = c.makefile("rwb")
+        def say(x): f.write(x.encode() + b"\r\n"); f.flush()
+        say("220 mail.lab.example ESMTP toy")
+        while (line := f.readline()):
+            cmd = line.strip().upper()
+            if cmd.startswith(b"EHLO"):
+                say("250-mail.lab.example"); say("250 STARTTLS")
+            elif cmd == b"STARTTLS":
+                say("220 2.0.0 go ahead")
+                try:
+                    t = ctx.wrap_socket(c, server_side=True)
+                    tf = t.makefile("rwb")
+                    while (l2 := tf.readline()):
+                        if l2.strip().upper() == b"QUIT":
+                            tf.write(b"221 bye\r\n"); tf.flush(); break
+                        tf.write(b"250 ok\r\n"); tf.flush()
+                except (ssl.SSLError, OSError):
+                    pass
+                return
+            elif cmd == b"QUIT":
+                say("221 bye"); return
+            else:
+                say("250 ok")
+    while True:
+        c, _ = s.accept()
+        threading.Thread(target=handle, args=(c,), daemon=True).start()
+
+if __name__ == "__main__":
+    serve(int(sys.argv[1]), sys.argv[2], sys.argv[3])
+```
+
+```{.bash filename="openssl-dane.sh"}
+#!/bin/sh
+# OpenSSL's built-in DANE verifier against two toy STARTTLS servers on loopback.
+# 2525 serves the current key, 2526 the rotated key, 2527 an expired cert on the current key.
+python3 toysmtp.py 2525 pki/leaf-chain.pem    pki/cur.key & p1=$!
+python3 toysmtp.py 2526 pki/rotated-chain.pem pki/next.key & p2=$!
+python3 toysmtp.py 2527 pki/expired-chain.pem pki/cur.key & p3=$!
+sleep 1
+ee=$(openssl x509 -in pki/leaf.pem -noout -pubkey | openssl pkey -pubin -outform DER | openssl dgst -sha256 -r | cut -d' ' -f1)
+ta=$(openssl x509 -in pki/ca.pem   -noout -pubkey | openssl pkey -pubin -outform DER | openssl dgst -sha256 -r | cut -d' ' -f1)
+try() { # try <port> <tlsa rrdata> <domain> <label> [extra s_client flag]
+  r=$(echo QUIT | timeout 5 openssl s_client -connect 127.0.0.1:$1 -starttls smtp \
+        -dane_tlsa_domain "$3" -dane_tlsa_rrdata "$2" $5 2>&1)
+  code=$(echo "$r" | grep -m1 'Verify return code' | sed 's/.*code: //')
+  match=$(echo "$r" | grep -m1 '^DANE TLSA' | sed 's/.*matched/matched/')
+  printf '%-44s %s %s\n' "$4" "$code" "$match"
+}
+try 2525 "3 1 1 $ee" mail.lab.example "3 1 1, current key"
+try 2525 "3 1 1 $ee" mx.wrong.example "3 1 1, current key, other name"
+try 2525 "3 1 1 $ee" mx.wrong.example "same, -dane_ee_no_namechecks" -dane_ee_no_namechecks
+try 2527 "3 1 1 $ee" mail.lab.example "3 1 1, expired cert on current key"
+try 2526 "3 1 1 $ee" mail.lab.example "3 1 1, rotated key, TLSA not updated"
+try 2526 "2 1 1 $ta" mail.lab.example "2 1 1, rotated key"
+try 2526 "2 1 1 $ta" mx.wrong.example "2 1 1, rotated key, other name"
+try 2527 "2 1 1 $ta" mail.lab.example "2 1 1, expired cert"
+kill $p1 $p2 $p3
+```
+
+```text
+3 1 1, current key                           0 (ok) matched the EE certificate at depth 0
+3 1 1, current key, other name               62 (hostname mismatch) 
+same, -dane_ee_no_namechecks                 0 (ok) matched the EE certificate at depth 0
+3 1 1, expired cert on current key           0 (ok) matched the EE certificate at depth 0
+3 1 1, rotated key, TLSA not updated         65 (no matching DANE TLSA records) 
+2 1 1, rotated key                           0 (ok) matched the TA certificate at depth 1
+2 1 1, rotated key, other name               62 (hostname mismatch) 
+2 1 1, expired cert                          10 (certificate has expired) 
+```
+
+### What a sender decides for real domains
+
+```{.python filename="smtp.py"}
+"""RFC 7672 sender view: what a DANE-aware MTA decides for each recipient domain (DNS only)."""
+import json, urllib.request
+
+def q(name, rtype):
+    url = f"https://dns.google/resolve?name={name}&type={rtype}"
+    with urllib.request.urlopen(url, timeout=10) as r:
+        return json.load(r)
+
+def decide(domain):
+    mx = q(domain, "MX")
+    hosts = sorted((int(a["data"].split()[0]), a["data"].split()[1].rstrip("."))
+                   for a in mx.get("Answer", []) if a["type"] == 15)
+    if not mx.get("AD"):
+        sts = q(f"_mta-sts.{domain}", "TXT")
+        has_sts = any("v=STSv1" in a["data"] for a in sts.get("Answer", []))
+        return [f"{domain}: MX RRset insecure (AD=0) -> no DANE; "
+                f"MTA-STS TXT {'present' if has_sts else 'absent'}"]
+    out = [f"{domain}: MX RRset validated (AD=1), {len(hosts)} MX host(s)"]
+    for pref, h in hosts:
+        t = q(f"_25._tcp.{h}", "TLSA")
+        recs = [a["data"] for a in t.get("Answer", []) if a["type"] == 52]
+        if recs:
+            kinds = sorted({" ".join(r.split()[:3]) for r in recs})
+            verdict = "DANE: authenticated TLS REQUIRED, no fallback to cleartext"
+            out.append(f"  {pref:>3} {h:28} AD={t.get('AD')} TLSA {', '.join(kinds)} -> {verdict}")
+        else:
+            out.append(f"  {pref:>3} {h:28} AD={t.get('AD')} rcode={t['Status']} no TLSA -> opportunistic TLS")
+    return out
+
+for d in ("nlnetlabs.nl", "posteo.de", "freebsd.org", "ietf.org", "gmail.com"):
+    print("\n".join(decide(d)))
+```
+
+```text
+nlnetlabs.nl: MX RRset validated (AD=1), 4 MX host(s)
+   10 mxext1.mailbox.org           AD=True TLSA 3 1 1 -> DANE: authenticated TLS REQUIRED, no fallback to cleartext
+   10 mxext2.mailbox.org           AD=True TLSA 3 1 1 -> DANE: authenticated TLS REQUIRED, no fallback to cleartext
+   10 mxext3.mailbox.org           AD=True TLSA 3 1 1 -> DANE: authenticated TLS REQUIRED, no fallback to cleartext
+   10 mxext4.mailbox.org           AD=True TLSA 3 1 1 -> DANE: authenticated TLS REQUIRED, no fallback to cleartext
+posteo.de: MX RRset validated (AD=1), 4 MX host(s)
+   10 mx01.posteo.de               AD=True TLSA 3 1 1 -> DANE: authenticated TLS REQUIRED, no fallback to cleartext
+   10 mx02.posteo.de               AD=True TLSA 3 1 1 -> DANE: authenticated TLS REQUIRED, no fallback to cleartext
+   10 mx03.posteo.de               AD=True TLSA 3 1 1 -> DANE: authenticated TLS REQUIRED, no fallback to cleartext
+   10 mx04.posteo.de               AD=True TLSA 3 1 1 -> DANE: authenticated TLS REQUIRED, no fallback to cleartext
+freebsd.org: MX RRset validated (AD=1), 2 MX host(s)
+   10 mx1.freebsd.org              AD=True TLSA 3 1 1 -> DANE: authenticated TLS REQUIRED, no fallback to cleartext
+   30 mx66.freebsd.org             AD=True rcode=3 no TLSA -> opportunistic TLS
+ietf.org: MX RRset validated (AD=1), 1 MX host(s)
+    0 mx.ietf.org                  AD=True TLSA 3 1 1 -> DANE: authenticated TLS REQUIRED, no fallback to cleartext
+gmail.com: MX RRset insecure (AD=0) -> no DANE; MTA-STS TXT present
+```
+
+`smtp.py` takes the strict reading for an insecure MX RRset (no DANE). A real MTA may still use the TLSA records of the MX hosts, as section 2.2.1 allows. It also trusts the AD bit from Google's resolver, which is acceptable for a lab over HTTPS but not for a production MTA (see the production section).
+
+## Reading the results
+
+**The SPKI hash is easy to compute twice.** The OpenSSL pipeline and the 30-line DER walker agree on `cb66729e...`. That pipeline is what you will run in production, and the Python version shows there is nothing magic in it: SHA-256 over the DER `SubjectPublicKeyInfo`.
+
+**Selector 1 survives renewals; selector 0 does not.** `3 1 1` passes for the renewed certificate on the same key; `3 0 1` fails. Any change to serial, dates or extensions changes a selector-0 hash. A new key breaks `3 1 1` too (the "new key, TLSA not updated" row), which is why key changes need the rollover below.
+
+**DANE-EE ignores dates and, by the RFC, names.** In `lab.py`, `3 1 1` passes for an expired certificate and for one issued to `www.other.example`. The DNS zone owner pinned that key; nothing else about the certificate matters. DANE-TA is different: the chain is validated normally up to the pinned CA, so expiry (`certificate has expired`) and name (`hostname mismatch`) are enforced.
+
+**OpenSSL checks names for DANE-EE unless told not to.** The OpenSSL rows mostly agree with my matcher, with one exception: `3 1 1, current key, other name` fails with code 62. OpenSSL's `SSL_CTX_dane_enable(3)` page explains why: name checks stay on for DANE-EE by default because, for web browsers, skipping them opens "unknown key share" attacks. Applications such as MTAs that follow RFC 7671 set `DANE_FLAG_NO_DANE_EE_NAMECHECKS`, which is what `-dane_ee_no_namechecks` does, and the row passes. Expiry is ignored for DANE-EE even by default (the expired row is `0 (ok)`).
+
+**DANE-TA needs the CA in the handshake.** `2 1 1` keeps working across a key change from the same CA (row "rotated key"), which is its main attraction. In `lab.py`, the "server forgot to send the CA" case fails: with only the leaf on the wire there is nothing for the TLSA record to match.
+
+**Unvalidated answers are ignored.** The `AD=0` row fails even though the hash matches. An unsigned TLSA record is just a hint an attacker can forge.
+
+**On the Internet.** `www.huque.com`, `www.nlnetlabs.nl` and `www.freebsd.org` publish signed TLSA records whose `3 1 1` hash matches the key they serve today; `www.ietf.org` publishes none, so plain WebPKI applies. For mail, `nlnetlabs.nl` (hosted at mailbox.org), `posteo.de` and `ietf.org` have signed MX RRsets and TLSA records on every MX host, so a DANE sender will not deliver to them in cleartext. `freebsd.org` is the instructive case: `mx1` has a TLSA record, but the backup `mx66` returns a *secure* NXDOMAIN for `_25._tcp.mx66.freebsd.org`. That is a valid "no DANE here" answer, so mail to that host goes out with opportunistic TLS. `gmail.com` has an unsigned MX RRset, so DANE does not apply; it publishes an MTA-STS record (RFC 8461) instead.
+
+## Rolling keys without an outage
+
+TLSA records are cached for their TTL. If you change the server's key before every resolver has seen a record for the new key, DANE senders with the old RRset cached will refuse to deliver. RFC 7671 section 8 gives the rule that prevents this:
+
+> each and every parameter combination that appears in the TLSA RRset is, on its own, sufficient to match the server's current certificate chain
+
+and section 8.1 gives the procedure for a fixed `3 1 1` setup:
+
+```text
+step 0   RRset: 3 1 1 <cur>               server: cur key
+step 1   RRset: 3 1 1 <cur>, 3 1 1 <next> server: cur key     wait at least 2 x TTL
+step 2   RRset: 3 1 1 <cur>, 3 1 1 <next> server: next key    check delivery works
+step 3   RRset: 3 1 1 <next>              server: next key
+```
+
+Section 3 of `lab.py` lints each step against the chain the server serves at that moment, and shows two mistakes. Publishing only the next key while the old key is still served leaves no matching record. The subtler one is adding a record with a *different* parameter combination (`3 0 1`) that matches only the future certificate. A client that only implements `3 0 1`, or that prefers it, sees a combination with no current match. Every combination you publish has to match what is on the wire now.
+
+A practical routine is to keep a pre-generated next key at all times, publish `3 1 1` for both current and next, and renew certificates on the current key. When you want to rotate, swap to the next key (it is already in DNS), generate a new next key, publish its hash, and remove the old one after two TTLs.
+
+RFC 7671 section 13 adds the TTL trade-off: long TTLs mean long waits before a planned change and long outages after an unplanned one (lost or compromised key). Pick a TTL short enough that an emergency key change with a few hours of failed deliveries is acceptable. Mail queues retry, so a delay of hours costs much less for SMTP than for HTTPS.
+
+## Production configuration (not run here)
+
+### Publishing the record
+
+Compute the hash from the certificate the server actually uses, then publish it in a DNSSEC-signed zone:
+
+```{.bash filename="tlsa-hash.sh"}
+# not run here
+openssl x509 -in /etc/ssl/mx1.example.net.pem -noout -pubkey \
+  | openssl pkey -pubin -outform DER \
+  | openssl dgst -sha256 -r | cut -d' ' -f1
+```
+
+```text
+; zone example.net, signed (not run here)
+example.net.                 3600 IN MX    10 mx1.example.net.
+mx1.example.net.             3600 IN A     192.0.2.25
+mx1.example.net.             3600 IN AAAA  2001:db8::25
+_25._tcp.mx1.example.net.    3600 IN TLSA  3 1 1 <64 hex digits>
+```
+
+Both the zone holding the MX records and the zone holding the MX host's TLSA record must be signed and correctly delegated with DS records. If your mail is hosted by a provider, the TLSA records belong to the provider's zone (`_25._tcp.mxext1.mailbox.org` in the `nlnetlabs.nl` example), and your part is signing your own zone so the MX RRset validates.
+
+If certificates come from an ACME client, make it reuse the key on renewal (for certbot, `--reuse-key`), or hook the DNS update into the renewal so the new key is published two TTLs before it is used. Otherwise each renewal is an unannounced key change.
+
+### Sending side: Postfix
+
+From `postconf(5)` and `TLS_README`:
+
+```{.ini filename="main.cf"}
+# /etc/postfix/main.cf (not run here)
+# Postfix only treats "#" at the start of a line as a comment.
+# Ask the resolver for DNSSEC and honour its AD bit:
+smtp_dns_support_level = dnssec
+# Opportunistic DANE: authenticate where usable signed TLSA records exist:
+smtp_tls_security_level = dane
+smtp_tls_loglevel = 1
+```
+
+`dane` is opportunistic DANE: authenticated TLS where signed TLSA records exist, ordinary opportunistic TLS elsewhere. `dane-only` makes DANE mandatory, so mail to destinations without usable TLSA records is deferred; use it in a per-destination policy table, not as a global default. (Since Postfix 3.11 the default `smtp_tls_security_level` is `may` instead of empty.)
+
+Postfix does not validate DNSSEC itself. It trusts the AD bit from the resolver in `/etc/resolv.conf`, so that resolver must be a validating one on the same host, for example Unbound on 127.0.0.1. An AD bit received over an untrusted network can be forged as easily as the answer.
+
+### Receiving side
+
+Publishing the record is the whole receiving-side change, plus making sure every MX host offers `STARTTLS` with the pinned key on every address it answers on, IPv4 and IPv6 alike.
+
+### MTA-STS
+
+MTA-STS (RFC 8461) solves the same downgrade problem without DNSSEC: a TXT record at `_mta-sts.<domain>` and a policy file over HTTPS, with certificates checked against public CAs. A domain can publish both. A sender may implement either or both; check your MTA's documentation for what it does when both are present.
+
+## Gotchas
+
+- **OpenSSL name checks on DANE-EE.** Applications that use OpenSSL's DANE API get name checks on DANE-EE by default. For SMTP, RFC 7671 says to skip them, and Postfix does. If you write your own client, decide deliberately and set `DANE_FLAG_NO_DANE_EE_NAMECHECKS` only where unknown-key-share attacks do not matter.
+- **`3 0 1` breaks on every renewal.** Pin the SPKI (`3 1 1`) unless you have a specific reason not to.
+- **DANE-TA without the CA on the wire fails.** Configure the server to send the full chain, including the certificate the `2 x x` record matches.
+- **The AD bit is only as trustworthy as the path to the resolver.** Use a validating resolver on loopback for the MTA.
+- **ACME renewals rotate keys by default.** Reuse keys or automate the TLSA update with the two-TTL wait.
+- **One unprotected MX host weakens the domain.** An attacker who blocks the DANE-protected hosts can push senders to a host without TLSA records. Publish TLSA for every MX host or none.
+- **TLSA without working STARTTLS stops your inbound mail.** DANE senders will defer instead of delivering in cleartext.
+- **SERVFAIL on TLSA queries is an outage.** Broken signatures, a missing DS, or nameservers that mishandle the TLSA query type (RFC 7672 section 2.2.2 mentions load-balancing nameservers that do) all make the MX host unreachable for DANE senders.
+- **Secure NXDOMAIN is not an error.** `mx66.freebsd.org` shows that a signed "no TLSA here" is a valid answer and leads to opportunistic TLS.
+- **Emergency key changes run into cached RRsets.** Senders keep the old TLSA RRset until its TTL expires. Keep the TTL modest and a pre-published next key ready.
+
+## Exercises
+
+1. Run `openssl s_client -connect www.freebsd.org:443 -servername www.freebsd.org` and compute the `3 1 1` hash of the leaf with the pipeline from `lab.py`. Compare it with the TLSA records `lab.py` fetched. Which of the two published records matches, and what might the other one be for?
+2. Add matching type 2 (SHA2-512) records to section 2 of `lab.py`, then add a case where the RRset holds a `3 1 2` record for the next key only. What does `publisher_lint` report, and which client would break?
+3. Change `openssl-dane.sh` so the server on 2526 sends only the leaf (use `pki/rotated.pem` instead of `pki/rotated-chain.pem`). Which `2 1 1` rows change and why?
+4. Extend `smtp.py` to sort MX hosts by preference and print, for each domain, whether an attacker who blocks the DANE-protected hosts could get mail delivered in cleartext.
+5. Pick a domain you run. Is the MX RRset secure? Do all MX hosts have TLSA records? Write down the steps and TTL waits needed to roll the key on one MX host without deferring mail.
+
+## Verification
+
+- Ran on the build box (Linux 6.12, OpenSSL 3.5.7, Python 3.13, unprivileged, no installs): `mkcerts.sh`, `lab.py` (with `dane.py`), `openssl-dane.sh` (with `toysmtp.py` on 127.0.0.1) and `smtp.py`. The text blocks after them are the genuine output from 2026-11-14 (IST); live answers will change as operators roll keys.
+- The live sections use Google Public DNS over HTTPS for TLSA, MX and TXT lookups and `openssl s_client` to port 443 for chains.
+- Not run: any SMTP session to a real MX host (outbound port 25 is blocked from the build box), the Postfix configuration, the zone file snippet, the TLSA hash command against a production certificate, and certbot.
+
+## Sources
+
+- RFC 6698, The DNS-Based Authentication of Named Entities (DANE) Transport Layer Security (TLS) Protocol: TLSA.
+- RFC 7218, Adding Acronyms to Simplify Conversations about DNS-Based Authentication of Named Entities (DANE).
+- RFC 7671, The DNS-Based Authentication of Named Entities (DANE) Protocol: Updates and Operational Guidance (sections 5.1, 8, 8.1, 13).
+- RFC 7672, SMTP Security via Opportunistic DNS-Based Authentication of Named Entities (DANE) Transport Layer Security (TLS) (sections 2.1.1, 2.1.2, 2.2, 2.2.1, 2.2.2, 3.1.3).
+- RFC 4035, Protocol Modifications for the DNS Security Extensions (section 4.3, validation states).
+- RFC 8461, SMTP MTA Strict Transport Security (MTA-STS).
+- OpenSSL 3.5 manual: `SSL_CTX_dane_enable(3)`, `openssl-s_client(1)`, `openssl-verify(1)`.
+- Postfix documentation: `postconf(5)` (`smtp_tls_security_level`, `smtp_dns_support_level`) and `TLS_README`.

@@ -1,0 +1,525 @@
+---
+title: "Protecting the BGP Session: TCP-MD5, TCP-AO and GTSM on Linux"
+author:
+  - name: "K19G"
+  - name: "grok-bot"
+---
+
+# Protecting the BGP Session: TCP-MD5, TCP-AO and GTSM on Linux
+
+Border Gateway Protocol (BGP) runs on top of TCP port 179. Because TCP is stateful and long-lived, an unauthenticated BGP session is vulnerable to TCP sequence number guessing attacks, off-path TCP RST injection, fake BGP notification insertion, and CPU exhaustion from unauthenticated connection attempts. While control-plane access lists and CoPP filter unauthorized traffic at network boundaries (see [Control-Plane Protection](02-control-plane-protection.qmd)), protecting the integrity and authenticity of the TCP transport layer itself requires socket-level mechanisms.
+
+Three main socket-level protection mechanisms exist for BGP on modern network hardware and Linux operating systems:
+1. **TCP MD5 Signature Option (RFC 2385)**: Authenticates each segment using a shared symmetric key and MD5 digest embedded in the TCP options.
+2. **TCP Authentication Option / TCP-AO (RFC 5925 / RFC 5926)**: Obsoletes TCP-MD5, providing algorithm agility (RFC 5926 mandates HMAC-SHA-1-96 and AES-128-CMAC-96; Linux also offers other kernel crypto MACs such as HMAC-SHA-256), key identifiers on the wire so keys can be rolled without dropping the session, and a sequence number extension (SNE) against replay on long-lived connections.
+3. **Generalized TTL Security Mechanism / GTSM (RFC 5082)**: Leverages IP Time-To-Live (TTL) mechanics to drop off-path attack traffic before it consumes host socket resources.
+
+This chapter details the protocol internals, Linux kernel socket system calls, `/proc` counter behaviors, and daemon configurations for TCP-MD5, TCP-AO, and GTSM.
+
+## Learning goals
+
+- Understand the wire format and cryptographic structure of TCP MD5 (RFC 2385) and TCP-AO (RFC 5925).
+- Inspect Linux kernel socket options `TCP_MD5SIG`, `IP_MINTTL`, and `TCP_AO_ADD_KEY`.
+- Trace kernel drop behaviors and `/proc/net/netstat` `TcpExt` counters (`TCPMD5NotFound`, `TCPMD5Unexpected`, `TCPMD5Failure`, `TCPMinTTLDrop`).
+- Analyze the operational challenges of MD5 key rotation compared to TCP-AO hitless MKT transitions.
+- Implement GTSM to protect socket resources against remote multi-hop spoofing.
+- Configure session protection in FRR and BIRD, and know which daemons support TCP-AO today.
+
+## Version note
+
+The lab experiments in this chapter were conducted on an unprivileged Linux 6.12 environment using iproute2 version 6.15.0 and Python 3.13 inside isolated user, net, and mount namespaces (`unshare -urnm`). System kernel configuration notes:
+- `CONFIG_TCP_MD5SIG=y`: Enabled.
+- `# CONFIG_TCP_AO is not set`: Disabled on the host kernel (TCP-AO socket calls return `ENOPROTOOPT` / errno 92).
+
+---
+
+## TCP MD5 Signature Option (RFC 2385)
+
+### Mechanism and Wire Format
+
+RFC 2385 defines option kind 19, an 18-byte TCP option header attached to every TCP segment (SYN, ACK, DATA, FIN, RST).
+
+```
+ 0                   1                   2                   3
+ 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|   Kind = 19   |  Length = 18  |  MD5 Digest (bytes 1-2)       |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                     MD5 Digest (bytes 3-6)                    |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                     MD5 Digest (bytes 7-10)                   |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                     MD5 Digest (bytes 11-14)                  |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                     MD5 Digest (bytes 15-16)                  |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+```
+
+The 16-byte MD5 digest is calculated over:
+1. TCP pseudo-header (Source IP, Destination IP, zero padding, Protocol 6, TCP Segment Length).
+2. TCP header excluding options, with checksum field set to zero.
+3. TCP segment payload.
+4. Shared secret key.
+
+### Limitations of TCP-MD5
+
+1. **No Key Identifier**: The option header does not transmit a key identifier or key index. Both ends must use the identical secret key simultaneously.
+2. **No Dynamic Key Rollover**: Changing a key on one peer causes the receiver to fail verification on subsequent segments, triggering connection termination once BGP hold timers expire.
+3. **No Replay Protection Beyond TCP Sequence Numbers**: Replay protection relies entirely on standard TCP sequence number validation within the active window.
+4. **Weak construction and weak keys**: the digest is a keyed MD5 over the segment, not an HMAC. In practice the bigger risk is the key: BGP passwords are often short and shared for years, and anyone who captures signed segments can try to guess the password offline.
+
+### Linux Kernel Implementation (`CONFIG_TCP_MD5SIG`)
+
+The Linux kernel configures TCP-MD5 via `setsockopt` on an open socket using level `IPPROTO_TCP` and option `TCP_MD5SIG` (14).
+
+```c
+struct tcp_md5sig {
+    struct sockaddr_storage tcpm_addr;      /* Peer address family and IP */
+    __u8                    tcpm_flags;     /* Flags (e.g. prefix matching) */
+    __u8                    tcpm_prefixlen; /* Prefix length */
+    __u16                   tcpm_keylen;    /* Key length in bytes (max 80) */
+    int                     tcpm_ifindex;   /* Interface index */
+    __u8                    tcpm_key[80];   /* Shared key string */
+};
+```
+
+Key kernel options:
+- `TCP_MD5SIG_EXT` (32): Extended configuration format.
+- `TCP_MD5SIG_FLAG_PREFIX`: Matches a whole IP prefix (used by listening sockets accepting connections from dynamic neighbors).
+- `TCP_MD5SIG_FLAG_IFINDEX`: Binds the key scope to a specific interface (useful for link-local IPv6 addresses or VRF instances).
+
+### Kernel Drop Behavior and Counters
+
+When a segment fails the MD5 check, the kernel drops it silently. No TCP RST and no ICMP message go back, so the peer only sees its SYN or data go unanswered and retransmits until it gives up. The kernel also writes rate-limited "MD5 Hash failed" / "MD5 Hash not found" lines to the kernel log.
+
+`/proc/net/netstat` tracks MD5 events under `TcpExt`:
+- `TCPMD5NotFound`: A segment arrived without an MD5 option, but the receiving socket has an MD5 key configured for that peer.
+- `TCPMD5Unexpected`: A segment arrived with an MD5 option, but the receiving socket has no MD5 key configured for that peer.
+- `TCPMD5Failure`: A segment arrived with an MD5 option and matched a configured key, but MD5 signature validation failed.
+
+---
+
+## TCP Authentication Option / TCP-AO (RFC 5925 / RFC 5926)
+
+RFC 5925 obsoletes RFC 2385 by introducing TCP-AO (Option Kind 29).
+
+### Wire Format
+
+```
+ 0                   1                   2                   3
+ 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|   Kind = 29   |  Length = 16  |     KeyID     |  RNextKeyID   |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                    MAC (bytes 1-4)                            |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                    MAC (bytes 5-8)                            |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                    MAC (bytes 9-12)                           |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+```
+
+The length shown is for a 96-bit MAC (HMAC-SHA-1-96 or AES-128-CMAC-96); the MAC field is variable length. KeyID is the SendID of the MKT that signed this segment; RNextKeyID is the RecvID of the key the sender wants to receive next.
+
+### Architectural Improvements over TCP-MD5
+
+1. **Master Key Tuples (MKTs)**: Master keys are configured with unique `SendID` and `RecvID` byte values (0-255).
+2. **Key rollover without a session reset**: every segment names its key in KeyID. Both ends first install the new MKT next to the old one; one end then advertises the new key in RNextKeyID, the peer switches its sending key, and the old MKT is removed afterwards. The TCP connection and therefore the BGP session stay up.
+3. **Algorithm agility**: RFC 5926 defines HMAC-SHA-1-96 and AES-128-CMAC-96 as the mandatory pair; the Linux implementation accepts other MAC algorithms from the kernel crypto API (for example HMAC-SHA-256), which both ends must then agree on.
+4. **Traffic Key Derivation (KDF)**: Master keys are not used directly over the wire. Derivation functions compute per-connection traffic keys using Initial Sequence Numbers (ISNs).
+5. **Sequence Number Extension (SNE)**: Tracks higher-order bits of sequence numbers to prevent replay attacks over long-lived, high-throughput TCP sessions that wrap sequence numbers beyond $2^{32}$ bytes.
+
+### Linux Kernel Implementation (`CONFIG_TCP_AO`)
+
+TCP-AO support landed in Linux kernel 6.7 (January 2024). Socket operations use `setsockopt` with level `IPPROTO_TCP`:
+- `TCP_AO_ADD_KEY` (38): Add a Master Key Tuple.
+- `TCP_AO_DEL_KEY` (39): Remove a Master Key Tuple.
+- `TCP_AO_INFO` (40): Set socket-wide AO operational options.
+- `TCP_AO_GET_KEYS` (41): Dump MKT configurations.
+- `TCP_AO_REPAIR` (42): Restore SNE state during TCP repair mode.
+
+Kernel counter fields under `/proc/net/netstat` (`TcpExt`): `TCPAOGood`, `TCPAOBad`, `TCPAOKeyNotFound`, `TCPAORequired`, `TCPAODroppedIcmps`.
+
+---
+
+## Generalized TTL Security Mechanism / GTSM (RFC 5082)
+
+### Principle of Operation
+
+GTSM protects protocol sessions from off-path multi-hop attack vectors by enforcing IP Time-To-Live (TTL for IPv4) or Hop Limit (for IPv6) constraints.
+
+For directly connected single-hop BGP neighbors:
+1. Sender sets IP TTL to `255`.
+2. Router hops along the path decrement the TTL by at least 1 per hop.
+3. Receiver enforces a minimum acceptable TTL of `255` (or `255 - (hops - 1)` for multi-hop sessions).
+
+An off-path attacker located multiple hops away cannot forge a packet arriving with TTL 255 because intermediate routers decrement the field during forwarding.
+
+```
++------------------+         +--------------------+         +------------------+
+| Sender           |         | Off-path Attacker  |         | Receiver         |
+| (Sets TTL = 255) |         | (Sends TTL = 255)  |         | (Requires 255)   |
++--------+---------+         +---------+----------+         +--------+---------+
+         |                             |                             |
+         |  Direct link (TTL=255)      |                             |
+         +---------------------------------------------------------->| ACCEPT
+         |                             |                             |
+         |                             |  Multi-hop path             |
+         |                             v  (arrives with TTL <= 254)  |
+         |                     +---------------+                     |
+         |                     | Transit Node  |                     |
+         |                     +-------+-------+                     |
+         |                             |                             |
+         |                             +---------------------------->| DROP
+```
+
+### Linux Kernel Socket Interface
+
+Linux supports IPv4 GTSM via `setsockopt` option `IP_MINTTL` (21) under `IPPROTO_IP`:
+
+```c
+int minttl = 255;
+setsockopt(sock, IPPROTO_IP, IP_MINTTL, &minttl, sizeof(minttl));
+```
+
+For IPv6 sessions, option `IPV6_MINHOPCOUNT` (73) under `IPPROTO_IPV6` provides identical functionality.
+
+If an incoming packet fails the minimum TTL threshold, the kernel drops the packet silently and increments the `TcpExt` `TCPMinTTLDrop` counter in `/proc/net/netstat`.
+
+---
+
+## Comparison Matrix
+
+| Feature / Attribute | TCP-MD5 (RFC 2385) | TCP-AO (RFC 5925) | GTSM (RFC 5082) |
+| :--- | :--- | :--- | :--- |
+| **Primary Goal** | Payload & Header Auth | Payload & Header Auth | CPU Protection / Distance Verification |
+| **Layer** | TCP Option (Kind 19) | TCP Option (Kind 29) | IP Header (TTL / Hop Limit) |
+| **Crypto Agility** | Fixed (MD5) | Flexible (SHA-1, AES-CMAC, SHA-2) | None (No Crypto) |
+| **Hitless Key Rollover** | No (Causes BGP session flap) | Yes (Supported via SendID / RNextKeyID) | N/A |
+| **Replay Protection** | TCP Sequence Number | Sequence Number Extension (SNE) | None |
+| **Linux Socket Option** | `TCP_MD5SIG` (14) | `TCP_AO_ADD_KEY` (38) | `IP_MINTTL` (21) / `IPV6_MINHOPCOUNT` (73) |
+| **Linux drop counters** | `TCPMD5Failure`, `TCPMD5NotFound` | `TCPAOBad`, `TCPAOKeyNotFound` | `TCPMinTTLDrop` |
+| **CPU Verification Overhead** | Moderate | Moderate to High | Negligible (one comparison) |
+
+---
+
+## The lab
+
+The lab script runs inside an unprivileged namespace environment (`unshare -urnm`). Three python scripts execute test cases across network namespaces `a`, `b`, and router `r`.
+
+### Script: `tcpauth.py`
+
+```{.python filename="tcpauth.py"}
+# tcpauth.py: TCP-MD5 (RFC 2385), TCP-AO (RFC 5925) and GTSM (RFC 5082) socket options, stdlib only.
+#   tcpauth.py listen ADDR PORT [--md5 PEER:KEY] [--minttl N]
+#   tcpauth.py connect SRC DST PORT [--md5 PEER:KEY] [--ttl N]
+#   tcpauth.py rekey SRC DST PORT PEER:OLDKEY NEWKEY  (change the key on an open session)
+#   tcpauth.py ao                     (try to add a TCP-AO key)
+import socket, struct, sys, threading, time
+TCP_MD5SIG, TCP_AO_ADD_KEY, IP_MINTTL = 14, 38, 21
+
+def md5(sock, peer, key):
+    # struct tcp_md5sig: sockaddr_storage(128) flags(u8) prefixlen(u8) keylen(u16) ifindex(int) key[80]
+    sa = struct.pack("=H", socket.AF_INET) + struct.pack("!H4s", 0, socket.inet_aton(peer))
+    sa = sa.ljust(128, b"\0")
+    k = key.encode()
+    sock.setsockopt(socket.IPPROTO_TCP, TCP_MD5SIG,
+                    sa + struct.pack("=BBHi", 0, 0, len(k), 0) + k.ljust(80, b"\0"))
+
+def opts(args):
+    o = {}
+    while args:
+        f, v = args.pop(0), args.pop(0)
+        o[f] = v
+    return o
+
+cmd = sys.argv[1]
+if cmd == "listen":
+    addr, port, o = sys.argv[2], int(sys.argv[3]), opts(sys.argv[4:])
+    s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    if "--md5" in o: md5(s, *o["--md5"].split(":", 1))
+    if "--minttl" in o: s.setsockopt(socket.IPPROTO_IP, IP_MINTTL, int(o["--minttl"]))
+    s.bind((addr, port)); s.listen(8)
+    def serve(c):
+        while data := c.recv(100):
+            c.sendall(b"OPEN-ACK " + data)
+        c.close()
+    while True:
+        c, peer = s.accept()
+        threading.Thread(target=serve, args=(c,), daemon=True).start()
+elif cmd == "connect":
+    src, dst, port, o = sys.argv[2], sys.argv[3], int(sys.argv[4]), opts(sys.argv[5:])
+    s = socket.socket(); s.bind((src, 0)); s.settimeout(3)
+    if "--md5" in o: md5(s, *o["--md5"].split(":", 1))
+    if "--ttl" in o: s.setsockopt(socket.IPPROTO_IP, socket.IP_TTL, int(o["--ttl"]))
+    t = time.monotonic()
+    try:
+        s.connect((dst, port)); s.sendall(b"OPEN"); r = s.recv(100).decode()
+        print(f"   connected, got {r!r} in {time.monotonic() - t:.2f} s")
+    except OSError as e:
+        print(f"   {type(e).__name__}: {e} after {time.monotonic() - t:.2f} s")
+elif cmd == "rekey":
+    src, dst, port, (peer, old), new = sys.argv[2], sys.argv[3], int(sys.argv[4]), sys.argv[5].split(":", 1), sys.argv[6]
+    s = socket.socket(); s.bind((src, 0)); s.settimeout(3)
+    md5(s, peer, old); s.connect((dst, port))
+    s.sendall(b"KEEPALIVE-1"); print(f"   old key: got {s.recv(100).decode()!r}")
+    md5(s, peer, new)                        # only this end changes; there is no key ID to negotiate
+    t = time.monotonic(); s.sendall(b"KEEPALIVE-2")
+    try:
+        print(f"   new key: got {s.recv(100).decode()!r}")
+    except OSError as e:
+        print(f"   new key: {type(e).__name__}: {e} after {time.monotonic() - t:.2f} s")
+    md5(s, peer, old)                        # roll back: the retransmission now verifies
+    t = time.monotonic()
+    print(f"   rolled back: got {s.recv(100).decode()!r} after {time.monotonic() - t:.2f} s")
+elif cmd == "ao":
+    s = socket.socket()
+    try:
+        s.setsockopt(socket.IPPROTO_TCP, TCP_AO_ADD_KEY, bytes(300))
+    except OSError as e:
+        print(f"   setsockopt(TCP_AO_ADD_KEY) -> errno {e.errno} {e.strerror}")
+```
+
+### Script: `counters.py`
+
+```{.python filename="counters.py"}
+# counters.py NAME...: print TcpExt counters from /proc/net/netstat of the current netns.
+import sys
+lines = open("/proc/net/netstat").read().split("\n")
+vals = {}
+for h, v in zip(lines[0::2], lines[1::2]):
+    if h.startswith("TcpExt:"):
+        vals = dict(zip(h.split()[1:], map(int, v.split()[1:])))
+print("   " + "  ".join(f"{n}={vals.get(n, 'absent')}" for n in sys.argv[1:]))
+```
+
+### Script: `lab.sh`
+
+```{.sh filename="lab.sh"}
+#!/bin/sh
+# Run as: unshare -urnm sh lab.sh   (unprivileged user, net and mount namespaces; no sudo)
+H=$(pwd); mount -t tmpfs tmpfs /run; mkdir -p /run/netns
+for ns in a b r; do ip netns add $ns; ip -n $ns link set lo up; done
+# a (10.1.0.1) --- b (10.1.0.2) directly; a (10.2.0.1) --- r --- b (10.3.0.2) via one router
+ip link add eab netns a type veth peer name eba netns b
+ip link add ear netns a type veth peer name era netns r
+ip link add erb netns r type veth peer name ebr netns b
+ip -n a addr add 10.1.0.1/24 dev eab; ip -n b addr add 10.1.0.2/24 dev eba
+ip -n a addr add 10.2.0.1/24 dev ear; ip -n r addr add 10.2.0.254/24 dev era
+ip -n r addr add 10.3.0.254/24 dev erb; ip -n b addr add 10.3.0.2/24 dev ebr
+for p in a:eab a:ear r:era r:erb b:eba b:ebr; do ip -n ${p%%:*} link set ${p#*:} up; done
+ip -n a route add 10.3.0.0/24 via 10.2.0.254; ip -n b route add 10.2.0.0/24 via 10.3.0.254
+ip netns exec r sh -c 'echo 1 > /proc/sys/net/ipv4/ip_forward'
+C="TCPMD5NotFound TCPMD5Unexpected TCPMD5Failure TCPMinTTLDrop"
+A="ip netns exec a python3 $H/tcpauth.py"; B="ip netns exec b"
+
+echo "== 1. TCP-MD5: listener on b:179 holds key 's3cret' for peer 10.1.0.1"
+$B python3 $H/tcpauth.py listen 10.1.0.2 179 --md5 10.1.0.1:s3cret & L1=$!
+$B python3 $H/tcpauth.py listen 10.1.0.2 1179 & L2=$!
+sleep 0.5
+step() { echo " $1"; shift; $A connect "$@"; $B python3 $H/counters.py $C; }
+step "1a. a connects with the same key"    10.1.0.1 10.1.0.2 179 --md5 10.1.0.2:s3cret
+step "1b. a connects with no key"          10.1.0.1 10.1.0.2 179
+step "1c. a connects with a wrong key"     10.1.0.1 10.1.0.2 179 --md5 10.1.0.2:typo
+step "1d. a signs, but b:1179 has no key"  10.1.0.1 10.1.0.2 1179 --md5 10.1.0.2:s3cret
+echo " counters on a:"; ip netns exec a python3 $H/counters.py $C
+
+echo "== 2. MD5 key change on an established session (only a changes its key)"
+$A rekey 10.1.0.1 10.1.0.2 179 10.1.0.2:s3cret n3wkey
+$B python3 $H/counters.py $C
+
+echo "== 3. TCP-AO on this kernel"
+$A ao
+echo "   kernel config: $(zcat /proc/config.gz 2>/dev/null | grep -E '^(# )?CONFIG_TCP_(AO|MD5SIG)[ =]' | tr '\n' ' ')"
+
+echo "== 4. GTSM: listener on b:2179 with IP_MINTTL=255 (default TTL here: $(cat /proc/sys/net/ipv4/ip_default_ttl))"
+$B python3 $H/tcpauth.py listen 0.0.0.0 2179 --minttl 255 & L3=$!
+sleep 0.5
+$B python3 $H/tcpauth.py listen 0.0.0.0 3179 & L4=$!; sleep 0.5
+step "4a. direct neighbour, TTL 255"               10.1.0.1 10.1.0.2 2179 --ttl 255
+step "4b. direct neighbour, default TTL"           10.1.0.1 10.1.0.2 2179
+step "4c. one router away, TTL 255 (arrives 254)"  10.2.0.1 10.3.0.2 2179 --ttl 255
+step "4d. one router away, b:3179 has no MINTTL"   10.2.0.1 10.3.0.2 3179 --ttl 255
+kill $L1 $L2 $L3 $L4 2>/dev/null; wait 2>/dev/null
+```
+
+### Execution Output
+
+```text
+== 1. TCP-MD5: listener on b:179 holds key 's3cret' for peer 10.1.0.1
+ 1a. a connects with the same key
+   connected, got 'OPEN-ACK OPEN' in 0.00 s
+   TCPMD5NotFound=0  TCPMD5Unexpected=0  TCPMD5Failure=0  TCPMinTTLDrop=0
+ 1b. a connects with no key
+   TimeoutError: timed out after 3.00 s
+   TCPMD5NotFound=3  TCPMD5Unexpected=0  TCPMD5Failure=0  TCPMinTTLDrop=0
+ 1c. a connects with a wrong key
+   TimeoutError: timed out after 3.00 s
+   TCPMD5NotFound=3  TCPMD5Unexpected=0  TCPMD5Failure=3  TCPMinTTLDrop=0
+ 1d. a signs, but b:1179 has no key
+   TimeoutError: timed out after 3.00 s
+   TCPMD5NotFound=3  TCPMD5Unexpected=3  TCPMD5Failure=3  TCPMinTTLDrop=0
+ counters on a:
+   TCPMD5NotFound=0  TCPMD5Unexpected=0  TCPMD5Failure=0  TCPMinTTLDrop=0
+== 2. MD5 key change on an established session (only a changes its key)
+   old key: got 'OPEN-ACK KEEPALIVE-1'
+   new key: TimeoutError: timed out after 3.00 s
+   rolled back: got 'OPEN-ACK KEEPALIVE-2' after 0.33 s
+   TCPMD5NotFound=3  TCPMD5Unexpected=3  TCPMD5Failure=8  TCPMinTTLDrop=0
+== 3. TCP-AO on this kernel
+   setsockopt(TCP_AO_ADD_KEY) -> errno 92 Protocol not available
+   kernel config: # CONFIG_TCP_AO is not set CONFIG_TCP_MD5SIG=y 
+== 4. GTSM: listener on b:2179 with IP_MINTTL=255 (default TTL here: 127)
+ 4a. direct neighbour, TTL 255
+   connected, got 'OPEN-ACK OPEN' in 0.00 s
+   TCPMD5NotFound=3  TCPMD5Unexpected=3  TCPMD5Failure=8  TCPMinTTLDrop=0
+ 4b. direct neighbour, default TTL
+   TimeoutError: timed out after 3.00 s
+   TCPMD5NotFound=3  TCPMD5Unexpected=3  TCPMD5Failure=8  TCPMinTTLDrop=3
+ 4c. one router away, TTL 255 (arrives 254)
+   TimeoutError: timed out after 3.00 s
+   TCPMD5NotFound=3  TCPMD5Unexpected=3  TCPMD5Failure=8  TCPMinTTLDrop=6
+ 4d. one router away, b:3179 has no MINTTL
+   connected, got 'OPEN-ACK OPEN' in 0.00 s
+   TCPMD5NotFound=3  TCPMD5Unexpected=3  TCPMD5Failure=8  TCPMinTTLDrop=6
+```
+
+---
+
+## Reading the output
+
+### Section 1: TCP-MD5 Connection Behaviors
+
+- **Step 1a (`a` connects with matching key `s3cret`)**: The handshakes succeed instantly in `0.00 s`. Peer `b` calculates the expected MD5 digest matching `a`'s option header. All counters remain `0`.
+- **Step 1b (`a` connects with no key)**: `a` transmits unauthenticated SYN segments. Host `b` requires MD5 for peer `10.1.0.1`. Host `b` drops incoming segments silently. `a` retransmits SYN at 1 s and 3 s intervals before timing out. Host `b` increments `TCPMD5NotFound` by `3` (1 initial SYN + 2 retransmits).
+- **Step 1c (`a` connects with wrong key `typo`)**: `a` sends segments signed with key `typo`. Host `b` validates signatures using key `s3cret`. Validation fails, segments are dropped silently, and `b` increments `TCPMD5Failure` by `3` (1 initial SYN + 2 retransmits).
+- **Step 1d (`a` signs, but `b:1179` has no key)**: Destination port 1179 on `b` has no MD5 configuration. Segments signed by `a` arrive with Option Kind 19. Host `b` drops the unexpected signed segments, incrementing `TCPMD5Unexpected` by `3`.
+- **Client namespace `a` counters**: All counters on `a` remain `0` because all drop events occurred on host `b`'s socket listener.
+
+### Section 2: MD5 Key Change Failure and Rollback
+
+1. **Initial Connection**: Host `a` opens a socket using key `s3cret` and transmits payload `KEEPALIVE-1`. Peer `b` verifies and returns `OPEN-ACK KEEPALIVE-1`.
+2. **Asymmetric Rekey**: Host `a` executes `setsockopt(TCP_MD5SIG)` on the active socket to update the socket key to `n3wkey`. Host `b` still expects `s3cret`.
+3. **Data Stall**: Host `a` sends `KEEPALIVE-2` signed with `n3wkey`. Host `b` fails signature verification, silently drops segments, and increments `TCPMD5Failure`. Host `a` times out after 3.00 s.
+4. **Rollback**: Host `a` reverts its socket key back to `s3cret`. The pending TCP retransmission queue sends the cached segment signed with `s3cret`. Host `b` accepts the packet and responds after `0.33 s`. `TCPMD5Failure` increases by `5` during the failure window.
+
+### Section 3: Kernel Feature Probe for TCP-AO
+
+- Calling `setsockopt(socket.IPPROTO_TCP, TCP_AO_ADD_KEY, ...)` triggers `OSError` with errno `92` (`Protocol not available` / `ENOPROTOOPT`).
+- Kernel config inspection confirms `# CONFIG_TCP_AO is not set` while `CONFIG_TCP_MD5SIG=y`.
+
+### Section 4: GTSM Execution Traces
+
+- Default host TTL on this machine is set to `127` (`/proc/sys/net/ipv4/ip_default_ttl`).
+- **Step 4a (`direct neighbour, TTL 255`)**: Socket on `a` sends SYN with explicit IP TTL `255`. Listener `b` enforces `IP_MINTTL=255`. Direct interface link does not decrement TTL. The packet arrives with TTL 255 and connects in `0.00 s`.
+- **Step 4b (`direct neighbour, default TTL`)**: Socket on `a` sends default TTL `127`. Listener `b` expects TTL $\ge 255$. Host `b` drops 3 SYN attempts (1 initial + 2 retransmits). `TCPMinTTLDrop` increases from `0` to `3`.
+- **Step 4c (`one router away, TTL 255`)**: Host `a` sends packet with TTL `255` across router `r` (`10.2.0.1` -> `10.2.0.254` -> `10.3.0.2`). Router `r` decrements TTL by 1. Packet arrives at `b` with TTL `254`. Listener `b` requires TTL 255, drops 3 SYN attempts, and `TCPMinTTLDrop` increases from `3` to `6`.
+- **Step 4d (`one router away, b:3179 no MINTTL`)**: Port 3179 on `b` does not set `IP_MINTTL`. The routed segment arriving with TTL `254` connects in `0.00 s`.
+
+---
+
+## Daemon configuration snippets (not run here)
+
+### FRR Configuration
+
+FRR supports TCP-MD5 and GTSM (`ttl-security`). TCP-AO is not supported in FRR: the feature request [FRRouting/frr#7240](https://github.com/FRRouting/frr/issues/7240) was still open when this chapter was written (2026-11-14). If you need TCP-AO on a Linux router today, BIRD (2.17+ or 3.1+) and ExaBGP 6 are the open-source options.
+
+```text
+! (not run here)
+router bgp 65001
+ neighbor 10.1.0.2 remote-as 65002
+ neighbor 10.1.0.2 password s3cret
+ neighbor 10.1.0.2 ttl-security hops 1
+```
+
+*Note*: `ttl-security hops 1` instructs FRR to configure `IP_MINTTL=255` on the receiving socket and set outgoing packet TTL to `255`. `ttl-security` and `ebgp-multihop` are mutually exclusive in FRR.
+
+### BIRD Configuration
+
+BIRD supports TCP-MD5, GTSM, and TCP-AO (added in BIRD 2.17 / 3.1).
+
+#### BIRD with TCP-MD5 and GTSM
+
+```text
+# (not run here)
+protocol bgp peer_md5 {
+    local 10.1.0.1 as 65001;
+    neighbor 10.1.0.2 as 65002;
+    password "s3cret";
+    ttl security yes;
+}
+```
+
+#### BIRD with TCP-AO
+
+```text
+# (not run here)
+protocol bgp peer_ao {
+    local 10.1.0.1 as 65001;
+    neighbor 10.1.0.2 as 65002;
+    authentication ao;
+    keys {
+        key {
+            send id 1;
+            recv id 1;
+            secret "SuperSecretKey123";
+            algorithm hmac sha256;
+            preferred;
+        };
+    };
+}
+```
+
+### Router operating systems
+
+Junos, Cisco IOS XR and Nokia SR OS implement TCP-MD5, GTSM and TCP-AO through their key-chain features. Syntax differs between releases, so take it from the vendor documentation for the release you run rather than from a book. Whatever the vendor, the interoperability checklist is the same: algorithm, MAC length, SendID/RecvID pairing (my SendID is your RecvID), and which key is preferred at session start.
+
+---
+
+## Gotchas
+
+1. **In-Flight Segment Drops During MD5 Key Change**: Updating `TCP_MD5SIG` on an active connection changes key expectations immediately. Because MD5 option headers carry no key identifier, the receiving peer drops all incoming segments signed with the new key until its own local socket configuration is updated.
+2. **Kernel Error ENOPROTOOPT on TCP-AO**: Calling `TCP_AO_ADD_KEY` on kernels built without `CONFIG_TCP_AO=y` fails with errno `92` (`Protocol not available`). System administrators must verify kernel compile-time flags in `/proc/config.gz` or `/boot/config-*`.
+3. **Multi-hop GTSM TTL Misconfigurations**: Setting `ttl-security hops 1` (expecting TTL 255) on a neighbor that is two routing hops away causes persistent connection timeouts. The packet arrives with TTL 254 and is silently dropped by the kernel (`TCPMinTTLDrop` increments).
+4. **No overlap between TCP-MD5 and TCP-AO on one connection**: RFC 5925 forbids using both on the same connection, and the Linux TCP-AO documentation states that an MD5-protected connection cannot be migrated to TCP-AO. Moving a session from MD5 to AO therefore costs one session reset; plan it like a maintenance window.
+5. **VRF / Link-Local Scope Omission in `struct tcp_md5sig`**: When configuring MD5 keys for IPv6 link-local peers (`fe80::/10`) or VRF interfaces, failing to populate `tcpm_ifindex` or set `TCP_MD5SIG_FLAG_IFINDEX` causes key lookup failures against inbound packets.
+6. **Dynamic BGP Neighbor MD5 Prefix Mask Matching**: When configuring listen ranges for dynamic BGP peers, standard address structures match exact host IPs (`/32` or `/128`). To cover a subnet, `TCP_MD5SIG_FLAG_PREFIX` must be set alongside `tcpm_prefixlen`.
+7. **GTSM Does Not Provide Cryptographic Authentication**: GTSM filters packets generated by remote off-path spoofers but offers zero cryptographic protection against malicious or compromised hosts located on the local physical segment.
+8. **Silent Kernel Packet Drops**: Failed TCP-MD5 and GTSM checks do not return TCP RST or ICMP error codes. Troubleshooting connectivity issues requires inspecting `/proc/net/netstat` counters rather than capturing ICMP error responses.
+
+---
+
+## Exercises
+
+1. **Calculate Rekey Retransmission Intervals**: Using `tcpauth.py`, modify the `rekey` function to measure the exact retransmission delay sequence of the Linux kernel when an MD5 signature mismatch occurs.
+2. **Simulate Off-Path Spoofing against GTSM**: Extend `lab.sh` by adding a second route through router `r` that sends packets with TTL 253. Verify that `TCPMinTTLDrop` increments on namespace `b` while normal packets with TTL 255 connect successfully.
+3. **Count drops per attempt**: Run 10 unsigned connect attempts against `b:179` with a 0.5 s timeout instead of 3 s. Predict the `TCPMD5NotFound` delta from the SYN retransmission schedule seen in section 1, then measure it with `counters.py`.
+4. **Configure IPv6 GTSM**: Adapt `tcpauth.py` to use `socket.AF_INET6` and option `IPV6_MINHOPCOUNT` (73). Verify that packets with Hop Limit 255 succeed and packets with Hop Limit 254 fail.
+5. **Verify Dynamic Prefix Keys**: Modify `tcpauth.py` to pass `TCP_MD5SIG_FLAG_PREFIX` and `tcpm_prefixlen=24` in `struct tcp_md5sig`. Connect from multiple source IP addresses within `10.1.0.0/24` using the same key and confirm all connections complete.
+
+---
+
+## Verification
+
+The tests presented in this chapter were executed in an isolated Linux environment with the following parameters:
+- **Operating System / Kernel**: Linux 6.12.94, unprivileged.
+- **Tools Used**: `iproute2` version 6.15.0, Python 3.13.5 standard library.
+- **Execution Context**: Executed inside `unshare -urnm` utilizing net, mount, and user namespaces. Network interfaces created as standard `veth` pairs.
+- **Kernel Compile Options Verified**: `CONFIG_TCP_MD5SIG=y`, `# CONFIG_TCP_AO is not set`.
+- **Unused Tools**: No external packet generators, `tcpdump`, `ping`, or `dig` binaries were used to obtain execution outputs.
+- **Not run**: TCP-AO (kernel built without `CONFIG_TCP_AO`), the FRR and BIRD snippets (neither daemon is installed), IPv6 `IPV6_MINHOPCOUNT`, and the `TCP_MD5SIG_EXT` prefix and ifindex variants. These are written from the RFCs, the kernel documentation and the daemon documentation.
+
+---
+
+## Sources
+
+- RFC 2385: *Protection of BGP Sessions via the TCP MD5 Signature Option*. URL: https://datatracker.ietf.org/doc/html/rfc2385
+- RFC 5082: *The Generalized TTL Security Mechanism (GTSM)*. URL: https://datatracker.ietf.org/doc/html/rfc5082
+- RFC 5925: *The TCP Authentication Option*. URL: https://datatracker.ietf.org/doc/html/rfc5925
+- RFC 5926: *Cryptographic Algorithms for the TCP Authentication Option (TCP-AO)*. URL: https://datatracker.ietf.org/doc/html/rfc5926
+- Linux Kernel TCP-AO Documentation: https://docs.kernel.org/networking/tcp_ao.html
+- BIRD NEWS, version 2.17 (2025-04-01), "TCP-AO implementation for Linux": https://gitlab.nic.cz/labs/bird/-/blob/master/NEWS
+- BIRD user's guide, BGP protocol options (`password`, `authentication ao`, `keys`, `ttl security`): https://bird.network.cz/?get_doc&f=bird-6.html
+- FRR BGP documentation (`neighbor PEER password`, `neighbor PEER ttl-security hops N`): https://docs.frrouting.org/en/latest/bgp.html
+- Linux UAPI header `include/uapi/linux/tcp.h` (`TCP_MD5SIG`, `struct tcp_md5sig`, `TCP_AO_*`): https://github.com/torvalds/linux/blob/master/include/uapi/linux/tcp.h
+- FRR Issue #7240 (TCP-AO Feature Tracking): https://github.com/FRRouting/frr/issues/7240

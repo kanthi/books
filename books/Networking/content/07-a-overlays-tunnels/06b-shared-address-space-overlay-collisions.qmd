@@ -1,0 +1,386 @@
+---
+title: "Shared Address Space (100.64.0.0/10), CGNAT and Overlay Address Collisions"
+author:
+  - name: "K19G"
+  - name: "grok-bot"
+---
+
+# Shared Address Space (100.64.0.0/10), CGNAT and Overlay Address Collisions
+
+## Learning goals
+
+- Distinguish RFC 6598 Shared Address Space (100.64.0.0/10) from RFC 1918 private IPv4 space and RFC 6890 global internet space.
+- Analyze how Carrier-Grade NAT (CGNAT) deployment on access networks creates IP address overlap with overlay networks such as Tailscale.
+- Predict the impact of routing policy decisions, specifically coarse aggregate routes versus fine-grained node routes, on host connectivity.
+- Identify host-level firewall drop rules and lookup table preferences that break communication with ISP resolvers and gateways.
+- Evaluate strategies for avoiding address collisions, including custom IP pools, IPv6-only overlay modes, and address overlap detection.
+
+## Version note
+
+The lab in this chapter was run on Linux 6.12.94+, iproute2 6.15.0, and Python 3.13.5. It ran as an unprivileged user executing `unshare -urnm sh lab.sh` to create three network namespaces (`home`, `isp`, and `peer`) connected via veth pairs. The interface `ts0` is a standard veth pair standing in for an overlay tunnel interface such as `tailscale0`. No Tailscale, WireGuard, iptables, or nftables binaries were executed during the run; firewall rules discussed in text are derived from Tailscale open-source code and official documentation and marked as not run where appropriate.
+
+## The IPv4 Scarcity Bridge: Shared Address Space
+
+As the available pool of unallocated IPv4 addresses dried up, Internet Service Providers (ISPs) faced a structural problem. Assigning a globally routable IPv4 address to every residential home router or mobile handset was no longer viable. The straightforward solution was Carrier-Grade NAT (CGNAT), also known as Large-Scale NAT (LSN). Under CGNAT, the ISP assigns a non-globally-routable IPv4 address to the WAN interface of the Customer Premises Equipment (CPE) and translates thousands of customer traffic flows through a small pool of public IPv4 addresses at a centralized NAT gateway.
+
+Initially, some operators deployed RFC 1918 private addresses (such as `10.0.0.0/8` or `172.16.0.0/12`) on WAN links between the CPE and the CGNAT gateway. This approach triggered severe routing collisions. If a customer used `192.168.1.0/24` or `10.0.0.0/8` on their internal LAN, and the ISP used `10.0.0.0/8` on the WAN, the home router could not distinguish between local LAN hosts and upstream ISP infrastructure.
+
+To resolve this issue without consuming precious global IPv4 space, RFC 6598 established the **Shared Address Space** block: `100.64.0.0/10` (spanning `100.64.0.0` through `100.127.255.255`, providing 4,194,304 addresses).
+
+| Range | Who uses it |
+|---|---|
+| `100.64.0.0/10` (all of it) | ISPs, for the link between CGN and CPE; any part of the block can appear on your WAN |
+| `100.64.0.0/10` (all of it) | Tailscale's default pool for node IPv4 addresses |
+| `100.100.0.0/24`, `100.100.100.0/24`, `100.115.92.0/23` | Reserved by Tailscale for internal use (`100.100.100.100` is the Quad100 resolver) |
+
+
+RFC 6598 explicitly defines Shared Address Space for service provider networks. It is intended primarily for the links between the CPE and the ISP's CGNAT gateways. It is not global space, nor is it standard RFC 1918 private space:
+
+1. **Not globally routable**: the RFC 6890 special-purpose registry marks `100.64.0.0/10` as not global, and RFC 6598 says packets with shared-space addresses MUST NOT be forwarded across service provider boundaries and providers MUST filter them on ingress.
+2. **Not general private space**: RFC 6598 designates it for service provider use to facilitate CGN, requires devices to cope with the same shared range on two different interfaces, and warns that anyone using it for other purposes is likely to have problems connecting to CGN service. That warning is exactly the overlay problem in this chapter.
+3. **Reverse DNS isolation**: RFC 6598 says reverse queries for shared space MUST NOT be forwarded to the global DNS, and RFC 7793 adds the reverse DNS zones `64.100.in-addr.arpa` through `127.100.in-addr.arpa` to locally served DNS zones, preventing reverse lookup queries for shared addresses from leaking to root nameservers.
+
+### The Standard Library Misclassification
+
+Because `100.64.0.0/10` is non-global but also not part of RFC 1918, standard network classification tools often produce unexpected results. In Python 3.13, the `ipaddress` module models this distinction precisely:
+
+```python
+import ipaddress
+addr = ipaddress.ip_address("100.72.15.20")
+print(addr.is_private) # False
+print(addr.is_global)  # False
+```
+
+Code that tests `addr.is_private` to decide whether an address is "internal" gets `False` for `100.64.0.0/10` and treats it as public. Code that tests `not addr.is_global` gets the answer it probably wanted. Pick the test deliberately, and write a test case with a `100.64.0.0/10` address.
+
+## Overlay Networks and the Address Collision Problem
+
+Mesh VPNs and overlay networks, most notably Tailscale, selected `100.64.0.0/10` as their default node address allocation pool. The rationale appeared sound: RFC 1918 space (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`) is heavily used across home LANs, corporate offices, and cloud VPCs. By picking `100.64.0.0/10`, overlays hoped to avoid collisions with local network subnets.
+
+However, choosing `100.64.0.0/10` moved the collision vector from the internal LAN to the WAN. When an ISP deploys CGNAT, the customer host's real WAN interface receives an address inside `100.64.0.0/10` (for example, `100.72.15.20/10`). If the overlay network on that same host also assigns addresses from `100.64.0.0/10` (for example, node address `100.81.3.4`), two distinct networking systems on the same device claim ownership of the same RFC 6598 block.
+
+### Anatomy of an Overlay Address Hijack
+
+On Linux hosts, routing decisions are governed by policy routing rules (`ip rule`) and routing tables. Tailscale by default configures custom policy rules and a dedicated routing table:
+- Base rule preference: 5200 (with table 52 assigned at preference 5270, via `5200 + 70`).
+- Priority structure: Rule 5270 evaluates table 52 *before* the Linux kernel evaluates the standard `main` table at preference 32766.
+
+If an overlay network installs a broad aggregate route for `100.64.0.0/10` into table 52 pointing to its tunnel interface (`ts0`), the Linux routing engine evaluates packets through the following mechanism:
+
+1. A local application attempts to reach an ISP DNS resolver at `100.64.0.53`.
+2. The kernel checks rule preference 5270, pointing to table 52.
+3. Table 52 contains `100.64.0.0/10 dev ts0`.
+4. The destination `100.64.0.53` matches `100.64.0.0/10`. The packet is routed out `ts0` into the overlay tunnel.
+5. The ISP resolver never receives the query. The overlay peer on the other side of `ts0` drops or ignores the traffic.
+
+Crucially, standard internet browsing (to public IP addresses such as `198.51.100.10`) continues to function normally under this broken state. When a packet targets `198.51.100.10`:
+1. Rule 5270 (table 52) checks for a match. Table 52 has no route for `198.51.100.10`.
+2. Lookup falls through to rule 32766 (table `main`).
+3. Table `main` contains `default via 100.64.0.1 dev wan0`.
+4. The policy rules are consulted for the packet's destination only. The gateway `100.64.0.1` was resolved against `main`'s connected route on `wan0` when the default route was installed, so the packet leaves via `wan0` even though table 52 would claim `100.64.0.1` if you asked about it directly.
+
+This is a confusing, partial failure: traffic to public addresses works, but anything the ISP addresses inside shared space (its DNS resolvers, a captive or account portal, CGN-hosted services) is unreachable. Users report it as "DNS is broken", not "routing is broken".
+
+```
+Destination: 198.51.100.10 (Public IP)
+  │
+  ├──► Check Table 52 (Pref 5270) ──► No Match
+  │
+  └──► Check Table main (Pref 32766) ──► Matches default via 100.64.0.1 (wan0) ──► SUCCESS
+
+Destination: 100.64.0.53 (ISP Resolver)
+  │
+  └──► Check Table 52 (Pref 5270) ──► Matches 100.64.0.0/10 dev ts0 ────────────► DROPPED / HIJACKED
+```
+
+### Tailscale Linux Firewall Rules and Inbound Drops
+
+Beyond route tables, host firewalls introduce additional collision traps. The Tailscale Linux client implementation (found in `util/linuxfw/iptables_runner.go` under `buildExternalCGNATRules`) installs protective filtering rules into netfilter (not run in this lab, documented directly from source):
+
+In the `ts-input` firewall chain, after permitting traffic from the `tailscale0` interface, the client inserts the following rules:
+- `! -i tailscale0 -s 100.115.92.0/23 -j RETURN` (Exemption for ChromeOS container ranges)
+- `! -i tailscale0 -s 100.64.0.0/10 -j DROP`
+
+This rule instructs the Linux kernel: **If any packet arrives on an interface other than `tailscale0` with a source address inside `100.64.0.0/10`, drop it immediately.**
+
+If your ISP uses CGNAT and assigns your WAN router an address in `100.64.0.0/10`, any inbound UDP response from an ISP resolver (e.g., source IP `100.64.0.53` arriving on `wan0`) triggers this firewall rule and is dropped by the host.
+
+Newer clients (capability version 136, dated 2026-04-09 in the source) understand a node attribute, `DisableLinuxCGNATDropRule` in the code, that switches the rule from `DROP` to `RETURN`. It is delivered by the control plane, so check Tailscale's current documentation before relying on it (not run here).
+
+## Remediation and Avoidance Strategies
+
+To prevent CGNAT and overlay collisions, modern networking tools implement three primary remediation strategies:
+
+### 1. Specific Node Routes (/32) Instead of Subnet Aggregates
+
+An overlay that installs only the addresses it owns (here the peer's `/32`, `100.81.9.9/32 dev ts0 table 52`) instead of the whole `100.64.0.0/10` leaves the rest of shared space to the WAN. Check what yours actually installs with `ip route show table all | grep '^100\.'`.
+
+Because standard IP routing relies on longest-prefix matching, a query for `100.64.0.53` matches the WAN interface's directly connected network `100.64.0.0/10` (prefix length 10) in table `main`, while traffic for peer node `100.81.9.9` matches `100.81.9.9/32` (prefix length 32) in table 52. Both systems coexist without interference.
+
+### 2. Custom IP Pools (`ipPool`)
+
+Tailscale lets administrators restrict node addresses with an `ipPool` node attribute in the tailnet policy file (in beta as of the docs' January 2026 validation). Instead of selecting addresses across the entire `/10`, admins restrict node allocations to a narrow `/16` subset.
+
+Example Tailscale Policy JSON:
+```json
+{
+  "nodeAttrs": [
+    {
+      "target": ["autogroup:admin"],
+      "ipPool": ["100.81.0.0/16"]
+    },
+    {
+      "target": ["group:dev"],
+      "ipPool": ["100.85.0.0/16"]
+    }
+  ]
+}
+```
+
+Certain ranges within `100.64.0.0/10` are permanently reserved by Tailscale and cannot be assigned to custom pools:
+- `100.100.0.0/24`: Tailscale internal use
+- `100.100.100.0/24`: Tailscale internal use (contains `100.100.100.100`, Quad100, the device-local MagicDNS resolver)
+- `100.115.92.0/23`: Tailscale internal use (the client source calls it the ChromeOS VM range)
+
+Node IPv6 addresses come from the ULA prefix `fd7a:115c:a1e0::/48` and are not affected by `ipPool`. Pools only apply to new nodes; an admin can change an existing node's address.
+
+### 3. IPv6-Only Overlay Mode
+
+When an ISP's CGNAT infrastructure completely overlaps with local requirements, administrators can apply the `disable-ipv4` node attribute. Those nodes then get no tailnet IPv4 address and use their IPv6 ULA tailnet address only. The trade-off from the docs: IPv4-only resources, such as IPv4-only exit nodes, become unreachable.
+
+---
+
+## Lab Execution: Simulating CGNAT and Overlay Collisions
+
+The following shell script and accompanying Python scripts construct a multi-namespace laboratory environment demonstrating CGNAT address assignment, overlay routing collisions, prefix matching behavior, and programmatic overlap detection.
+
+### Lab Script (`lab.sh`)
+
+```sh
+#!/bin/sh
+# Run as: unshare -urnm sh lab.sh   (unprivileged user, net and mount namespaces)
+H=$(pwd)
+mount -t tmpfs tmpfs /run; mkdir -p /run/netns
+for ns in home isp peer; do ip netns add $ns; ip -n $ns link set lo up; done
+ip link add wan0 type veth peer name cust0; ip link set wan0 netns home; ip link set cust0 netns isp
+ip link add ts0 type veth peer name ts1;    ip link set ts0 netns home;  ip link set ts1 netns peer
+# ISP side: CGNAT gateway 100.64.0.1/10 and a resolver at 100.64.0.53
+ip -n isp addr add 100.64.0.1/10 dev cust0; ip -n isp link set cust0 up
+ip -n isp addr add 100.64.0.53/32 dev lo
+ip netns exec isp python3 $H/resolver.py 100.64.0.53 & R=$!
+# Home router: WAN address from the ISP's shared space, default route to the CGN
+ip -n home addr add 100.72.15.20/10 dev wan0; ip -n home link set wan0 up
+ip -n home route add default via 100.64.0.1
+# Overlay: this node is 100.81.3.4, one peer is 100.81.9.9 (both from an ipPool of 100.81.0.0/16)
+ip -n home addr add 100.81.3.4/32 dev ts0; ip -n home link set ts0 up
+ip -n peer addr add 100.81.9.9/32 dev ts1; ip -n peer link set ts1 up
+ip -n peer route add 100.81.3.4/32 dev ts1
+ip -n home rule add pref 5270 table 52            # same table and preference Tailscale uses on Linux
+H_="ip netns exec home"; sleep 0.3
+get() { printf "   route get %-12s -> " $1; ip -n home route get $1 | head -1 | sed 's/ *uid.*//'; }
+
+echo "== 1. before any overlay route"
+get 100.64.0.53; $H_ python3 $H/ask.py 100.64.0.53
+
+echo "== 2. overlay claims the whole shared space: 100.64.0.0/10 dev ts0 table 52"
+ip -n home route add 100.64.0.0/10 dev ts0 table 52
+get 100.64.0.53; get 100.64.0.1; get 198.51.100.10
+$H_ python3 $H/ask.py 100.64.0.53
+ip -n home route del 100.64.0.0/10 dev ts0 table 52
+
+echo "== 3. overlay installs only what it owns: the peer /32"
+ip -n home route add 100.81.9.9/32 dev ts0 table 52
+get 100.64.0.53; get 100.81.9.9
+$H_ python3 $H/ask.py 100.64.0.53
+
+echo "== 4. which candidate pools collide with this host's real state?"
+$H_ python3 $H/overlap.py 100.64.0.0/10 100.100.0.0/16 100.81.0.0/16 100.72.0.0/16
+echo "== 5. Python's view of shared address space"
+python3 -c "import ipaddress as i; a=i.ip_address('100.72.15.20'); print('   is_private', a.is_private, ' is_global', a.is_global, ' in 100.64.0.0/10', a in i.ip_network('100.64.0.0/10'))"
+kill $R
+```
+
+### Supporting Helper Scripts
+
+#### `resolver.py`
+```{.python filename="resolver.py"}
+#!/usr/bin/env python3
+"""resolver.py ADDR: a stand-in for an ISP resolver: answers any UDP/53 datagram with 'ok from ADDR'."""
+import socket, sys
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.bind((sys.argv[1], 53))
+while True:
+    d, a = s.recvfrom(512); s.sendto(b"ok from " + sys.argv[1].encode(), a)
+```
+
+#### `ask.py`
+```{.python filename="ask.py"}
+#!/usr/bin/env python3
+"""ask.py ADDR: send one UDP/53 datagram, wait 1 s for a reply."""
+import socket, sys
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.settimeout(1)
+s.sendto(b"q", (sys.argv[1], 53))
+try:
+    print("      reply:", s.recv(100).decode())
+except socket.timeout:
+    print("      no reply (timeout)")
+```
+
+#### `overlap.py`
+```{.python filename="overlap.py"}
+#!/usr/bin/env python3
+"""overlap.py POOL...: read this namespace's addresses and routes (all tables) from
+`ip -j`, then report every candidate overlay pool that collides with them, and
+with Tailscale's reserved ranges."""
+import ipaddress, json, subprocess, sys
+def ipj(*a): return json.loads(subprocess.run(["ip", "-j", *a], capture_output=True, text=True, check=True).stdout)
+seen = {}
+for link in ipj("-4", "addr"):
+    for ai in link.get("addr_info", []):
+        n = ipaddress.ip_network(f"{ai['local']}/{ai['prefixlen']}", strict=False)
+        seen[n] = f"on-link via {link['ifname']}"
+        if ai["prefixlen"] < 32:
+            seen[ipaddress.ip_network(ai["local"] + "/32")] = f"local address on {link['ifname']}"
+for r in ipj("-4", "route", "show", "table", "all"):
+    if r.get("type", "unicast") != "unicast" or r["dst"] == "default":
+        continue
+    n = ipaddress.ip_network(r["dst"] if "/" in r["dst"] else r["dst"] + "/32")
+    seen.setdefault(n, f"route dev {r.get('dev')} table {r.get('table', 'main')}")
+RESERVED = {ipaddress.ip_network(p): "Tailscale reserved" for p in
+            ("100.100.0.0/24", "100.100.100.0/24", "100.115.92.0/23")}
+for pool in map(ipaddress.ip_network, sys.argv[1:]):
+    hits = [(n, why) for n, why in {**seen, **RESERVED}.items() if pool.overlaps(n)]
+    print(f"   pool {pool}:")
+    if not hits:
+        print("      no overlap")
+    for n, why in sorted(hits, key=lambda h: h[0].prefixlen):
+        rel = "inside" if pool.subnet_of(n) else ("contains" if n.subnet_of(pool) else "overlaps")
+        print(f"      {rel} {n} ({why})")
+```
+
+---
+
+## Lab Execution Output
+
+```text
+== 1. before any overlay route
+   route get 100.64.0.53  -> 100.64.0.53 dev wan0 src 100.72.15.20
+      reply: ok from 100.64.0.53
+== 2. overlay claims the whole shared space: 100.64.0.0/10 dev ts0 table 52
+   route get 100.64.0.53  -> 100.64.0.53 dev ts0 table 52 src 100.81.3.4
+   route get 100.64.0.1   -> 100.64.0.1 dev ts0 table 52 src 100.81.3.4
+   route get 198.51.100.10 -> 198.51.100.10 via 100.64.0.1 dev wan0 src 100.72.15.20
+      no reply (timeout)
+== 3. overlay installs only what it owns: the peer /32
+   route get 100.64.0.53  -> 100.64.0.53 dev wan0 src 100.72.15.20
+   route get 100.81.9.9   -> 100.81.9.9 dev ts0 table 52 src 100.81.3.4
+      reply: ok from 100.64.0.53
+== 4. which candidate pools collide with this host's real state?
+   pool 100.64.0.0/10:
+      inside 100.64.0.0/10 (on-link via wan0)
+      contains 100.115.92.0/23 (Tailscale reserved)
+      contains 100.100.0.0/24 (Tailscale reserved)
+      contains 100.100.100.0/24 (Tailscale reserved)
+      contains 100.72.15.20/32 (local address on wan0)
+      contains 100.81.3.4/32 (on-link via ts0)
+      contains 100.81.9.9/32 (route dev ts0 table 52)
+   pool 100.100.0.0/16:
+      inside 100.64.0.0/10 (on-link via wan0)
+      contains 100.100.0.0/24 (Tailscale reserved)
+      contains 100.100.100.0/24 (Tailscale reserved)
+   pool 100.81.0.0/16:
+      inside 100.64.0.0/10 (on-link via wan0)
+      contains 100.81.3.4/32 (on-link via ts0)
+      contains 100.81.9.9/32 (route dev ts0 table 52)
+   pool 100.72.0.0/16:
+      inside 100.64.0.0/10 (on-link via wan0)
+      contains 100.72.15.20/32 (local address on wan0)
+== 5. Python's view of shared address space
+   is_private False  is_global False  in 100.64.0.0/10 True
+```
+
+---
+
+## Reading the Output
+
+Every section of the output demonstrates a specific rule of Linux routing behavior and address classification:
+
+### Section 1: Initial Baseline State
+- `route get 100.64.0.53 -> 100.64.0.53 dev wan0 src 100.72.15.20`: Querying the routing decision for the ISP resolver `100.64.0.53` resolves via the physical WAN interface `wan0` using source address `100.72.15.20`.
+- `reply: ok from 100.64.0.53`: `ask.py` successfully sends a UDP datagram to `100.64.0.53:53` and receives the expected string from `resolver.py`.
+
+### Section 2: Broad Overlay Hijack (`100.64.0.0/10` in Table 52)
+- `route get 100.64.0.53 -> 100.64.0.53 dev ts0 table 52 src 100.81.3.4`: Because rule preference 5270 points to table 52, and table 52 contains `100.64.0.0/10 dev ts0`, packets to `100.64.0.53` are immediately diverted to `ts0` with source IP `100.81.3.4`.
+- `route get 100.64.0.1 -> 100.64.0.1 dev ts0 table 52 src 100.81.3.4`: The ISP CGNAT gateway address `100.64.0.1` is also captured by table 52 and routed out `ts0`.
+- `route get 198.51.100.10 -> 198.51.100.10 via 100.64.0.1 dev wan0 src 100.72.15.20`: Internet traffic to `198.51.100.10` fails to match table 52, falls back to table `main`, and resolves via `wan0`.
+- `no reply (timeout)`: UDP DNS queries sent to `100.64.0.53` travel down `ts0` into a black hole or unresponsive peer, resulting in socket timeout.
+
+### Section 3: Fine-Grained Node Routes (`/32`)
+- `route get 100.64.0.53 -> 100.64.0.53 dev wan0 src 100.72.15.20`: With the aggregate `/10` route removed, queries to `100.64.0.53` bypass table 52 and hit the connected `100.64.0.0/10` route on `wan0` in table `main`.
+- `route get 100.81.9.9 -> 100.81.9.9 dev ts0 table 52 src 100.81.3.4`: Packets destined for explicit overlay peer `100.81.9.9` match the `/32` route in table 52 and route out `ts0`.
+- `reply: ok from 100.64.0.53`: DNS connectivity to the ISP resolver is fully restored while maintaining full connectivity to overlay peers.
+
+### Section 4: Programmatic Overlap Detection (`overlap.py`)
+- `pool 100.64.0.0/10`: Reports that the standard `/10` block is "inside" the active WAN range `100.64.0.0/10` on `wan0`, and contains all reserved Tailscale subnets (`100.100.0.0/24`, `100.100.100.0/24`, `100.115.92.0/23`), the WAN local address `100.72.15.20/32`, and overlay addresses (`100.81.3.4/32`, `100.81.9.9/32`).
+- `pool 100.100.0.0/16`: Detects a hard collision with Tailscale's reserved infrastructure ranges (`100.100.0.0/24` and `100.100.100.0/24`).
+- `pool 100.81.0.0/16`: Contains only the overlay's own assigned node addresses (`100.81.3.4`, `100.81.9.9`). It is hierarchically inside the WAN's `100.64.0.0/10` interface, but does not overlap the host's actual WAN IP (`100.72.15.20`).
+- `pool 100.72.0.0/16`: Triggers a direct collision ("contains `100.72.15.20/32`"), proving that assigning an overlay pool of `100.72.0.0/16` would hijack the host's primary physical WAN IPv4 address.
+
+### Section 5: Python Standard Library Evaluation
+- `is_private False`: Confirms Python does not treat `100.72.15.20` as RFC 1918 space.
+- `is_global False`: Confirms Python does not treat `100.72.15.20` as routable internet space.
+- `in 100.64.0.0/10 True`: Confirms membership inside the RFC 6598 Shared Address Space block.
+
+---
+
+## Gotchas
+
+- **"Shared Address Space (100.64.0.0/10) is just another RFC 1918 private block."**
+  False. RFC 6598 explicitly restricts `100.64.0.0/10` to service provider CGNAT links. Treating it as standard private space leads to severe WAN/LAN routing overlaps when connecting to ISPs that use CGNAT.
+
+- **"If my public internet traffic works, my ISP connection has no routing conflicts."**
+  False. Default internet traffic matches `0.0.0.0/0` in table `main` and routes out `wan0`. However, overlay table routes (e.g. table 52) evaluated at higher priorities hijack traffic bound for ISP resolvers, local gateways, and ISP management portals assigned inside `100.64.0.0/10`.
+
+- **"Python's `ipaddress.is_private` returns `True` for CGNAT addresses."**
+  False. Python 3.13 returns `is_private=False` and `is_global=False` for `100.64.0.0/10`. Naive scripts that use `is_private` to detect internal or private network ranges misclassify CGNAT addresses as public.
+
+- **"The overlay's routes are its own business."**
+  They are yours too. Whether an overlay installs a `/10`, a `/16` for its pool, or per-peer `/32`s decides which parts of shared space your WAN can still reach. Read them (`ip rule`, `ip route show table all`) instead of assuming.
+
+- **"Firewall issues with Tailscale only happen if you run explicit iptables rules."**
+  False. Tailscale's Linux client automatically injects anti-spoofing rules (`! -i tailscale0 -s 100.64.0.0/10 -j DROP`) into netfilter. If your physical WAN interface uses a `100.64.0.0/10` CGNAT address, inbound packets from ISP services (like local DNS responses) arriving on `wan0` are silently dropped by default, whatever pool you chose.
+
+- **"Custom IP pools (`ipPool`) can use any subset of 100.64.0.0/10."**
+  False. Reserved blocks such as `100.100.0.0/24`, `100.100.100.0/24` (MagicDNS resolver), and `100.115.92.0/23` are hardcoded and unavailable for allocation in custom overlay pools.
+
+---
+
+## Exercises
+
+1. **Inspect Your Local WAN Interface**: Query your primary physical host or home router using `ip addr show`. Determine whether your ISP assigns an address from RFC 6598 (`100.64.0.0/10`), RFC 1918 (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`), or global IPv4 space.
+2. **Execute Overlap Detection**: Run `overlap.py` on your workstation against candidate subnets (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, `100.64.0.0/10`). Identify which candidate overlay pools collide with your real local routes and default gateway.
+3. **Simulate a /16 Overlay Subnet Collision**: Modify `lab.sh` to install `100.72.0.0/16 dev ts0 table 52` in Section 2 instead of `100.64.0.0/10`. Observe that `ip route get 100.72.15.20` still answers `local` (the local table, at preference 0, is consulted before 5270), while every other address in `100.72.0.0/16`, including neighbours of your WAN address, now leaves via `ts0`.
+4. **Inspect Tailscale Policy Rules**: On a Linux system running Tailscale, execute `ip rule show` and `ip route show table 52`. Verify the preference offset (e.g., preference 5270 pointing to table 52) and list exactly which prefixes the client installed there.
+5. **Verify Reverse DNS Zones (RFC 7793)**: Use `dig -x 100.64.0.1` or `host 100.64.0.1` to perform a reverse DNS lookup. Observe whether your resolver answers it locally from an RFC 7793 empty zone or forwards it upstream.
+
+---
+
+## Verification
+
+The commands, routing states, and outputs in this chapter were verified in a test environment with the following specifications:
+
+- **Operating System**: Linux 6.12.94+
+- **Iproute2 Version**: 6.15.0
+- **Python Version**: 3.13.5
+- **Execution Context**: Unprivileged execution via `unshare -urnm sh lab.sh`
+- **Network Architecture**: Isolated network namespaces (`home`, `isp`, `peer`) linked via Linux `veth` virtual ethernet pairs. Policy routing verified via `ip rule` preference 5270 and table 52.
+
+---
+
+## Sources
+
+- [RFC 6598: IANA-Reserved IPv4 Prefix for Shared Address Space](https://www.rfc-editor.org/rfc/rfc6598)
+- [RFC 6890: Special-Purpose IP Address Registries](https://www.rfc-editor.org/rfc/rfc6890)
+- [RFC 7793: Locally Served DNS Zones for RFC 6598 IP Address Space](https://www.rfc-editor.org/rfc/rfc7793)
+- [Tailscale IP Pool Documentation](https://tailscale.com/docs/reference/ip-pool)
+- [Tailscale CGNAT Conflicts Troubleshooting Guide](https://tailscale.com/docs/reference/troubleshooting/network-configuration/cgnat-conflicts)
+- [Tailscale Open Source Linux Client Repository](https://github.com/tailscale/tailscale)

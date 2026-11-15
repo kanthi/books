@@ -1,0 +1,754 @@
+---
+title: "Batching UDP on Linux: sendmmsg, recvmmsg, UDP GSO and GRO"
+author:
+  - name: "K19G"
+  - name: "grok-bot"
+---
+
+# Batching UDP on Linux: sendmmsg, recvmmsg, UDP GSO and GRO
+
+In high-throughput networking applications—such as QUIC protocol stacks, authoritative DNS resolvers, WireGuard VPN concentrators, and real-time media relays—the traditional POSIX socket interface presents a severe performance bottleneck. Processing UDP traffic one packet at a time using `sendto()` and `recvfrom()` imposes a high CPU cost per datagram. When packet rates reach hundreds of thousands or millions of packets per second (pps), kernel context switches, socket lock contention, memory allocation, and layer-by-layer protocol traversal consume the majority of host CPU cycles.
+
+Without batching techniques, a single CPU core quickly reaches a performance ceiling long before saturating high-bandwidth network interfaces. If the kernel network stack or user-space application cannot drain incoming socket buffers quickly enough, the receiver's socket queue fills up. This leads to silent packet drops inside the kernel, visible in metrics as socket buffer overflows (`RcvbufErrors`). For latency-sensitive media protocols or packet-loss-sensitive QUIC transport connections, these drops introduce heavy jitter, head-of-line blocking, and throughput collapse.
+
+Linux offers several generations of socket API extensions to solve UDP throughput and CPU efficiency challenges:
+1. Syscall-level batching via `sendmmsg()` and `recvmmsg()`, which amortize the overhead of entering and exiting the kernel across multiple messages.
+2. Kernel and hardware segmentation offloads via UDP Generic Segmentation Offload (UDP GSO / `UDP_SEGMENT`) and UDP Generic Receive Offload (UDP GRO / `UDP_GRO`), which allow applications to pass multi-kilobyte buffers representing dozens of datagrams in a single operation.
+
+Understanding how these mechanisms function, how they interact across virtual interface boundaries (such as `veth` and `loopback`), and how they behave under buffer pressure is essential for operating high-performance UDP infrastructure.
+
+## Learning goals
+
+- Quantify the CPU overhead and packet rate limits of single-datagram UDP syscalls versus batched syscalls.
+- Differentiate between syscall-level batching (`sendmmsg`/`recvmmsg`) and packet-level offloading (`UDP_SEGMENT`/`UDP_GRO`).
+- Implement UDP GSO (Generic Segmentation Offload) on socket buffers using control messages (`cmsg`).
+- Implement UDP GRO (Generic Receive Offload) on receiver sockets and parse incoming segment sizing metadata.
+- Analyze kernel UDP drop mechanics, specifically why fast GSO senders cause elevated `RcvbufErrors` on non-GRO receivers.
+- Observe packet counter semantics across virtual interfaces when hardware and software offloads are active.
+- Identify the structural constraints, MTU limits, and socket state requirements for UDP GSO offloading.
+
+## Version note
+
+The concepts, kernel socket options, and lab measurements described in this chapter were compiled on Linux kernel version 6.12.94 using gcc 14.2.0 and iproute2 6.15.0 in unprivileged user, network, and mount namespaces. UDP GSO (`UDP_SEGMENT`) was introduced in Linux 4.18, and UDP GRO (`UDP_GRO`) was added in Linux 5.0.
+
+## Per-datagram overhead in standard UDP sockets
+
+A standard `sendto()` or `recvfrom()` call requires a complete transition across the user-kernel boundary for every single datagram. The kernel must copy memory, perform socket lock management, check access permissions, build or parse headers, and manage socket buffer state (`sk_buff` or `skb`).
+
+```text
++-----------------------------------------------------------------+
+|                       User Space App                            |
++-----------------------------------------------------------------+
+   | sendto()        | sendto()        | sendto()        | sendto()
+   v                 v                 v                 v
+====================== Kernel Boundary ============================
+   |                 |                 |                 |
+   v                 v                 v                 v
++---------+       +---------+       +---------+       +---------+
+| sk_buff |       | sk_buff |       | sk_buff |       | sk_buff |
++---------+       +---------+       +---------+       +---------+
+   |                 |                 |                 |
+   v                 v                 v                 v
++-----------------------------------------------------------------+
+|                     Network Driver / Wire                       |
++-----------------------------------------------------------------+
+```
+
+When operating at 1,000,000 packets per second, executing a `sendto()` or `recvfrom()` call 1,000,000 times per second incurs substantial overhead:
+- **Syscall Entry/Exit**: Execution of instruction-pointer isolation barriers, context saving/restoration, and security mitigations (e.g., KPTI, spec-store bypass controls).
+- **Buffer allocation**: Allocating and initialising an `sk_buff` for every payload, however small.
+- **Locking and Traversal**: Acquiring socket lock structures, updating socket queue pointers, computing IP/UDP header fields, and updating kernel statistics.
+
+For high-packet-rate workloads, the cost of packet processing is dominated by per-packet fixed overhead rather than payload byte copying.
+
+## Syscall batching: sendmmsg and recvmmsg
+
+Linux added `recvmmsg()` in 2.6.33 and `sendmmsg()` in 3.0 to allow applications to pass arrays of datagram buffers to or from the kernel in a single system call.
+
+```text
++-----------------------------------------------------------------+
+|                       User Space App                            |
+|             mmsghdr array: [ msg1, msg2, msg3, msg4 ]           |
++-----------------------------------------------------------------+
+                                  |
+                                  | sendmmsg(batch=4)
+                                  v
+====================== Kernel Boundary ============================
+                                  |
+         +------------------------+------------------------+
+         |                        |                        |
+         v                        v                        v
+    +---------+              +---------+              +---------+
+    | sk_buff |              | sk_buff |              | sk_buff |
+    +---------+              +---------+              +---------+
+         |                        |                        |
+         +------------------------+------------------------+
+                                  |
+                                  v
++-----------------------------------------------------------------+
+|                     Network Driver / Wire                       |
++-----------------------------------------------------------------+
+```
+
+### sendmmsg semantics
+
+The `sendmmsg()` system call accepts an array of `struct mmsghdr` structures:
+
+```c
+struct mmsghdr {
+    struct msghdr msg_hdr;  /* Message header */
+    unsigned int  msg_len;  /* Number of transmitted bytes */
+};
+```
+
+The application populates the `msg_hdr` array with distinct payload buffer pointers, destination addresses, and ancillary data controls. `sendmmsg()` iterates over the array inside the kernel, allocating an `sk_buff` for each element and queuing it to the network stack.
+
+### recvmmsg semantics and MSG_WAITFORONE
+
+`recvmmsg()` receives multiple messages from a socket into an array of `struct mmsghdr` elements. By default, `recvmmsg()` blocks until the entire array is filled or a socket timeout occurs.
+
+The `MSG_WAITFORONE` flag alters this behavior: it causes `recvmmsg()` to block until at least *one* packet is available, fill as many remaining array elements as are immediately present in the receive buffer without blocking further, and then return instantly. This prevents latency penalties for low-rate or sporadic traffic while maintaining high batching efficiency during traffic spikes.
+
+### Performance characteristics of syscall batching
+
+Syscall batching reduces CPU instruction count by crossing the kernel boundary once per batch instead of once per packet. However, inside the kernel, `sendmmsg()` still constructs individual `sk_buff` instances for every datagram. The stack continues to process each packet individually through routing, netfilter/iptables rules, and queueing disciplines (`qdisc`). Consequently, while `sendmmsg()` improves efficiency over `sendto()`, it does not eliminate per-packet kernel stack overhead.
+
+## Packet-level batching: UDP GSO and UDP GRO
+
+Generic Segmentation Offload (GSO) and Generic Receive Offload (GRO) move batching from the system call API down into packet buffer processing in the network layer.
+
+```text
++-----------------------------------------------------------------+
+|                       User Space App                            |
+|        Single Buffer (e.g. 38,400 Bytes) + GSO Size (1200)      |
++-----------------------------------------------------------------+
+                                  |
+                                  | sendmsg() with UDP_SEGMENT
+                                  v
+====================== Kernel Boundary ============================
+                                  |
+                                  v
++-----------------------------------------------------------------+
+|           Single Super-skb (38,400 Bytes, gso_size=1200)        |
++-----------------------------------------------------------------+
+                                  |
+                 (Traverses Stack, Netfilter, qdisc)
+                                  |
+            +---------------------+---------------------+
+            | Virtual / Software  |  Hardware NIC       |
+            | Segmentation        |  (USO / Offload)    |
+            v                     v                     v
+       +---------+           +---------+           +---------+
+       | Packet  |           | Packet  |           | Packet  |  (Separated at driver or wire)
+       +---------+           +---------+           +---------+
+```
+
+### UDP Generic Segmentation Offload (UDP GSO / UDP_SEGMENT)
+
+With UDP GSO (`UDP_SEGMENT`), an application passes a single large memory buffer (up to ~64 KiB) containing multiple concatenated UDP payload segments to the kernel via `sendmsg()`. The application attaches ancillary data (`cmsg`) specifying the target segment length (`gso_size`).
+
+The kernel constructs a single large `sk_buff` ("super-skb"). This super-skb traverses the routing engine, socket queues, and netfilter chains as a single entity. The payload is segmented into standard MTU-sized wire packets at the last possible moment:
+- In software, inside the IP layer or driver queue before transmission.
+- In hardware, offloaded to the Network Interface Card via UDP Segmentation Offload (USO / `NETIF_F_GSO_UDP_L4`).
+
+### UDP Generic Receive Offload (UDP GRO / UDP_GRO)
+
+UDP GRO reverses this process on the receive path. When consecutive UDP datagrams arrive from a single source address and port destined for a matching target socket, the kernel or network interface coalesces them into a single super-skb.
+
+When an application enables the `UDP_GRO` socket option, calling `recvmsg()` returns a single large payload buffer along with a `UDP_GRO` control message indicating the original segment size (`gso_size`). The application then iterates over the buffer in memory, slicing segments of length `gso_size`.
+
+### Socket option reference
+
+| Option / Flag | Cmsg Type | Purpose | Introduced Kernel |
+| :--- | :--- | :--- | :--- |
+| `UDP_SEGMENT` | `UDP_SEGMENT` | Specifies segment size for TX batching | Linux 4.18 |
+| `UDP_GRO` | `UDP_GRO` | Enables hardware/software RX coalescing | Linux 5.0 |
+
+## Interface boundaries and packet counter semantics
+
+The behavior of GSO super-skbs varies depending on the underlying network interface type:
+
+```text
++--------------------------------------------------------------------+
+|                         Sender Namespace                           |
++--------------------------------------------------------------------+
+                                  |
+                                  | GSO Super-skb (32 segs)
+                                  v
++--------------------------------------------------------------------+
+|                     veth Pair (Virtual Device)                     |
+|    GSO skb stays INTACT across virtual interface boundary          |
++--------------------------------------------------------------------+
+                                  |
+                                  v
+         +------------------------+------------------------+
+         |                                                 |
+         | GRO Enabled Receiver                            | GRO Disabled Receiver
+         v                                                 v
++----------------------------------+             +-------------------+
+| Received as 1 Super-skb (32 segs)|             | Kernel splits into|
+| App reads 32 segs in 1 syscall   |             | 32 individual skbs|
++----------------------------------+             +-------------------+
+                                                           |
+                                                           v
+                                                 +-------------------+
+                                                 | Recv queue bursts |
+                                                 | Drops occur if    |
+                                                 | rmem is full      |
+                                                 +-------------------+
+```
+
+1. **Physical NICs**: a NIC that advertises USO (`tx-udp-segmentation`) splits the super-skb into wire frames in hardware; otherwise the kernel segments it in software just before the driver. On the receive side, NAPI GRO only coalesces plain UDP datagrams of one flow when the destination socket has `UDP_GRO` enabled, or when the device has the forwarding features (`rx-udp-gro-forwarding`, `rx-gro-list`) turned on.
+2. **Virtual interfaces (`veth`, `lo`)**: both advertise the GSO features, so the kernel never needs to segment a super-skb on its way through them. It arrives in the peer namespace as the same single skb.
+3. **Interface counters**: on `veth` and `lo` the packet counters (`ip -s link`, `/sys/class/net/*/statistics`) count skbs. Sending 32 datagrams as one GSO buffer adds **1** to `tx_packets`, not 32. Physical drivers differ: many report wire frames for offloaded packets, so compare counters only on the same kind of device.
+
+## Buffer pressure, fast senders, and drop mechanics
+
+When a GSO sender transmits packets to a non-GRO receiver, a significant speed imbalance occurs.
+
+The GSO sender converts tens of thousands of datagrams into super-skbs with minimal CPU overhead. When these super-skbs arrive at a receiver socket that does **not** have `UDP_GRO` enabled, the kernel's receive path must segment the super-skb into individual standard `sk_buff` instances before enqueuing them into the socket receive buffer (`sk_rcvbuf`).
+
+```text
+GSO sender: 1 sendmsg = 32 datagrams, ~290 ns CPU each
+       |
+       |  one super-skb across the veth
+       v
+receiver without UDP_GRO: kernel segments it back into 32 skbs
+       |
+       v  each skb is charged to sk_rcvbuf separately
++-----------------------------------------------------+
+| socket receive queue (SO_RCVBUF, capped by rmem_max)|
++-----------------------------------------------------+
+       |  drained by recvfrom(), one datagram per syscall
+       v
+queue full -> the datagram that does not fit is dropped, RcvbufErrors += 1
+
+receiver with UDP_GRO: the super-skb is queued as ONE skb
+       -> if it does not fit, all 32 datagrams are dropped together
+```
+
+If the receiver application processes datagrams using single-datagram calls (`recvfrom()`), its consumption rate will be far slower than the sender's transmission rate. Once the receiver's `sk_rcvbuf` limit is reached, the kernel rejects new incoming datagrams.
+
+The unit of loss depends on the receiver. A socket without `UDP_GRO` gets the super-skb segmented before queueing, so each datagram is accounted and dropped on its own: the 86,052 losses in scenario D are not a multiple of 32. A socket with `UDP_GRO` queues the whole super-skb as one buffer, so a drop takes all of its segments at once. `RcvbufErrors` counts dropped skbs, not datagrams: in one GRO run of this lab the counter rose by 77 while the receiver came up 2,464 datagrams short, which is 77 x 32.
+
+## Constraints, limits, and pacing
+
+To use UDP GSO and GRO safely in production, several architectural constraints must be observed:
+
+- **Maximum Segment Count**: The kernel enforces a maximum of 128 segments per GSO super-skb.
+- **Maximum Payload Size**: The total aggregated length of a GSO super-skb cannot exceed the maximum IPv4 UDP datagram payload limit of 65,507 bytes (65,535 byte IP limit minus 20-byte IP header and 8-byte UDP header).
+- **MTU Alignment**: The `gso_size` parameter must be chosen such that individual segmented frames do not exceed the path MTU when IP and UDP headers are added (e.g., maximum `gso_size` of 1472 bytes for a 1500-byte MTU under standard IPv4).
+- **Checksums and paths that refuse GSO**: the kernel leaves the UDP checksum to be completed per segment, so GSO is refused on a socket with checksums disabled (`SO_NO_CHECK`: `EINVAL`), for UDP-Lite, and when the route goes through an IPsec (xfrm) transform (`EIO`), per `udp_send_skb()` in v6.12. QUIC stacks treat `EIO` at send time as "turn GSO off for this socket".
+- **Burstiness and Pacing**: Transmitting large GSO super-skbs causes bursts of back-to-back packets at line rate when segmented. In networks with shallow-buffered switches, these bursts can induce packet drops. Production deployments running QUIC often combine GSO with Fair Queueing (`fq`) and rate pacing (`SO_TXTIME`).
+- **Connected vs Unconnected Sockets**: `UDP_SEGMENT` functions on both connected sockets (where `connect()` sets the default destination) and unconnected sockets (where `sendmsg()` specifies destination addresses via `sockaddr_in`).
+
+## The lab
+
+The lab benchmarks the send and receive strategies across two network namespaces, `tx` and `rx`, joined by a `veth` pair with the default MTU of 1500 bytes. Both ends of the pair are called `v0`.
+
+```text
++-----------------------+                         +-----------------------+
+| Namespace: tx         |                         | Namespace: rx         |
+|                       |                         |                       |
+|   +---------------+   |                         |   +---------------+   |
+|   |   udpbench    |   |                         |   |   udpbench    |   |
+|   |  (TX Role)    |   |                         |   |  (RX Role)    |   |
+|   +---------------+   |                         |   +---------------+   |
+|           |           |                         |           |           |
+|          v0           |=========================|          v0           |
+|     10.9.0.1/24       |        veth pair        |     10.9.0.2/24       |
+|     MTU 1500          |                         |     MTU 1500          |
++-----------------------+                         +-----------------------+
+```
+
+The lab executes test runs transmitting 200,000 datagrams of 1,200 payload bytes each under six scenarios:
+1. `sendto` (batch 1) -> `recvfrom`
+2. `sendmmsg` (batch 32) -> `recvfrom`
+3. `sendmmsg` (batch 32) -> `recvmmsg`
+4. UDP GSO (batch 32) -> `recvfrom`
+5. UDP GSO (batch 32) -> UDP GRO
+6. `sendto` (batch 1) -> UDP GRO
+
+It also tests `UDP_SEGMENT` size and boundary constraints, followed by a performance comparison over the loopback interface (`lo`).
+
+### Lab files
+
+`udpbench.c`:
+
+```c
+/* udpbench.c - compare UDP send/receive batching on Linux.
+ * send <dst-ip> <port> <sendto|mmsg|gso> <datagrams> <payload> [batch]
+ * recv <port> <recvfrom|mmsg|gro>
+ * errors <dst-ip> <port>       (probe UDP_SEGMENT limits)
+ */
+#define _GNU_SOURCE
+#include <arpa/inet.h>
+#include <errno.h>
+#include <netinet/in.h>
+#include <netinet/udp.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/resource.h>
+#include <sys/socket.h>
+#include <sys/time.h>
+#include <time.h>
+#include <unistd.h>
+#ifndef UDP_SEGMENT
+#define UDP_SEGMENT 103
+#endif
+#ifndef UDP_GRO
+#define UDP_GRO 104
+#endif
+
+static double now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec / 1e9; }
+static double cpu(void) { struct rusage r; getrusage(RUSAGE_SELF, &r);
+  return r.ru_utime.tv_sec + r.ru_utime.tv_usec / 1e6 + r.ru_stime.tv_sec + r.ru_stime.tv_usec / 1e6; }
+
+static int sendmsg_gso(int fd, struct sockaddr_in *dst, char *buf, size_t len, unsigned short seg) {
+  char ctl[CMSG_SPACE(sizeof(unsigned short))] = {0};
+  struct iovec iov = { buf, len };
+  struct msghdr m = { .msg_name = dst, .msg_namelen = sizeof *dst, .msg_iov = &iov, .msg_iovlen = 1,
+                      .msg_control = ctl, .msg_controllen = sizeof ctl };
+  struct cmsghdr *c = CMSG_FIRSTHDR(&m);
+  c->cmsg_level = SOL_UDP; c->cmsg_type = UDP_SEGMENT; c->cmsg_len = CMSG_LEN(sizeof seg);
+  memcpy(CMSG_DATA(c), &seg, sizeof seg);
+  return sendmsg(fd, &m, 0);
+}
+
+static int do_send(int argc, char **argv) {
+  struct sockaddr_in dst = { .sin_family = AF_INET, .sin_port = htons(atoi(argv[3])) };
+  inet_pton(AF_INET, argv[2], &dst.sin_addr);
+  const char *mode = argv[4]; long n = atol(argv[5]); int size = atoi(argv[6]);
+  int batch = argc > 7 ? atoi(argv[7]) : 32;
+  int fd = socket(AF_INET, SOCK_DGRAM, 0);
+  char *buf = calloc(batch, size);
+  long sent = 0, calls = 0, errs = 0; double t0 = now(), c0 = cpu();
+  if (!strcmp(mode, "sendto")) {
+    for (; sent < n; sent++, calls++)
+      if (sendto(fd, buf, size, 0, (void *)&dst, sizeof dst) < 0) errs++;
+  } else if (!strcmp(mode, "mmsg")) {
+    struct mmsghdr *v = calloc(batch, sizeof *v); struct iovec *io = calloc(batch, sizeof *io);
+    for (int i = 0; i < batch; i++) { io[i].iov_base = buf + i * size; io[i].iov_len = size;
+      v[i].msg_hdr.msg_iov = &io[i]; v[i].msg_hdr.msg_iovlen = 1;
+      v[i].msg_hdr.msg_name = &dst; v[i].msg_hdr.msg_namelen = sizeof dst; }
+    while (sent < n) { int k = n - sent < batch ? n - sent : batch;
+      int r = sendmmsg(fd, v, k, 0); calls++; if (r < 0) { errs++; r = k; } sent += r; }
+  } else if (!strcmp(mode, "gso")) {
+    while (sent < n) { int k = n - sent < batch ? n - sent : batch;
+      if (sendmsg_gso(fd, &dst, buf, (size_t)k * size, size) < 0) errs++;
+      calls++; sent += k; }
+  } else { fprintf(stderr, "bad mode\n"); return 2; }
+  double dt = now() - t0, dc = cpu() - c0;
+  printf("send %-6s batch=%-3d datagrams=%ld syscalls=%ld errors=%ld wall=%.3fs cpu=%.3fs  %.0f kpps  %.0f ns-cpu/datagram\n",
+         mode, !strcmp(mode, "sendto") ? 1 : batch, sent, calls, errs, dt, dc, sent / dt / 1e3, dc / sent * 1e9);
+  return 0;
+}
+
+static int do_recv(char **argv) {
+  const char *mode = argv[3];
+  int fd = socket(AF_INET, SOCK_DGRAM, 0), one = 1, rb = 8 << 20;
+  setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &rb, sizeof rb);
+  struct sockaddr_in a = { .sin_family = AF_INET, .sin_port = htons(atoi(argv[2])) };
+  if (bind(fd, (void *)&a, sizeof a)) { perror("bind"); return 1; }
+  if (!strcmp(mode, "gro") && setsockopt(fd, SOL_UDP, UDP_GRO, &one, sizeof one)) perror("UDP_GRO");
+  struct timeval tv = { 0, 500000 }; setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+  enum { B = 64, SZ = 65536 };
+  static char bufs[B][SZ]; long dgrams = 0, calls = 0, bytes = 0, coalesced = 0, maxseg = 0;
+  double t0 = 0, c0 = cpu(), tl = 0;
+  printf("recv %s listening\n", mode); fflush(stdout);
+  for (;;) {
+    if (!strcmp(mode, "mmsg")) {
+      struct mmsghdr v[B]; struct iovec io[B]; memset(v, 0, sizeof v);
+      for (int i = 0; i < B; i++) { io[i].iov_base = bufs[i]; io[i].iov_len = SZ; v[i].msg_hdr.msg_iov = &io[i]; v[i].msg_hdr.msg_iovlen = 1; }
+      int r = recvmmsg(fd, v, B, MSG_WAITFORONE, NULL); calls++;
+      if (r <= 0) break;
+      if (!t0) t0 = now();
+      for (int i = 0; i < r; i++) bytes += v[i].msg_len;
+      dgrams += r; tl = now();
+    } else {
+      char ctl[CMSG_SPACE(sizeof(int))]; struct iovec io = { bufs[0], SZ };
+      struct msghdr m = { .msg_iov = &io, .msg_iovlen = 1, .msg_control = ctl, .msg_controllen = sizeof ctl };
+      ssize_t r = recvmsg(fd, &m, 0); calls++;
+      if (r <= 0) break;
+      if (!t0) t0 = now();
+      tl = now(); bytes += r;
+      int gso = 0;
+      for (struct cmsghdr *c = CMSG_FIRSTHDR(&m); c; c = CMSG_NXTHDR(&m, c))
+        if (c->cmsg_level == SOL_UDP && c->cmsg_type == UDP_GRO) memcpy(&gso, CMSG_DATA(c), sizeof gso);
+      if (gso) { long segs = (r + gso - 1) / gso; dgrams += segs; if (segs > 1) coalesced++; if (segs > maxseg) maxseg = segs; }
+      else dgrams++;
+    }
+  }
+  calls--; /* the final call that timed out */
+  double dc = cpu() - c0;
+  printf("recv %-8s datagrams=%ld bytes=%ld syscalls=%ld datagrams/syscall=%.1f", mode, dgrams, bytes, calls, calls ? (double)dgrams / calls : 0);
+  if (!strcmp(mode, "gro")) printf(" coalesced-reads=%ld max-segs-per-read=%ld", coalesced, maxseg);
+  printf(" active=%.3fs cpu=%.3fs\n", tl - t0, dc);
+  return 0;
+}
+
+static int do_errors(char **argv) {
+  struct sockaddr_in dst = { .sin_family = AF_INET, .sin_port = htons(atoi(argv[3])) };
+  inet_pton(AF_INET, argv[2], &dst.sin_addr);
+  int fd = socket(AF_INET, SOCK_DGRAM, 0); static char buf[70000];
+  struct { const char *what; size_t len; unsigned short seg; } t[] = {
+    { "64 x 1000 B (64000 B total)", 64000, 1000 },
+    { "65 x 1000 B (65000 B total)", 65000, 1000 },
+    { "128 x 500 B", 64000, 500 },
+    { "129 x 500 B", 64500, 500 },
+    { "segment 1472 B on a 1500 MTU", 14720, 1472 },
+    { "segment 1473 B on a 1500 MTU", 14730, 1473 },
+    { "66 x 1000 B (66000 B > 65507)", 66000, 1000 },
+    { "last segment short: 10 x 1000 + 1", 10001, 1000 },
+  };
+  for (unsigned i = 0; i < sizeof t / sizeof t[0]; i++) {
+    int r = sendmsg_gso(fd, &dst, buf, t[i].len, t[i].seg);
+    printf("  %-36s -> %s\n", t[i].what, r < 0 ? strerror(errno) : "ok");
+  }
+  return 0;
+}
+
+int main(int argc, char **argv) {
+  if (argc > 6 && !strcmp(argv[1], "send")) return do_send(argc, argv);
+  if (argc > 3 && !strcmp(argv[1], "recv")) return do_recv(argv);
+  if (argc > 3 && !strcmp(argv[1], "errors")) return do_errors(argv);
+  fprintf(stderr, "usage: see header\n"); return 2;
+}
+```
+
+`lab-udp.sh`:
+
+```bash
+#!/bin/sh
+# Run as: unshare -urnm sh lab-udp.sh   (no root, no installs)
+set -e
+mount -t tmpfs none /run && mkdir -p /run/netns
+for n in tx rx; do ip netns add $n; ip -n $n link set lo up; done
+ip -n tx link add v0 type veth peer name v0 netns rx
+ip -n tx addr add 10.9.0.1/24 dev v0 && ip -n tx link set v0 up
+ip -n rx addr add 10.9.0.2/24 dev v0 && ip -n rx link set v0 up
+X="ip netns exec"
+N=${N:-200000}; S=1200
+ctr() { cat /sys/class/net/v0/statistics/$1; }
+udp() { $X rx awk '/^Udp:/{if(!h){split($0,k);h=1}else{split($0,v);for(i=2;i<=NF;i++)if(k[i]=="InDatagrams"||k[i]=="RcvbufErrors")printf "%s=%s ",k[i],v[i]}}' /proc/net/snmp; }
+run() { # $1 send mode, $2 batch, $3 recv mode
+  echo "--- sender $1 (batch $2) -> receiver $3"
+  $X rx ./udpbench recv 9000 $3 > rx.out & R=$!
+  sleep 0.3
+  t0=$($X tx sh -c 'cat /sys/class/net/v0/statistics/tx_packets'); u0=$(udp)
+  $X tx ./udpbench send 10.9.0.2 9000 $1 $N $S $2
+  wait $R; cat rx.out | grep -v listening
+  t1=$($X tx sh -c 'cat /sys/class/net/v0/statistics/tx_packets')
+  echo "    tx v0 packets counted: $((t1 - t0))   rx netns Udp before: $u0"
+  echo "                                              after:  $(udp)"
+}
+echo "== 1. 200000 x 1200 B datagrams, one call each vs batched"
+run sendto 1  recvfrom
+run mmsg   32 recvfrom
+run mmsg   32 mmsg
+run gso    32 recvfrom
+run gso    32 gro
+run sendto 1  gro
+echo
+echo "== 2. UDP_SEGMENT limits on a 1500-byte MTU veth"
+$X tx ./udpbench errors 10.9.0.2 9000
+echo
+echo "== 3. the same GSO send on loopback (MTU 65536)"
+$X rx ./udpbench recv 9001 gro > rx.out & R=$!; sleep 0.3
+$X rx ./udpbench send 127.0.0.1 9001 gso $N $S 32; wait $R; grep -v listening rx.out
+$X rx ./udpbench recv 9002 recvfrom > rx.out & R=$!; sleep 0.3
+$X rx ./udpbench send 127.0.0.1 9002 gso $N $S 32; wait $R; grep -v listening rx.out
+```
+
+### Execution output
+
+```text
+== 1. 200000 x 1200 B datagrams, one call each vs batched
+--- sender sendto (batch 1) -> receiver recvfrom
+send sendto batch=1   datagrams=200000 syscalls=200000 errors=0 wall=0.340s cpu=0.340s  588 kpps  1701 ns-cpu/datagram
+recv recvfrom datagrams=199798 bytes=239757600 syscalls=199798 datagrams/syscall=1.0 active=0.340s cpu=0.231s
+    tx v0 packets counted: 200002   rx netns Udp before: InDatagrams=0 RcvbufErrors=0 
+                                              after:  InDatagrams=199798 RcvbufErrors=202 
+--- sender mmsg (batch 32) -> receiver recvfrom
+send mmsg   batch=32  datagrams=200000 syscalls=6250 errors=0 wall=0.296s cpu=0.296s  676 kpps  1478 ns-cpu/datagram
+recv recvfrom datagrams=200000 bytes=240000000 syscalls=200000 datagrams/syscall=1.0 active=0.296s cpu=0.218s
+    tx v0 packets counted: 200001   rx netns Udp before: InDatagrams=199798 RcvbufErrors=202 
+                                              after:  InDatagrams=399798 RcvbufErrors=202 
+--- sender mmsg (batch 32) -> receiver mmsg
+send mmsg   batch=32  datagrams=200000 syscalls=6250 errors=0 wall=0.345s cpu=0.345s  579 kpps  1727 ns-cpu/datagram
+recv mmsg     datagrams=200000 bytes=240000000 syscalls=97637 datagrams/syscall=2.0 active=0.345s cpu=0.235s
+    tx v0 packets counted: 200000   rx netns Udp before: InDatagrams=399798 RcvbufErrors=202 
+                                              after:  InDatagrams=599798 RcvbufErrors=202 
+--- sender gso (batch 32) -> receiver recvfrom
+send gso    batch=32  datagrams=200000 syscalls=6250 errors=0 wall=0.058s cpu=0.058s  3449 kpps  290 ns-cpu/datagram
+recv recvfrom datagrams=113948 bytes=136737600 syscalls=113948 datagrams/syscall=1.0 active=0.058s cpu=0.058s
+    tx v0 packets counted: 6250   rx netns Udp before: InDatagrams=599798 RcvbufErrors=202 
+                                              after:  InDatagrams=713746 RcvbufErrors=86254 
+--- sender gso (batch 32) -> receiver gro
+send gso    batch=32  datagrams=200000 syscalls=6250 errors=0 wall=0.023s cpu=0.023s  8632 kpps  116 ns-cpu/datagram
+recv gro      datagrams=200000 bytes=240000000 syscalls=6250 datagrams/syscall=32.0 coalesced-reads=6250 max-segs-per-read=32 active=0.023s cpu=0.020s
+    tx v0 packets counted: 6251   rx netns Udp before: InDatagrams=713746 RcvbufErrors=86254 
+                                              after:  InDatagrams=719996 RcvbufErrors=86254 
+--- sender sendto (batch 1) -> receiver gro
+send sendto batch=1   datagrams=200000 syscalls=200000 errors=0 wall=0.262s cpu=0.262s  764 kpps  1309 ns-cpu/datagram
+recv gro      datagrams=199689 bytes=239626800 syscalls=199689 datagrams/syscall=1.0 coalesced-reads=0 max-segs-per-read=0 active=0.261s cpu=0.199s
+    tx v0 packets counted: 200000   rx netns Udp before: InDatagrams=719996 RcvbufErrors=86254 
+                                              after:  InDatagrams=919685 RcvbufErrors=86565 
+
+== 2. UDP_SEGMENT limits on a 1500-byte MTU veth
+  64 x 1000 B (64000 B total)          -> ok
+  65 x 1000 B (65000 B total)          -> ok
+  128 x 500 B                          -> ok
+  129 x 500 B                          -> Invalid argument
+  segment 1472 B on a 1500 MTU         -> ok
+  segment 1473 B on a 1500 MTU         -> Message too long
+  66 x 1000 B (66000 B > 65507)        -> Message too long
+  last segment short: 10 x 1000 + 1    -> ok
+
+== 3. the same GSO send on loopback (MTU 65536)
+send gso    batch=32  datagrams=200000 syscalls=6250 errors=0 wall=0.022s cpu=0.022s  9143 kpps  109 ns-cpu/datagram
+recv gro      datagrams=197376 bytes=236851200 syscalls=6168 datagrams/syscall=32.0 coalesced-reads=6168 max-segs-per-read=32 active=0.022s cpu=0.019s
+send gso    batch=32  datagrams=200000 syscalls=6250 errors=0 wall=0.059s cpu=0.059s  3397 kpps  294 ns-cpu/datagram
+recv recvfrom datagrams=116492 bytes=139790400 syscalls=116492 datagrams/syscall=1.0 active=0.059s cpu=0.059s
+```
+
+## Reading the output
+
+### 1. 200000 x 1200 B datagrams, one call each vs batched
+
+#### Scenario A: sender sendto (batch 1) -> receiver recvfrom
+- **Sender performance**: 200,000 datagrams sent in 200,000 system calls (`sendto`). Wall time: `0.340s`, CPU time: `0.340s`, throughput: `588 kpps`, CPU cost: `1701 ns-cpu/datagram`.
+- **Receiver performance**: Received 199,798 datagrams (239,757,600 bytes) across 199,798 system calls (`recvfrom`). CPU time: `0.231s`.
+- **Counters**: Interface `tx v0` counted 200,002 packets (including IPv6 background neighbor discovery). UDP SNMP statistics recorded `InDatagrams=199798` and `RcvbufErrors=202`. A minor loss of 202 packets occurred due to socket queue transient saturation during unpinned execution.
+
+#### Scenario B: sender mmsg (batch 32) -> receiver recvfrom
+- **Sender performance**: 200,000 datagrams sent using `sendmmsg()` in 6,250 system calls (`200000 / 32 = 6250`). Wall time: `0.296s`, throughput: `676 kpps`, CPU cost: `1478 ns-cpu/datagram`.
+- **Syscall Overhead Analysis**: Converting from `sendto` to `sendmmsg` reduced system calls from 200,000 to 6,250. CPU cost dropped slightly from 1,701 ns to 1,478 ns per datagram. On this kernel, per-datagram network stack allocation overhead (`sk_buff` creation, IP routing) dominates total CPU consumption, meaning syscall elimination provides a modest boost (~15%) rather than an order-of-magnitude shift.
+- **Receiver performance**: 200,000 datagrams received via 200,000 `recvfrom` calls (`datagrams/syscall=1.0`). No additional drops occurred (`RcvbufErrors=202`).
+
+#### Scenario C: sender mmsg (batch 32) -> receiver mmsg
+- **Sender performance**: 200,000 datagrams sent in 6,250 `sendmmsg` calls (`579 kpps`, `1727 ns-cpu/datagram`).
+- **Receiver performance**: 200,000 datagrams received across 97,637 `recvmmsg` system calls. Average yield: `datagrams/syscall=2.0`.
+- **Batching Analysis**: Even though the receiver requested batches of up to 32 datagrams, `recvmmsg` returned an average of 2.0 datagrams per call. This occurs because the receiver drained incoming socket buffers as quickly as single packet `sk_buff` items were enqueued by the kernel thread, demonstrating that `recvmmsg` batching yield is limited by receiver scheduling and incoming queue depth.
+
+#### Scenario D: sender gso (batch 32) -> receiver recvfrom
+- **Sender performance**: Wall time: `0.058s`, CPU time: `0.058s`, throughput: `3449 kpps`, CPU cost: `290 ns-cpu/datagram`.
+- **Throughput Jump**: GSO reduced sender CPU overhead from ~1,478 ns to 290 ns per datagram, driving a 5x increase in transmission speed (3.45 Mpps). Passing 38,400-byte buffers (32 segments * 1,200 bytes) allows the kernel stack to process 1 super-skb instead of 32 individual skbs.
+- **Receiver Buffer Overflow**: The receiver obtained only 113,948 datagrams. Receiver `RcvbufErrors` jumped from 202 to 86,254 (a loss of 86,052 datagrams).
+- **Root cause**: the sender got cheaper, the receiver did not. The receiver still pays one `recvfrom()` per datagram, so the queue (8 MiB requested, capped by `rmem_max`) filled and the kernel dropped datagrams individually after segmenting each super-skb. 86,052 is not a multiple of 32, which confirms the per-datagram accounting. The sender is unaware: GSO makes it possible to send faster than the peer can read.
+- **Interface Counters**: `tx v0` counted exactly 6,250 packets. This confirms that virtual interfaces (`veth`) treat GSO super-skbs as single packet entities in network driver statistics.
+
+#### Scenario E: sender gso (batch 32) -> receiver gro
+- **Sender performance**: Wall time: `0.023s`, throughput: `8632 kpps`, CPU cost: `116 ns-cpu/datagram`.
+- **Receiver performance**: Received all 200,000 datagrams (240,000,000 bytes) across exactly 6,250 system calls (`datagrams/syscall=32.0`). Receiver active CPU time: `0.020s`.
+- **Coalescing efficiency**: `coalesced-reads=6250`, `max-segs-per-read=32`. `RcvbufErrors` stayed at 86,254, so nothing was lost in this run. In the two other runs the same scenario lost 2,464 and 2,048 datagrams: 77 and 64 whole 32-segment buffers.
+- **Optimization Alignment**: Combining UDP GSO on the sender with UDP GRO on the receiver eliminated the processing bottleneck on both sides of the socket. The receiver read 38,400 bytes per `recvmsg()` call, allowing kernel and user space to operate entirely on 32-segment super-units.
+
+#### Scenario F: sender sendto (batch 1) -> receiver gro
+- **Sender performance**: `764 kpps`, `1309 ns-cpu/datagram`.
+- **Receiver performance**: 199,689 datagrams received in 199,689 system calls (`coalesced-reads=0`).
+- **GRO Ineffectiveness**: Enabling `UDP_GRO` on a receiver provides no performance benefit when the sender transmits individual `sendto` frames over a `veth` interface without NAPI hardware GRO support. The receiver processed 1 datagram per call (`datagrams/syscall=1.0`), proving that software GRO requires either GSO super-skbs from the sender or GRO support in the network driver.
+
+### 2. UDP_SEGMENT limits on a 1500-byte MTU veth
+
+The second lab section tests kernel enforcement of payload and segment boundary constraints:
+
+- `64 x 1000 B (64000 B total)` -> `ok`: Valid (64 segments <= 128 max limit; total payload <= 65507 bytes).
+- `65 x 1000 B (65000 B total)` -> `ok`: Valid (65 segments <= 128 max limit; total payload <= 65507 bytes).
+- `128 x 500 B` -> `ok`: Valid (128 segments matches the maximum segment count limit).
+- `129 x 500 B` -> `Invalid argument` (`EINVAL`): Transmitting 129 segments violates the kernel constraint of 128 segments per GSO payload.
+- `segment 1472 B on a 1500 MTU` -> `ok`: Valid (1472 bytes payload + 8 bytes UDP header + 20 bytes IP header = 1500 bytes, fitting MTU).
+- `segment 1473 B on a 1500 MTU` -> `Message too long` (`EMSGSIZE`): A segment size of 1473 bytes produces an IP packet of 1501 bytes, exceeding the link MTU of 1500 bytes.
+- `66 x 1000 B (66000 B > 65507)` -> `Message too long` (`EMSGSIZE`): Total payload exceeds the maximum IPv4 UDP datagram limit of 65,507 bytes.
+- `last segment short: 10 x 1000 + 1` -> `ok`: Valid. The kernel allows the final segment in a GSO buffer to be smaller than `gso_size` (e.g., 10 full 1000-byte segments followed by 1 trailing byte).
+
+### 3. The same GSO send on loopback (MTU 65536)
+
+The final lab section runs GSO benchmarks over the loopback interface (`lo`, MTU 65536):
+
+- **GSO -> GRO**: `9143 kpps` and `109 ns-cpu/datagram`. The receiver read 197,376 datagrams in 6,168 reads of 32, so 82 buffers (2,624 datagrams) were dropped whole this time. Loopback behaves like the veth: the super-skb stays intact, and the large loopback MTU changes nothing because the segment size, not the MTU, decides what the receiver sees.
+- **GSO -> recvfrom**: Throughput fell to `3397 kpps` (`294 ns-cpu/datagram`), with significant packet drops resulting from receiver queue saturation.
+
+## In production
+
+### Inspecting offload capabilities with ethtool
+
+Verify that UDP segmentation offload (USO) and receive offload features are active on physical interfaces:
+
+```bash
+# (not run here)
+ethtool -k eth0 | grep -E "udp|gro"
+```
+
+Flags to look for:
+- `tx-udp-segmentation`: the NIC can split UDP GSO buffers (USO). When off, the kernel segments in software and GSO still saves most of the per-datagram stack cost.
+- `rx-udp-gro-forwarding` and `rx-gro-list`: GRO for UDP that is forwarded rather than delivered locally (routers, container hosts). A local socket gets GRO through `UDP_GRO` without them.
+
+To change them on an interface:
+
+```bash
+# (not run here)
+sudo ethtool -K eth0 tx-udp-segmentation on rx-gro-list on
+```
+
+### Monitoring socket drops and errors
+
+To diagnose UDP socket queue overflows and transmission buffer drops, query SNMP kernel statistics using `nstat`:
+
+```bash
+# (not run here)
+nstat -az UdpRcvbufErrors UdpSndbufErrors UdpInErrors
+```
+
+- `UdpRcvbufErrors`: Increments when the kernel discards incoming UDP datagrams due to socket receive buffer space exhaustion (`sk_rcvbuf`).
+- `UdpSndbufErrors`: Increments when an application attempts to transmit datagrams faster than the egress queue or socket send buffer can accept.
+
+### Tuning socket memory limits
+
+Because high-rate GSO transmission delivers datagrams in large super-skb bursts, default system receive buffer caps may be insufficient. Increase maximum socket buffer sizes via `sysctl`:
+
+```bash
+# (not run here)
+sudo sysctl -w net.core.rmem_max=268435456
+sudo sysctl -w net.core.wmem_max=268435456
+```
+
+Inside production application code, set the socket receive buffer explicitly using `SO_RCVBUF`:
+
+```c
+// (not run here)
+int rcvbuf = 33554432; // 32 MiB
+setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
+```
+
+### How QUIC stacks use it
+
+QUIC stacks such as quic-go, msquic and quiche use GSO when the kernel offers it and fall back otherwise. The pattern, without quoting any one implementation:
+1. At socket setup, probe for the option (a `getsockopt` or `setsockopt` of `UDP_SEGMENT` at `SOL_UDP`). `ENOPROTOOPT` means the kernel predates 4.18.
+2. Batch packets of one connection that share a destination and a segment size into one `sendmsg()` with a `UDP_SEGMENT` cmsg; only the last packet of a batch may be shorter.
+3. If a send fails with `EIO` (no checksum offload on the path, or IPsec), disable GSO for that socket and resend one datagram per call.
+
+### C Implementation: Reading UDP_GRO cmsg and splitting payload
+
+The following C snippet demonstrates how a production receiver configures `UDP_GRO`, receives a super-skb via `recvmsg()`, extracts the `UDP_GRO` segment size cmsg, and processes individual datagram segments:
+
+```c
+// (not run here)
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <netinet/udp.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/types.h>
+
+void receive_gro_packets(int fd) {
+    // Enable UDP_GRO socket option
+    int val = 1;
+    if (setsockopt(fd, SOL_UDP, UDP_GRO, &val, sizeof(val)) < 0) {
+        perror("setsockopt UDP_GRO");
+        return;
+    }
+
+    char buffer[65536];
+    char control[CMSG_SPACE(sizeof(int))];   /* the kernel delivers gso_size as an int */
+
+    struct iovec iov = {
+        .iov_base = buffer,
+        .iov_len = sizeof(buffer)
+    };
+
+    struct msghdr msg = {
+        .msg_iov = &iov,
+        .msg_iovlen = 1,
+        .msg_control = control,
+        .msg_controllen = sizeof(control)
+    };
+
+    ssize_t nread = recvmsg(fd, &msg, 0);
+    if (nread < 0) {
+        perror("recvmsg");
+        return;
+    }
+
+    int gso_size = 0;
+    struct cmsghdr *cmsg;
+    for (cmsg = CMSG_FIRSTHDR(&msg); cmsg != NULL; cmsg = CMSG_NXTHDR(&msg, cmsg)) {
+        if (cmsg->cmsg_level == SOL_UDP && cmsg->cmsg_type == UDP_GRO) {
+            memcpy(&gso_size, CMSG_DATA(cmsg), sizeof gso_size);
+            break;
+        }
+    }
+
+    if (gso_size == 0) {
+        // Standard single datagram received
+        printf("Received single datagram of %zd bytes\n", nread);
+    } else {
+        // Coalesced GRO super-skb received
+        size_t offset = 0;
+        size_t total = (size_t)nread;
+        int count = 0;
+
+        while (offset < total) {
+            size_t seg_len = (total - offset < (size_t)gso_size) ? (total - offset) : (size_t)gso_size;
+            // Process individual payload segment at buffer + offset with length seg_len
+            count++;
+            offset += seg_len;
+        }
+        printf("Received GRO super-packet: %zd total bytes, %d segments of gso_size %d\n",
+               nread, count, gso_size);
+    }
+}
+```
+
+## Gotchas
+
+- **GSO Creates Micro-Bursts**: Transmitting 64 KiB GSO super-skbs emits back-to-back packets at line rate. This can saturate queue buffers on intermediate switches, causing packet drops. Use `SO_TXTIME` or `fq` (Fair Queueing) pacing where necessary.
+- **GRO receivers lose whole buffers**: a socket with `UDP_GRO` queues a coalesced buffer as one skb, so when its queue is full all 32 datagrams go at once and `RcvbufErrors` rises by 1. Divide nothing by the counter without knowing which kind of receiver you are looking at.
+- **A fast sender is not a healthy sender**: scenario D shows GSO making the sender five times cheaper while the receiver lost 43 % of the datagrams. Pair GSO on the sender with `UDP_GRO` on the receiver, and rely on the protocol's own flow and congestion control (QUIC has both) rather than on the socket buffer.
+- **Software segmentation is silent**: on a NIC without USO the kernel segments in software. It still beats one `sendto()` per datagram, but the savings are smaller than with hardware USO.
+- **Receiver App Must Split GRO Buffers**: `UDP_GRO` returns concatenated payloads in a single buffer. If the application does not inspect the `UDP_GRO` cmsg and parse the payload into `gso_size` chunks, it will treat multiple distinct datagrams as one corrupted payload.
+- **Truncated Final Segment**: In both GSO transmission and GRO reception, the final payload segment can be shorter than `gso_size`. Receiver parsing loops must handle trailing partial segments correctly.
+- **128 Segment Limit**: Attempting to pass more than 128 segments in a single `UDP_SEGMENT` `sendmsg()` call fails immediately with `EINVAL` (Invalid argument).
+- **MTU Enforcement**: The `gso_size` value passed to `UDP_SEGMENT` must account for outer headers. Setting a segment size that causes IP frames to exceed the path MTU results in `EMSGSIZE` errors.
+- **Virtual Interface Counter Artifacts**: Tools monitoring `veth` or `loopback` interfaces report super-skb counts rather than wire packet counts. A single reported packet on a `veth` link may represent up to 128 UDP datagrams.
+
+## Exercises
+
+1. **Verify Syscall Reduction**: Modify `udpbench.c` to send 500,000 datagrams using `sendmmsg()` with batch sizes of 1, 8, 32, and 128. Use `strace -c` to count total system call invocations and compare overall runtime.
+2. **Observe Drop Thresholds**: Reduce `rmem_max` and the socket receive buffer (`SO_RCVBUF`) to 64 KiB. Run a GSO sender (batch 32) against a non-GRO `recvfrom()` receiver. Calculate the exact ratio of lost datagrams using `nstat -az UdpRcvbufErrors`.
+3. **Implement GRO Parsing**: Write a standalone receiver loop in C that accepts incoming datagrams, inspects `SOL_UDP` / `UDP_GRO` cmsg headers, and prints the timestamp, total bytes read, segment count, and payload length of every parsed segment.
+4. **Test Trailing Partial Segments**: Construct a GSO payload containing 5 full segments of 1,000 bytes plus one partial segment of 350 bytes (total 5,350 bytes). Transmit the payload using `UDP_SEGMENT` set to 1000 and verify that the receiver correctly parses 6 distinct segments.
+5. **Measure Loopback MTU Interaction**: Change the `loopback` interface MTU from 65536 to 1500 (`ip link set dev lo mtu 1500`). Rerun the GSO benchmark suite and compare performance metrics against the high-MTU baseline.
+6. **Simulate Offload Disabling**: Use `ethtool -K` to disable GRO on a physical network interface. Compare CPU utilization and packet loss for a high-rate QUIC traffic stream before and after toggling the setting.
+
+## Verification
+
+The benchmark results and kernel behavior analysis presented in this chapter were gathered using the following execution environment:
+
+- **OS / Kernel**: Linux 6.12.94 x86_64
+- **Toolchain**: gcc 14.2.0, iproute2 6.15.0
+- **Execution Context**: Isolated, unprivileged network and user namespaces (`unshare -urnm`).
+- **Hardware Profile**: 8-core CPU host, unpinned process execution.
+
+### Executed commands
+- `udpbench` execution across six primary test scenarios (200,000 datagrams x 1,200 bytes per scenario over `veth` and `loopback`).
+- Enforced constraint validation tests (`UDP_SEGMENT` limits, MTU boundaries, payload capacity checks).
+- In-kernel SNMP counter tracking via `/proc/net/snmp` (`InDatagrams`, `RcvbufErrors`).
+
+Repeatability: the whole lab ran three times. The per-datagram scenarios lost 0 to 202 datagrams; GSO towards a `recvfrom()` receiver lost 83,729 to 87,875 every time; GSO towards a `UDP_GRO` receiver lost 0 to 2,464 over the veth and 0 to 8,896 over loopback, always a multiple of 32. CPU figures moved by up to about 20 % between runs; the ratios did not change.
+
+### Not run here
+- `ethtool -k` and `ethtool -K` commands for querying and modifying physical NIC offload states.
+- `nstat -az UdpRcvbufErrors` commands for production system monitoring.
+- Socket memory sysctl tuning (`net.core.rmem_max`, `net.core.wmem_max`).
+
+## Sources
+
+- **udp(7)** Linux Manual Page: [https://man7.org/linux/man-pages/man7/udp.7.html](https://man7.org/linux/man-pages/man7/udp.7.html)
+- **sendmmsg(2)** Linux Manual Page: [https://man7.org/linux/man-pages/man2/sendmmsg.2.html](https://man7.org/linux/man-pages/man2/sendmmsg.2.html)
+- **recvmmsg(2)** Linux Manual Page: [https://man7.org/linux/man-pages/man2/recvmmsg.2.html](https://man7.org/linux/man-pages/man2/recvmmsg.2.html)
+- **Linux Kernel Networking Segmentation Offloads Documentation**: [https://docs.kernel.org/networking/segmentation-offloads.html](https://docs.kernel.org/networking/segmentation-offloads.html)
+- **Linux Kernel v6.12 Source Code (`net/ipv4/udp.c`, `net/ipv4/udp_offload.c`)**: [https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/net/ipv4/udp.c?h=v6.12.94](https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/net/ipv4/udp.c?h=v6.12.94)
+- **RFC 9000 - QUIC: A UDP-Based Multiplexed and Secure Transport**: [https://www.rfc-editor.org/rfc/rfc9000.html](https://www.rfc-editor.org/rfc/rfc9000.html)
+- **Cloudflare Blog - Accelerating UDP packet transmission for QUIC (2019)**: [https://blog.cloudflare.com/accelerating-udp-packet-transmission-for-quic/](https://blog.cloudflare.com/accelerating-udp-packet-transmission-for-quic/)

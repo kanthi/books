@@ -1,0 +1,350 @@
+---
+title: "Where the Microseconds Go: Timestamping One UDP Datagram Through the Linux Stack"
+author:
+  - name: "K19G"
+  - name: "grok-bot"
+---
+
+# Where the Microseconds Go: Timestamping One UDP Datagram Through the Linux Stack
+
+## Learning goals
+
+- Break one-way UDP latency into stages you can name: the send syscall and stack, the driver hand-off, the wire and switches, the receive stack, the socket queue, and the wake-up of the application
+- Use the kernel's software timestamps (`SO_TIMESTAMPING` with `SOF_TIMESTAMPING_TX_SOFTWARE` and `SOF_TIMESTAMPING_RX_SOFTWARE`) to measure those stages yourself, without root
+- Show with real numbers that, on an idle path, waking a blocked receiver costs more than the whole network stack, and that under load, queueing in the socket buffer costs more than everything else combined
+- Read the drop counter that tells you a socket buffer overflowed (`Udp: RcvbufErrors`), and size receive buffers from evidence
+- Place the parts this lab cannot measure (serialization, propagation, interrupt coalescing, kernel bypass) in the same budget with simple arithmetic
+
+## Thesis
+
+"The network is slow" usually means "somewhere between `sendto()` and `recvfrom()` time went missing". On a single host, or two hosts in the same rack, very little of that time is on the wire. A 64-byte frame takes about 67 ns to serialize at 10 Gb/s, including preamble and inter-frame gap, and light covers a 2 m cable in about 10 ns. The rest is software: the syscall, building and routing the `skb`, the qdisc, the driver, the receive path, the socket buffer, and most of all the scheduler deciding when the receiving thread runs again.
+
+The kernel can stamp a packet at the two points where it crosses the device boundary. Add two user-space clock reads and you get four timestamps per datagram, and the differences between them are the latency budget. This chapter builds that tool in about 130 lines of C, runs it across a veth pair between two network namespaces, and reads three experiments: an idle blocked receiver, a spinning receiver, and a slow receiver under a burst.
+
+## Mental model
+
+```text
+  sender (netns a)                                   receiver (netns b)
+  ----------------                                   ------------------
+  t0 = clock_gettime()      user
+     send()                 syscall, UDP/IP, route, neighbour, qdisc
+  t1 = TX software stamp    driver hands skb to the device   (SOF_TIMESTAMPING_TX_SOFTWARE)
+        |                   NIC queue, serialization, wire, switches, remote NIC,
+        |                   interrupt (or coalescing), NAPI poll
+  t2 = RX software stamp    skb handed to the receive stack  (SOF_TIMESTAMPING_RX_SOFTWARE)
+                            IP/UDP receive, socket lookup, enqueue on socket,
+                            wake the blocked thread, scheduler runs it, syscall returns
+  t3 = clock_gettime()      user
+
+  send path = t1 - t0      "network" = t2 - t1      sock->app = t3 - t2
+```
+
+All four timestamps are `CLOCK_REALTIME` on one host, so they can be subtracted directly. Across two hosts you would need PTP-synchronized clocks to compare t1 and t2. On one host with veth they are the same clock.
+
+## What the kernel timestamps mean
+
+The kernel's timestamping documentation (`Documentation/networking/timestamping.rst`) defines the flags used here:
+
+| Flag | What it asks for |
+|------|------------------|
+| `SOF_TIMESTAMPING_TX_SOFTWARE` | A timestamp when the packet leaves the kernel: "generated in the device driver as close as possible, but always prior to, passing the packet to the network interface". Delivered later on the socket's error queue. |
+| `SOF_TIMESTAMPING_RX_SOFTWARE` | A timestamp "just after a device driver hands a packet to the kernel receive stack". Delivered with the data as a control message. |
+| `SOF_TIMESTAMPING_SOFTWARE` | Report software timestamps (the reporting flag that goes with the two above). |
+| `SOF_TIMESTAMPING_OPT_ID` | Tag each TX timestamp with a per-socket counter, so you can match it to the datagram it belongs to. |
+| `SOF_TIMESTAMPING_OPT_TSONLY` | Return only the timestamp on the error queue, not a copy of the packet. |
+
+Hardware timestamps (`SOF_TIMESTAMPING_TX_HARDWARE` / `RX_HARDWARE`) are taken by the NIC itself and remove the driver's own jitter from the measurement. They need a NIC that supports them and `SIOCSHWTSTAMP`, which requires `CAP_NET_ADMIN` on the real device. They are out of reach here, and veth has no hardware clock anyway.
+
+## Lab: four timestamps per datagram
+
+### The tool
+
+`udplat tx` sends COUNT datagrams, recording t0 before each `send()`. It then drains the error queue to collect each t1, matched by the `OPT_ID` counter carried in `ee_data`. `udplat rx` receives, takes t2 from the `SCM_TIMESTAMPING` control message and t3 right after `recvmsg()` returns. It can block, spin with `MSG_DONTWAIT`, shrink its receive buffer, and burn a fixed amount of CPU per datagram to imitate application work.
+
+```c
+// udplat.c - where do the microseconds go on one UDP datagram?
+// tx: stamps t0 (user, before sendto) and t1 (kernel software TX timestamp,
+//     taken as the driver hands the skb on), read back from MSG_ERRQUEUE.
+// rx: stamps t2 (kernel software RX timestamp, taken on receive) and
+//     t3 (user, right after recvmsg returns).
+// All four are CLOCK_REALTIME on the same host, so they can be subtracted.
+#define _GNU_SOURCE
+#include <arpa/inet.h>
+#include <errno.h>
+#include <linux/errqueue.h>
+#include <linux/net_tstamp.h>
+#include <poll.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <time.h>
+#include <unistd.h>
+
+static int64_t now_ns(void) {
+    struct timespec t; clock_gettime(CLOCK_REALTIME, &t);
+    return (int64_t)t.tv_sec * 1000000000 + t.tv_nsec;
+}
+static int64_t ts_ns(struct timespec *t) { return (int64_t)t->tv_sec * 1000000000 + t->tv_nsec; }
+
+static int64_t stamp_from(struct msghdr *m) {          // first SCM_TIMESTAMPING ts[0]
+    for (struct cmsghdr *c = CMSG_FIRSTHDR(m); c; c = CMSG_NXTHDR(m, c))
+        if (c->cmsg_level == SOL_SOCKET && c->cmsg_type == SCM_TIMESTAMPING)
+            return ts_ns((struct timespec *)CMSG_DATA(c));
+    return -1;
+}
+
+static int rx(int port, int spin, int rcvbuf, int work_us) {
+    int s = socket(AF_INET, SOCK_DGRAM, 0);
+    int f = SOF_TIMESTAMPING_RX_SOFTWARE | SOF_TIMESTAMPING_SOFTWARE;
+    setsockopt(s, SOL_SOCKET, SO_TIMESTAMPING, &f, sizeof f);
+    if (rcvbuf) setsockopt(s, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof rcvbuf);
+    struct sockaddr_in a = {.sin_family = AF_INET, .sin_port = htons(port)};
+    if (bind(s, (void *)&a, sizeof a)) { perror("bind"); return 1; }
+    char buf[256], ctl[256];
+    for (;;) {
+        struct iovec io = {buf, sizeof buf};
+        struct msghdr m = {.msg_iov = &io, .msg_iovlen = 1, .msg_control = ctl, .msg_controllen = sizeof ctl};
+        ssize_t n;
+        do n = recvmsg(s, &m, spin ? MSG_DONTWAIT : 0); while (n < 0 && errno == EAGAIN);
+        int64_t t3 = now_ns();
+        uint32_t seq; memcpy(&seq, buf, 4);
+        if (seq == 0xffffffff) break;                   // end marker
+        printf("%u %lld %lld\n", seq, (long long)stamp_from(&m), (long long)t3);
+        if (work_us) { int64_t until = now_ns() + work_us * 1000LL; while (now_ns() < until) ; }
+    }
+    return 0;
+}
+
+static int tx(const char *dst, int port, int n, int gap_us) {
+    int s = socket(AF_INET, SOCK_DGRAM, 0);
+    int f = SOF_TIMESTAMPING_TX_SOFTWARE | SOF_TIMESTAMPING_SOFTWARE |
+            SOF_TIMESTAMPING_OPT_ID | SOF_TIMESTAMPING_OPT_TSONLY;
+    if (setsockopt(s, SOL_SOCKET, SO_TIMESTAMPING, &f, sizeof f)) { perror("SO_TIMESTAMPING"); return 1; }
+    struct sockaddr_in a = {.sin_family = AF_INET, .sin_port = htons(port)};
+    inet_pton(AF_INET, dst, &a.sin_addr);
+    connect(s, (void *)&a, sizeof a);
+    char buf[64] = {0}, ctl[256];
+    int64_t *t0 = calloc(n, sizeof *t0), *t1 = calloc(n, sizeof *t1);
+    for (uint32_t i = 0; i < (uint32_t)n; i++) {
+        memcpy(buf, &i, 4);
+        t0[i] = now_ns();
+        send(s, buf, sizeof buf, 0);
+        if (gap_us) { int64_t until = t0[i] + gap_us * 1000LL; while (now_ns() < until) ; }
+    }
+    // drain the error queue: one TX timestamp per datagram, ee_data = OPT_ID counter
+    int got = 0;
+    struct pollfd p = {s, POLLERR, 0};
+    while (got < n && poll(&p, 1, 500) > 0) {
+        struct msghdr m = {.msg_control = ctl, .msg_controllen = sizeof ctl};
+        if (recvmsg(s, &m, MSG_ERRQUEUE) < 0) break;
+        int64_t t = stamp_from(&m); uint32_t id = 0;
+        for (struct cmsghdr *c = CMSG_FIRSTHDR(&m); c; c = CMSG_NXTHDR(&m, c))
+            if (c->cmsg_level == SOL_IP && c->cmsg_type == IP_RECVERR)
+                id = ((struct sock_extended_err *)CMSG_DATA(c))->ee_data;
+        if (id < (uint32_t)n) { t1[id] = t; got++; }
+    }
+    uint32_t end = 0xffffffff; memcpy(buf, &end, 4);
+    for (int k = 0; k < 3; k++) send(s, buf, sizeof buf, 0);
+    for (int i = 0; i < n; i++) printf("%d %lld %lld\n", i, (long long)t0[i], (long long)t1[i]);
+    return 0;
+}
+
+int main(int argc, char **argv) {
+    if (argc >= 3 && !strcmp(argv[1], "rx"))
+        return rx(atoi(argv[2]), argc > 3 && !strcmp(argv[3], "spin"),
+                  argc > 4 ? atoi(argv[4]) : 0, argc > 5 ? atoi(argv[5]) : 0);
+    if (argc >= 6 && !strcmp(argv[1], "tx"))
+        return tx(argv[2], atoi(argv[3]), atoi(argv[4]), atoi(argv[5]));
+    fprintf(stderr, "usage: udplat rx PORT [block|spin] [RCVBUF] [WORK_US]\n"
+                    "       udplat tx DST PORT COUNT GAP_US\n");
+    return 2;
+}
+```
+
+Build it with the system compiler (no extra libraries):
+
+```bash
+gcc -O2 -Wall -o udplat udplat.c
+```
+
+`budget.py` joins the two outputs on the sequence number and prints percentiles for each stage:
+
+```python
+#!/usr/bin/env python3
+"""Join tx.txt (seq t0 t1) and rx.txt (seq t2 t3) and print percentiles of
+each stage in microseconds.  usage: budget.py TX RX LABEL"""
+import sys
+tx = {int(a): (int(b), int(c)) for a, b, c in (l.split() for l in open(sys.argv[1]))}
+rx = {int(a): (int(b), int(c)) for a, b, c in (l.split() for l in open(sys.argv[2]))}
+both = [k for k in tx if k in rx and tx[k][1] > 0 and rx[k][0] > 0]
+def pct(v, p): v = sorted(v); return v[min(len(v) - 1, int(p / 100 * len(v)))]
+stages = {
+    "send path   t1-t0": [tx[k][1] - tx[k][0] for k in both],
+    "veth+rx     t2-t1": [rx[k][0] - tx[k][1] for k in both],
+    "sock->app   t3-t2": [rx[k][1] - rx[k][0] for k in both],
+    "total       t3-t0": [rx[k][1] - tx[k][0] for k in both],
+}
+print(f"   {sys.argv[3]}: sent={len(tx)} received={len(rx)} lost={len(tx) - len(rx)}")
+print(f"   {'stage (us)':<20}{'p50':>9}{'p90':>9}{'p99':>9}{'max':>10}")
+for name, v in stages.items():
+    print(f"   {name:<20}" + "".join(f"{pct(v, p) / 1000:>9.1f}" for p in (50, 90, 99)) + f"{max(v) / 1000:>10.1f}")
+```
+
+### The namespaces and the three runs
+
+```bash
+#!/bin/sh
+# Run as: unshare -urnm sh lab.sh     (two namespaces joined by one veth)
+set -e
+mount -t tmpfs tmpfs /run; mkdir -p /run/netns
+ip netns add a; ip netns add b
+ip link add va type veth peer name vb; ip link set va netns a; ip link set vb netns b
+ip -n a addr add 10.9.0.1/24 dev va; ip -n b addr add 10.9.0.2/24 dev vb
+for n in a b; do ip -n $n link set lo up; done
+ip -n a link set va up; ip -n b link set vb up
+H=$(pwd); A="ip netns exec a"; B="ip netns exec b"
+snmp() { $B awk '/^Udp:/ {if (!h) {split($0,k); h=1} else {for (i=2;i<=NF;i++) if (k[i]=="InDatagrams"||k[i]=="RcvbufErrors") printf "   b Udp %s=%s\n", k[i], $i}}' /proc/net/snmp; }
+run() { # label rx-args tx-count tx-gap
+  $B $H/udplat rx 9000 $2 > /tmp/rx.txt & R=$!; sleep 0.2
+  $A $H/udplat tx 10.9.0.2 9000 $3 $4 > /tmp/tx.txt
+  wait $R; python3 $H/budget.py /tmp/tx.txt /tmp/rx.txt "$1"; }
+
+echo "== 1. 2000 datagrams, 1 ms apart, receiver blocked in recvmsg()"
+run "blocking rx" "block" 2000 1000
+echo "== 2. same traffic, receiver spinning on recvmsg(MSG_DONTWAIT)"
+run "spinning rx" "spin" 2000 1000
+echo "== 3. back-to-back burst, 4 KiB SO_RCVBUF, receiver does 20 us of work per datagram"
+snmp
+run "slow rx, burst" "block 4096 20" 2000 0
+snmp
+```
+
+```bash
+unshare -urnm sh lab.sh
+```
+
+Output, unedited (8-vCPU VM, kernel 6.12.94+, gcc 14.2.0):
+
+```text
+== 1. 2000 datagrams, 1 ms apart, receiver blocked in recvmsg()
+   blocking rx: sent=2000 received=2000 lost=0
+   stage (us)                p50      p90      p99       max
+   send path   t1-t0         1.7     10.6     32.2      49.3
+   veth+rx     t2-t1         0.2      0.3      0.5       0.6
+   sock->app   t3-t2        13.8    168.6    263.5     283.3
+   total       t3-t0        17.0    176.6    265.4     295.7
+== 2. same traffic, receiver spinning on recvmsg(MSG_DONTWAIT)
+   spinning rx: sent=2000 received=2000 lost=0
+   stage (us)                p50      p90      p99       max
+   send path   t1-t0         1.1      6.0     23.8      40.9
+   veth+rx     t2-t1         0.1      0.2      0.8       0.9
+   sock->app   t3-t2         1.4      2.2      9.5      30.2
+   total       t3-t0         2.7      8.9     31.5      47.2
+== 3. back-to-back burst, 4 KiB SO_RCVBUF, receiver does 20 us of work per datagram
+   b Udp InDatagrams=4002
+   b Udp RcvbufErrors=0
+   slow rx, burst: sent=2000 received=121 lost=1879
+   stage (us)                p50      p90      p99       max
+   send path   t1-t0         0.9      2.1      8.8       8.8
+   veth+rx     t2-t1         0.1      0.1      1.0       1.0
+   sock->app   t3-t2       259.9    376.2    395.6     395.6
+   total       t3-t0       260.9    376.8    396.3     396.3
+   b Udp InDatagrams=4124
+   b Udp RcvbufErrors=1879
+```
+
+## Reading the numbers
+
+### Run 1: the idle path is dominated by wake-up, not by networking
+
+With one datagram per millisecond and the receiver blocked in `recvmsg()`:
+
+- **Send path, p50 1.7 µs.** Syscall entry, UDP header, route lookup, neighbour lookup, qdisc (the default `noqueue` on veth) and the driver call. This is the part people usually blame, and it is small.
+- **veth + rx, p50 0.2 µs.** This is *not* a wire. veth passes the skb straight into the peer's receive path in the same call chain, so t1 and t2 are taken a few hundred nanoseconds apart on the same CPU. On real hardware this interval holds the NIC queue, serialization, the cable, any switches, the remote NIC and its interrupt moderation. See the budget table below.
+- **sock->app, p50 13.8 µs, p90 169 µs.** This interval holds the IP/UDP receive work, the socket lookup and enqueue, and then the wait while the scheduler wakes the receiving thread and the syscall returns. The long tail comes from the receiving CPU having gone idle (deeper idle states take longer to leave) and from this being a virtual machine whose vCPUs are themselves scheduled.
+
+So on an idle path, about 80 percent of the median and nearly all of the tail is the cost of the receiver *not running* when the packet arrived.
+
+### Run 2: spinning removes the wake-up
+
+Same traffic, but the receiver loops on `recvmsg(MSG_DONTWAIT)` and never sleeps:
+
+- sock->app falls from 13.8 µs to **1.4 µs** at p50, and from 264 µs to **9.5 µs** at p99.
+- The total one-way median falls from 17 µs to **2.7 µs**.
+
+The difference, roughly 12 µs at the median, is the wake-up cost on this machine. Spinning buys it back at the cost of one CPU at 100 percent all the time. That is the trade every low-latency system makes in some form. Kernel busy polling (`SO_BUSY_POLL`, `net.core.busy_read`, `net.core.busy_poll`) is the in-kernel version: the receiving syscall polls the device's NAPI queue directly instead of sleeping. It only applies to devices with NAPI, so it is not exercised over plain veth here. The `SO_BUSY_POLL` description is in `socket(7)`.
+
+### Run 3: under load, the queue is the latency
+
+A back-to-back burst of 2000 datagrams into a receiver with `SO_RCVBUF` set to 4096 bytes, doing 20 µs of "work" per datagram:
+
+- Only **121 of 2000** arrived. The kernel counted the rest: `RcvbufErrors` went from 0 to **1879**, exactly the number lost. This counter, in `/proc/net/snmp` (or `nstat -az UdpRcvbufErrors`, or the `drops` column of `/proc/net/udp`), is the first thing to check when a UDP application "loses packets" that `tcpdump` saw arrive.
+- The ones that did arrive waited **260 µs at p50 and 396 µs at worst** between the receive stamp and the application. The send path and the "wire" did not change at all. All of the extra latency is datagrams sitting in the socket queue behind other datagrams.
+
+Two details explain the small number. First, `socket(7)` says the kernel doubles the requested `SO_RCVBUF` to allow for bookkeeping overhead, so 4096 becomes 8192 bytes. Second, the buffer is charged with each skb's *truesize* (the payload plus the skb and its memory slab), not with the 64-byte payload. That is why only a handful of tiny datagrams fit. A buffer sized as "messages × payload size" is always too small.
+
+## The full one-way budget
+
+The lab measured the host parts. The parts on the wire are arithmetic:
+
+| Stage | Typical size | Measured here? |
+|-------|-------------|----------------|
+| Send syscall + UDP/IP + qdisc + driver | 1–10 µs | yes (t1−t0: 1.7 µs p50) |
+| NIC TX queue and DMA | sub-µs to µs when the queue is empty; unbounded when it is full | no |
+| Serialization: 64 B frame (84 B on the wire with preamble and IFG) | 672 ns at 1 Gb/s, 67 ns at 10 Gb/s, 6.7 ns at 100 Gb/s | no (arithmetic) |
+| Serialization: 1500 B frame (1538 B on the wire) | 12.3 µs at 1 Gb/s, 1.23 µs at 10 Gb/s | no (arithmetic) |
+| Propagation in fibre or copper | about 5 µs per km (2 m: about 10 ns) | no (arithmetic) |
+| Switch, cut-through | hundreds of ns per hop | no |
+| Switch, store-and-forward | one extra serialization per hop + lookup | no |
+| RX interrupt moderation (`ethtool -c`, `rx-usecs`) | up to the configured value, often tens of µs; driver-dependent | no |
+| IP/UDP receive + socket enqueue + wake-up + syscall return | 2–15 µs idle, ms when queued | yes (t3−t2: 13.8 µs blocking, 1.4 µs spinning) |
+
+Read it as a ladder of fixes, cheapest first:
+
+1. **Don't queue.** Size socket buffers from measured bursts. Read the drop counters. Keep the consumer faster than the producer. Run 3 shows a queue can cost a hundred times more than everything else.
+2. **Don't sleep.** Spin (run 2), busy-poll, or pin the receiving thread to a CPU that is kept out of deep idle states.
+3. **Don't moderate.** Lower `rx-usecs` on the NIC when latency matters more than CPU use.
+4. **Don't enter the kernel.** AF_XDP (in-kernel, zero-copy to a user-space ring, still using the kernel driver) and full kernel bypass such as DPDK remove the syscall, the skb and the socket from the path. They also remove the tools you just used: no socket, no `RcvbufErrors`, no `ss`. You take on the job of measuring.
+
+## Case
+
+A trading-adjacent team saw "network jitter" of up to 400 µs between two hosts in the same rack and asked for a faster switch. They added `SO_TIMESTAMPING` to their UDP receiver (RX software and hardware stamps) and logged t2 and t3 for a day. The hardware-to-application time was 3 µs at the median. The tail came entirely from the consumer thread being descheduled behind a logging thread on the same core, plus a 256 KiB receive buffer that filled during bursts and produced `RcvbufErrors` every market open. The fix was CPU pinning, a busy-polling receive loop, and a buffer sized from the measured burst. The switch stayed.
+
+## Trap
+
+**"tcpdump saw it, so the application got it."** `tcpdump` taps the packet on the receive path, before UDP checks the socket buffer. A datagram can show up in a capture and still be dropped at the socket. Check `RcvbufErrors`.
+
+**"Bigger buffers fix latency."** Bigger buffers fix *drops*. Run 3 with a larger buffer would deliver more datagrams, each waiting longer. If the consumer is slower than the producer, a bigger buffer turns loss into delay.
+
+**"veth timings are network timings."** veth has no wire, no interrupt and no coalescing. The 0.2 µs between t1 and t2 here is not a benchmark of anything. The *host* stages and the wake-up effect carry over to real NICs; the middle column does not.
+
+**"Software timestamps are exact."** They are taken by the CPU at points near the driver, so they include some driver and scheduling jitter. For sub-microsecond work use hardware timestamps and a PTP-disciplined clock.
+
+## Boring rule
+
+Measure the four timestamps before tuning anything. If t3−t2 dominates, the problem is your process (sleeping or queueing), not the network. Watch `RcvbufErrors` in every UDP service's dashboard.
+
+## Try this
+
+1. Pin sender and receiver to different CPUs (`taskset -c 2 ...` inside each `ip netns exec`) and rerun run 1. Then pin both to the same CPU. Which stage moves?
+2. Rerun run 3 with `SO_RCVBUF` at 262144 and then 4194304 (the kernel caps it at `net.core.rmem_max` unless you use `SO_RCVBUFFORCE`, which needs `CAP_NET_ADMIN`). Plot lost vs median sock->app.
+3. Add `SOF_TIMESTAMPING_TX_SCHED` to the sender flags. The kernel then also reports when the packet entered the qdisc. Split t1−t0 into "before the qdisc" and "after".
+4. Replace the 20 µs busy-wait in the receiver with `usleep(20)` and explain why the latency gets much worse than 20 µs per datagram.
+
+## Verification
+
+- `udplat.c` was compiled with gcc 14.2.0 and run with `unshare -urnm sh lab.sh` as an unprivileged user on an 8-vCPU VM (kernel 6.12.94+). No root, no sudo, nothing installed. The output is pasted verbatim.
+- Absolute numbers are specific to this VM and will vary between runs and machines, especially the tails. The relationships (wake-up much larger than the stack when idle; queueing larger than everything else under load; lost = RcvbufErrors delta) are what to check.
+- Not run: hardware timestamps, kernel busy polling, `ethtool -C`, AF_XDP and DPDK. The table rows marked "no" are arithmetic or come from the cited documentation.
+
+## Sources
+
+- Linux kernel documentation, *Timestamping*: <https://docs.kernel.org/networking/timestamping.html>
+- `socket(7)` (`SO_RCVBUF` doubling, `SO_BUSY_POLL`, `SO_TIMESTAMPING`): <https://man7.org/linux/man-pages/man7/socket.7.html>
+- `udp(7)` and the `Udp:` counters in `/proc/net/snmp`: <https://man7.org/linux/man-pages/man7/udp.7.html>
+- Linux kernel documentation, *NAPI* (busy polling): <https://docs.kernel.org/networking/napi.html>
+- Linux kernel documentation, *AF_XDP*: <https://docs.kernel.org/networking/af_xdp.html>
+- `ethtool(8)` (interrupt coalescing, `-c` / `-C`): <https://man7.org/linux/man-pages/man8/ethtool.8.html>
+- IEEE 802.3 framing overhead (preamble 7 + SFD 1 + IFG 12 bytes) as used in the serialization arithmetic.

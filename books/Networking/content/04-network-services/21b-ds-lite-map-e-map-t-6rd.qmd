@@ -1,0 +1,639 @@
+---
+title: "IPv4 as a Service over IPv6: DS-Lite, MAP-E, MAP-T and 6rd"
+author:
+  - name: "K19G"
+  - name: "grok-bot"
+---
+
+# IPv4 as a Service over IPv6: DS-Lite, MAP-E, MAP-T and 6rd
+
+Many access networks built in the last ten years carry only IPv6 between the subscriber and the provider. The provider runs one protocol on the access side, numbers millions of customer routers without touching IPv4 space, and still has to deliver IPv4 to every home, because a large part of the Internet is still IPv4-only. There are two ways to do that. Translation rewrites IPv6 headers into IPv4 headers; that is NAT64 and 464XLAT, covered in their own chapter. Encapsulation carries the customer's IPv4 packets unchanged inside IPv6 to a box that sends them on to the IPv4 Internet; that is DS-Lite and MAP-E. MAP-T is the stateless-translation cousin of MAP-E. 6rd does the opposite: it carries IPv6 over an IPv4-only access network.
+
+This chapter takes the four mechanisms apart at the packet and bit level. The lab builds a DS-Lite B4 and AFTR and a MAP-E CE and Border Relay out of raw IPv6 sockets in an unprivileged network namespace. Two homes with the same private address share one public address, a 1500-byte link fragments exactly where RFC 6333 says it must, and a stateless BR drops a spoofed port it has never seen before. A small calculator reproduces every worked example in the MAP RFCs.
+
+## Learning goals
+
+- Explain why a provider runs IPv6-only access and the difference between stateful centralised (DS-Lite) and stateless distributed (MAP) IPv4 service.
+- Trace a DS-Lite packet from the home through the B4 and the AFTR, and say what the AFTR's binding key is and why it lets every home use 192.168.1.0/24.
+- Derive a MAP CE's IPv4 address, PSID, port set and IPv6 address from a Basic Mapping Rule and an end-user prefix, and do the reverse at the BR.
+- Describe how a MAP BR validates source addresses without per-flow state.
+- Compute a 6rd delegated prefix from the CE's IPv4 address.
+- Handle the 40-byte MTU cost of IPv4-in-IPv6, and plan logging for shared IPv4 addresses.
+
+## Version note
+
+The lab ran on Linux 6.12.94 with Python 3.13.5 (standard library only) and iproute2 6.15.0, as an ordinary user inside `unshare -urnm`. This kernel has no `ip6_tunnel` or `sit` support loaded and modules cannot be loaded without root, so the tunnel endpoints are written in Python on raw IPv6 sockets with next header 4; the packets on the veth are real IPv4-in-IPv6 packets and the kernel does the IPv6 fragmentation and reassembly. No real AFTR, BR or CE software (Jool, VPP, OpenWrt's `ds-lite` and `map` packages, ISC Kea) was run; the "In production" section is written from their documentation and the RFCs and is marked as not run.
+
+## Why IPv6-only access
+
+A provider that runs dual-stack access has to number every customer twice and operate two address plans, two sets of DHCP servers, two sets of ACLs and two routing tables on every access router. The IPv4 half no longer scales: there is no new IPv4 space, and every subscriber already needs a share of a public address. Moving the access network to IPv6 only and treating IPv4 as an overlay service fixes the operational half. The question is where the IPv4 state lives.
+
+```text
+                         where is IPv4 NAPT state?           per-flow state in core?
+DS-Lite (RFC 6333)       AFTR, centralised (CGN)             yes, every flow
+Lightweight 4over6 (7596) CE; AFTR keeps one binding per CE  per subscriber only
+MAP-E (RFC 7597)         CE; BR is stateless                 none
+MAP-T (RFC 7599)         CE; BR is stateless (translates)    none
+NAT64 + 464XLAT          PLAT (translation, own chapter)     yes, every flow
+6rd (RFC 5969)           none: IPv6 carried over IPv4        none
+```
+
+## DS-Lite: one tunnel per home, one big NAT in the core
+
+DS-Lite (RFC 6333) splits the job between two boxes.
+
+- The **B4** (Basic Bridging BroadBand element) is the home router's IPv4 side. It has no public IPv4 address and does no NAT. It takes the home's private IPv4 packets and wraps them, unchanged, in an IPv6 header with next header 4 (IPv4-in-IPv6, the generic tunnel of RFC 2473), addressed to the AFTR.
+- The **AFTR** (Address Family Transition Router) removes the IPv6 header and does carrier-grade NAPT to a public IPv4 pool.
+
+```text
+home LAN                 B4 (CPE)                  access (IPv6 only)            AFTR                      IPv4 Internet
+192.168.1.10:5000  -->  [IPv6 2001:db8:a::10 -> 2001:db8:a::1, nh=4][IPv4 192.168.1.10:5000 -> 198.51.100.7:7]
+                                                                             --> NAPT --> 192.0.2.1:40000 -> 198.51.100.7:7
+```
+
+The key idea is the AFTR's binding key. A home NAT keys its table by inner source address and port. The AFTR cannot do that, because every home on the access network may use 192.168.1.10. It keys the table by the softwire, the B4's IPv6 address, plus the inner 5-tuple. RFC 6888 (CGN requirements) spells out the consequence for pooling: with overlapping inner ranges such as DS-Lite, "paired" pooling applies per subscriber (per softwire), not per inner IP address.
+
+Other fixed parts:
+
+- **Well-known addresses.** IANA set aside 192.0.0.0/29 for the softwire itself: 192.0.0.1 for the AFTR and 192.0.0.2 for the B4 (RFC 6333 section 5.7). Traceroutes from a DS-Lite home show 192.0.0.1 as the first IPv4 hop beyond the B4.
+- **Finding the AFTR.** The CPE learns the AFTR's name from DHCPv6 option `OPTION_AFTR_NAME` (64, RFC 6334) and resolves it over IPv6.
+- **The AFTR is a CGN.** It inherits the RFC 6888 requirements: endpoint-independent mapping and filtering for UDP and TCP (RFC 4787 and 5382 behaviour), a configurable limit on ports per subscriber (REQ-4), and logs that let an abuse report naming a public address, port and time be traced back to a softwire. Logging every flow is expensive; most deployments allocate port blocks per subscriber and log only the block allocation.
+
+**Lightweight 4over6** (RFC 7596) keeps the DS-Lite tunnel but moves the NAPT to the CPE. The provider hands each CPE a public IPv4 address and a port set (the same port-set idea MAP uses), and the lwAFTR keeps one binding per subscriber instead of one per flow.
+
+## MAP: putting the IPv4 address inside the IPv6 prefix
+
+MAP removes per-subscriber state from the core altogether. The trick is that the IPv6 prefix delegated to the CE already encodes the CE's public IPv4 address and its share of the port space, so any box that knows the rule can compute one from the other.
+
+### The Basic Mapping Rule
+
+A MAP domain has a **Basic Mapping Rule (BMR)** made of three parameters:
+
+- **Rule IPv6 prefix**, for example 2001:db8::/40;
+- **Rule IPv4 prefix**, for example 192.0.2.0/24;
+- **EA-bits length**, for example 16.
+
+The CE gets an end-user IPv6 prefix that starts with the rule IPv6 prefix. The **EA bits** (embedded address bits) are the next EA-length bits of that prefix. The first `32 - IPv4 prefix length` of them are the IPv4 address suffix. The rest are the **PSID**, the port-set identifier.
+
+```text
+end-user prefix 2001:db8:0012:34 00::/56
+                |--- 40 bits ---|-16 EA-|
+rule IPv6 prefix 2001:db8::/40   EA bits = 0x1234
+                                 |0x12 | 0x34|
+                                 IPv4   PSID
+                                 suffix (q = 16 - 8 = 8 bits)
+IPv4 = 192.0.2.0/24 + 0x12 = 192.0.2.18,  PSID = 0x34
+```
+
+### Port sets
+
+With q PSID bits, 2^q CEs share one IPv4 address (the sharing ratio). RFC 7597 section 5.1 spreads each CE's ports across the port space with the **GMA** (generalised modulus) algorithm. A port number is split into three fields:
+
+```text
+   0                   1
+   0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5
+  +-----------+-----------+-------+
+  |    A      |   PSID    |   j   |
+  +-----------+-----------+-------+
+  |<- a bits->|<- q bits->|<- m ->|      a + q + m = 16
+```
+
+- `a` is the PSID offset, 6 by default. Values of A from 1 to 63 are allowed; A = 0 is excluded, which keeps ports 0 to 1023 out of every set.
+- `m` is whatever is left. Each value of A gives a contiguous range of 2^m ports.
+
+With a = 6 and q = 8, m = 2: 63 ranges of 4 ports, 252 ports per CE. PSID 0x34 owns 1232 to 1235, 2256 to 2259, and so on up to 64720 to 64723. The BR finds the PSID of any port by taking the middle q bits; no table is involved.
+
+### The CE's IPv6 address
+
+The CE's MAP IPv6 address, the one it uses as the tunnel source, is the end-user prefix completed with an interface identifier of 16 zero bits, the 32-bit IPv4 address and the 16-bit PSID (RFC 7597 section 6). For the example: 2001:db8:12:3400:0:c000:212:34. That address appears in the lab.
+
+### What the BR checks
+
+A BR receiving an encapsulated packet extracts the IPv4 address and PSID from the outer IPv6 source with the matching rule, then extracts the source address and port from the inner IPv4 packet. If they do not match, the packet "MUST be silently discarded and a counter incremented to indicate that a potential spoofing attack may be underway" (RFC 7597 section 8.1). That is the stateless equivalent of BCP 38: a CE can only send from its own address and its own ports. In the other direction the BR takes a packet for 192.0.2.18 port 1232, computes the PSID from the port, joins the IPv4 suffix and PSID into EA bits, and gets the CE's IPv6 address. Again no table.
+
+### Forwarding Mapping Rules, MAP-E vs MAP-T
+
+A **Forwarding Mapping Rule (FMR)** lets a CE apply the same arithmetic itself, so traffic between two CEs in the same domain goes directly CE to CE instead of hair-pinning through the BR (mesh mode). Without FMRs (hub and spoke) everything goes through the BR. A **Default Mapping Rule (DMR)** points at the BR for everything outside the domain.
+
+MAP-E encapsulates: the original IPv4 packet rides intact behind a 40-byte IPv6 header. MAP-T (RFC 7599) translates instead. The CE's NAT44 output is rewritten into an IPv6 packet whose source is the CE's MAP address and whose destination embeds the IPv4 destination in the DMR prefix using the RFC 6052 format; the BR translates back. MAP-T saves the 40 bytes and lets IPv6 middleboxes see real transport headers, but it inherits translation's limits (options, fragments and anything carrying addresses in the payload). The DHCPv6 options for all of this are in RFC 7598: `OPTION_S46_RULE` (89), `OPTION_S46_BR` (90), `OPTION_S46_DMR` (91), `OPTION_S46_V4V6BIND` (92), `OPTION_S46_PORTPARAMS` (93) and the containers `OPTION_S46_CONT_MAPE` (94), `OPTION_S46_CONT_MAPT` (95) and `OPTION_S46_CONT_LW` (96).
+
+## 6rd: the mirror image
+
+6rd (RFC 5969) solves the reverse problem: an IPv4-only access network that wants to give customers native-looking IPv6. The CE's delegated IPv6 prefix is the provider's **6rd prefix** followed by the CE's IPv4 address with its first `IPv4MaskLen` bits removed (the bits common to every CE). The packets are IPv6-in-IPv4, protocol 41. The parameters come from DHCPv4 option `OPTION_6RD` (212). With 6rd prefix 2001:db8::/32 and IPv4MaskLen 0, the CE 192.0.2.130 gets 2001:db8:c000:282::/64. With a provider whose CEs are all in 10.0.0.0/8, IPv4MaskLen 8 saves 8 bits and the same /32 yields /56s.
+
+## MTU: the 40 bytes have to come from somewhere
+
+IPv4-in-IPv6 adds a 40-byte header, so a 1500-byte IPv4 packet from the home becomes 1540 bytes. RFC 6333 section 5.3 gives the order of preference. First, raise the MTU between B4 and AFTR by at least 40 bytes. If that is impossible, the B4 must fragment the IPv6 packet after encapsulation, and the AFTR must reassemble before decapsulation. "The inner IPv4 packet MUST NOT be fragmented." In practice operators also clamp TCP MSS on the CPE so that TCP never produces 1500-byte packets in the first place. MAP-E has the same problem. MAP-T and NAT64 shrink IPv4 headers into IPv6 headers, which costs 20 bytes rather than 40. 6rd costs 20 bytes on the IPv4 side.
+
+## The lab
+
+The lab builds one user and network namespace with `unshare -urnm` (no root needed), mounts a private `/run` so `ip netns` works, and creates two network namespaces joined by a 1500-byte veth that carries IPv6 only:
+
+- **cpe** holds two DS-Lite B4 addresses (2001:db8:a::10 and ::20, two different homes) and the MAP-E CE address from RFC 7597 example 1.
+- **core** holds the AFTR's softwire endpoint, the BR address, the AFTR's public IPv4 address 192.0.2.1 and a UDP echo server at 198.51.100.7:7 standing in for the IPv4 Internet.
+
+`softwire.py` implements each role on raw IPv6 sockets with protocol 4, so the kernel hands it the inner IPv4 packet and builds the outer IPv6 header itself. The B4 sends a hand-built IPv4/UDP packet with DF set. The AFTR keeps a NAPT table keyed by (softwire IPv6 address, inner source, inner port), opens a real UDP socket on 192.0.2.1 per mapping and re-encapsulates replies. The BR validates per RFC 7597 section 8.1 and forwards valid packets through a raw IPv4 socket. Downstream packets for 192.0.2.0/24 are routed into a TUN device named `mapbr`, and the BR computes the CE address from destination address and port. `mapcalc.py` holds the MAP and 6rd arithmetic and prints the RFC appendix values next to its own.
+
+To run it: `unshare -urnm sh lab-softwire.sh` in a folder with the three files.
+
+`lab-softwire.sh`:
+
+```bash
+#!/bin/sh
+# Run as: unshare -urnm sh lab-softwire.sh   (no root, no installs)
+set -e
+cd "$(dirname "$0")"
+mount -t tmpfs none /run && mkdir -p /run/netns
+for n in cpe core; do ip netns add $n; ip -n $n link set lo up; done
+ip -n cpe link add v0 type veth peer name v0 netns core
+ip -n cpe link set v0 mtu 1500 up; ip -n core link set v0 mtu 1500 up
+# IPv6-only access link: two DS-Lite B4s and one MAP-E CE on the subscriber side
+ip -n cpe  addr add 2001:db8:a::10/64 dev v0 nodad
+ip -n cpe  addr add 2001:db8:a::20/64 dev v0 nodad
+ip -n core addr add 2001:db8:a::1/64 dev v0 nodad          # AFTR softwire endpoint
+ip -n core addr add 2001:db8:ffff::1/128 dev v0 nodad      # MAP BR address
+ip -n cpe  addr add 2001:db8:12:3400:0:c000:212:34/128 dev v0 nodad   # MAP CE (RFC 7597 ex. 1)
+ip -n cpe  route add 2001:db8:ffff::1/128 dev v0
+ip -n core route add 2001:db8:12:3400::/56 dev v0
+# "Internet" side lives in core: AFTR public address and a UDP echo server
+ip -n core addr add 192.0.2.1/32 dev lo
+ip -n core addr add 198.51.100.7/32 dev lo
+X="ip netns exec"
+v6stat() { $X core awk -v k="$1" '$1==k{print $2}' /proc/net/snmp6; }
+echo "### $(uname -r), $(python3 -V), $(ip -V)"
+echo; echo "== 1. DS-Lite: two subscribers with the same private address 192.168.1.10 =="
+RUN=4 $X core python3 softwire.py server 198.51.100.7 7 > srv.out & S=$!
+RUN=4 $X core python3 softwire.py aftr 2001:db8:a::1 192.0.2.1 > aftr.out & A=$!
+sleep 0.5
+$X cpe python3 softwire.py b4 2001:db8:a::10 2001:db8:a::1 192.168.1.10
+$X cpe python3 softwire.py b4 2001:db8:a::20 2001:db8:a::1 192.168.1.10
+wait $A $S; cat srv.out aftr.out
+echo; echo "== 2. MTU: inner IPv4 of 1460 and 1500 bytes over a 1500-byte IPv6 link =="
+RUN=4 $X core python3 softwire.py server 198.51.100.7 7 > srv.out & S=$!
+RUN=4 $X core python3 softwire.py aftr 2001:db8:a::1 192.0.2.1 > aftr.out & A=$!
+sleep 0.5
+for size in 1460 1500; do
+  f0=$($X cpe awk '$1=="Ip6FragCreates"{print $2}' /proc/net/snmp6); r0=$(v6stat Ip6ReasmOKs)
+  $X cpe python3 softwire.py b4 2001:db8:a::10 2001:db8:a::1 192.168.1.10 $size
+  f1=$($X cpe awk '$1=="Ip6FragCreates"{print $2}' /proc/net/snmp6); r1=$(v6stat Ip6ReasmOKs)
+  echo "   inner $size B -> IPv6 $((size + 40)) B: B4 Ip6FragCreates +$((f1 - f0)), AFTR Ip6ReasmOKs +$((r1 - r0))"
+done
+wait $A $S; cat srv.out
+echo; echo "== 3. MAP-E: stateless BR validating CE 2001:db8:12:3400:0:c000:212:34 =="
+RUN=6 $X core python3 softwire.py server 198.51.100.7 7 > srv.out & S=$!
+RUN=6 $X core python3 softwire.py br 2001:db8:ffff::1 2001:db8::/40 192.0.2.0/24 16 > br.out & B=$!
+sleep 0.5
+for t in "192.0.2.18 1232" "192.0.2.18 64723" "192.0.2.18 5000" "192.0.2.19 1232"; do
+  set -- $t; $X cpe python3 softwire.py ce 2001:db8:12:3400:0:c000:212:34 2001:db8:ffff::1 $1 $2
+done
+wait $B $S; cat br.out srv.out
+echo; echo "== 4. MAP rule arithmetic =="
+python3 mapcalc.py
+```
+
+`softwire.py`:
+
+```python
+#!/usr/bin/env python3
+"""Userspace DS-Lite B4/AFTR and MAP-E CE/BR over real IPv4-in-IPv6
+(IPv6 next header 4) packets, using raw sockets inside a netns.
+Roles: aftr | b4 | br | ce | server"""
+import fcntl, ipaddress as ip, os, select, socket, struct, subprocess, sys, time
+from mapcalc import psid_of_port
+
+IPPROTO_IPIP = 4
+
+def csum(b):
+    if len(b) % 2: b += b"\0"
+    s = sum(struct.unpack(f"!{len(b)//2}H", b)); s = (s >> 16) + (s & 0xffff); s += s >> 16
+    return ~s & 0xffff
+
+def ipv4_udp(src, sport, dst, dport, payload, ident=0):
+    udp_len = 8 + len(payload)
+    ph = socket.inet_aton(src) + socket.inet_aton(dst) + struct.pack("!BBH", 0, 17, udp_len)
+    udp = struct.pack("!HHHH", sport, dport, udp_len, 0) + payload
+    udp = udp[:6] + struct.pack("!H", csum(ph + udp) or 0xffff) + udp[8:]
+    hdr = struct.pack("!BBHHHBBH4s4s", 0x45, 0, 20 + udp_len, ident, 0x4000, 64, 17, 0,
+                      socket.inet_aton(src), socket.inet_aton(dst))   # DF set, like most hosts
+    hdr = hdr[:10] + struct.pack("!H", csum(hdr)) + hdr[12:]
+    return hdr + udp
+
+def parse_v4(p):
+    ihl = (p[0] & 0x0f) * 4
+    src, dst = socket.inet_ntoa(p[12:16]), socket.inet_ntoa(p[16:20])
+    sport, dport, ulen = struct.unpack("!HHH", p[ihl:ihl + 6])
+    return src, sport, dst, dport, p[ihl + 8:ihl + ulen]
+
+def raw6(bind=None):
+    s = socket.socket(socket.AF_INET6, socket.SOCK_RAW, IPPROTO_IPIP)
+    if bind: s.bind((bind, 0))
+    return s
+
+def aftr(local6, public4, log=print):
+    """DS-Lite AFTR: decapsulate, NAPT keyed by (B4 IPv6, inner src, inner sport)."""
+    tun = raw6(local6)
+    table, socks, nextport = {}, {}, 40000
+    deadline = time.time() + float(os.environ.get("RUN", "6"))
+    while time.time() < deadline:
+        r, _, _ = select.select([tun] + list(socks), [], [], 0.2)
+        for s in r:
+            if s is tun:
+                pkt, (b4, *_) = tun.recvfrom(65535)
+                src, sport, dst, dport, data = parse_v4(pkt)
+                key = (b4, src, sport)
+                if key not in table:
+                    u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); u.bind((public4, nextport))
+                    table[key] = nextport; socks[u] = key; nextport += 1
+                    log(f"AFTR new mapping  [{b4}] {src}:{sport} -> {public4}:{table[key]}  (inner packet {len(pkt)} B)")
+                u = next(k for k, v in socks.items() if v == key)
+                u.sendto(data, (dst, dport))
+            else:
+                data, (rsrc, rport) = s.recvfrom(65535)
+                b4, src, sport = socks[s]
+                tun.sendto(ipv4_udp(rsrc, rport, src, sport, data), (b4, 0))
+    log("AFTR binding table:")
+    for (b4, src, sport), port in table.items():
+        log(f"  softwire {b4:18s} inner {src}:{sport} <-> {public4}:{port}")
+
+def b4(local6, aftr6, inner_src, size=60):
+    tun = raw6(local6)
+    payload = f"hi from B4 {local6}".encode().ljust(size - 28, b".")
+    pkt = ipv4_udp(inner_src, 5000, "198.51.100.7", 7, payload)
+    try:
+        tun.sendto(pkt, (aftr6, 0))
+    except OSError as e:
+        print(f"B4 {local6}: send {len(pkt)} B inner IPv4 ({len(pkt) + 40} B IPv6) failed: {e.strerror}"); return
+    tun.settimeout(2)
+    try:
+        while True:
+            r, (peer, *_) = tun.recvfrom(65535)
+            src, sport, dst, dport, data = parse_v4(r)
+            if dport == 5000 and dst == inner_src:
+                print(f"B4 {local6}: sent {len(pkt)} B inner, reply from {src}:{sport} to {dst}:{dport}: {data[:44].decode(errors='replace')!r}")
+                return
+    except socket.timeout:
+        print(f"B4 {local6}: no reply")
+
+def server(addr, port):
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.bind((addr, port)); s.settimeout(float(os.environ.get("RUN", "6")))
+    try:
+        while True:
+            data, peer = s.recvfrom(65535)
+            print(f"server {addr}:{port} got {len(data)} B from {peer[0]}:{peer[1]}")
+            s.sendto(b"echo to " + f"{peer[0]}:{peer[1]}".encode(), peer)
+    except socket.timeout:
+        pass
+
+def tun_open(name):
+    TUNSETIFF, IFF_TUN, IFF_NO_PI = 0x400454CA, 0x0001, 0x1000
+    fd = os.open("/dev/net/tun", os.O_RDWR)
+    fcntl.ioctl(fd, TUNSETIFF, struct.pack("16sH", name.encode(), IFF_TUN | IFF_NO_PI))
+    return fd
+
+def br(local6, rule_v6, rule_v4, ea_len, psid_offset=6):
+    """Stateless MAP-E BR. Upstream: validate the source per RFC 7597
+    section 8.1, then forward. Downstream: IPv4 packets routed into a TUN
+    device are mapped to the CE's IPv6 address from address + port alone."""
+    tun6 = raw6(local6)
+    out = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_RAW)
+    r6, r4 = ip.IPv6Network(rule_v6), ip.IPv4Network(rule_v4)
+    p = 32 - r4.prefixlen; q = ea_len - p
+    fd = tun_open("mapbr")
+    subprocess.run(["ip", "link", "set", "mapbr", "up"], check=True)
+    subprocess.run(["ip", "route", "add", str(r4), "dev", "mapbr"], check=True)
+    drops = fwd = down = 0
+    deadline = time.time() + float(os.environ.get("RUN", "6"))
+    while time.time() < deadline:
+        r, _, _ = select.select([tun6, fd], [], [], 0.2)
+        if tun6 in r:
+            pkt, (ce6, *_) = tun6.recvfrom(65535)
+            src, sport, dst, dport, data = parse_v4(pkt)
+            a6 = int(ip.IPv6Address(ce6))
+            ea = (a6 >> (128 - r6.prefixlen - ea_len)) & ((1 << ea_len) - 1)
+            want4 = ip.IPv4Address(int(r4.network_address) | (ea >> q))
+            want_psid = ea & ((1 << q) - 1)
+            got_psid = psid_of_port(sport, psid_offset, q)
+            ok = ip.IPv6Address(ce6) in r6 and str(want4) == src and got_psid == want_psid
+            print(f"BR up   from [{ce6}] inner {src}:{sport}: rule says {want4} PSID 0x{want_psid:02x}, "
+                  f"port's PSID 0x{got_psid:02x} -> {'forward' if ok else 'DROP (spoof counter +1)'}")
+            if ok:
+                out.sendto(pkt, (dst, 0)); fwd += 1
+            else:
+                drops += 1
+        if fd in r:
+            pkt = os.read(fd, 65535)
+            if pkt[0] >> 4 != 4 or pkt[9] != 17:
+                continue
+            src, sport, dst, dport, data = parse_v4(pkt)
+            suffix = int(ip.IPv4Address(dst)) & ((1 << p) - 1)
+            ea = (suffix << q) | psid_of_port(dport, psid_offset, q)
+            prefix = int(r6.network_address) | (ea << (128 - r6.prefixlen - ea_len))
+            ce6 = ip.IPv6Address(prefix | (int(ip.IPv4Address(dst)) << 16) | (ea & ((1 << q) - 1)))
+            print(f"BR down {src}:{sport} -> {dst}:{dport}: EA bits 0x{ea:04x} -> encapsulate to [{ce6}]")
+            tun6.sendto(pkt, (str(ce6), 0)); down += 1
+    print(f"BR totals: up forwarded {fwd}, up dropped {drops}, down mapped {down}; no per-flow state kept")
+
+def ce(local6, br6, src4, sport):
+    tun = raw6(local6); tun.settimeout(1)
+    tun.sendto(ipv4_udp(src4, sport, "198.51.100.7", 7, b"map-e test"), (br6, 0))
+    try:
+        while True:
+            r, _ = tun.recvfrom(65535)
+            s4, sp, d4, dp, data = parse_v4(r)
+            if (d4, dp) == (src4, sport):
+                print(f"CE  {src4}:{sport} got reply {data.decode()!r} from {s4}:{sp}"); return
+    except socket.timeout:
+        print(f"CE  {src4}:{sport} no reply")
+
+if __name__ == "__main__":
+    role, args = sys.argv[1], sys.argv[2:]
+    if role == "aftr":   aftr(*args)
+    elif role == "b4":   b4(args[0], args[1], args[2], int(args[3]) if len(args) > 3 else 60)
+    elif role == "server": server(args[0], int(args[1]))
+    elif role == "br":   br(args[0], args[1], args[2], int(args[3]))
+    elif role == "ce":   ce(args[0], args[1], args[2], int(args[3]))
+```
+
+`mapcalc.py`:
+
+```python
+#!/usr/bin/env python3
+"""MAP (RFC 7597/7599) rule arithmetic and 6rd (RFC 5969) prefix
+derivation, checked against the RFC appendix examples."""
+import ipaddress as ip
+
+def map_rule(enduser_prefix, rule_v6, rule_v4, ea_len, psid_offset=6, psid=None, psid_len=None):
+    """Return IPv4 address, PSID, PSID length, port ranges and CE IPv6 address."""
+    eu = ip.IPv6Network(enduser_prefix); r6 = ip.IPv6Network(rule_v6); r4 = ip.IPv4Network(rule_v4)
+    p = 32 - r4.prefixlen                         # IPv4 suffix bits carried in EA bits
+    if ea_len:
+        o = eu.prefixlen - r6.prefixlen          # EA bits present in this end-user prefix
+        ea = (int(eu.network_address) >> (128 - eu.prefixlen)) & ((1 << o) - 1)
+        suffix, q = ea >> (o - p), o - p
+        psid = ea & ((1 << q) - 1)
+    else:
+        suffix, q = 0, psid_len or 0
+        psid = psid or 0
+    v4 = ip.IPv4Address(int(r4.network_address) | suffix)
+    ranges = []
+    if q:
+        a, m = psid_offset, 16 - psid_offset - q          # A bits, M bits
+        for A in range(1 if a else 0, 1 << a):            # A = 0 excluded: ports 0-1023 (a = 6)
+            start = (A << (16 - a)) | (psid << m)
+            ranges.append((start, start + (1 << m) - 1))
+    # Interface identifier (RFC 7597 section 6): 16 zero bits | IPv4 | PSID (left padded)
+    iid = (int(v4) << 16) | psid
+    ce6 = ip.IPv6Address(int(eu.network_address) | iid)
+    return v4, psid, q, ranges, ce6
+
+def rfc6052(prefix, v4):
+    """Embed IPv4 in a /64 DMR prefix (RFC 6052 section 2.2, u-octet bits 64-71 zero)."""
+    pr = ip.IPv6Network(prefix); assert pr.prefixlen == 64
+    return ip.IPv6Address(int(pr.network_address) | (int(ip.IPv4Address(v4)) << 24))
+
+def psid_of_port(port, psid_offset, q):
+    return (port >> (16 - psid_offset - q)) & ((1 << q) - 1)
+
+def sixrd(prefix6, ipv4_masklen, ce_v4):
+    pr = ip.IPv6Network(prefix6)
+    bits = 32 - ipv4_masklen
+    v4bits = int(ip.IPv4Address(ce_v4)) & ((1 << bits) - 1)
+    plen = pr.prefixlen + bits
+    net = int(pr.network_address) | (v4bits << (128 - plen))
+    return ip.IPv6Network((net, plen))
+
+if __name__ == "__main__":
+    print("== MAP-E RFC 7597 Appendix A, Example 1 (BMR 2001:db8::/40, 192.0.2.0/24, EA 16) ==")
+    v4, psid, q, rng, ce6 = map_rule("2001:db8:12:3400::/56", "2001:db8::/40", "192.0.2.0/24", 16)
+    print(f"IPv4 {v4}  PSID 0x{psid:02x} (length {q})  ranges {len(rng)} x {rng[0][1]-rng[0][0]+1} ports = {sum(b-a+1 for a,b in rng)}")
+    print("first/last ranges:", ", ".join(f"{a}-{b}" for a, b in rng[:2] + rng[-2:]))
+    print("CE IPv6 address:", ce6.exploded, "| RFC: 2001:0db8:0012:3400:0000:c000:0212:0034")
+    print("\n== Example 2 (BR side): packet to 192.0.2.18:1232 -> which CE? ==")
+    pid = psid_of_port(1232, 6, 8)
+    print(f"PSID from port 1232 = 0x{pid:02x}; EA bits = 0x12{pid:02x} -> CE prefix 2001:db8:12:{pid:02x}00::/56")
+    for port in (1232, 1235, 1236, 5000, 64723):
+        print(f"  port {port:5d} belongs to PSID 0x{psid_of_port(port, 6, 8):02x}")
+    print("\n== Example 4 / 5 (no EA bits; 1:1 and PSID from DHCP) ==")
+    v4, psid, q, rng, ce6 = map_rule("2001:db8:12:3400::/56", "2001:db8:12:3400::/56", "192.0.2.18/32", 0)
+    print(f"ex4: IPv4 {v4}, PSID length {q}, CE {ce6.exploded}")
+    v4, psid, q, rng, ce6 = map_rule("2001:db8:12:3400::/56", "2001:db8:12:3400::/56", "192.0.2.18/32", 0, psid=0x34, psid_len=8)
+    print(f"ex5: IPv4 {v4}, PSID 0x{psid:02x}, {len(rng)} ranges, CE {ce6.exploded}")
+    print("\n== MAP-T RFC 7599 Appendix A, Example 2/3 (DMR 2001:db8:ffff::/64) ==")
+    print("10.2.3.4 ->", rfc6052("2001:db8:ffff::/64", "10.2.3.4").exploded, "| RFC: 2001:db8:ffff:0:000a:0203:0400::")
+    print("\n== Sharing ratio vs ports per subscriber (PSID offset 6) ==")
+    for q in (0, 2, 4, 6, 8, 10):
+        n = (2**6 - 1) * 2 ** (16 - 6 - q) if q else 65536
+        print(f"PSID length {q:2d}: 1:{2**q:<5d} subscribers per IPv4 address, {n:5d} ports each")
+    print("\n== 6rd (RFC 5969 section 4): delegated prefix from the CE's IPv4 address ==")
+    for pfx, mask, v4 in [("2001:db8::/32", 0, "192.0.2.130"), ("2001:db8::/32", 8, "10.100.20.5"), ("2001:db8:ab00::/40", 16, "100.64.7.9")]:
+        print(f"6rdPrefix {pfx:18s} IPv4MaskLen {mask:2d} CE {v4:12s} -> {sixrd(pfx, mask, v4)}")
+```
+
+### Execution output
+
+The output below is from one run; a second run was byte-identical.
+
+```text
+### 6.12.94+, Python 3.13.5, ip utility, iproute2-6.15.0, libbpf 1.5.0
+
+== 1. DS-Lite: two subscribers with the same private address 192.168.1.10 ==
+B4 2001:db8:a::10: sent 60 B inner, reply from 198.51.100.7:7 to 192.168.1.10:5000: 'echo to 192.0.2.1:40000'
+B4 2001:db8:a::20: sent 60 B inner, reply from 198.51.100.7:7 to 192.168.1.10:5000: 'echo to 192.0.2.1:40001'
+server 198.51.100.7:7 got 32 B from 192.0.2.1:40000
+server 198.51.100.7:7 got 32 B from 192.0.2.1:40001
+AFTR new mapping  [2001:db8:a::10] 192.168.1.10:5000 -> 192.0.2.1:40000  (inner packet 60 B)
+AFTR new mapping  [2001:db8:a::20] 192.168.1.10:5000 -> 192.0.2.1:40001  (inner packet 60 B)
+AFTR binding table:
+  softwire 2001:db8:a::10     inner 192.168.1.10:5000 <-> 192.0.2.1:40000
+  softwire 2001:db8:a::20     inner 192.168.1.10:5000 <-> 192.0.2.1:40001
+
+== 2. MTU: inner IPv4 of 1460 and 1500 bytes over a 1500-byte IPv6 link ==
+B4 2001:db8:a::10: sent 1460 B inner, reply from 198.51.100.7:7 to 192.168.1.10:5000: 'echo to 192.0.2.1:40000'
+   inner 1460 B -> IPv6 1500 B: B4 Ip6FragCreates +0, AFTR Ip6ReasmOKs +0
+B4 2001:db8:a::10: sent 1500 B inner, reply from 198.51.100.7:7 to 192.168.1.10:5000: 'echo to 192.0.2.1:40000'
+   inner 1500 B -> IPv6 1540 B: B4 Ip6FragCreates +2, AFTR Ip6ReasmOKs +1
+server 198.51.100.7:7 got 1432 B from 192.0.2.1:40000
+server 198.51.100.7:7 got 1472 B from 192.0.2.1:40000
+
+== 3. MAP-E: stateless BR validating CE 2001:db8:12:3400:0:c000:212:34 ==
+CE  192.0.2.18:1232 got reply 'echo to 192.0.2.18:1232' from 198.51.100.7:7
+CE  192.0.2.18:64723 got reply 'echo to 192.0.2.18:64723' from 198.51.100.7:7
+CE  192.0.2.18:5000 no reply
+CE  192.0.2.19:1232 no reply
+BR up   from [2001:db8:12:3400:0:c000:212:34] inner 192.0.2.18:1232: rule says 192.0.2.18 PSID 0x34, port's PSID 0x34 -> forward
+BR down 198.51.100.7:7 -> 192.0.2.18:1232: EA bits 0x1234 -> encapsulate to [2001:db8:12:3400:0:c000:212:34]
+BR up   from [2001:db8:12:3400:0:c000:212:34] inner 192.0.2.18:64723: rule says 192.0.2.18 PSID 0x34, port's PSID 0x34 -> forward
+BR down 198.51.100.7:7 -> 192.0.2.18:64723: EA bits 0x1234 -> encapsulate to [2001:db8:12:3400:0:c000:212:34]
+BR up   from [2001:db8:12:3400:0:c000:212:34] inner 192.0.2.18:5000: rule says 192.0.2.18 PSID 0x34, port's PSID 0xe2 -> DROP (spoof counter +1)
+BR up   from [2001:db8:12:3400:0:c000:212:34] inner 192.0.2.19:1232: rule says 192.0.2.18 PSID 0x34, port's PSID 0x34 -> DROP (spoof counter +1)
+BR totals: up forwarded 2, up dropped 2, down mapped 2; no per-flow state kept
+server 198.51.100.7:7 got 10 B from 192.0.2.18:1232
+server 198.51.100.7:7 got 10 B from 192.0.2.18:64723
+
+== 4. MAP rule arithmetic ==
+== MAP-E RFC 7597 Appendix A, Example 1 (BMR 2001:db8::/40, 192.0.2.0/24, EA 16) ==
+IPv4 192.0.2.18  PSID 0x34 (length 8)  ranges 63 x 4 ports = 252
+first/last ranges: 1232-1235, 2256-2259, 63696-63699, 64720-64723
+CE IPv6 address: 2001:0db8:0012:3400:0000:c000:0212:0034 | RFC: 2001:0db8:0012:3400:0000:c000:0212:0034
+
+== Example 2 (BR side): packet to 192.0.2.18:1232 -> which CE? ==
+PSID from port 1232 = 0x34; EA bits = 0x1234 -> CE prefix 2001:db8:12:3400::/56
+  port  1232 belongs to PSID 0x34
+  port  1235 belongs to PSID 0x34
+  port  1236 belongs to PSID 0x35
+  port  5000 belongs to PSID 0xe2
+  port 64723 belongs to PSID 0x34
+
+== Example 4 / 5 (no EA bits; 1:1 and PSID from DHCP) ==
+ex4: IPv4 192.0.2.18, PSID length 0, CE 2001:0db8:0012:3400:0000:c000:0212:0000
+ex5: IPv4 192.0.2.18, PSID 0x34, 63 ranges, CE 2001:0db8:0012:3400:0000:c000:0212:0034
+
+== MAP-T RFC 7599 Appendix A, Example 2/3 (DMR 2001:db8:ffff::/64) ==
+10.2.3.4 -> 2001:0db8:ffff:0000:000a:0203:0400:0000 | RFC: 2001:db8:ffff:0:000a:0203:0400::
+
+== Sharing ratio vs ports per subscriber (PSID offset 6) ==
+PSID length  0: 1:1     subscribers per IPv4 address, 65536 ports each
+PSID length  2: 1:4     subscribers per IPv4 address, 16128 ports each
+PSID length  4: 1:16    subscribers per IPv4 address,  4032 ports each
+PSID length  6: 1:64    subscribers per IPv4 address,  1008 ports each
+PSID length  8: 1:256   subscribers per IPv4 address,   252 ports each
+PSID length 10: 1:1024  subscribers per IPv4 address,    63 ports each
+
+== 6rd (RFC 5969 section 4): delegated prefix from the CE's IPv4 address ==
+6rdPrefix 2001:db8::/32      IPv4MaskLen  0 CE 192.0.2.130  -> 2001:db8:c000:282::/64
+6rdPrefix 2001:db8::/32      IPv4MaskLen  8 CE 10.100.20.5  -> 2001:db8:6414:500::/56
+6rdPrefix 2001:db8:ab00::/40 IPv4MaskLen 16 CE 100.64.7.9   -> 2001:db8:ab07:900::/56
+```
+
+## Reading the output
+
+### 1. Two homes, one private address, one public address
+
+Both B4s send from 192.168.1.10:5000 to 198.51.100.7:7. The AFTR sees two different softwires, so it creates two bindings, 192.0.2.1:40000 and 192.0.2.1:40001. The server sees two unrelated flows from one public address, and each reply goes back down the right softwire: each B4 is told which public port it was given. The server reports 32 bytes because the 60-byte inner packet carries 20 bytes of IPv4 header and 8 of UDP. Remove the B4 address from the key in `aftr()` and the second home's packets would be glued onto the first home's mapping. That is the bug the binding key exists to prevent.
+
+### 2. Fragment after encapsulation, reassemble before decapsulation
+
+A 1460-byte inner packet becomes exactly 1500 bytes of IPv6 and crosses the link whole. A 1500-byte inner packet (DF set, as most hosts send) becomes 1540 bytes. The B4's kernel splits the IPv6 packet into two fragments (`Ip6FragCreates +2`), the AFTR's kernel reassembles it once (`Ip6ReasmOKs +1`), and the AFTR process receives the complete 1500-byte IPv4 packet; the server got 1472 bytes of UDP payload. The inner IPv4 packet was never fragmented and its DF bit never mattered. That is RFC 6333 section 5.3 exactly, and the cost is visible: every full-size packet is now two packets plus reassembly state on the AFTR. This is why operators raise the access MTU or clamp MSS.
+
+### 3. A stateless BR that still catches spoofing
+
+The CE uses 2001:db8:12:3400:0:c000:212:34, the RFC 7597 example 1 address. For each upstream packet the BR recomputes "this IPv6 source may use 192.0.2.18 with PSID 0x34" from the address alone.
+
+- Ports 1232 and 64723 are the first and last ports of PSID 0x34. They are forwarded, and the replies come back. Downstream, the BR derives EA bits 0x1234 from destination 192.0.2.18 and port 1232 (or 64723) and encapsulates to the right CE.
+- Port 5000 belongs to PSID 0xe2 (5000 = 4 x 1024 + 0xe2 x 4 + 0). That is another subscriber's port, so the packet is dropped and counted.
+- Source 192.0.2.19 is another CE's address. It is dropped too, even though its port is in the right set.
+
+The last line is the point: two forwarded, two dropped, two mapped down, and no per-flow state. The BR could be replaced mid-flow by any other BR with the same rule.
+
+### 4. The arithmetic matches the RFCs
+
+Every value the calculator prints equals the RFC appendix: 192.0.2.18 with PSID 0x34 and 63 x 4 = 252 ports, the CE address, the PSID of each port in example 2, the 1:1 and DHCP-provisioned PSID cases of examples 4 and 5, and the MAP-T DMR mapping of 10.2.3.4. The sharing table is the capacity-planning number. At 1:256 a subscriber gets 252 ports, and a single browser with many tabs, or a home with a few game consoles, can use that up. At 1:16 a subscriber gets 4032 ports but an IPv4 /24 serves only 4096 homes. The 6rd rows apply the RFC 5969 formula; the RFC has no worked example, so check them with the exercise.
+
+## In production
+
+None of this section was run here: the box has no tunnel kernel modules, no root and no AFTR, BR or CE software.
+
+### A Linux B4
+
+```bash
+# (not run here) Linux host or CPE acting as a DS-Lite B4
+ip -6 tunnel add dslite0 mode ipip6 local 2001:db8:a::10 remote 2001:db8:a::1
+ip link set dslite0 up
+ip addr add 192.0.0.2/29 dev dslite0
+ip route add default dev dslite0
+# no NAT44 on the B4: the AFTR does it
+```
+
+`mode ipip6` is IPv4 over IPv6 on the `ip6_tunnel` driver (see `ip-tunnel(8)`). The AFTR address normally comes from the AFTR-Name DHCPv6 option, resolved over IPv6.
+
+### Clamp MSS on the CPE
+
+```bash
+# (not run here) nftables: rewrite the MSS of forwarded SYNs to fit the tunnel's MTU
+nft add table inet mangle
+nft add chain inet mangle forward '{ type filter hook forward priority mangle; }'
+nft add rule inet mangle forward oifname "dslite0" tcp flags syn tcp option maxseg size set rt mtu
+```
+
+`rt mtu` uses the route MTU towards the destination, which is the tunnel's MTU (normally 1460 on a 1500 link), so TCP SYNs leave with MSS 1420. UDP and ICMP are not helped; for them, raising the access MTU by 40 bytes is the real fix.
+
+### Linux 6rd
+
+```bash
+# (not run here) 6rd CE: 6rd prefix 2001:db8::/32, IPv4MaskLen 0, BR at 203.0.113.1
+ip tunnel add 6rd0 mode sit local 192.0.2.130 ttl 64
+ip tunnel 6rd dev 6rd0 6rd-prefix 2001:db8::/32
+ip link set 6rd0 up
+ip -6 addr add 2001:db8:c000:282::1/64 dev 6rd0
+ip -6 route add ::/0 via ::203.0.113.1 dev 6rd0
+```
+
+The `via ::203.0.113.1` form tells the `sit` driver to send to that IPv4 address. Hand out the LAN /64s from the delegated prefix, not the one on the tunnel.
+
+### OpenWrt and DHCPv6
+
+OpenWrt ships separate `ds-lite` and `map` packages. They add interface protocols for a DS-Lite softwire (with the AFTR given explicitly or learned from DHCPv6) and for MAP-E, MAP-T and lightweight 4over6 driven by the RFC 7598 options. Check the package documentation for your release for option names; they have changed over time.
+
+On the provider side, ISC Kea's DHCPv6 server defines the AFTR-Name option by name:
+
+```json
+// (not run here) kea-dhcp6.conf fragment
+"option-data": [ { "name": "aftr-name", "data": "aftr.example.net" } ]
+```
+
+Kea also defines the `s46-*` container and sub-options from RFC 7598 for MAP and lw4o6; build them from Kea's option reference rather than from memory.
+
+### What to log
+
+- **DS-Lite AFTR:** a binding is (softwire IPv6, inner tuple) to (public address, port) at a time. Answering "who was 192.0.2.1:40001 at 10:42:07?" needs that mapping. Port-block allocation, for example 512 ports per softwire logged once at allocation, keeps the log to one line per subscriber per block (RFC 6888 REQ-13 and REQ-14).
+- **MAP and lw4o6:** the public address and port set follow from the delegated prefix, so the existing DHCPv6 prefix-delegation log plus the rule configuration answers the same question with no per-flow logging at all.
+- **Everyone:** abuse reports and geolocation databases that name only an IPv4 address now point at up to 2^q households. Ask complainants for the source port and an accurate timestamp, and see RFC 6269 for the general problems of address sharing.
+
+### Choosing
+
+- DS-Lite is simplest for the CPE and most flexible for port use (ports are allocated on demand), at the cost of a stateful, logged, scaled CGN in the core.
+- MAP pushes NAT to the edge and makes the core stateless and any-cast-friendly, but every subscriber gets a fixed slice of ports and the address plan is now tied to the IPv6 plan.
+- lw4o6 sits between them: a fixed port set like MAP, with per-subscriber bindings so it is not tied to the prefix plan.
+- 464XLAT is the usual choice on mobile networks, where the handset already has a CLAT.
+
+## Gotchas
+
+- **Ports below 1024 are gone.** With the default offset a = 6, no CE owns ports 0 to 1023, so a subscriber cannot run a server on port 80 or 443 over shared IPv4. A 1:1 rule (PSID length 0) restores them for customers who pay for it.
+- **Inbound needs port forwarding into the set.** A MAP customer can forward only ports in their own set; a DS-Lite customer needs PCP or provider-side configuration on the AFTR.
+- **The BR checks the source port, so the CE's NAT must stay inside the set.** A CE whose NAT44 picks ports outside its PSID has its packets dropped as spoofs. Lab section 3 is exactly that failure.
+- **ICMP identifiers are ports too.** MAP CEs must map ICMP echo identifiers into their port set, or pings from behind the CE break while TCP works.
+- **Fragments carry no port.** Only the first fragment of a fragmented IPv4 packet carries the UDP or TCP header, so CEs, BRs and AFTRs must reassemble (or track fragment IDs) before they can make port-based decisions. That is another reason to avoid inner fragmentation entirely.
+- **Hair-pinning.** Two DS-Lite customers on the same AFTR talking to each other's public addresses rely on the AFTR's hairpin support (RFC 4787 REQ-9, carried into RFC 6888). In MAP, FMRs avoid the round trip through the BR.
+- **192.0.0.1 in traceroutes is not a bug.** It is the AFTR's well-known softwire address.
+- **One 6rd rule per DHCPv4 lease.** `OPTION_6RD` carries one IPv4MaskLen and 6rd prefix pair, so a CE gets one 6rd domain.
+
+## Exercises
+
+1. A MAP rule has IPv6 prefix 2001:db8:100::/40, IPv4 prefix 198.51.100.0/24 and EA-bits length 14 with offset 6. What is the sharing ratio, how many ports does each CE get, and which IPv4 address, PSID and first port range belong to the CE whose end-user prefix is 2001:db8:1a5:c000::/54? Check with `mapcalc.py`.
+2. Change the BMR in lab section 3 to EA-bits length 12 (PSID length 4) and work out the CE's new IPv6 address before running it. Which of the four test ports are now forwarded?
+3. In `aftr()`, change the key to `(src, sport)` and rerun section 1. What does the server see, and where does the second B4's reply go?
+4. Set the veth MTU to 1540 in `lab-softwire.sh` and rerun section 2. What happens to the fragment counters? Then set it to 1280 (the IPv6 minimum) and send a 1500-byte inner packet: how many fragments now?
+5. Compute the 6rd delegated prefix for a CE at 100.64.7.9 with 6rd prefix 2001:db8:ab00::/40 and IPv4MaskLen 16 by hand, bit by bit, and compare with the last 6rd row.
+6. A provider has one IPv4 /22 and 200,000 subscribers. What PSID length is needed for MAP, and how many ports does each subscriber get? Would DS-Lite with port blocks of 1024 do better or worse for a subscriber who briefly needs 3000 ports?
+
+## Verification
+
+- Run: `unshare -urnm sh lab-softwire.sh` on Linux 6.12.94, Python 3.13.5, iproute2 6.15.0, as an unprivileged user; no packages installed. The output above is pasted unchanged, and a second run produced identical output.
+- Checked against the RFCs: every MAP value in section 4 against RFC 7597 Appendix A (examples 1, 2, 4 and 5) and RFC 7599 Appendix A; the BR behaviour against RFC 7597 section 8.1; the fragmentation behaviour against RFC 6333 section 5.3; option numbers against RFC 6334, RFC 7598 and RFC 5969.
+- Not run: kernel `ip6_tunnel` and `sit` tunnels (modules not available without root), nftables MSS clamping, OpenWrt, Kea, and any real AFTR or BR. Those parts follow the man pages and RFCs and are marked "(not run here)".
+
+## Sources
+
+- RFC 6333, Dual-Stack Lite Broadband Deployments Following IPv4 Exhaustion: <https://www.rfc-editor.org/rfc/rfc6333>
+- RFC 6334, DHCPv6 Option for Dual-Stack Lite (AFTR-Name): <https://www.rfc-editor.org/rfc/rfc6334>
+- RFC 2473, Generic Packet Tunneling in IPv6: <https://www.rfc-editor.org/rfc/rfc2473>
+- RFC 6888, Common Requirements for Carrier-Grade NATs: <https://www.rfc-editor.org/rfc/rfc6888>
+- RFC 7596, Lightweight 4over6: <https://www.rfc-editor.org/rfc/rfc7596>
+- RFC 7597, Mapping of Address and Port with Encapsulation (MAP-E): <https://www.rfc-editor.org/rfc/rfc7597>
+- RFC 7598, DHCPv6 Options for Configuration of Softwire Address and Port-Mapped Clients: <https://www.rfc-editor.org/rfc/rfc7598>
+- RFC 7599, Mapping of Address and Port using Translation (MAP-T): <https://www.rfc-editor.org/rfc/rfc7599>
+- RFC 6052, IPv6 Addressing of IPv4/IPv6 Translators: <https://www.rfc-editor.org/rfc/rfc6052>
+- RFC 5969, IPv6 Rapid Deployment on IPv4 Infrastructures (6rd): <https://www.rfc-editor.org/rfc/rfc5969>
+- RFC 6269, Issues with IP Address Sharing: <https://www.rfc-editor.org/rfc/rfc6269>
+- `ip-tunnel(8)` and `ip-link(8)`: <https://man7.org/linux/man-pages/man8/ip-tunnel.8.html>, <https://man7.org/linux/man-pages/man8/ip-link.8.html>
+- nftables wiki, mangling TCP options: <https://wiki.nftables.org/wiki-nftables/index.php/Mangling_packet_headers>

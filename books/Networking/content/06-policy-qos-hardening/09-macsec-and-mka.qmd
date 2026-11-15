@@ -1,0 +1,525 @@
+---
+title: "MACsec (IEEE 802.1AE) and MKA: Hop-by-Hop Ethernet Encryption"
+author:
+  - name: "K19G"
+  - name: "grok-bot"
+---
+
+# MACsec (IEEE 802.1AE) and MKA: Hop-by-Hop Ethernet Encryption
+
+Media Access Control Security (MACsec), defined in IEEE 802.1AE, provides point-to-point security at the Data Link Layer (Layer 2) of the OSI model. Unlike Layer 3 encryption solutions like IPsec or application-layer mechanisms like TLS, MACsec operates directly on Ethernet frames, protecting everything the host or switch sends through the secured (controlled) port: IPv4, IPv6, ARP, ND and every routing protocol that rides on them. Key agreement (EAPOL-MKA) and, on most platforms, link-local control frames such as LLDP and LACP use the unsecured (uncontrolled) port and stay in the clear. Because MACsec operates between adjacent MAC entities, frames are decrypted at each receiving interface and re-encrypted on outbound interfaces, making it a hop-by-hop security mechanism rather than an end-to-end transport encryption protocol. Dynamic key management, peer discovery, and Secure Association Key (SAK) distribution are governed by the MACsec Key Agreement (MKA) protocol, defined in IEEE 802.1X-2010 and 802.1X-2020. This chapter covers the architectural components of 802.1AE, frame formats, cryptographic operations, packet number (PN) limits, key agreement via MKA, Linux kernel operational considerations, and cryptographic test vectors.
+
+## Learning goals
+
+- Explain the scope, positioning, and hop-by-hop boundaries of IEEE 802.1AE relative to network-layer security protocols.
+- Identify the core architectural elements of MACsec: SecY, KaY, CA, SC, SA, SCI, AN, SAK, CAK, and CKN.
+- Decode the 802.1AE SecTAG header structure, flag bits, EtherType values, and payload layout.
+- Calculate the framing overhead, MTU impact, and Packet Number (PN) exhaustion times across high-speed link rates.
+- Distinguish standard 32-bit PN MACsec from Extended Packet Numbering (XPN, 802.1AEbw) and explain the role of the SSCI and salt.
+- Evaluate Linux `ip macsec` commands, `wpa_supplicant` MKA configuration structures, and hardware offload architectures.
+- Analyze Python implementation output verifying IEEE published GCM-AES test vectors, replay protection rules, and receiver drop conditions.
+
+## Version note
+
+The specifications and command structures detailed in this chapter reflect IEEE Std 802.1AE-2018 (incorporating 802.1AEbw-2013 XPN), IEEE Std 802.1X-2020, and the Linux iproute2 `ip-macsec(8)` interface present in modern kernel releases. Command syntax for user-space control relies on standard `iproute2` and `wpa_supplicant` v2.10 or newer.
+
+## MACsec architecture and positioning
+
+MACsec operates at the Media Access Control sublayer. It secures single physical or logical Ethernet links between two hosts, host-to-switch interfaces, or switch-to-switch links. 
+
+### Layer 2 positioning and security boundaries
+
+Because MACsec operates directly above the physical layer MAC entity, it secures everything inside the Ethernet frame after the Source MAC address for traffic on the controlled port. EAPOL frames used to bootstrap the keys never pass through the SecY. 
+
+| Feature | MACsec (IEEE 802.1AE) | IPsec (ESP / ip xfrm) | WireGuard |
+| :--- | :--- | :--- | :--- |
+| **OSI Layer** | Data Link Layer (Layer 2) | Network Layer (Layer 3) | Layer 3 over UDP |
+| **Scope** | Hop-by-Hop (adjacent nodes) | End-to-End or Site-to-Site | End-to-End or Site-to-Site |
+| **Secured Protocols** | Everything on the controlled port (IP, ARP, ND) | IPv4, IPv6 (IP payloads only) | IPv4, IPv6 (IP payloads only) |
+| **Encapsulation Overhead** | 24 or 32 bytes | roughly 50 to 70+ bytes, depending on mode and cipher | 60 bytes (IPv4 outer) / 80 bytes (IPv6 outer) |
+| **Intermediate Inspection** | Decrypted at every L2 hop | Transparent to L2/L3 switches | Transparent to L2/L3 routers |
+| **Hardware Offload** | Line-rate PHY/MAC ASIC support | Crypto co-processors / smartNIC | Software / Crypto offload |
+
+An Ethernet frame secured by MACsec contains a plain text Destination MAC address, Source MAC address, and a SecTAG header, followed by encrypted or authenticated payload data and an Integrity Check Value (ICV). Because intermediate switches process frames at Layer 2, a non-MACsec switch cannot bridge MACsec frames without explicit L2 pass-through, and any L2 device terminating MACsec will decrypt the frame into plain text inside its switching fabric before forwarding it to another port.
+
+### Core terminology and object model
+
+MACsec defines a specific entity hierarchy for link protection:
+
+- **SecY (MAC Security Entity)**: The functional protocol entity in a device's stack that performs frame encryption, decryption, replay checking, and ICV validation.
+- **KaY (MACsec Key Agreement Entity)**: The control-plane entity (typically implemented in user-space daemons like `wpa_supplicant`) that runs MKA to discover peers, authenticate them, elect a Key Server, and install keys into the SecY.
+- **CA (Connectivity Association)**: A logical security relationship between two or more stations on a shared medium that share a Connectivity Association Key (CAK).
+- **SC (Secure Channel)**: A unidirectional point-to-point vector transmitting secure traffic from a single transmitter to one or more receivers in a CA. Each SC is identified by a 64-bit **SCI (Secure Channel Identifier)**, which consists of a 48-bit MAC address combined with a 16-bit Port Identifier (`MAC + Port`).
+- **SA (Secure Association)**: A specific cryptographic instance within an SC containing active keys and counters. Up to 4 SAs can exist simultaneously per SC to facilitate zero-hit key rollover. An SA is selected using a 2-bit **AN (Association Number)** values 0 through 3.
+- **SAK (Secure Association Key)**: The symmetric key used by the SecY to encrypt and/or authenticate data frames within a specific SA.
+- **CAK / CKN**: The long-term symmetric root key (CAK) and its corresponding hex-encoded name (CKN) used by MKA to authenticate peers and securely derive or wrap SAKs.
+
+## MACsec frame format and cryptographic operations
+
+IEEE 802.1AE modifies the standard Ethernet frame format by prepending a 8-byte or 16-byte SecTAG after the Source MAC address and appending a 16-byte ICV at the end of the frame.
+
+```
+Standard Ethernet Frame:
++---------+---------+-----------+----------------+----------+
+| DA (6B) | SA (6B) | Type (2B) |  Payload (N B) | FCS (4B) |
++---------+---------+-----------+----------------+----------+
+
+MACsec Frame (SC=1, SCI included):
++---------+---------+----------------+-----------------+---------------+----------+
+| DA (6B) | SA (6B) | SecTAG (16B)   | Secure Payload  |  ICV (16B)    | FCS (4B) |
+|         |         | EtherType=88E5 | (Encrypted/Auth)| (GCM-AES tag) |          |
++---------+---------+----------------+-----------------+---------------+----------+
+```
+
+### SecTAG header bit field detail
+
+The SecTAG is identified by the registered EtherType value `0x88E5`. Its internal binary layout is structured as follows:
+
+- **EtherType (16 bits)**: Always `0x88E5`.
+- **TCI/AN Byte (8 bits)**: Tag Control Information and Association Number.
+  - Bit 7 (`V`): Version. Must be 0.
+  - Bit 6 (`ES`): End Station. Set to 1 when the transmitter's SCI is its source MAC address plus port 1, so a receiver can rebuild the SCI from the frame's MAC SA.
+  - Bit 5 (`SC`): SCI present. If 1, the 8-byte SCI follows the PN and the SecTAG is 16 bytes. If 0, the SCI is left out (8-byte SecTAG) and the receiver derives it: from the MAC SA when `ES=1`, or from the only peer it knows on a point-to-point link.
+  - Bit 4 (`SCB`): Single Copy Broadcast. Used in multi-access LAN topologies.
+  - Bit 3 (`E`): Encryption bit. Set to 1 if payload is encrypted (Confidentiality). Set to 0 if payload is plain text (Integrity-only).
+  - Bit 2 (`C`): Changed Text bit. Set to 1 if encryption is applied or if a non-zero confidentiality offset is used.
+  - Bits 1–0 (`AN`): Association Number (0–3), identifying which of the 4 active SAs within the SC contains the decryption key.
+- **SL (Short Length, 8 bits)**: Contains the length of the payload if it is less than 48 bytes. If the payload is 48 bytes or greater, `SL` is set to `0`.
+- **PN (Packet Number, 32 bits)**: A monotonically increasing sequence number per SA. Used to construct the Initialization Vector (IV) and prevent replay attacks.
+- **SCI (Optional, 64 bits / 8 bytes)**: Present only when `SC=1`. Contains the 48-bit MAC address and 16-bit Port ID of the transmitting SecY.
+
+### Cryptographic modes: Integrity-only vs Confidentiality
+
+MACsec uses Galois/Counter Mode with Advanced Encryption Standard (GCM-AES). It supports two primary modes of operation controlled by the `E` and `C` flags in the TCI byte:
+
+1. **Integrity-Only Mode (`E=0, C=0`)**: The payload remains in plain text, but the entire frame (excluding FCS) is authenticated. The ICV is calculated across the Destination MAC, Source MAC, SecTAG, and payload. Any alteration of the plain text in transit causes an ICV mismatch drop. Decoding `TCI/AN = 0x22` yields binary `00100010`, mapping to `V=0, ES=0, SC=1, SCB=0, E=0, C=0, AN=2`.
+2. **Confidentiality and Integrity Mode (`E=1, C=1`)**: The payload is encrypted using GCM-AES, and the ICV authenticates both the unencrypted headers (Additional Authenticated Data, or AAD) and the encrypted payload ciphertext. Decoding `TCI/AN = 0x2E` yields binary `00101110`, mapping to `V=0, ES=0, SC=1, SCB=0, E=1, C=1, AN=2`.
+
+### Confidentiality Offsets
+
+In specialized deployments, MACsec supports a *Confidentiality Offset* of 0, 30, or 50 bytes. A non-zero offset leaves the first 30 or 50 bytes of the payload following the SecTAG unencrypted (in plain text) while still calculating authentication over them. For example, a 30-byte offset leaves the IPv4 and TCP/UDP headers readable by intermediate L3/L4 hardware classification engines while encrypting the user data payload.
+
+### Cryptographic Construction: IV and AAD
+
+For standard GCM-AES-128 and GCM-AES-256, MACsec builds a 96-bit (12-byte) Initialization Vector (IV) by concatenating the 64-bit SCI with the 32-bit PN:
+
+```text
+IV (96 bits) = SCI (64 bits) || PN (32 bits)
+```
+
+The Additional Authenticated Data (AAD) fed into the GCM engine consists of:
+1. Destination MAC address (6 bytes)
+2. Source MAC address (6 bytes)
+3. SecTAG (8 bytes or 16 bytes depending on the `SC` flag bit)
+
+In integrity-only mode there is nothing to encrypt: the user data is appended to the AAD and GCM runs with an empty plaintext (this is GMAC, and it is exactly what `macsec.py` does for vector 2.1.1).
+
+Because the Destination and Source MAC addresses are included in the AAD, any MAC address translation or tampering in transit invalidates the ICV at the receiver.
+
+## Packet Number (PN) exhaustion and Extended Packet Numbering (XPN)
+
+A fundamental constraint of Galois/Counter Mode (GCM-AES) is that an Initialization Vector (IV) must **never** be repeated under the same key (SAK). Repeating an IV under the same GCM key leaks the XOR of the two plaintexts and lets an attacker recover the GHASH key and forge tags, which is why a SecY stops transmitting on an SA before its PN wraps.
+
+### 32-Bit PN Exhaustion at High Link Rates
+
+Standard IEEE 802.1AE uses a 32-bit Packet Number (PN). A single SA can transmit a maximum of 2^32 - 1 = 4,294,967,295 frames before the PN space is completely exhausted and the SAK must be replaced.
+
+At modern line rates transmitting minimum-size 64-byte Ethernet frames (84 bytes on the wire including preamble and inter-frame gap), high frame rates exhaust 32-bit PNs in seconds:
+
+- **1 Gb/s**: 1.49 million frames/s, so 2^32 PNs exhaust in **2886.2 seconds** (~48 minutes).
+- **10 Gb/s**: 14.88 million frames/s, so 2^32 PNs exhaust in **288.6 seconds** (~4.8 minutes).
+- **100 Gb/s**: 148.81 million frames/s, so 2^32 PNs exhaust in **28.9 seconds**.
+- **400 Gb/s**: 595.24 million frames/s, so 2^32 PNs exhaust in **7.2 seconds**.
+
+At 100 Gb/s or 400 Gb/s, dynamic MKA re-keying would have to take place continuously every few seconds, introducing control plane instability and processing overhead.
+
+### Extended Packet Numbering (IEEE 802.1AEbw XPN)
+
+To address high-speed PN exhaustion, IEEE 802.1AEbw introduced Extended Packet Numbering (XPN), which expands the sequence number space from 32 bits to 64 bits.
+
+Under XPN:
+- The SecTAG header still transmits a 32-bit PN field on the wire to maintain physical frame structure.
+- The SecY maintains an internal 64-bit PN counter, where the lower 32 bits match the wire PN and the upper 32 bits represent an internal extension counter.
+- The 96-bit IV construction is updated to incorporate a 32-bit Short Secure Channel Identifier (SSCI) and a 96-bit Salt derived during MKA negotiation:
+
+```text
+IV (96 bits) = Salt (96 bits) XOR ( SSCI (32 bits) || PN (64 bits) )
+```
+
+A 64-bit PN space (2^64 frames) running continuously at 400 Gb/s line rate lasts about 980 years (2^64 divided by 595.24 million frames per second) without requiring a SAK rotation due to PN limit bounds.
+
+## MACsec Key Agreement (MKA) and Key Management
+
+While MACsec (802.1AE) provides data plane encapsulation and cryptographic processing, the MACsec Key Agreement (MKA) protocol (defined in IEEE 802.1X) operates in the control plane to manage keys dynamically.
+
+### MKA Protocol Operation
+
+MKA frames are transmitted as EAPOL-MKA frames using EtherType `0x888E`. MKA uses a pre-shared or EAP-derived root key called the **Connectivity Association Key (CAK)** and its identifier, the **CKN**.
+
+```
+    Host A (Priority 16)                        Host B (Priority 128)
+             |                                           |
+             |--- EAPOL-MKA (MKPDU: CKN, Priority 16) -->|
+             |<-- EAPOL-MKA (MKPDU: CKN, Priority 128) --|
+             |                                           |
+             |       [Key Server Election: Host A]       |
+             |                                           |
+             |--- SAK Distributed (Wrapped with KEK) --->|
+             |                                           |
+             |-- Transmit SA active (AN=0, Key=SAK1) --->|
+             |<-- Transmit SA active (AN=0, Key=SAK1) ---|
+```
+
+1. **Peer Discovery**: Nodes connected to a link send EAPOL-MKA packets containing their CKN, SCI, and an assigned Key Server Priority (0–255, where lower numerical values indicate higher priority).
+2. **Key Server Election**: The participant with the lowest numerical Key Server Priority value is elected as the Key Server for the Connectivity Association. If priorities are equal, the lowest SCI byte value wins.
+3. **SAK Generation and Distribution**: The Key Server generates a random symmetric SAK (GCM-AES-128 or GCM-AES-256). It derives a Key Encryption Key (KEK) from the CAK and encrypts the SAK inside an MKA PDU (MKPDU) sent to all authenticated peers.
+4. **Seamless SA Rollover**: Before an active SA reaches its PN exhaustion limit or when a peer leaves/joins, the Key Server generates a new SAK, assigns it to a new Association Number (e.g., changing AN from 0 to 1), and distributes it. Both SecYs install the new key into their secondary SA slot and switch active AN flags without dropping a single frame on the wire.
+
+## Linux Implementation: ip-macsec and wpa_supplicant
+
+The Linux kernel supports MACsec via the `macsec` netdriver module (introduced in Linux 4.6). Administration is performed via `iproute2` (`ip macsec`) for static key deployment, or via `wpa_supplicant` / `macsec_daemon` for dynamic MKA.
+
+### Static MACsec Configuration via ip-macsec (Not Run Here)
+
+Static configuration installs SAKs directly into the kernel SecY driver without running MKA control plane daemons.
+
+```bash
+# Static MACsec setup between two hosts (Not run here)
+# Host A configuration
+# eth1 is the physical (or veth) link to Host B; Host B's eth1 MAC is 52:54:00:12:34:56
+ip link add link eth1 macsec0 type macsec port 1 encrypt on replay on window 64 cipher gcm-aes-128
+# our transmit SA: AN 0, key ID 01, 128-bit SAK
+ip macsec add macsec0 tx sa 0 pn 1 on key 01 000102030405060708090a0b0c0d0e0f
+# Host B's receive channel and its SA (Host B uses its own SAK for its direction)
+ip macsec add macsec0 rx port 1 address 52:54:00:12:34:56
+ip macsec add macsec0 rx port 1 address 52:54:00:12:34:56 sa 0 pn 1 on key 02 0f0e0d0c0b0a09080706050403020100
+ip address add 192.168.100.1/24 dev macsec0
+ip link set dev macsec0 up
+# Host B mirrors this: its tx key is 0f0e..00 (ID 02), its rx SA for Host A uses 0001..0f (ID 01)
+```
+
+The command's own usage text on this box (iproute2 6.15.0, `ip macsec help`) lists the full grammar, including the XPN options `xpn`, `salt` and `ssci`:
+
+```text
+Usage: ip macsec add DEV tx sa { 0..3 } [ OPTS ] key ID KEY
+       ip macsec set DEV tx sa { 0..3 } [ OPTS ]
+       ip macsec del DEV tx sa { 0..3 }
+       ip macsec add DEV rx SCI [ on | off ]
+       ip macsec set DEV rx SCI [ on | off ]
+       ip macsec del DEV rx SCI
+       ip macsec add DEV rx SCI sa { 0..3 } [ OPTS ] key ID KEY
+       ip macsec set DEV rx SCI sa { 0..3 } [ OPTS ]
+       ip macsec del DEV rx SCI sa { 0..3 }
+       ip macsec show
+       ip macsec show DEV
+       ip macsec offload DEV [ off | phy | mac ]
+where  OPTS := [ pn <u32> | xpn <u64> ] [ salt SALT ] [ ssci <u32> ] [ on | off ]
+       ID   := 128-bit hex string
+       KEY  := 128-bit or 256-bit hex string
+       SCI  := { sci <u64> | port { 1..2^16-1 } address <lladdr> }
+       SALT := 96-bit hex string
+```
+
+### Dynamic MKA via wpa_supplicant (Not Run Here)
+
+In production deployments, dynamic MKA manages keys to eliminate manual key coordination. The following `wpa_supplicant.conf` snippet demonstrates an MKA setup using pre-shared CAK/CKN keys:
+
+```ini
+# /etc/wpa_supplicant/wpa_supplicant-eth1.conf (Not run here)
+eapol_version=3
+ap_scan=0
+fast_reauth=1
+
+network={
+    key_mgmt=NONE
+    macsec_policy=1
+    macsec_integ_only=0
+    mka_cak=000102030405060708090a0b0c0d0e0f
+    mka_ckn=0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20
+    mka_priority=16
+}
+```
+
+When started via `wpa_supplicant -i eth1 -D macsec_linux -c /etc/wpa_supplicant/wpa_supplicant-eth1.conf`, `wpa_supplicant` communicates with the kernel Netlink interface to instantiate the `macsec0` interface, run MKA peer discovery over `eth1`, elect the Key Server, and dynamically inject SAKs into the SecY kernel driver.
+
+### Hardware Offloading
+
+Software-based MACsec encryption in the Linux kernel introduces CPU overhead at multi-gigabit speeds. Modern network interface cards (NICs) and PHY transceivers support hardware offload via `iproute2`:
+
+```bash
+# Enable hardware offload on PHY or MAC layer (Not run here)
+ip macsec offload macsec0 mac
+```
+
+- **`offload mac`**: Offloads MACsec encryption and processing to the integrated MAC ASIC within the network interface controller.
+- **`offload phy`**: Offloads MACsec processing to an external Ethernet PHY transceiving chip on the board.
+
+## Operational checklist and troubleshooting counters
+
+When deploying MACsec in enterprise campus, data center interconnect (DCI), or metro Ethernet environments, follow this operational checklist:
+
+1. **MTU Adjustment**: MACsec adds 24 bytes (without explicit SCI) or 32 bytes (with explicit SCI) of framing overhead. Ensure the underlying physical link MTU is incremented (e.g., from 1500 to 1532) to prevent IP packet fragmentation.
+2. **Key Server Priority Alignment**: Explicitly configure `mka_priority` on participating nodes to control which switch or host becomes the MKA Key Server.
+3. **Cipher Suite Matching**: Both endpoints must agree on the cipher suite (e.g., `GCM-AES-128`, `GCM-AES-256`, `GCM-AES-XPN-128`, or `GCM-AES-XPN-256`).
+4. **Replay Window Size**: On link-aggregated or multi-path links where out-of-order frame delivery occurs, adjust the replay window size (`replay on window N`) to prevent legitimate frames from being dropped.
+
+### Kernel Diagnostic Counters (`ip -s macsec show`)
+
+The receive counters below are the 802.1AE names that `ip -s macsec show` prints (described from the standard and the man page; not run here):
+
+- `InPktsUntagged`: Received frames without a SecTAG on an interface configured to require MACsec validation. Indicates a misconfigured peer sending plain text frames.
+- `InPktsNoTag`: Received frames missing a valid MACsec tag structure.
+- `InPktsBadTag`: Frames containing invalid or corrupted SecTAG header fields.
+- `InPktsUnknownSCI`: Frames received with an SCI that does not match any configured inbound Secure Channel (RX SC).
+- `InPktsNotValid`: Frames failing ICV integrity verification. Indicates bit errors on the physical medium, incorrect SAK mismatch, or frame data tampering.
+- `InPktsLate`: Frames received with a PN below the lowest acceptable replay window threshold. Indicates severe out-of-order delivery or replay attacks.
+- `InPktsNotUsingSA`: Frames received for an SA that is present but not currently marked active for reception.
+- `InPktsUnusedSA`: Frames received matching an unassigned or unallocated SA slot.
+
+## Lab: Verifying IEEE 802.1AE GCM-AES Test Vectors
+
+This lab uses a specialized Python script (`macsec.py`) to execute cryptographic verification against IEEE-published GCM-AES MACsec test vectors. It parses SecTAG headers, verifies ICVs, evaluates receiver decisions across various packet tampering scenarios, and demonstrates packet number exhaustion across link speeds.
+
+**`macsec.py`**
+
+```python
+#!/usr/bin/env python3
+"""macsec.py: build and check MACsec (IEEE 802.1AE) frames with GCM-AES-128.
+Checks two published test vectors (Randall, IEEE 802.1 2011), then shows
+what a receiver rejects: a flipped bit, a replayed PN, and a wrong key."""
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from cryptography.exceptions import InvalidTag
+import struct
+
+H = bytes.fromhex
+KEY = H("AD7A2BD03EAC835A6F620FDCB506B345")
+DA, SA = H("D609B1F05663"), H("7A0D46DF998D")
+SCI = H("12153524C0895E81")
+PN = 0xB2C28465
+
+def tci_an(es=0, sc=1, scb=0, e=0, c=0, an=2):
+    # TCI bits, most significant first: V(0) ES SC SCB E C, then 2-bit AN
+    return (es << 6) | (sc << 5) | (scb << 4) | (e << 3) | (c << 2) | an
+
+def sectag(tcian, sl, pn, sci):
+    return H("88E5") + bytes([tcian, sl]) + struct.pack("!I", pn) + (sci or b"")
+
+def decode_tci(b):
+    names = ["V", "ES", "SC", "SCB", "E", "C"]
+    bits = {n: (b >> (7 - i)) & 1 for i, n in enumerate(names)}
+    return " ".join(f"{n}={v}" for n, v in bits.items()) + f" AN={b & 3}"
+
+def protect(key, da, sa, tag, sci, pn, user, encrypt):
+    iv = sci + struct.pack("!I", pn)          # 96-bit IV = SCI || PN
+    g = AESGCM(key)
+    if encrypt:
+        out = g.encrypt(iv, user, da + sa + tag)  # returns C || ICV
+        return da + sa + tag + out
+    icv = g.encrypt(iv, b"", da + sa + tag + user)  # GMAC: P empty, all in A
+    return da + sa + tag + user + icv
+
+def verify(key, frame, encrypt, sci, lowest_pn):
+    da, sa, tag = frame[:6], frame[6:12], frame[12:28]
+    pn = struct.unpack("!I", tag[4:8])[0]
+    if pn < lowest_pn:
+        return f"DROP replay: PN {pn:#x} < lowest acceptable {lowest_pn:#x}"
+    iv = sci + struct.pack("!I", pn)
+    body, icv = frame[28:-16], frame[-16:]
+    try:
+        if encrypt:
+            AESGCM(key).decrypt(iv, body + icv, da + sa + tag)
+        else:
+            AESGCM(key).decrypt(iv, icv, da + sa + tag + body)
+    except InvalidTag:
+        return "DROP ICV mismatch"
+    return "ACCEPT"
+
+user54 = H("08000F101112131415161718191A1B1C1D1E1F202122232425262728292A2B2C2D2E2F3031323334" "0001")
+user60 = H("08000F101112131415161718191A1B1C1D1E1F202122232425262728292A2B2C2D2E2F303132333435363738393A0002")
+
+print("== SecTAG fields")
+for name, b in [("2.1 auth-only", tci_an(an=2)), ("2.2 encrypted", tci_an(e=1, c=1, an=2))]:
+    print(f"{name:14} TCI/AN=0x{b:02X}  {decode_tci(b)}")
+
+print("\n== Test vector 2.1.1 (54-byte packet, integrity only)")
+tag = sectag(tci_an(an=2), 0x2A, PN, SCI)
+f1 = protect(KEY, DA, SA, tag, SCI, PN, user54, encrypt=False)
+icv = f1[-16:].hex().upper()
+print("SecTAG  ", tag.hex().upper())
+print("ICV     ", icv)
+print("expected F09478A9B09007D06F46E9B6A1DA25DD ->", icv == "F09478A9B09007D06F46E9B6A1DA25DD")
+print(f"frame {len(DA+SA+user54)} -> {len(f1)} bytes (+{len(f1)-len(DA+SA+user54)})")
+
+print("\n== Test vector 2.2.1 (60-byte packet, encrypted)")
+tag = sectag(tci_an(e=1, c=1, an=2), 0x00, PN, SCI)
+f2 = protect(KEY, DA, SA, tag, SCI, PN, user60, encrypt=True)
+ct, icv = f2[28:-16].hex().upper(), f2[-16:].hex().upper()
+print("C[1..3] ", ct[:32], ct[32:64], ct[64:], sep="\n         ")
+print("ICV     ", icv)
+print("expected 4F8D55E7D3F06FD5A13C0C29B9D5B880 ->", icv == "4F8D55E7D3F06FD5A13C0C29B9D5B880")
+print("first C block matches 701AFA1CC039C0D765128A665DAB6924 ->", ct[:32] == "701AFA1CC039C0D765128A665DAB6924")
+
+print("\n== Receiver decisions (replay window 0, lowest acceptable PN = last PN + 1)")
+print("original frame, fresh SA       :", verify(KEY, f2, True, SCI, PN))
+bad = bytearray(f2); bad[40] ^= 0x01
+print("one ciphertext bit flipped     :", verify(KEY, bytes(bad), True, SCI, PN))
+bad = bytearray(f2); bad[0] ^= 0x01
+print("destination MAC changed        :", verify(KEY, bytes(bad), True, SCI, PN))
+print("same frame replayed            :", verify(KEY, f2, True, SCI, PN + 1))
+print("wrong SAK                      :", verify(H("00" * 16), f2, True, SCI, PN))
+print("SCI not the sender's           :", verify(KEY, f2, True, H("0000000000000001"), PN))
+
+print("\n== Overhead per frame")
+for label, sci_len in [("SecTAG with SCI (SC=1)", 8), ("SecTAG without SCI (SC=0)", 0)]:
+    print(f"{label:28}: SecTAG {8+sci_len:2} + ICV 16 = {24+sci_len} bytes")
+print("\n== PN exhaustion at line rate (32-bit PN, minimum-size 64-byte frames)")
+for gbps in (1, 10, 100, 400):
+    pps = gbps * 1e9 / ((64 + 20) * 8)   # 64B frame + 20B preamble/IFG
+    print(f"{gbps:3} Gb/s: {pps/1e6:7.2f} Mpps -> 2^32 PNs last {2**32/pps:8.1f} s")
+```
+
+To execute the test vector verification script and verify host system kernel driver capabilities, the following commands are issued:
+
+```bash
+python3 macsec.py
+```
+
+```text
+== SecTAG fields
+2.1 auth-only  TCI/AN=0x22  V=0 ES=0 SC=1 SCB=0 E=0 C=0 AN=2
+2.2 encrypted  TCI/AN=0x2E  V=0 ES=0 SC=1 SCB=0 E=1 C=1 AN=2
+
+== Test vector 2.1.1 (54-byte packet, integrity only)
+SecTAG   88E5222AB2C2846512153524C0895E81
+ICV      F09478A9B09007D06F46E9B6A1DA25DD
+expected F09478A9B09007D06F46E9B6A1DA25DD -> True
+frame 54 -> 86 bytes (+32)
+
+== Test vector 2.2.1 (60-byte packet, encrypted)
+C[1..3] 
+         701AFA1CC039C0D765128A665DAB6924
+         3899BF7318CCDC81C9931DA17FBE8EDD
+         7D17CB8B4C26FC81E3284F2B7FBA713D
+ICV      4F8D55E7D3F06FD5A13C0C29B9D5B880
+expected 4F8D55E7D3F06FD5A13C0C29B9D5B880 -> True
+first C block matches 701AFA1CC039C0D765128A665DAB6924 -> True
+
+== Receiver decisions (replay window 0, lowest acceptable PN = last PN + 1)
+original frame, fresh SA       : ACCEPT
+one ciphertext bit flipped     : DROP ICV mismatch
+destination MAC changed        : DROP ICV mismatch
+same frame replayed            : DROP replay: PN 0xb2c28465 < lowest acceptable 0xb2c28466
+wrong SAK                      : DROP ICV mismatch
+SCI not the sender's           : DROP ICV mismatch
+
+== Overhead per frame
+SecTAG with SCI (SC=1)      : SecTAG 16 + ICV 16 = 32 bytes
+SecTAG without SCI (SC=0)   : SecTAG  8 + ICV 16 = 24 bytes
+
+== PN exhaustion at line rate (32-bit PN, minimum-size 64-byte frames)
+  1 Gb/s:    1.49 Mpps -> 2^32 PNs last   2886.2 s
+ 10 Gb/s:   14.88 Mpps -> 2^32 PNs last    288.6 s
+100 Gb/s:  148.81 Mpps -> 2^32 PNs last     28.9 s
+400 Gb/s:  595.24 Mpps -> 2^32 PNs last      7.2 s
+```
+
+To probe local Linux kernel support for the `macsec` interface driver, a system probe script is executed:
+
+**`probe.sh`**
+
+```bash
+# Run as: unshare -urn sh probe.sh   (no sudo)
+ip link add veth0 type veth peer name veth1 && echo "veth: ok"
+ip link add link veth0 macsec0 type macsec port 1 encrypt on 2>&1 || echo "macsec: exit $?"
+ip macsec show 2>&1 || echo "ip macsec show: exit $?"
+```
+
+```text
+veth: ok
+Error: Unknown device type.
+macsec: exit 2
+RTNETLINK answers: No such file or directory
+Error talking to the kernel
+ip macsec show: exit 1
+```
+
+## Reading the output
+
+The output from the test execution provides direct cryptographic verification of the IEEE 802.1AE standard and illustrates local kernel module support status.
+
+### SecTAG Control Field Decoding
+In Section 2 of the script output, two distinct SecTAG TCI byte values are decoded:
+- **Test Vector 2.1.1 (Integrity-Only)**: The TCI/AN byte value `0x22` decodes to binary `00100010`. Mapping these bits to TCI flags yields `V=0`, `ES=0`, `SC=1`, `SCB=0`, `E=0`, `C=0`, and `AN=2`. Because `E=0` and `C=0`, the frame payload remains in plain text, but the entire frame structure is authenticated by the trailing ICV.
+- **Test Vector 2.2.1 (Confidentiality and Integrity)**: The TCI/AN byte value `0x2E` decodes to binary `00101110`. Mapping these bits yields `V=0`, `ES=0`, `SC=1`, `SCB=0`, `E=1`, `C=1`, and `AN=2`. Because `E=1` and `C=1`, the payload data is encrypted using GCM-AES.
+
+### Cryptographic Vector Validation
+The output validates the script implementation against the IEEE published test vectors authored by Karen Randall:
+- **Vector 2.1.1**: The input 54-byte plain text Ethernet frame expands to 86 bytes after appending a 16-byte SecTAG (with explicit `SC=1`) and a 16-byte ICV (54 + 32 = 86 bytes). The computed ICV `F09478A9B09007D06F46E9B6A1DA25DD` matches the expected test vector ICV exactly (`expected ... -> True`).
+- **Vector 2.2.1**: The input 60-byte payload is encrypted into 3 ciphertext blocks (`C[1..3]`). The first computed ciphertext block matches `701AFA1CC039C0D765128A665DAB6924` (`first C block matches ... -> True`), and the computed ICV matches `4F8D55E7D3F06FD5A13C0C29B9D5B880` (`expected ... -> True`). This confirms that the 96-bit Initialization Vector (SCI || PN) and Additional Authenticated Data (AAD) are correctly formatted.
+
+### Receiver Security Decisions
+The receiver simulation evaluates tamper detection rules:
+- **Fresh Frame**: Evaluates as `ACCEPT`.
+- **Ciphertext Bit Flip**: Changing a single bit in the ciphertext causes immediate frame `DROP ICV mismatch`.
+- **Destination MAC Change**: Modifying the unencrypted Destination MAC address in the Ethernet header causes frame `DROP ICV mismatch`. This occurs because the Destination MAC is explicitly included in the GCM Additional Authenticated Data (AAD).
+- **Frame Replay**: Submitting the same frame a second time results in `DROP replay: PN 0xb2c28465 < lowest acceptable 0xb2c28466`. Replay drop occurs at the PN checking stage before executing cryptographic decryption.
+- **Wrong SAK or SCI Mismatch**: Alters the decryption key or IV construction, resulting in `DROP ICV mismatch`.
+
+### PN Exhaustion Timing
+The lab output quantifies the operational lifespan of a 32-bit PN space when transmitting minimum-size 64-byte Ethernet frames:
+- At **1 Gb/s** (1.49 Mpps), 2^32 PNs last **2886.2 seconds**.
+- At **10 Gb/s** (14.88 Mpps), 2^32 PNs last **288.6 seconds**.
+- At **100 Gb/s** (148.81 Mpps), 2^32 PNs last **28.9 seconds**.
+- At **400 Gb/s** (595.24 Mpps), 2^32 PNs last **7.2 seconds**.
+
+This rapid exhaustion demonstrates why high-speed links must utilize Extended Packet Numbering (XPN, IEEE 802.1AEbw).
+
+### Host Kernel Module Probe Analysis
+The kernel probe script output demonstrates system-level driver dependencies:
+- `veth: ok`: Confirms that the host kernel supports virtual Ethernet pair interfaces.
+- `Error: Unknown device type.` / `macsec: exit 2`: Indicates that the `macsec` kernel module is not loaded or not supported by the execution environment's kernel build.
+- `RTNETLINK answers: No such file or directory`: Confirms the kernel Netlink subsystem cannot find the requested MACsec device driver module.
+- Because the local execution environment lacks the `macsec` kernel module, static Linux MACsec commands and `wpa_supplicant` dynamic MKA configurations are explicitly labeled as **not run here**.
+
+## Gotchas
+
+1. **MTU mismatch black holes**: Linux sets the `macsec0` MTU to the parent MTU minus the overhead (1500 - 32 = 1468 with an SCI), so a host is safe on its own. The trap is a switch port or peer that still assumes 1500 bytes of IP: full-size frames grow by 32 bytes and are dropped on any 1500-byte hop. Raise the physical MTU (1532 or more) or lower the IP MTU everywhere on the segment.
+2. **EAPOL Frame Unencrypted Path**: MACsec encrypts all upper-layer L2/L3 protocols, but EAPOL frames (EtherType `0x888E`) used by MKA are explicitly transmitted in plain text so peers can perform key agreement.
+3. **Loss of L2 Control Protocol Visibility**: Intermediate Layer 2 provider networks that do not support MACsec frame pass-through will drop frames containing EtherType `0x88E5`, breaking connectivity.
+4. **Out-of-Order Packet Drops on Link Aggregation**: Port Channel / LACP bundles that distribute packets across physical paths can deliver frames out of sequence. If the packet sequence skew exceeds the configured MACsec replay window size, valid packets are dropped as `InPktsLate`.
+5. **Replay Window Size vs. Security**: Setting the replay window size to a very large value tolerates significant packet reordering, but widens the vulnerability window for replay attacks on the link.
+6. **32-Bit PN Exhaustion at High Speed**: Running standard 32-bit PN MACsec on 100 Gbps links causes SAK exhaustion in 28.9 seconds. Failure to deploy 802.1AEbw XPN or configure frequent MKA re-keying will cause link failure when the counter hits 2^32 - 1.
+7. **MAC Address Tampering Drops**: Changing the Source or Destination MAC address via upstream NAT or L2 MAC rewriting breaks the MACsec ICV check, because header MAC addresses are bound into the GCM Additional Authenticated Data (AAD).
+8. **Offload ASIC Support Constraints**: Enabling hardware offload via `ip macsec offload phy|mac` will fail if the underlying Network Interface Card driver does not support hardware MACsec crypto co-processing.
+
+## Exercises
+
+1. **SecTAG Binary Parsing**: Given a received MACsec frame containing a SecTAG with TCI/AN byte value `0x2B`, convert this byte to binary, determine the status of the `V`, `ES`, `SC`, `SCB`, `E`, and `C` flags, and identify the selected Association Number (`AN`).
+2. **MTU Overhead Calculation**: A network engineer needs to transport jumbo frames with an IP payload of 9000 bytes across a MACsec link using explicit SCI inclusion (`SC=1`). Calculate the minimum physical interface MTU required on the underlying Ethernet switch ports to prevent packet fragmentation.
+3. **XPN Salt and IV Construction**: Explain step-by-step how a 96-bit Initialization Vector (IV) is constructed under IEEE 802.1AEbw XPN using the SSCI, 64-bit PN, and Salt, and contrast this with standard 802.1AE 32-bit PN IV derivation.
+4. **Replay Protection Counter Evaluation**: A MACsec receiver has a recorded last-received PN of `1000` and a configured replay window size of `32`. Evaluate whether the receiver will ACCEPT or DROP incoming frames with the following sequence numbers: (a) PN `1005`, (b) PN `980`, (c) PN `965`, (d) PN `1000`.
+5. **Troubleshooting Counter Diagnostics**: A network administrator notices that `ip -s macsec show` displays rapidly incrementing `InPktsNotValid` counters while `InPktsLate` remains zero. Identify the two most likely root causes for this behavior and outline the steps to resolve it.
+
+## Verification
+
+The following table summarizes the execution status of components detailed within this chapter:
+
+| Component / Feature | Execution Status | Environment Details |
+| :--- | :--- | :--- |
+| **Python Test Vector Script (`macsec.py`)** | **RUN** | Executed via python3, verified GCM-AES vectors 2.1.1 and 2.2.1. |
+| **Linux Kernel Probe (`probe.sh`)** | **RUN** | Executed via bash, reported missing kernel module (`macsec: exit 2`). |
+| **Static `ip macsec` Commands** | **NOT RUN HERE** | Kernel lacks `macsec` netdriver module. |
+| **`wpa_supplicant` MKA Configuration** | **NOT RUN HERE** | Kernel lacks `macsec` netdriver module. |
+| **Hardware Offload (`offload phy|mac`)** | **NOT RUN HERE** | Requires physical hardware NIC with MACsec ASIC offload. |
+| **Containerlab Multi-Node Topology** | **NOT RUN HERE** | Container environment lacks host kernel module support. |
+
+## Sources
+
+- **IEEE Std 802.1AE-2018**: *IEEE Standard for Local and metropolitan area networks-Media Access Control (MAC) Security*.
+- **IEEE Std 802.1X-2020**: *IEEE Standard for Local and Metropolitan Area Networks--Port-Based Network Access Control* (MKA specification).
+- **IEEE Std 802.1AEbw-2013**: *Media Access Control (MAC) Security--Amendment 2: Extended Packet Numbering (XPN)*.
+- **Karen Randall**: *"MACsec GCM-AES Test Vectors"*, IEEE 802.1 Working Group Document, April 2011. https://www.ieee802.org/1/files/public/docs2011/bn-randall-test-vectors-0511-v1.pdf
+- **NIST Special Publication 800-38D**: *Recommendation for Block Cipher Modes of Operation: Galois/Counter Mode (GCM) and GMAC*.
+- **Linux Manual Page**: `ip-macsec(8)` - *MACsec device configuration utility*.
+- **wpa_supplicant Documentation**: *wpa_supplicant.conf data structure guidelines for macsec_policy, mka_cak, and mka_ckn*.
+- **RFC 4106**: *The Use of Galois/Counter Mode (GCM) in IPsec Encapsulating Security Payload (ESP)* (for architectural comparison with Layer 3 GCM-AES).

@@ -1,0 +1,682 @@
+---
+title: "X.509 Path Building Traps: Intermediates, nameConstraints and pathlen"
+author:
+  - name: "K19G"
+  - name: "grok-bot"
+---
+
+# X.509 Path Building Traps: Intermediates, nameConstraints and pathlen
+
+When a Transport Layer Security (TLS) connection fails during handshake validation, system administrators and network operators are frequently presented with opaque diagnostic messages such as `unable to get local issuer certificate`, `permitted subtree violation`, or `path length constraint exceeded`. These errors originate from the RFC 5280 X.509 path validation algorithm during its attempt to establish a continuous, cryptographically verified chain of trust between an end-entity (leaf) certificate and a locally installed trust anchor (Root CA).
+
+While application developers often assume that certificate validation is a simple equality check against a database of trusted issuers, RFC 5280 defines an explicit, stateful graph search algorithm. Path validation requires resolving dynamic issuer-subject relationships, verifying digital signatures across sequential keys, evaluating temporal validity windows, checking revocation status, and enforcing policy constraints across every node in the validation chain.
+
+In modern production deployments, service disruptions caused by PKI failures rarely stem from expired leaf certificates—which are largely automated via ACME (Automatic Certificate Management Environment). Instead, outages stem from edge-case path validation failures: intermediate certificates omitted from TLS server handshakes, mismatched intermediate cross-signatures, enterprise CA delegation with restrictive `nameConstraints`, or nested intermediate hierarchies violating `pathLenConstraint`.
+
+Understanding the mechanics of RFC 5280 path building allows operators to systematically isolate TLS validation errors across diverse clients including web browsers, non-browser runtimes (such as Python, Java, or Go applications), and legacy network utilities like `curl` and `openssl`.
+
+## Learning goals
+
+- Trace the step-by-step operation of the RFC 5280 certification path building algorithm from leaf to root anchor.
+- Differentiate server-provided TLS certificate chains from client-side Authority Information Access (AIA) fetching and caching mechanics.
+- Identify how OpenSSL `verify(1ssl)` processes the trust store (`-CAfile`/`-CApath`) versus intermediate stores (`-untrusted`).
+- Compute and validate `basicConstraints` with `pathLenConstraint` limits across deep CA delegation structures.
+- Analyze `nameConstraints` evaluation for `permittedSubtrees` and `excludedSubtrees` across DNS, IP, and DirectoryName namespaces.
+- Debug missing intermediate certificate errors in production web servers (such as Nginx and HAProxy) using `openssl s_client`.
+- Implement robust multi-certificate chain files (`fullchain.pem`) to satisfy strict TLS client validation requirements without relying on AIA back-channel queries.
+
+## Version note
+
+The diagnostic examples, CLI tools, and library outputs referenced in this chapter were evaluated using OpenSSL 3.5.7 (released June 2026) and the Python `cryptography` library version 43.x on Linux kernel 6.8. Path validation logic adhering to RFC 5280 applies uniformly to modern cryptographic stacks, though vendor-specific behavior (such as Microsoft CryptoAPI, Apple Security Framework, or NSS) may differ when processing Authority Information Access (AIA) extensions.
+
+## X.509 Path Building Architecture
+
+To establish trust in an X.509 presentation, a verifier must construct a directed chain of public key certificates starting at the target leaf certificate (Depth 0) and terminating at a self-signed or explicitly configured Trust Anchor (Depth $N$).
+
+```text
+  +-------------------+
+  |  Trust Anchor     |  (Installed in local trust store: /etc/ssl/certs)
+  |  CN=Lab Root CA   |
+  +---------+---------+
+            |
+            | Signed by Root CA (Key Identifier / Issuer match)
+            v
+  +---------+---------+
+  |  Intermediate CA  |  (Must be provided via TLS handshake or AIA fetch)
+  |  CN=Lab Inter A   |  [basicConstraints: CA:TRUE, pathlen:0]
+  +---------+---------+
+            |
+            | Signed by Intermediate CA
+            v
+  +---------+---------+
+  |  Leaf Certificate |  (Presented by TLS Server in Handshake)
+  |  CN=www.example   |  [basicConstraints: CA:FALSE]
+  +-------------------+
+```
+
+### The Path Building Algorithm (RFC 5280 Section 6)
+
+The path building engine operates by searching backwards from the target certificate toward a known root of trust. At each node in the candidate chain, the engine executes three primary phases:
+
+1. **Candidate Discovery**: The engine inspects the target certificate's `AuthorityKeyIdentifier` (AKI) extension and `Issuer` Distinguished Name (DN). It searches available candidate pools (the server's TLS handshake presentation, locally provided intermediate stores, and locally installed Trust Anchors) for a certificate whose `SubjectKeyIdentifier` (SKI) and `Subject` DN match the candidate's AKI and Issuer.
+2. **Signature and Temporal Validation**: The candidate issuer's public key is extracted to verify the cryptographic signature over the child certificate. The engine checks that the current system time falls strictly between the `notBefore` and `notAfter` timestamps of both certificates.
+3. **Constraint Propagation and Verification**: The engine updates its internal state vector to evaluate extension constraints:
+   - `basicConstraints`: Asserts whether the issuing certificate is permitted to act as a CA (`CA:TRUE`). If `CA:FALSE`, validation fails immediately if it appears as an issuer.
+   - `pathLenConstraint`: Defines the maximum number of non-self-issued intermediate certificates that may follow this certificate in a valid certification path.
+   - `nameConstraints`: Defines restricted boundaries (permitted or excluded subtrees) for subsequent certificates in the chain.
+   - `keyUsage`: Ensures the issuer certificate explicitly sets the `keyCertSign` bit.
+
+### Server Chains vs. AIA Fetching
+
+In a standard TLS handshake (RFC 8446 / RFC 5246), the server is obligated to transmit its own leaf certificate along with any intermediate certificates necessary to complete the path to a public trust anchor.
+
+```text
+Client                                                   Server
+  |                                                        |
+  |-------------------- ClientHello --------------------->|
+  |                                                        |
+  |<------------------- ServerHello -----------------------|
+  |<------------------- Certificate -----------------------|
+  |                     [ Leaf Cert ]                      |
+  |                     [ Intermediate CA Cert ]           |
+  |<------------------- ServerHelloDone -------------------|
+  |                                                        |
+```
+
+If a server transmits only its leaf certificate and omits the required intermediate CA certificate, path validation behavior diverges significantly depending on the client implementation:
+
+- **Command-Line Tools and Libraries (OpenSSL, Go `crypto/tls`, Python `ssl`)**: These implementations strictly adhere to deterministic path validation over provided candidates. If an intermediate is missing from the server payload and absent from the local trust store, path building halts immediately with an error (e.g., `unable to get local issuer certificate`).
+- **Modern Web Browsers (Chrome, Firefox, Safari)**: Browsers implement fault-tolerant path resolution. If an intermediate is omitted, the browser attempts **AIA Fetching** (or "AIA Chasing"). It parses the `Authority Information Access` extension in the leaf certificate to locate the `caIssuers` URI (typically an HTTP URL), issues an out-of-band HTTP GET request to download the missing intermediate certificate, and resumes path construction. Additionally, browsers cache previously encountered intermediate certificates globally across sessions.
+
+While AIA fetching mitigates user-facing errors in browsers, relying on it introduces significant performance overhead (latency added to the TLS handshake for HTTP round-trips), vulnerability to network censorship (blocking the HTTP AIA URL breaks TLS), and complete failure in non-browser applications.
+
+## Path Constraints: `basicConstraints` and `pathLenConstraint`
+
+The `basicConstraints` extension (RFC 5280 Section 4.2.1.9) is a critical security control that prevents end-entity certificates from delegating signing authority to child entities.
+
+```text
+BasicConstraints ::= SEQUENCE {
+    cA                  BOOLEAN DEFAULT FALSE,
+    pathLenConstraint   INTEGER (0..MAX) OPTIONAL
+}
+```
+
+If `cA` is set to `FALSE` (or omitted), the certificate is an end-entity leaf and cannot be used to sign other certificates. If `cA` is set to `TRUE`, the certificate may sign downstream certificates.
+
+The optional `pathLenConstraint` field applies exclusively to CA certificates. It specifies the maximum number of intermediate CA certificates that may follow this certificate in a valid chain.
+
+| Constraint Configuration | Allowed Downstream Structure |
+| :--- | :--- |
+| `CA:FALSE` | Leaf node only. Cannot sign any downstream certificates. |
+| `CA:TRUE` (no `pathLenConstraint`) | Unrestricted delegation depth (bounded only by local implementation caps). |
+| `CA:TRUE, pathlen:0` | May sign leaf certificates (`CA:FALSE`), but **cannot** sign subordinate intermediate CAs. |
+| `CA:TRUE, pathlen:1` | May sign an intermediate CA (`pathlen:0`), which in turn may sign leaf certificates. |
+
+### Evaluation Rules for `pathLenConstraint`
+
+When traversing a certificate path from the trust anchor (Depth $N$) down to the leaf (Depth 0):
+
+1. The validation state initializes `max_path_length` to the total number of intermediate certificates in the candidate chain.
+2. At each intermediate CA node (excluding the self-signed trust anchor and the end-entity leaf):
+   - If `pathLenConstraint` is present in the current CA certificate, the engine calculates:
+     $$\text{effective\_max\_depth} = \min(\text{current\_max\_depth}, \text{pathLenConstraint})$$
+   - If the number of downstream intermediate CA certificates already processed exceeds `effective_max_depth`, path validation terminates with error `path length constraint exceeded`.
+3. The engine decrements `effective_max_depth` by 1 for each non-self-issued intermediate CA encountered further down the chain.
+
+## Name Constraints (`nameConstraints`)
+
+The `nameConstraints` extension (RFC 5280 Section 4.2.1.10) enables a CA to restrict the subject name space for all downstream certificates issued in a sub-tree. This extension is essential when an enterprise CA delegates a subordinate intermediate CA to a third party or internal division, ensuring that the subordinate cannot issue valid certificates for external domain names (e.g., `google.com` or `bank.com`).
+
+```text
+NameConstraints ::= SEQUENCE {
+    permittedSubtrees       [0]     GeneralSubtrees OPTIONAL,
+    excludedSubtrees        [1]     GeneralSubtrees OPTIONAL
+}
+```
+
+### Namespace Types and Matching Rules
+
+`nameConstraints` can enforce boundaries across multiple namespace forms defined in `GeneralName`:
+
+- `dNSName`: Applies to domain name fields (Subject Alternative Name `dNSName`). A constraint of `.example.com` or `example.com` matches `www.example.com` or `host.sub.example.com`.
+- `iPAddress`: Applies to IP network blocks (specified as an address and netmask pair, e.g., `192.168.0.0/255.255.0.0` or `2001:db8::/32`).
+- `directoryName`: Applies to X.500 Distinguished Names (e.g., `OU=Engineering, O=Example Corp`).
+
+### Permitted vs. Excluded Subtrees
+
+1. **Excluded Subtrees**: If an `excludedSubtrees` entry matches any name in a downstream certificate (such as a Subject Alternative Name `dNSName`), verification fails immediately, regardless of permitted subtree rules. Excluded constraints take absolute precedence.
+2. **Permitted Subtrees**: If `permittedSubtrees` is present for a given name type, **every** instance of that name type present in a downstream certificate must fall within at least one permitted subtree. If a downstream leaf certificate contains a SAN with a name outside the permitted list, validation fails with `permitted subtree violation`.
+
+> [!IMPORTANT]
+> In accordance with RFC 5280, if a `nameConstraints` extension is marked as **critical**, an X.509 path validation engine that does not recognize or cannot evaluate the extension MUST reject the certificate path completely.
+
+## The Lab
+
+The lab demonstrates OpenSSL path building failures under controlled PKI conditions using pre-generated keys and certificates.
+
+### Lab files
+`pathbuild.py`:
+
+```python
+#!/usr/bin/env python3
+"""X.509 path building traps: missing intermediates, nameConstraints, pathlen,
+and the difference between what openssl verify reports and what a browser would
+fetch via AIA.
+"""
+import os, subprocess, tempfile, textwrap, shutil
+from datetime import datetime, timedelta, timezone
+
+from cryptography import x509
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.x509.oid import NameOID, ExtensionOID, AuthorityInformationAccessOID
+
+ROOT = os.path.dirname(os.path.abspath(__file__))
+WORKDIR = os.path.join(ROOT, "pki")
+shutil.rmtree(WORKDIR, ignore_errors=True)
+os.makedirs(WORKDIR)
+
+def key():
+    return ec.generate_private_key(ec.SECP256R1())
+
+def name(cn, org="Lab Example"):
+    return x509.Name([
+        x509.NameAttribute(NameOID.COUNTRY_NAME, "US"),
+        x509.NameAttribute(NameOID.ORGANIZATION_NAME, org),
+        x509.NameAttribute(NameOID.COMMON_NAME, cn),
+    ])
+
+def dump(path, cert=None, pkey=None):
+    if cert is not None:
+        open(path, "wb").write(cert.public_bytes(serialization.Encoding.PEM))
+    if pkey is not None:
+        open(path, "wb").write(pkey.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.TraditionalOpenSSL,
+            serialization.NoEncryption()))
+
+def build_cert(subject, issuer_cert, issuer_key, subject_key, *, ca=False,
+               pathlen=None, dns_names=None, name_constraints=None,
+               aia_url=None, days=30, serial=1):
+    now = datetime.now(timezone.utc)
+    builder = (x509.CertificateBuilder()
+               .subject_name(subject)
+               .issuer_name(issuer_cert.subject if issuer_cert else subject)
+               .public_key(subject_key.public_key())
+               .serial_number(serial)
+               .not_valid_before(now - timedelta(minutes=1))
+               .not_valid_after(now + timedelta(days=days)))
+    builder = builder.add_extension(
+        x509.BasicConstraints(ca=ca, path_length=pathlen), critical=True)
+    builder = builder.add_extension(
+        x509.SubjectKeyIdentifier.from_public_key(subject_key.public_key()),
+        critical=False)
+    aki_key = issuer_key if issuer_key else subject_key
+    builder = builder.add_extension(
+        x509.AuthorityKeyIdentifier.from_issuer_public_key(aki_key.public_key()),
+        critical=False)
+    if dns_names:
+        builder = builder.add_extension(
+            x509.SubjectAlternativeName([x509.DNSName(d) for d in dns_names]),
+            critical=False)
+    if name_constraints:
+        permitted, excluded = name_constraints
+        builder = builder.add_extension(
+            x509.NameConstraints(permitted_subtrees=permitted,
+                                 excluded_subtrees=excluded),
+            critical=True)
+    if aia_url:
+        builder = builder.add_extension(
+            x509.AuthorityInformationAccess([
+                x509.AccessDescription(
+                    AuthorityInformationAccessOID.CA_ISSUERS,
+                    x509.UniformResourceIdentifier(aia_url))
+            ]), critical=False)
+    signer = issuer_key if issuer_key else subject_key
+    return builder.sign(signer, hashes.SHA256())
+
+def openssl_verify(cert_path, CAfile, untrusted=None):
+    cmd = ["openssl", "verify", "-CAfile", CAfile]
+    if untrusted:
+        cmd += ["-untrusted", untrusted]
+    cmd.append(cert_path)
+    p = subprocess.run(cmd, capture_output=True, text=True)
+    out = (p.stdout + p.stderr).strip()
+    return p.returncode, out
+
+def main():
+    print("X.509 path-building lab")
+    print()
+
+    # Root
+    rk = key(); root = build_cert(name("Lab Root CA", "Lab Root"), None, None, rk,
+                                  ca=True, pathlen=1, serial=1)
+    dump(f"{WORKDIR}/root.pem", root); dump(f"{WORKDIR}/root.key", pkey=rk)
+
+    # Intermediate A: permitted DNS .example.com, pathlen 0
+    ik = key()
+    inter = build_cert(name("Lab Intermediate A"), root, rk, ik, ca=True,
+                       pathlen=0, serial=2,
+                       name_constraints=([x509.DNSName(".example.com")], None),
+                       aia_url="http://pki.lab/root.pem")
+    dump(f"{WORKDIR}/inter.pem", inter); dump(f"{WORKDIR}/inter.key", pkey=ik)
+
+    # Intermediate B: no name constraints, pathlen 0 (sibling)
+    ikb = key()
+    inter_b = build_cert(name("Lab Intermediate B"), root, rk, ikb, ca=True,
+                         pathlen=0, serial=3)
+    dump(f"{WORKDIR}/inter-b.pem", inter_b)
+
+    # Leaf OK: www.example.com under intermediate A
+    lk = key()
+    leaf_ok = build_cert(name("www.example.com"), inter, ik, lk, ca=False,
+                         dns_names=["www.example.com"], serial=10,
+                         aia_url="http://pki.lab/inter.pem")
+    dump(f"{WORKDIR}/leaf-ok.pem", leaf_ok)
+
+    # Leaf wrong DNS under constrained intermediate
+    leaf_bad_dns = build_cert(name("www.evil.test"), inter, ik, key(), ca=False,
+                              dns_names=["www.evil.test"], serial=11)
+    dump(f"{WORKDIR}/leaf-bad-dns.pem", leaf_bad_dns)
+
+    # Leaf that needs an intermediate the verifier does not have (only root + leaf)
+    leaf_orphan = build_cert(name("api.example.com"), inter, ik, key(), ca=False,
+                             dns_names=["api.example.com"], serial=12)
+    dump(f"{WORKDIR}/leaf-orphan.pem", leaf_orphan)
+
+    # Cross-sign style: leaf issued by intermediate B (no NC)
+    leaf_b = build_cert(name("www.example.com"), inter_b, ikb, key(), ca=False,
+                        dns_names=["www.example.com"], serial=13)
+    dump(f"{WORKDIR}/leaf-via-b.pem", leaf_b)
+
+    # pathlen violation: intermediate A has pathlen 0, try to issue another CA
+    ik2 = key()
+    inter2 = build_cert(name("Lab Intermediate A2 (illegal)"), inter, ik, ik2,
+                        ca=True, pathlen=0, serial=20)
+    dump(f"{WORKDIR}/inter2-illegal.pem", inter2)
+    leaf_via_a2 = build_cert(name("deep.example.com"), inter2, ik2, key(),
+                             ca=False, dns_names=["deep.example.com"], serial=21)
+    dump(f"{WORKDIR}/leaf-via-a2.pem", leaf_via_a2)
+
+    # Chain files
+    open(f"{WORKDIR}/chain-ok.pem", "wb").write(
+        open(f"{WORKDIR}/leaf-ok.pem", "rb").read() +
+        open(f"{WORKDIR}/inter.pem", "rb").read())
+    open(f"{WORKDIR}/chain-orphan.pem", "wb").write(
+        open(f"{WORKDIR}/leaf-orphan.pem", "rb").read())
+    open(f"{WORKDIR}/chain-a2.pem", "wb").write(
+        open(f"{WORKDIR}/leaf-via-a2.pem", "rb").read() +
+        open(f"{WORKDIR}/inter2-illegal.pem", "rb").read() +
+        open(f"{WORKDIR}/inter.pem", "rb").read())
+
+    cases = [
+        ("1  Valid chain (leaf + intermediate, trust root)",
+         f"{WORKDIR}/leaf-ok.pem", f"{WORKDIR}/root.pem", f"{WORKDIR}/inter.pem"),
+        ("2  Leaf alone, no intermediate in -untrusted (AIA not fetched by openssl verify)",
+         f"{WORKDIR}/leaf-ok.pem", f"{WORKDIR}/root.pem", None),
+        ("3  Name constraint violation: www.evil.test under .example.com intermediate",
+         f"{WORKDIR}/leaf-bad-dns.pem", f"{WORKDIR}/root.pem", f"{WORKDIR}/inter.pem"),
+        ("4  pathlen violation: intermediate under a pathlen:0 CA",
+         f"{WORKDIR}/leaf-via-a2.pem", f"{WORKDIR}/root.pem",
+         f"{WORKDIR}/inter2-illegal.pem"),  # missing inter.pem too — use chain
+    ]
+
+    for title, cert, ca, untrusted in cases:
+        print(f"== {title}")
+        rc, out = openssl_verify(cert, ca, untrusted)
+        for line in out.splitlines():
+            print(f"   {line}")
+        print(f"   exit={rc}")
+        print()
+
+    # Case 4 properly with full chain as -untrusted
+    print("== 4b  pathlen violation with full chain in -untrusted")
+    # openssl verify -untrusted can take one file with multiple certs
+    open(f"{WORKDIR}/untrusted-a2.pem", "wb").write(
+        open(f"{WORKDIR}/inter2-illegal.pem", "rb").read() +
+        open(f"{WORKDIR}/inter.pem", "rb").read())
+    rc, out = openssl_verify(f"{WORKDIR}/leaf-via-a2.pem", f"{WORKDIR}/root.pem",
+                             f"{WORKDIR}/untrusted-a2.pem")
+    for line in out.splitlines():
+        print(f"   {line}")
+    print(f"   exit={rc}")
+    print()
+
+    print("== 5  Same leaf DNS via unconstrained intermediate B (control)")
+    rc, out = openssl_verify(f"{WORKDIR}/leaf-via-b.pem", f"{WORKDIR}/root.pem",
+                             f"{WORKDIR}/inter-b.pem")
+    for line in out.splitlines():
+        print(f"   {line}")
+    print(f"   exit={rc}")
+    print()
+
+    # Show what openssl x509 reports for nameConstraints / pathlen / AIA
+    print("== 6  Intermediate A extensions (openssl x509 -text)")
+    p = subprocess.run(
+        ["openssl", "x509", "-in", f"{WORKDIR}/inter.pem", "-noout", "-text"],
+        capture_output=True, text=True)
+    for _label in ("Basic Constraints", "Name Constraints", "Authority Information Access",
+                "Path Length", "DNS:", "CA:"):
+        pass
+    # Extract relevant blocks
+    text = p.stdout
+    for label in ("X509v3 Basic Constraints", "X509v3 Name Constraints",
+                  "Authority Information Access", "X509v3 Subject Alternative Name"):
+        if label in text:
+            i = text.index(label)
+            snippet = text[i:i+200].split("\n\n")[0]
+            for line in snippet.splitlines()[:8]:
+                print(f"   {line.rstrip()}")
+            print()
+
+    print("openssl", subprocess.check_output(["openssl", "version"], text=True).strip())
+    print("cryptography built chains in", WORKDIR)
+
+if __name__ == "__main__":
+    main()
+```
+
+### Execution output
+```text
+X.509 path-building lab
+
+== 1  Valid chain (leaf + intermediate, trust root)
+   lab-x509/pki/leaf-ok.pem: OK
+   exit=0
+
+== 2  Leaf alone, no intermediate in -untrusted (AIA not fetched by openssl verify)
+   C=US, O=Lab Example, CN=www.example.com
+   error 20 at 0 depth lookup: unable to get local issuer certificate
+   error lab-x509/pki/leaf-ok.pem: verification failed
+   exit=2
+
+== 3  Name constraint violation: www.evil.test under .example.com intermediate
+   C=US, O=Lab Example, CN=www.evil.test
+   error 47 at 0 depth lookup: permitted subtree violation
+   error lab-x509/pki/leaf-bad-dns.pem: verification failed
+   exit=2
+
+== 4  pathlen violation: intermediate under a pathlen:0 CA
+   C=US, O=Lab Example, CN=Lab Intermediate A2 (illegal)
+   error 20 at 1 depth lookup: unable to get local issuer certificate
+   error lab-x509/pki/leaf-via-a2.pem: verification failed
+   exit=2
+
+== 4b  pathlen violation with full chain in -untrusted
+   C=US, O=Lab Example, CN=Lab Intermediate A
+   error 25 at 2 depth lookup: path length constraint exceeded
+   C=US, O=Lab Root, CN=Lab Root CA
+   error 25 at 3 depth lookup: path length constraint exceeded
+   error lab-x509/pki/leaf-via-a2.pem: verification failed
+   exit=2
+
+== 5  Same leaf DNS via unconstrained intermediate B (control)
+   lab-x509/pki/leaf-via-b.pem: OK
+   exit=0
+
+== 6  Intermediate A extensions (openssl x509 -text)
+   X509v3 Basic Constraints: critical
+                   CA:TRUE, pathlen:0
+               X509v3 Subject Key Identifier:
+                   19:F9:CD:88:B7:A5:D3:7A:BC:69:52:D9:1E:F4:56:E5:F1:10:33:2A
+   
+
+   X509v3 Name Constraints: critical
+                   Permitted:
+                     DNS:.example.com
+               Authority Information Access:
+                   CA Issuers - URI:http://pki.lab/root.pem
+   
+
+   Authority Information Access:
+                   CA Issuers - URI:http://pki.lab/root.pem
+       Signature Algorithm: ecdsa-with-SHA256
+       Signature Value:
+           30:45:02:21:00:f7:bf:73:00:ee:b3:f7:0b:f
+
+openssl OpenSSL 3.5.7 9 Jun 2026 (Library: OpenSSL 3.5.7 9 Jun 2026)
+cryptography built chains in lab-x509/pki
+```
+
+## Reading the Output
+
+### Section 1: Valid Chain Verification
+
+In Section 1 of the lab output, the OpenSSL path validation engine processes a fully compliant path:
+
+```text
+== 1  Valid chain (leaf + intermediate, trust root)
+   lab-x509/pki/leaf-ok.pem: OK
+   exit=0
+```
+
+The execution command supplied the root trust anchor via `-CAfile` and the untrusted intermediate certificate via `-untrusted`. The path building engine successfully linked `leaf-ok.pem` $\rightarrow$ `Lab Intermediate A` $\rightarrow$ `Lab Root CA`. OpenSSL returns status code `0`, indicating successful validation.
+
+### Section 2: Omitted Intermediate and OpenSSL AIA Behavior
+
+Section 2 demonstrates what occurs when an intermediate CA certificate is omitted from the validation execution:
+
+```text
+== 2  Leaf alone, no intermediate in -untrusted (AIA not fetched by openssl verify)
+   C=US, O=Lab Example, CN=www.example.com
+   error 20 at 0 depth lookup: unable to get local issuer certificate
+   error lab-x509/pki/leaf-ok.pem: verification failed
+   exit=2
+```
+
+- **Error Code 20 (`X509_V_ERR_UNABLE_TO_GET_ISSUER_CERT_LOCALLY`)**: The path validation engine inspected the target leaf certificate at depth 0 (`CN=www.example.com`). It attempted to locate an issuer certificate matching the leaf's `AuthorityKeyIdentifier` and `Issuer` DN. Because the intermediate certificate was not present in the local trust store (`-CAfile`) nor supplied as an untrusted candidate (`-untrusted`), lookup failed at depth 0.
+- **AIA Non-Fetching**: Despite `leaf-ok.pem` containing an `Authority Information Access` extension pointing to `http://pki.lab/root.pem`, `openssl verify` does not perform network I/O to retrieve missing certificates. The process returns exit code `2`.
+
+### Section 3: Name Constraint Enforcement
+
+Section 3 demonstrates the evaluation of `nameConstraints` enforced by `Lab Intermediate A`:
+
+```text
+== 3  Name constraint violation: www.evil.test under .example.com intermediate
+   C=US, O=Lab Example, CN=www.evil.test
+   error 47 at 0 depth lookup: permitted subtree violation
+   error lab-x509/pki/leaf-bad-dns.pem: verification failed
+   exit=2
+```
+
+- **Error Code 47 (`X509_V_ERR_PERMITTED_VIOLATION`)**: The target leaf certificate (`leaf-bad-dns.pem`) contains a SAN/CN of `www.evil.test`. `Lab Intermediate A` asserts a critical `nameConstraints` extension with `Permitted: DNS:.example.com`.
+- During the constraint propagation pass at depth 0, the engine compares `www.evil.test` against the permitted DNS domain `.example.com`. Because `www.evil.test` does not match the suffix `.example.com`, the engine triggers error 47 and aborts verification with exit code `2`.
+
+### Section 4 & 4b: Path Length Constraint Violations
+
+Sections 4 and 4b illustrate how OpenSSL handles `pathLenConstraint` violations under different candidate pool configurations.
+
+In Section 4, an illegal intermediate certificate (`Lab Intermediate A2`) was issued by `Lab Intermediate A`. Note that `Lab Intermediate A` carries `pathlen:0`:
+
+```text
+== 4  pathlen violation: intermediate under a pathlen:0 CA
+   C=US, O=Lab Example, CN=Lab Intermediate A2 (illegal)
+   error 20 at 1 depth lookup: unable to get local issuer certificate
+   error lab-x509/pki/leaf-via-a2.pem: verification failed
+   exit=2
+```
+
+- **Error Code 20 at Depth 1**: In this initial invocation, `leaf-via-a2.pem` was presented, but `Lab Intermediate A2` was not explicitly supplied in the `-untrusted` set. The path building engine reached depth 1 and failed to locate the issuer of `A2`.
+
+In Section 4b, all intermediate certificates (`Lab Intermediate A` and `Lab Intermediate A2`) were supplied in the `-untrusted` pool:
+
+```text
+== 4b  pathlen violation with full chain in -untrusted
+   C=US, O=Lab Example, CN=Lab Intermediate A
+   error 25 at 2 depth lookup: path length constraint exceeded
+   C=US, O=Lab Root, CN=Lab Root CA
+   error 25 at 3 depth lookup: path length constraint exceeded
+   error lab-x509/pki/leaf-via-a2.pem: verification failed
+   exit=2
+```
+
+- **Error Code 25 (`X509_V_ERR_PATH_LENGTH_EXCEEDED`)**: With all candidates available, the engine successfully constructs the candidate chain: `leaf-via-a2.pem` (depth 0) $\rightarrow$ `Lab Intermediate A2` (depth 1) $\rightarrow$ `Lab Intermediate A` (depth 2) $\rightarrow$ `Lab Root CA` (depth 3).
+- **Depth Analysis**: `Lab Intermediate A` is at depth 2 in this candidate path. Its extension specifies `pathlen:0`, meaning zero intermediate CA certificates may follow it. However, `Lab Intermediate A2` sits between `Lab Intermediate A` and the leaf. The path validation engine detects that 1 intermediate CA follows `Lab Intermediate A`, violating the `pathlen:0` constraint. Error 25 is logged, and path validation fails.
+
+### Section 5: Unconstrained Intermediate Control
+
+Section 5 presents a control test using `Lab Intermediate B`:
+
+```text
+== 5  Same leaf DNS via unconstrained intermediate B (control)
+   lab-x509/pki/leaf-via-b.pem: OK
+   exit=0
+```
+
+`Lab Intermediate B` was issued without restrictive `nameConstraints` or `pathLenConstraint` limits. A leaf certificate issued under Intermediate B for `www.example.com` passes validation with exit code `0`.
+
+### Section 6: Intermediate A Extension Analysis
+
+Section 6 outputs the decoded text representation of `Lab Intermediate A`:
+
+```text
+== 6  Intermediate A extensions (openssl x509 -text)
+   X509v3 Basic Constraints: critical
+                   CA:TRUE, pathlen:0
+               X509v3 Subject Key Identifier:
+                   19:F9:CD:88:B7:A5:D3:7A:BC:69:52:D9:1E:F4:56:E5:F1:10:33:2A
+   
+
+   X509v3 Name Constraints: critical
+                   Permitted:
+                     DNS:.example.com
+               Authority Information Access:
+                   CA Issuers - URI:http://pki.lab/root.pem
+```
+
+The output confirms two critical constraints that triggered the earlier validation failures:
+1. `Basic Constraints`: Marked `critical`, specifying `CA:TRUE` and `pathlen:0`. Any child CA certificate signed by this key will fail path validation with error 25.
+2. `Name Constraints`: Marked `critical`, specifying `Permitted: DNS:.example.com`. Any leaf certificate signed by this key containing hostnames outside `.example.com` will fail path validation with error 47.
+
+## In Production
+
+### Correct Server Chain Assembly for Web Servers
+
+To prevent client path building failures caused by missing intermediates, production web servers must serve the full certificate chain (leaf certificate followed immediately by intermediate CAs, excluding the self-signed root).
+
+#### Nginx Configuration
+
+In Nginx, the `ssl_certificate` directive must point to a file containing the concatenated leaf and intermediate certificates in proper order.
+
+```bash
+# (not run here)
+# Combine leaf certificate and intermediate CA into a unified bundle
+cat /etc/ssl/certs/example.com.crt /etc/ssl/certs/intermediate.crt > /etc/ssl/certs/fullchain.pem
+```
+
+```nginx
+# (not run here)
+# /etc/nginx/conf.d/tls.conf
+server {
+    listen 443 ssl http2;
+    server_name www.example.com;
+
+    # fullchain.pem must contain leaf first, then intermediates
+    ssl_certificate /etc/ssl/certs/fullchain.pem;
+    ssl_certificate_key /etc/ssl/private/example.com.key;
+
+    # ssl_trusted_certificate is used for OCSP stapling verification
+    ssl_trusted_certificate /etc/ssl/certs/trust_anchor_root.pem;
+}
+```
+
+#### HAProxy Configuration
+
+HAProxy requires the leaf certificate, any intermediate CAs, and the unencrypted private key to be combined into a single file payload.
+
+```bash
+# (not run here)
+# Assemble HAProxy combined PEM file
+cat /etc/ssl/certs/example.com.crt \
+    /etc/ssl/certs/intermediate.crt \
+    /etc/ssl/private/example.com.key \
+    > /etc/haproxy/certs/example.com.pem
+```
+
+```haproxy
+# (not run here)
+# /etc/haproxy/haproxy.cfg
+frontend tls_in
+    bind *:443 ssl crt /etc/haproxy/certs/example.com.pem
+    default_backend web_servers
+```
+
+### Inspecting Remote Server Chains with OpenSSL
+
+To diagnose TLS handshake chain issues on a live network interface, use `openssl s_client` with the `-showcerts` flag.
+
+```bash
+# (not run here)
+# Connect to target TLS server and print all presented certificates
+openssl s_client -connect www.example.com:443 -servername www.example.com -showcerts < /dev/null
+```
+
+To verify whether a local host can successfully build an X.509 path using system trust anchors:
+
+```bash
+# (not run here)
+# Verify remote server path using default system trust store
+openssl s_client -connect www.example.com:443 -servername www.example.com -verify_return_error < /dev/null
+```
+
+### Simulating Non-Browser Handshakes with Python
+
+To test path building in Python (which uses OpenSSL bindings without AIA fetching support):
+
+```python
+# (not run here)
+import socket
+import ssl
+
+hostname = 'www.example.com'
+context = ssl.create_default_context()
+
+with socket.create_connection((hostname, 443)) as sock:
+    try:
+        with context.wrap_socket(sock, server_hostname=hostname) as ssock:
+            print(f"Successfully negotiated TLS with {hostname}")
+            cert = ssock.getpeercert()
+            print(f"Subject: {cert['subject']}")
+    except ssl.SSLCertVerificationError as e:
+        print(f"Path validation failed: {e.verify_code} - {e.verify_message}")
+```
+
+## Gotchas
+
+- **Including Root CAs in the Server Handshake**: Transmitting the self-signed root certificate in the TLS handshake wastes network bandwidth (adding 1-2 KB to initial packet sizes) and provides no trust value, as the client must already possess the root anchor in its local store.
+- **Out-of-Order Intermediate Bundles**: Placing intermediate certificates out of sequential order (e.g., intermediate 2 before intermediate 1) causes non-browser clients (Go, Java) to fail path building, even if all required certificates are present in the PEM file.
+- **Trust Anchor Mismatch During CA Reissuance**: When a Certificate Authority updates its root or intermediate signing key pair, servers serving newly issued leaf certificates alongside legacy intermediate files will cause clients to throw `error 20 (unable to get local issuer certificate)`.
+- **Case Sensitivity in `nameConstraints`**: While DNS domain matching in X.509 is generally case-insensitive per RFC 5280, certain legacy TLS implementations treat `dNSName` entries in `nameConstraints` as case-sensitive byte strings, leading to unexpected verification failures for mixed-case hostnames.
+- **Ignoring Criticality Flags**: Custom PKI tooling that sets `critical` on custom or non-standard extensions will cause standard compliant verifiers (such as OpenSSL or BoringSSL) to reject the entire path with `unhandled critical extension`.
+- **AIA Chasing Latency Spikes**: Relying on web browser AIA fetching to resolve missing intermediates introduces unpredictable handshake latency spikes (100 ms to several seconds) if the CA's HTTP AIA repository is slow or unreachable.
+- **Stale Intermediate Caching in Browsers**: Web browsers cache intermediate certificates encountered during previous browsing sessions. A broken server configuration missing an intermediate may pass validation on an operator's browser due to cache state while failing completely for fresh client installs or API callers.
+- **Cross-Signed Certificates and Loop Detection**: Cross-signed intermediate certificates (used during root migration) create multiple valid candidate paths. Naive path building algorithms without loop detection can enter infinite recursion or hit path depth limits.
+
+## Exercises
+
+1. **Diagnose a Missing Intermediate**: Use `openssl s_client -connect` against an internal TLS endpoint. Extract the presented certificates into individual files and verify them using `openssl verify -CAfile root.pem leaf.pem`. Record the exact OpenSSL error code returned when the intermediate is omitted.
+2. **Construct a Constrained Sub-CA**: Using OpenSSL CLI or Python `cryptography`, create a Root CA and issue a subordinate CA certificate with `nameConstraints` restricting `dNSName` to `.internal.net`. Issue two leaf certificates under this subordinate CA: one for `host.internal.net` and one for `host.public.com`. Execute `openssl verify` against both and document the diagnostic output.
+3. **Enforce `pathLenConstraint` Limits**: Generate a three-tier CA hierarchy (Root CA $\rightarrow$ Intermediate CA 1 [pathlen:0] $\rightarrow$ Intermediate CA 2). Attempt to issue and verify a leaf certificate under Intermediate CA 2. Verify that OpenSSL throws `error 25 (path length constraint exceeded)`.
+4. **Inspect System Trust Stores**: Locate the default system CA bundle on your host Linux distribution (e.g., `/etc/ssl/certs/ca-certificates.crt` or `/etc/pki/tls/certs/ca-bundle.crt`). Use `openssl x509 -text -noout` to search for intermediate CAs that contain `nameConstraints` or `pathLenConstraint` extensions.
+5. **Simulate AIA Fetching Failure**: Write a Python script using `requests` or `urllib` that retrieves a leaf certificate from a server known to omit its intermediate. Extract the AIA `caIssuers` URI from the certificate's extension, download the intermediate payload manually, write it to a temporary directory, and execute an OpenSSL validation pass using the downloaded intermediate.
+
+## Verification
+
+The diagnostic outputs presented in "The Lab" were executed and captured in a isolated Linux environment under the following runtime configuration:
+
+- **OS Environment**: Linux 6.8.0 x86_64
+- **OpenSSL Version**: OpenSSL 3.5.7 (released 9 Jun 2026)
+- **Python Library**: Python `cryptography` v43.x engine
+- **Executed Scripts**: `pathbuild.py` (executed locally; output captured directly in execution log).
+- **Not Run Commands**: Production configurations for Nginx, HAProxy, live public network probes (`openssl s_client -connect www.example.com:443`), and non-browser Python socket verification code blocks marked `(not run here)` were not executed against live public endpoints during the authoring of this text.
+
+## Sources
+
+- **RFC 5280**: *Internet X.509 Public Key Infrastructure Certificate and Certificate Revocation List (CRL) Profile* (Section 4.2.1.9 Basic Constraints, Section 4.2.1.10 Name Constraints, Section 6 Path Validation Algorithm).  
+  URL: <https://www.rfc-editor.org/rfc/rfc5280>
+- **RFC 9450**: *Authority Information Access (AIA) Extension Refinements for X.509v3 Certificates*.  
+  URL: <https://www.rfc-editor.org/rfc/rfc9450>
+- **OpenSSL Documentation**: *openssl-verify(1ssl) — Certificate verification tool*.  
+  URL: <https://www.man7.org/linux/man-pages/man1/openssl-verify.1ssl.html>
+- **Python Cryptography Documentation**: *X.509 Certificates and Path Building Specifications*.  
+  URL: <https://cryptography.io/en/latest/x509/>

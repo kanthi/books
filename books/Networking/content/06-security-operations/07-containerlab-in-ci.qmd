@@ -1,0 +1,323 @@
+---
+title: "Containerlab in CI: Smoke-Testing a Topology on Every Change"
+author:
+  - name: "K19G"
+  - name: "grok-bot"
+---
+
+# Containerlab in CI: Smoke-Testing a Topology on Every Change
+
+A lab that only runs on your laptop drifts. A config change that "obviously" works breaks a BGP session nobody re-checked. The fix is the same as for software: every change to a topology or its configs deploys the lab in CI, waits for it to converge, asserts the things you care about, collects evidence, and tears it down. Automation and Lab-as-Code sketched this in a few lines. This chapter builds the whole pipeline: the workflow, a convergence check that waits properly instead of sleeping, teardown that always runs, and the runner decisions that decide whether CI can run your images at all.
+
+## Learning goals
+
+By the end of this chapter you can:
+
+- Write a GitHub Actions workflow that installs a pinned Containerlab, deploys a topology, runs checks, and always destroys the lab
+- Replace `sleep 60` with a convergence check that polls structured output until a deadline and fails with a useful message
+- Decide between GitHub-hosted and self-hosted runners based on the images your lab needs
+- Collect artifacts that make a red build debuggable after the lab is gone
+- Lint a topology in CI without deploying it
+
+**Version note.** The convergence checker in this chapter ran on 2026-11-13 on the writing host (Python 3.13.5, standard library only) against hand-written JSON fixtures in the shape of FRR's `show bgp summary json`. A small shell script stood in for `docker exec ... vtysh` so the checker could be exercised through converge and timeout paths. Its output is pasted verbatim. **The GitHub Actions workflow, Containerlab deploy, and all device commands were not run on the writing host**, which has no Docker and no Containerlab. They are written from the Containerlab documentation, the GitHub Actions documentation, and the Containerlab project's own CI. Containerlab install commands are quoted from containerlab.dev.
+
+## What a lab smoke test is, and is not
+
+| It is | It is not |
+|-------|-----------|
+| Proof that the topology deploys and the configs load | A performance test |
+| Proof that adjacencies form and expected routes appear | Proof that production will behave the same |
+| A fast, repeatable red/green on every pull request | A replacement for thinking about failure modes |
+| A record of what the lab looked like when it passed | A long-running lab you log into |
+
+Keep the smoke test small: the fewest nodes that exercise the change, and checks that read structured output. A CI lab that takes 25 minutes gets disabled.
+
+## Choose the runner first
+
+The images decide where the job can run.
+
+| Runner | Has Docker | Can pull | Good for |
+|--------|-----------|----------|----------|
+| GitHub-hosted `ubuntu-24.04` | Yes | Public images: FRR from quay.io, SR Linux and `network-multitool` from ghcr.io, Alpine | FRR and SR Linux labs |
+| Self-hosted runner on your lab host | Yes, already set up | Whatever is loaded locally, including vendor images you are licensed to use | cEOS and other images you cannot publish |
+
+Arista cEOS is downloaded from Arista after login and imported locally; you cannot pull it from a public registry, and you must not push it to one. A cEOS lab therefore runs on a **self-hosted runner** (your lab host), or not in CI at all. The lab host track's image table is exactly the inventory a self-hosted runner would see.
+
+Memory is the other limit. Each SR Linux or cEOS node wants about 2 GB. A GitHub-hosted runner has far less headroom than the 15 GB lab host, so keep hosted-runner labs to FRR and Linux nodes, or one SR Linux node.
+
+Self-hosted runners execute whatever a workflow says, with Docker access, which is root-equivalent on that host. Only attach them to private repositories, or require approval for workflows from forks.
+
+## The topology under test
+
+A three-router FRR eBGP triangle is enough to exercise configs and policy:
+
+```{.yaml filename="ci.clab.yml"}
+name: ci
+topology:
+  kinds:
+    frr:
+      image: quay.io/frrouting/frr:containerlab-10.7.1
+  nodes:
+    r1:
+      kind: frr
+      startup-config: configs/r1.frr.conf
+    r2:
+      kind: frr
+      startup-config: configs/r2.frr.conf
+    r3:
+      kind: frr
+      startup-config: configs/r3.frr.conf
+  links:
+    - endpoints: ["r1:eth1", "r2:eth1"]
+    - endpoints: ["r1:eth2", "r3:eth1"]
+    - endpoints: ["r2:eth2", "r3:eth2"]
+```
+
+Each router runs `bgpd` with two eBGP neighbours and announces one loopback, 10.0.0.N/32 for rN. The FRR configs follow the eBGP chapters; their exact content does not matter here. What matters is that the repository holds the topology, the configs, and the checks together, so one pull request changes all three.
+
+## Wait for convergence, do not sleep
+
+The most common CI lab bug is `sleep 60` followed by a check. On a fast runner it wastes a minute. On a slow runner BGP has not converged yet and the build goes red for no reason. Poll instead: read structured output, decide, wait a little, try again, and give up at a deadline with a message that says what was still wrong.
+
+```{.python filename="check-bgp.py"}
+#!/usr/bin/env python3
+"""Poll a node's FRR 'show bgp summary json' until every peer is Established
+and has received at least MIN_PFX prefixes, or fail after a deadline."""
+import json, subprocess, sys, time
+
+def bgp_summary(cmd):
+    out = subprocess.run(cmd, shell=True, capture_output=True, text=True, check=True).stdout
+    return json.loads(out)
+
+def check(summary, min_pfx):
+    problems = []
+    peers = summary.get("ipv4Unicast", {}).get("peers", {})
+    if not peers:
+        problems.append("no IPv4 unicast peers configured")
+    for addr, p in sorted(peers.items()):
+        if p.get("state") != "Established":
+            problems.append(f"{addr}: state {p.get('state')}")
+        elif p.get("pfxRcd", 0) < min_pfx:
+            problems.append(f"{addr}: {p.get('pfxRcd', 0)} prefixes < {min_pfx}")
+    return problems
+
+def main():
+    cmd, min_pfx, deadline_s, every_s = sys.argv[1], int(sys.argv[2]), float(sys.argv[3]), float(sys.argv[4])
+    start = time.monotonic()
+    attempt = 0
+    while True:
+        attempt += 1
+        problems = check(bgp_summary(cmd), min_pfx)
+        elapsed = time.monotonic() - start
+        if not problems:
+            print(f"PASS after {attempt} attempt(s), {elapsed:.1f}s")
+            return 0
+        print(f"attempt {attempt} at {elapsed:.1f}s: " + "; ".join(problems))
+        if elapsed + every_s > deadline_s:
+            print(f"FAIL: not converged within {deadline_s:.0f}s")
+            return 1
+        time.sleep(every_s)
+
+sys.exit(main())
+```
+
+The first argument is the command that produces FRR's JSON. In CI it is `docker exec clab-ci-r1 vtysh -c 'show bgp summary json'`. To exercise the checker without a lab, a stand-in script returns three snapshots in turn, the way a converging router would:
+
+```{.bash filename="fake-vtysh.sh"}
+#!/bin/sh
+# Stand-in for: docker exec clab-ci-r1 vtysh -c 'show bgp summary json'
+# Returns t0, t1, then t2 forever, to simulate a lab converging.
+n=$(cat .calls 2>/dev/null || echo 0)
+echo $((n + 1)) > .calls
+case $n in 0) f=t0 ;; 1) f=t1 ;; *) f=t2 ;; esac
+cat "fixtures/r1-$f.json"
+```
+
+The fixtures are hand-written, in the shape of FRR's `show bgp summary json` (top-level `ipv4Unicast`, a `peers` object keyed by neighbour address, each with `state` and `pfxRcd`). `fixtures/r1-t1.json`, the middle snapshot:
+
+```{.json filename="r1-t1.json"}
+{"ipv4Unicast": {"routerId": "10.0.0.1", "as": 65001, "peers": {
+  "10.12.0.2": {"remoteAs": 65002, "state": "Established", "pfxRcd": 2},
+  "10.13.0.2": {"remoteAs": 65003, "state": "OpenSent", "pfxRcd": 0}}}}
+```
+
+Converging case, captured:
+
+```text
+$ python3 check-bgp.py ./fake-vtysh.sh 2 60 2
+attempt 1 at 0.0s: 10.12.0.2: state Active; 10.13.0.2: state Connect
+attempt 2 at 2.0s: 10.13.0.2: state OpenSent
+PASS after 3 attempt(s), 4.0s
+exit=0
+```
+
+Never-converging case (a peer stuck in OpenSent), captured:
+
+```text
+$ python3 check-bgp.py "cat fixtures/r1-t1.json" 2 5 2
+attempt 1 at 0.0s: 10.13.0.2: state OpenSent
+attempt 2 at 2.0s: 10.13.0.2: state OpenSent
+attempt 3 at 4.0s: 10.13.0.2: state OpenSent
+FAIL: not converged within 5s
+exit=1
+```
+
+Read what that buys you. The pass took three polls and four seconds, not a fixed minute. The failure names the peer and its state, so the CI log already says "10.13.0.2 stuck in OpenSent", which points at a capability or AS mismatch, not at "BGP broken". The non-zero exit fails the step.
+
+Two habits in the checker are worth copying into every check you write:
+
+- **Fail on "nothing configured".** An empty peer list is a failure, not a pass. A typo in the config file name gives you a router with no BGP, and a naive loop over zero peers passes.
+- **Check content, not just state.** `Established` with zero prefixes received is usually a policy mistake. The `MIN_PFX` argument catches it.
+
+Write the same shape for each protocol you care about: OSPF neighbours `Full` from `show ip ospf neighbor json`, specific prefixes present in `show ip route json`, and end-to-end reachability with `ping -c 3` between Linux hosts. If you use netlab, `netlab validate` already implements this pattern for its modules, with retries, and exits non-zero on failure.
+
+## The workflow
+
+```{.yaml filename="lab-smoke.yml"}
+name: lab-smoke
+
+on:
+  pull_request:
+    paths:
+      - "lab/**"
+  workflow_dispatch:
+
+concurrency:
+  group: lab-smoke-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  smoke:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      CLAB_VERSION: "pin-a-release-here"
+    defaults:
+      run:
+        working-directory: lab
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install containerlab (pinned)
+        run: bash -c "$(curl -sL https://get.containerlab.dev)" -- -v "$CLAB_VERSION"
+
+      - name: Pre-pull images
+        run: docker pull quay.io/frrouting/frr:containerlab-10.7.1
+
+      - name: Deploy
+        run: sudo -E containerlab deploy -t ci.clab.yml --reconfigure
+
+      - name: Wait for BGP on every router
+        run: |
+          for r in r1 r2 r3; do
+            python3 check-bgp.py "sudo docker exec clab-ci-$r vtysh -c 'show bgp summary json'" 2 180 5
+          done
+
+      - name: End-to-end reachability
+        run: sudo docker exec clab-ci-r1 ping -c 3 -I 10.0.0.1 10.0.0.3
+
+      - name: Collect evidence
+        if: always()
+        run: |
+          mkdir -p evidence
+          sudo containerlab inspect -t ci.clab.yml --format json > evidence/inspect.json || true
+          for r in r1 r2 r3; do
+            sudo docker exec clab-ci-$r vtysh -c 'show running-config' > evidence/$r-running.txt || true
+            sudo docker exec clab-ci-$r vtysh -c 'show bgp summary json' > evidence/$r-bgp.json || true
+            sudo docker logs clab-ci-$r > evidence/$r-container.log 2>&1 || true
+          done
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lab-evidence
+          path: lab/evidence/
+
+      - name: Destroy
+        if: always()
+        run: sudo -E containerlab destroy -t ci.clab.yml --cleanup || true
+```
+
+Line by line, the parts that matter:
+
+- **`paths: lab/**`.** Only changes to the lab trigger it. A typo fix in a README does not boot three routers.
+- **`concurrency` with `cancel-in-progress`.** A new push to the same pull request cancels the old run, so two labs with the same name never fight over one runner.
+- **`timeout-minutes`.** A hung deploy fails in 20 minutes instead of GitHub's default of six hours.
+- **Pinned Containerlab.** The install script accepts `-- -v <version>`, as shown on containerlab.dev. Put a real release number in `CLAB_VERSION`; `latest` means a Containerlab release can turn your build red on a day you changed nothing. Pin the FRR image tag for the same reason.
+- **Pre-pull.** Image download time is separated from deploy time, so a slow registry shows up as a slow pull step, not a mysterious deploy timeout.
+- **`--reconfigure`.** Deploy from a clean state even if a previous run on a self-hosted runner left the lab directory behind.
+- **`if: always()` on evidence, upload and destroy.** These must run when an earlier step failed, which is exactly when you need them. On a hosted runner the VM is discarded anyway, but the same workflow on a self-hosted runner would otherwise leave three routers running.
+- **`|| true` in cleanup steps.** A failing cleanup must not mask the real failure, and must not stop the other cleanup commands.
+
+The `sudo` calls are there because a fresh hosted runner user is not in the groups Containerlab's installer configures for sudo-less use until a new login. On a self-hosted lab host where you already run `containerlab` without sudo, drop them.
+
+## Lint without deploying
+
+Some mistakes do not need a lab to find. Run these in a fast job before the smoke job, or on every push:
+
+| Check | Command | Catches |
+|-------|---------|---------|
+| Topology renders and is valid | `containerlab graph -t ci.clab.yml --mermaid` (or `--dot`); a non-zero exit fails the step | YAML errors, bad endpoints, unknown kinds |
+| Configs exist where the topology says | A one-line shell loop over `startup-config:` paths with `test -f` | Renamed or missing config files |
+| c9s compatibility (if you also run on Kubernetes) | `containerlab --runtime c9s validate -t ci.clab.yml` | Fields the c9s runtime cannot realise; needs no cluster |
+| FRR config syntax | Run `vtysh --dryrun -f configs/r1.frr.conf` in the FRR image, if your FRR version supports it | Typos in FRR config |
+
+The c9s row is useful even without a cluster: the containerlab documentation states that `validate` and `deploy --emit-crs` for the c9s runtime never contact the cluster.
+
+## Making red builds debuggable
+
+When a smoke test fails, the lab is already destroyed by the time you read the log. The evidence step is what you debug from.
+
+- `inspect.json` shows which nodes came up and their management addresses.
+- `rN-running.txt` is the configuration each router actually ran, which may differ from the file if a line failed to parse.
+- `rN-bgp.json` is the state at the moment of failure. Feed it straight back into `check-bgp.py` with `cat` as the command to reproduce the verdict locally.
+- `rN-container.log` holds daemon start-up errors such as a daemon that refused to start.
+
+Keep artifacts small and text. A pcap of every link for every run fills storage fast; capture only in a separate, manually triggered job.
+
+## Lab: run the pipeline (not run on the writing host)
+
+1. Put `ci.clab.yml`, three FRR configs, `check-bgp.py` and the workflow in a private repository, with the workflow at `.github/workflows/lab-smoke.yml`.
+2. Open a pull request that changes r3's AS number on one side only. Predict: the BGP wait step fails with `10.13.0.2` (or the equivalent peer) not Established, and the evidence artifact shows `remoteAs` disagreeing with the configured value.
+3. Fix it and push again. Predict: the earlier run is cancelled if still going, and the new one passes in the time it takes to boot and converge, not a fixed sleep.
+4. Add a prefix-list on r2 that filters r1's loopback. Predict: sessions are Established but `pfxRcd` is 1 on r1's session with r2, and the check fails on `MIN_PFX`.
+5. On your lab host, register a self-hosted runner for the repository, switch `runs-on` to it, and add a cEOS node. Predict: the job only works on the self-hosted runner, because the cEOS image exists only there.
+
+## Gotchas
+
+- **`sleep` instead of polling.** Flaky on slow runners, slow on fast ones.
+- **Unpinned versions.** `latest` for Containerlab or images means unrelated red builds.
+- **Teardown without `if: always()`.** Leaves labs running on self-hosted runners after the first failure.
+- **Same lab name in parallel runs** on one self-hosted runner. Use `concurrency`, or put the run ID into the lab name with `containerlab deploy --name`.
+- **Vendor images on hosted runners.** You cannot pull them, and you must not publish them to make it work.
+- **Self-hosted runners on public repositories.** A fork's pull request can run arbitrary code with Docker access on your lab host.
+- **Checks that pass on nothing.** Treat zero peers, zero routes or an empty JSON reply as failures.
+- **Masking failures in cleanup.** Use `|| true` in cleanup, never in the checks.
+
+## Boring rule
+
+Pin everything, poll with a deadline instead of sleeping, assert on structured output, and always collect evidence and destroy the lab, even when a step failed.
+
+## Try this
+
+1. Run `check-bgp.py` with `MIN_PFX` 3 against `fixtures/r1-t2.json` through `cat`. Expected: it never passes, and each attempt reports both peers with `2 prefixes < 3`.
+2. Create a fixture with `"peers": {}` and run the checker. Expected: `no IPv4 unicast peers configured` on every attempt, then FAIL.
+3. Write `check-ospf.py` in the same shape for FRR's `show ip ospf neighbor json`, failing unless every neighbour is `Full`. Test it with two hand-written fixtures before using it in CI.
+4. Add a `lint` job to the workflow that runs `containerlab graph --mermaid` and the config-exists loop, and make `smoke` depend on it with `needs: lint`. Expected: a broken endpoint name fails in seconds, without deploying.
+5. Change the workflow to name the lab `ci-${{ github.run_id }}` with `--name` on deploy, inspect and destroy, and point the `docker exec` commands at the matching container names. Expected: two runs on one self-hosted runner no longer collide.
+
+## Sources
+
+- Containerlab installation (install script and version pinning): <https://containerlab.dev/install/>
+- Containerlab `deploy` command (`--reconfigure`, `--name`, runtimes): <https://containerlab.dev/cmd/deploy/>
+- Containerlab `destroy` command (`--cleanup`): <https://containerlab.dev/cmd/destroy/>
+- Containerlab `inspect` command (`--format json`): <https://containerlab.dev/cmd/inspect/>
+- Containerlab `graph` command: <https://containerlab.dev/cmd/graph/>
+- Containerlab c9s runtime (`validate`, `deploy --emit-crs` without a cluster): <https://containerlab.dev/manual/clabernetes/runtime/>
+- Containerlab's own CI workflow: <https://github.com/srl-labs/containerlab/blob/main/.github/workflows/cicd.yml>
+- GitHub Actions workflow syntax (`concurrency`, `timeout-minutes`, `if: always()`): <https://docs.github.com/en/actions/writing-workflows/workflow-syntax-for-github-actions>
+- GitHub Actions security hardening for self-hosted runners: <https://docs.github.com/en/actions/security-for-github-actions/security-guides/security-hardening-for-github-actions>
+- `actions/upload-artifact`: <https://github.com/actions/upload-artifact>
+- FRR BGP documentation (`show bgp summary json`): <https://docs.frrouting.org/en/latest/bgp.html>
+- netlab `validate`: <https://netlab.tools/netlab/validate/>

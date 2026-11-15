@@ -1,0 +1,420 @@
+---
+title: "Dead Peers and Silent Paths: TCP Keepalive, TCP_USER_TIMEOUT and tcp_retries2"
+author:
+  - name: "K19G"
+  - name: "grok-bot"
+---
+
+# Dead Peers and Silent Paths: TCP Keepalive, TCP_USER_TIMEOUT and tcp_retries2
+
+## Learning goals
+
+- Explain why an idle TCP socket cannot detect a broken network path or a crashed peer by default.
+- Calculate detection times and configure socket options for TCP keepalives (`SO_KEEPALIVE`, `TCP_KEEPIDLE`, `TCP_KEEPINTVL`, `TCP_KEEPCNT`).
+- Contrast TCP keepalives with application-layer heartbeats and understand why stateful middleboxes cause silent connection deadlocks.
+- Differentiate between unacknowledged data retransmissions (`tcp_retries2`) and user-level timeout bounds (`TCP_USER_TIMEOUT`).
+- Identify how Linux processes soft ICMP errors (such as host or network unreachable) versus user timeouts.
+
+## Version note
+
+The experiments in this chapter were run on a Linux kernel 6.12.94 host inside an unprivileged multi-namespace container (`unshare -urnm`). Network tools include iproute2 version 6.15.0 (`ss`) and Python 3.13.5 standard library script execution. Three network namespaces (`c`, `r`, `s`) were chained sequentially to model a client-router-server topology. Path failures were injected via `ip route replace blackhole` and `ip route replace unreachable` commands on router `r`.
+
+## Detection of Dead Peers in TCP
+
+TCP is a stateful, connection-oriented protocol designed to operate over an unreliable datagram IP layer. However, TCP endpoints maintain connection state locally. If a remote host crashes, reboots, or suffers a silent network path outage while no data is actively flowing across the wire, neither endpoint receives explicit notification of the failure.
+
+The protocol relies on packets in flight to trigger state transitions or error timers. When a connection is idle, neither side sends traffic. If a physical line is severed or a router drops state silently, both endpoints remain in the `ESTABLISHED` state indefinitely.
+
+```
++----------+            +----------+            +----------+
+|  Client  |            |  Router  |            |  Server  |
+|   (c)    |------------|   (r)    |------------|   (s)    |
++----------+            +----------+            +----------+
+```
+
+### Stateful Middleboxes and Silent Expiry
+
+Modern IP networks frequently employ stateful middleboxes such as Network Address Translation (NAT) gateways, stateful firewalls (Linux `conntrack`), and Network Load Balancers (NLBs). These middleboxes maintain translation or connection tables mapping internal flows to external endpoints.
+
+Because memory resources on middleboxes are finite, inactive entries must be purged. For example, Linux Netfilter defaults to a 5-day timeout (`nf_conntrack_tcp_timeout_established = 432000`) for established TCP connections, but cloud infrastructure implements far shorter thresholds. An AWS Network Load Balancer, for example, defaults to a 350-second TCP idle timeout (configurable from 60 to 6000 seconds per listener); after it forgets a flow, the next packet on that flow is answered with a TCP RST. TCP keepalive packets do reset that idle timer.
+
+When a middlebox purges a flow entry due to inactivity:
+1. No TCP packets are sent to either endpoint to announce the table purge.
+2. Subsequent packets sent by either client or server hit the middlebox without an active table mapping.
+3. The middlebox typically responds with a `RST` packet or drops the frame silently.
+
+If an application does not generate periodic traffic, it will not discover that its session has been dropped by a middlebox until it attempts to send data after long periods of silence.
+
+---
+
+## TCP Keepalive Mechanisms
+
+TCP keepalive is an optional mechanism defined in RFC 9293 Section 3.8.4. When enabled on a socket, the protocol stack generates empty probe segments (or segments containing a single garbage payload byte with a previously acknowledged sequence number) after a period of channel silence.
+
+### Kernel Sysctls vs Socket Options
+
+Linux maintains three global sysctl defaults within each network namespace:
+
+| Sysctl Path | Meaning | Default Value |
+| :--- | :--- | :--- |
+| `/proc/sys/net/ipv4/tcp_keepalive_time` | Inactivity delay before sending the first probe | 7200 s (2 hours) |
+| `/proc/sys/net/ipv4/tcp_keepalive_intvl` | Interval between subsequent unacknowledged probes | 75 s |
+| `/proc/sys/net/ipv4/tcp_keepalive_probes` | Number of unacknowledged probes before dropping socket | 9 probes |
+
+By default, socket keepalive functionality is disabled. An application must explicitly issue `setsockopt()` with the `SO_KEEPALIVE` flag to enable probe generation.
+
+Applications can override the global sysctl configurations on a per-socket basis using raw IPPROTO_TCP options:
+- `TCP_KEEPIDLE`: Overrides `tcp_keepalive_time`.
+- `TCP_KEEPINTVL`: Overrides `tcp_keepalive_intvl`.
+- `TCP_KEEPCNT`: Overrides `tcp_keepalive_probes`.
+
+### Keepalive Probe Timing Calculation
+
+For an idle socket, the time from the last segment received from the peer to the abort is:
+
+detection time = TCP_KEEPIDLE + TCP_KEEPCNT x TCP_KEEPINTVL
+
+With the Linux defaults that is 7200 s + 9 x 75 s = 7875 s, or 2 hours, 11 minutes and 15 seconds.
+
+Because default idle thresholds on intermediate infrastructure (e.g., 350 seconds) are drastically lower than 7,200 seconds, stock OS keepalive parameters are insufficient to prevent idle session drops across stateful middleboxes.
+
+### Socket Diagnostics (`ss` Output)
+
+The `ss` utility inspects active socket timers. When keepalive probes are enabled and active, socket output includes timer metrics:
+
+```text
+timer:(keepalive,800ms,2)
+```
+
+Here, `keepalive` identifies the active timer type, `800ms` indicates the remaining duration before the next probe attempt, and `2` indicates the count of unacknowledged probes sent so far.
+
+---
+
+## Transmitting Data: `tcp_retries2` and `TCP_USER_TIMEOUT`
+
+Keepalive mechanisms monitor idle connections. When an application has active data in flight, connection reliability is governed by retransmission parameters.
+
+### Retransmission Limits: `tcp_retries2`
+
+When data is transmitted but unacknowledged, Linux starts a retransmission timer using exponential backoff starting from `TCP_RTO_MIN` (typically 200 ms). The sysctl `/proc/sys/net/ipv4/tcp_retries2` determines how many times TCP retransmits unacknowledged segments before aborting the connection.
+
+Despite the name, `tcp_retries2` is not used as a plain retry counter. The kernel documentation explains that it is converted into a time budget, computed as if the RTO started at `TCP_RTO_MIN` (200 ms) and doubled on every retransmission up to the 120 s maximum. The default of 15 yields a hypothetical timeout of 924.6 seconds (about 15.4 minutes), and the documentation calls this a lower bound for the effective timeout, because a connection with a larger RTO takes longer. RFC 1122 recommends at least 100 seconds, which corresponds to a value of at least 8.
+
+### Transmit Timeout Bounding: `TCP_USER_TIMEOUT`
+
+Introduced in Linux 2.6.37 (RFC 5482), `TCP_USER_TIMEOUT` is a socket option specifying the maximum time in milliseconds that sent data may remain unacknowledged before the kernel forcibly closes the connection and returns `ETIMEDOUT`.
+
+`TCP_USER_TIMEOUT` operates independently of retransmission counts:
+1. When data remains unacknowledged, the retransmission timer fires periodically.
+2. If the total elapsed time of unacknowledged transmission exceeds `TCP_USER_TIMEOUT`, the socket aborts immediately regardless of remaining `tcp_retries2` attempts.
+3. When combined with `SO_KEEPALIVE`, `TCP_USER_TIMEOUT` overrides probe counting logic: if a keepalive probe remains unacknowledged past the `TCP_USER_TIMEOUT` duration, the kernel terminates the connection instantly.
+
+---
+
+## ICMP Soft Errors vs Hard Errors
+
+When a intermediate router cannot forward a packet, it emits ICMP Destination Unreachable messages.
+
+RFC 1122 classifies ICMP Destination Unreachable codes 0 (`net unreachable`), 1 (`host unreachable`), and 5 (`source route failed`) as **soft errors**. Soft errors signal transient network conditions. Consequently, Linux does not terminate an `ESTABLISHED` TCP socket immediately upon receiving an ICMP soft error.
+
+Instead:
+1. Linux stores the error as a *soft* error (`sk_err_soft`), separate from the hard error (`sk_err`) that ends a connection.
+2. Retransmissions continue. Linux implements RFC 6069 (TCP-LCD), which reverts the RTO backoff when ICMP unreachable messages arrive for retransmitted segments, so the sender keeps re-probing the path at short intervals instead of backing off for minutes.
+3. If the user timeout or `tcp_retries2` budget expires while the path remains down, the socket closes. The error code exposed to the application via `SO_ERROR` or system calls reflects the pending soft error (e.g., `EHOSTUNREACH`) rather than generic `ETIMEDOUT`.
+
+---
+
+## Lab Architecture & Execution
+
+The lab setup creates three network namespaces (`c`, `r`, `s`) connected via virtual ethernet pairs (`veth`). Router `r` forwards traffic between subnet `10.0.1.0/24` (client `c`) and `10.0.2.0/24` (server `s`).
+
+```
+ +------------------+      +------------------+      +------------------+
+ | Namespace: c     |      | Namespace: r     |      | Namespace: s     |
+ | c0 10.0.1.2/24   |------| ra 10.0.1.1/24   |------| s0 10.0.2.2/24   |
+ | (client)         |      | rb 10.0.2.1/24   |      | (server)         |
+ +------------------+      +------------------+      +------------------+
+```
+
+### Lab Scripts
+
+Below are the complete, verbatim scripts used to run the experiments.
+
+```{.sh filename="lab.sh"}
+#!/bin/sh
+# Run as: unshare -urnm sh lab.sh   (unprivileged: user, net and mount namespaces; no sudo)
+H=$(pwd)
+mount -t tmpfs tmpfs /run; mkdir -p /run/netns
+for ns in c r s; do ip netns add $ns; ip -n $ns link set lo up; done
+ip link add c0 type veth peer name ra; ip link set c0 netns c; ip link set ra netns r
+ip link add rb type veth peer name s0; ip link set rb netns r; ip link set s0 netns s
+ip -n c addr add 10.0.1.2/24 dev c0; ip -n r addr add 10.0.1.1/24 dev ra
+ip -n r addr add 10.0.2.1/24 dev rb; ip -n s addr add 10.0.2.2/24 dev s0
+for d in c:c0 r:ra r:rb s:s0; do ip -n ${d%:*} link set ${d#*:} up; done
+ip netns exec r sh -c 'echo 1 > /proc/sys/net/ipv4/ip_forward'
+ip -n c route add default via 10.0.1.1; ip -n s route add default via 10.0.2.1
+ip netns exec s python3 $H/server.py 10.0.2.2 7000 & SV=$!; sleep 0.5
+echo "   c: tcp_retries2=$(ip netns exec c cat /proc/sys/net/ipv4/tcp_retries2) keepalive_time=$(ip netns exec c cat /proc/sys/net/ipv4/tcp_keepalive_time)s intvl=$(ip netns exec c cat /proc/sys/net/ipv4/tcp_keepalive_intvl)s probes=$(ip netns exec c cat /proc/sys/net/ipv4/tcp_keepalive_probes)"
+# run CASE-ROUTE MODE ARGS: start client, wait for its signal, break the path on r, let it run
+run() {
+  how=$1; shift; rm -f /tmp/ka-break
+  ip netns exec c python3 $H/client.py 10.0.2.2 7000 "$@" & C=$!
+  while [ ! -f /tmp/ka-break ]; do sleep 0.05; done
+  ip -n r route replace $how 10.0.2.0/24; rm -f /tmp/ka-break
+  if [ -n "$SS" ]; then sleep $SS; echo "   ss -tno in c, ${SS}s after the break:"; ip netns exec c ss -tno state established | sed 's/^/      /'; fi
+  wait $C
+  ip -n r route replace 10.0.2.0/24 dev rb
+}
+echo "== 1. path dies silently (blackhole on r), application is idle"
+SS=3 run blackhole idle limit=12
+echo "== 2. same, with keepalive idle=2 intvl=1 cnt=3"
+SS=3 run blackhole idle idle=2 intvl=1 cnt=3 limit=12
+SS=
+echo "== 3. path dies while the application is sending"
+ip netns exec c sh -c 'echo 6 > /proc/sys/net/ipv4/tcp_retries2'; echo "   (c: tcp_retries2=6 for the next run only)"
+run blackhole send limit=40
+ip netns exec c sh -c 'echo 15 > /proc/sys/net/ipv4/tcp_retries2'; echo "   (c: tcp_retries2 back to 15)"
+run blackhole send uto=3000 limit=40
+echo "== 4. TCP_USER_TIMEOUT together with keepalive (cnt=100 would mean 100 probes)"
+run blackhole idle idle=2 intvl=1 cnt=100 uto=5000 limit=40
+echo "== 5. the router says so: unreachable route (ICMP net-unreachable) instead of a blackhole"
+run unreachable send uto=3000 limit=40
+run unreachable idle idle=2 intvl=1 cnt=3 limit=12
+kill $SV
+```
+
+```{.python filename="server.py"}
+# server.py ADDR PORT: accept connections and hold them open; read and discard data.
+import socket, sys, threading
+l = socket.socket(); l.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+l.bind((sys.argv[1], int(sys.argv[2]))); l.listen(16)
+def hold(c):
+    try:
+        while c.recv(65536): pass
+    except OSError: pass
+while True:
+    c, _ = l.accept(); threading.Thread(target=hold, args=(c,), daemon=True).start()
+```
+
+```{.python filename="client.py"}
+# client.py DST PORT MODE [key=value...]: connect, signal the lab to break the path,
+# then either sit idle or keep sending, and report when (and how) the kernel gives up.
+# keys: idle, intvl, cnt (keepalive), uto (TCP_USER_TIMEOUT ms), limit (seconds to wait)
+import socket, sys, time, os, errno, select
+dst, port, mode = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+kv = dict(a.split("=") for a in sys.argv[4:]); limit = float(kv.get("limit", 30))
+s = socket.create_connection((dst, port))
+if "idle" in kv:
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+    s.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, int(kv["idle"]))
+    s.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, int(kv["intvl"]))
+    s.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, int(kv["cnt"]))
+if "uto" in kv:
+    s.setsockopt(socket.IPPROTO_TCP, socket.TCP_USER_TIMEOUT, int(kv["uto"]))
+s.send(b"hello"); time.sleep(0.2)
+open("/tmp/ka-break", "w").close()                 # lab breaks the path now
+while os.path.exists("/tmp/ka-break"): time.sleep(0.05)
+t0 = time.monotonic(); s.setblocking(False); result = None; soft = None
+while time.monotonic() - t0 < limit:
+    try:
+        if mode == "send":
+            s.send(b"z" * 1000)
+        r, _, x = select.select([s], [], [s], 0.1)
+        if r and s.recv(1) == b"": result = "peer closed"; break
+    except BlockingIOError:
+        time.sleep(0.1)
+    except OSError as e:
+        result = f"{errno.errorcode[e.errno]} ({e.strerror})"; break
+    if soft is None:      # SO_ERROR returns (and clears) sk_err, or else the ICMP soft error
+        err = s.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR)
+        if err: soft = f"{errno.errorcode[err]} at {time.monotonic() - t0:.1f}s"
+el = time.monotonic() - t0
+print(f"   {mode:4s} {' '.join(sys.argv[4:]):38s} -> " + (f"{result} after {el:.1f}s" if result else f"still ESTABLISHED after {el:.1f}s, no error")
+      + (f"   [first non-zero SO_ERROR: {soft}]" if soft else ""))
+```
+
+### Lab Execution Output
+
+The verbatim execution output from running `unshare -urnm sh lab.sh`:
+
+```text
+   c: tcp_retries2=15 keepalive_time=7200s intvl=75s probes=9
+== 1. path dies silently (blackhole on r), application is idle
+   ss -tno in c, 3s after the break:
+      Recv-Q Send-Q Local Address:Port  Peer Address:Port
+      0      0           10.0.1.2:60454     10.0.2.2:7000
+   idle limit=12                               -> still ESTABLISHED after 12.0s, no error
+== 2. same, with keepalive idle=2 intvl=1 cnt=3
+   ss -tno in c, 3s after the break:
+      Recv-Q Send-Q Local Address:Port  Peer Address:Port
+      0      0           10.0.1.2:55260     10.0.2.2:7000 timer:(keepalive,800ms,2)
+   idle idle=2 intvl=1 cnt=3 limit=12          -> ETIMEDOUT (Connection timed out) after 4.8s
+== 3. path dies while the application is sending
+   (c: tcp_retries2=6 for the next run only)
+   send limit=40                               -> EPIPE (Broken pipe) after 26.6s   [first non-zero SO_ERROR: ETIMEDOUT at 26.6s]
+   (c: tcp_retries2 back to 15)
+   send uto=3000 limit=40                      -> ETIMEDOUT (Connection timed out) after 3.4s
+== 4. TCP_USER_TIMEOUT together with keepalive (cnt=100 would mean 100 probes)
+   idle idle=2 intvl=1 cnt=100 uto=5000 limit=40 -> ETIMEDOUT (Connection timed out) after 4.9s
+== 5. the router says so: unreachable route (ICMP net-unreachable) instead of a blackhole
+   send uto=3000 limit=40                      -> EHOSTUNREACH (No route to host) after 5.0s   [first non-zero SO_ERROR: EHOSTUNREACH at 0.1s]
+   idle idle=2 intvl=1 cnt=3 limit=12          -> ETIMEDOUT (Connection timed out) after 4.8s
+```
+
+---
+
+## Reading the Output
+
+Each test phase demonstrates a specific timeout interaction:
+
+### Phase 1: Silent Path Blackhole on Idle Connection
+
+```text
+idle limit=12 -> still ESTABLISHED after 12.0s, no error
+```
+
+Without `SO_KEEPALIVE` configured, an idle TCP connection generates zero segments. Inspecting `ss -tno` confirms no timer is scheduled on the socket. Even though `ip route replace blackhole` drops all transit frames, the client socket remains in state `ESTABLISHED` indefinitely.
+
+### Phase 2: Keepalive Probe Execution
+
+```text
+idle idle=2 intvl=1 cnt=3 limit=12 -> ETIMEDOUT (Connection timed out) after 4.8s
+```
+
+Here `SO_KEEPALIVE` is configured with `idle=2`, `intvl=1`, and `cnt=3`.
+1. The client sends `b"hello"` (acknowledged at once), sleeps 0.2 s, signals the lab, and starts its clock (t = 0) once the path is broken, roughly 0.25 s after the last segment.
+2. The first keepalive probe goes out 2 s after the last activity, at about t = 1.75 s.
+3. Probes 2 and 3 follow at 1 s intervals, at about t = 2.75 s and t = 3.75 s.
+4. `ss` at t = 3 s shows `timer:(keepalive,800ms,2)`: two probes are unanswered and the next timer event is 800 ms away (at about 3.75 s).
+5. One interval after the third unanswered probe (t of about 4.75 s) the kernel gives up and the socket reports `ETIMEDOUT`: printed as 4.8 s.
+
+### Phase 3: Active Transmit Deadlocks (`tcp_retries2` vs `TCP_USER_TIMEOUT`)
+
+```text
+(c: tcp_retries2=6 for the next run only)
+send limit=40 -> EPIPE (Broken pipe) after 26.6s   [first non-zero SO_ERROR: ETIMEDOUT at 26.6s]
+```
+
+When transmitting continuously while the route is blackholed, Linux relies on exponential retransmission backoffs. Lowering `/proc/sys/net/ipv4/tcp_retries2` to `6` shrinks the time budget. The model gives 0.2 s x (2^7 - 1) = 25.4 s; the kernel dropped the session after 26.6 seconds, a little later because the real RTO started slightly above 200 ms and the check runs only when the retransmission timer fires. 
+
+Notice that the program's `send()` got `EPIPE`, not `ETIMEDOUT`. The lab client polls `getsockopt(SO_ERROR)` on every loop iteration, and that call returns *and clears* the pending error: the poll took `ETIMEDOUT`, and the next `send()` on the now-closed socket could only report `EPIPE`. Real applications that poll `SO_ERROR` (some event loops do, after a writable event) see exactly this.
+
+When `uto=3000` (`TCP_USER_TIMEOUT` set to 3000 ms) is applied with default `tcp_retries2=15`:
+
+```text
+send uto=3000 limit=40 -> ETIMEDOUT (Connection timed out) after 3.4s
+```
+
+Unacknowledged data in flight causes the connection to close after 3.4 seconds. The nominal overshoot (3.4 s versus 3.0 s) occurs because the user timeout threshold is evaluated whenever the active retransmission timer fires.
+
+### Phase 4: Overriding Keepalives with `TCP_USER_TIMEOUT`
+
+```text
+idle idle=2 intvl=1 cnt=100 uto=5000 limit=40 -> ETIMEDOUT (Connection timed out) after 4.9s
+```
+
+`TCP_KEEPCNT` is set to 100, which would normally require 102 seconds to fail (2 s + 100 x 1 s). However, `TCP_USER_TIMEOUT` is set to 5000 ms (5.0 s). The connection aborts at 4.9 s. This verifies that `TCP_USER_TIMEOUT` overrides keepalive probe counting to enforce a firm upper bound on unacknowledged probe duration.
+
+### Phase 5: ICMP Soft Error Handling
+
+```text
+send uto=3000 limit=40 -> EHOSTUNREACH (No route to host) after 5.0s   [first non-zero SO_ERROR: EHOSTUNREACH at 0.1s]
+```
+
+With an `unreachable` route rule configured, router `r` immediately returns an ICMP Net Unreachable packet to client `c`. 
+1. At t = 0.1 s, `getsockopt(SO_ERROR)` detects the pending soft error (`EHOSTUNREACH`).
+2. The socket remains `ESTABLISHED` and retransmissions continue according to RFC 6069.
+3. Once `TCP_USER_TIMEOUT` terminates the connection at t = 5.0 s, the recorded soft error (`EHOSTUNREACH`) is surfaced as the primary socket abort error instead of generic `ETIMEDOUT`.
+
+For an idle socket with keepalives enabled (`idle=2 intvl=1 cnt=3`), the result is `ETIMEDOUT` at 4.8 s, identical to the blackhole case, and no soft error was recorded at all. The router did answer every probe with ICMP unreachable, but a Linux keepalive probe carries sequence number `snd_una - 1`, deliberately just outside the window, and when an ICMP error quotes a sequence number outside `snd_una..snd_nxt` the kernel discards it as an out-of-window ICMP. A second run of just this case, with the same namespace setup as `lab.sh`, `ip netns exec c nstat -n` before it and `ip netns exec c nstat` after it, shows the counters:
+
+```text
+   idle idle=2 intvl=1 cnt=3 limit=12          -> ETIMEDOUT (Connection timed out) after 4.9s
+IcmpInMsgs                      4                  0.0
+IcmpInErrors                    1                  0.0
+IcmpInDestUnreachs              4                  0.0
+IcmpMsgInType3                  4                  0.0
+TcpExtOutOfWindowIcmps          3                  0.0
+TcpExtTCPAbortOnTimeout         1                  0.0
+TcpExtTCPKeepAlive              3                  0.0
+```
+
+Three keepalive probes (`TcpExtTCPKeepAlive 3`), three ICMP errors ignored as out of window (`TcpExtOutOfWindowIcmps 3`), and one abort on timeout. (The `Icmp6Out*` lines from the same `nstat` output are IPv6 neighbour discovery noise and are left out.) Keepalive detection on Linux therefore never gets faster because a router reports the path as unreachable.
+
+---
+
+## Choosing Values
+
+Work backwards from the shortest idle timeout on the path and from how fast you need to notice a failure:
+
+| Knob | Starting point for long-lived connections | Why |
+|---|---|---|
+| `SO_KEEPALIVE` | on | Nothing else detects a dead peer on an idle socket |
+| `TCP_KEEPIDLE` | below the smallest middlebox idle timeout, for example 60 s | Keeps NAT, conntrack and load-balancer state alive (350 s on an AWS NLB) |
+| `TCP_KEEPINTVL` | 10 to 15 s | Spacing between probes once the peer stops answering |
+| `TCP_KEEPCNT` | 3 to 5 | Tolerates a lost probe or two without false aborts |
+| `TCP_USER_TIMEOUT` | about `KEEPIDLE + KEEPINTVL x KEEPCNT` | Bounds failures that happen while data is in flight, which keepalive does not cover |
+
+Set these per socket in the application (database drivers, message-broker clients and HTTP connection pools usually expose them) rather than lowering the sysctls for the whole host. Be careful with `tcp_retries2`: lowering it globally also kills connections that are merely slow or crossing a brief outage, and RFC 1122 asks for at least 100 seconds. Where a proxy terminates TCP, add application-level liveness (HTTP/2 PING frames, WebSocket ping/pong, SSH `ServerAliveInterval`, gRPC keepalive), because TCP keepalives only ever test the hop to the proxy.
+
+## Gotchas
+
+- **Belief: TCP sockets naturally detect dead peers or broken cables.**
+  *Why it is wrong:* TCP sends packets only when an application writes data or when protocol timers (such as keepalives) fire. An idle connection without keepalive enabled will remain in state `ESTABLISHED` indefinitely despite host crashes or severed lines.
+
+- **Belief: Linux kernel keepalives protect applications against cloud middlebox flow entry timeouts.**
+  *Why it is wrong:* The default Linux `tcp_keepalive_time` is 7200 seconds (2 hours). AWS NLB defaults to a 350-second idle timeout, and many NAT devices and firewalls use idle timeouts well below two hours. Standard OS keepalives fire far too late to prevent middlebox drops.
+
+- **Belief: Application-level heartbeats and TCP keepalives perform identical functions.**
+  *Why it is wrong:* TCP keepalives monitor transport-layer reachability between OS kernels. If an intermediate proxy (e.g., an HTTP reverse proxy or layer-7 load balancer) terminates the TCP connection, TCP keepalives only test the leg between the client and the proxy. Application-layer heartbeats (such as gRPC keepalives or WebSocket ping/pong) test end-to-end application responsiveness.
+
+- **Belief: `tcp_retries2 = 15` means TCP will retransmit a packet 15 times at 1-second intervals.**
+  *Why it is wrong:* Linux converts `tcp_retries2` into a time duration using exponential backoff starting from `TCP_RTO_MIN` (200 ms). A setting of 15 corresponds to a timeout of roughly 924.6 seconds (~15.4 minutes), not 15 seconds or 15 probes.
+
+- **Belief: Inspecting `SO_ERROR` with `getsockopt` has no side effects on subsequent socket operations.**
+  *Why it is wrong:* Reading `SO_ERROR` retrieves **and clears** the pending socket error (`sk_err`). In Phase 3, polling `SO_ERROR` consumed `ETIMEDOUT`, causing the subsequent `send()` invocation to return `EPIPE` (Broken pipe) due to writing to a closed socket without a pending error state.
+
+- **Belief: ICMP Destination Unreachable messages cause TCP sockets to abort immediately.**
+  *Why it is wrong:* ICMP Destination Unreachable codes 0, 1, and 5 are treated as soft errors under RFC 1122. Linux logs the error code internally and continues retransmitting until user timeouts or retransmission limits expire.
+
+- **Belief: `TCP_USER_TIMEOUT` only controls active data retransmissions.**
+  *Why it is wrong:* `TCP_USER_TIMEOUT` also controls unacknowledged keepalive probes. When configured alongside `SO_KEEPALIVE`, `TCP_USER_TIMEOUT` terminates the socket as soon as the total unacknowledged probe duration exceeds the configured threshold.
+
+---
+
+## Exercises
+
+1. **Calculate Custom Keepalive Durations:**
+   An application configures `TCP_KEEPIDLE = 30`, `TCP_KEEPINTVL = 5`, and `TCP_KEEPCNT = 4`. Calculate the exact elapsed duration from the last received ACK until the kernel closes the connection.
+2. **Observe Socket Timers with `ss`:**
+   Modify `lab.sh` to execute `ss -tno` continuously every 0.5 seconds during Phase 2. Track the decay of the remaining timer interval and the incremental count of unacknowledged probes.
+3. **Analyze `SO_ERROR` Consumption:**
+   Write a Python script that causes a socket to time out. Compare the return value of `send()` when `getsockopt(SOL_SOCKET, SO_ERROR)` is called prior to `send()` versus when it is omitted.
+4. **Tune BGP-Style Session Failover:**
+   Given a network with a stateful firewall enforcing a 120-second TCP idle timeout, select appropriate values for `TCP_KEEPIDLE`, `TCP_KEEPINTVL`, `TCP_KEEPCNT`, and `TCP_USER_TIMEOUT` to detect path loss within 15 seconds while preventing middlebox flow drops.
+5. **Differentiate Hard vs Soft ICMP Errors:**
+   In phase 5, replace `ip route replace unreachable` with `ip route replace prohibit`, which makes r answer with ICMP code 13 (communication administratively prohibited) instead of net unreachable. Run the `send uto=3000` case again. Does the socket still survive until the user timeout, and which error does it report? Compare with the soft-error list in RFC 1122 section 4.2.3.9.
+
+---
+
+## Verification
+
+The system commands and socket settings described in this chapter were evaluated on the following platform:
+
+- **Linux Kernel:** 6.12.94 (x86_64 cloud VM environment)
+- **Networking Tools:** iproute2 `ss` utility version 6.15.0
+- **Runtime Environment:** Python 3.13.5 (standard library execution)
+- **Isolation Container:** Unprivileged network namespaces (`unshare -urnm`)
+- **Execution Script:** `lab.sh` test harness
+
+---
+
+## Sources
+
+- [RFC 9293: Transmission Control Protocol (TCP)](https://www.rfc-editor.org/rfc/rfc9293.html) - Section 3.8.4 details TCP keep-alive requirements.
+- [RFC 1122: Requirements for Internet Hosts -- Communication Layers](https://www.rfc-editor.org/rfc/rfc1122.html) - Section 4.2.3.9 defines ICMP soft error handling.
+- [RFC 5482: TCP User Timeout Option](https://www.rfc-editor.org/rfc/rfc5482.html) - Specifies user timeout options for TCP.
+- [RFC 6069: Making TCP More Robust to Long Connectivity Disruptions (TCP-LCD)](https://www.rfc-editor.org/rfc/rfc6069.html) - Reverting RTO backoff on ICMP unreachable messages.
+- [Linux kernel: IP Sysctl documentation](https://docs.kernel.org/networking/ip-sysctl.html) - Kernel documentation for `tcp_retries2`, `tcp_keepalive_time`, `tcp_keepalive_intvl`, and `tcp_keepalive_probes`.
+- [AWS: Network Load Balancer connection idle timeout](https://docs.aws.amazon.com/elasticloadbalancing/latest/network/network-load-balancers.html#connection-idle-timeout) - 350 s default, 60-6000 s range, RST after expiry, keepalives reset the timer.
+- [Linux TCP Manual Page (tcp(7))](https://man7.org/linux/man-pages/man7/tcp.7.html) - Details socket options including `TCP_USER_TIMEOUT`, `TCP_KEEPIDLE`, `TCP_KEEPINTVL`, and `TCP_KEEPCNT`.

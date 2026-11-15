@@ -1,0 +1,1104 @@
+---
+title: "Header Compression in HTTP/2 and HTTP/3: HPACK and QPACK from the Wire Up"
+author:
+  - name: "K19G"
+  - name: "grok-bot"
+---
+
+# Header Compression in HTTP/2 and HTTP/3: HPACK and QPACK from the Wire Up
+
+In HTTP/1.1, request and response headers are transmitted as uncompressed, ASCII-formatted text blocks terminated by control characters. As web applications grew in complexity, HTTP requests expanded to include dozens of headers, carrying cookies, authorization tokens, user-agent strings, caching directives, and detailed client state. In a typical modern web session, these headers routinely consume hundreds to thousands of bytes per HTTP exchange. When multiplied over hundreds of microservice calls or assets fetched on a single web page, the redundant transmission of identical header strings consumes measurable bandwidth and adds latency to connection round trips.
+
+When protocol designers created SPDY and HTTP/2, reducing header overhead was a top architectural priority. However, standard general-purpose compression algorithms like DEFLATE could not be applied naively across security boundaries. Security vulnerabilities demonstrated that compressing secret values (such as session cookies) alongside attacker-controlled data using stream-based algorithms created side-channel vulnerabilities. This realization led to the development of dedicated header compression standards built specifically for multiplexed transport layer architectures: HPACK for HTTP/2 over TCP, and QPACK for HTTP/3 over QUIC.
+
+For network engineers, site reliability teams, and protocol operators, understanding header compression is critical for system architecture, performance tuning, and defensive security. Misconfigured header table sizes can lead to memory exhaustion, dynamic table eviction churn, or unexpected stream stalls. Incorrect security defaults can expose authentication tokens to length-oracle side-channel attacks or open servers to low-rate Denial-of-Service (DoS) attacks such as decompression amplification and unbounded header frame floods.
+
+## Learning goals
+
+- Understand the security vulnerabilities of stream compression (DEFLATE/CRIME) that motivated custom HTTP header compression algorithms.
+- Master the bit-level wire formats of HPACK (RFC 7541) integer encoding, static canonical Huffman coding, static tables, and dynamic table management.
+- Trace the lifecycle of the HPACK dynamic table across multiplexed requests and calculate exact memory overhead per entry.
+- Identify the security guarantees of the Never-Indexed representation and defense against CRIME-style side-channel attacks.
+- Analyze HTTP/2 protocol attack vectors including HPACK decompression amplification bombs and CONTINUATION frame floods (VU#421644).
+- Explain why TCP-tailored HPACK causes Head-of-Line (HoL) blocking over out-of-order QUIC streams in HTTP/3.
+- Master QPACK (RFC 9204) dynamic table architecture, encoder/decoder unidirectional stream instructions, relative/absolute/post-base indexing, and blocked stream management.
+
+## Version note
+
+The analyses, algorithms, and experimental outputs in this chapter were generated with Python 3.13.5 and only its standard library, on Linux 6.12.94. The Huffman code and both static tables are parsed straight from the RFC text files (`rfc7541.txt` and `rfc9204.txt` from rfc-editor.org; the first line of the output prints a SHA-256 prefix of each file so you can tell whether yours is the same). No external HTTP/2, HTTP/3, `nghttp2`, `h2load`, or packet capture dependencies were used during local script execution. Command snippets shown in the production section are operational reference templates and were not executed in this execution environment.
+
+## The problem with stream compression: The CRIME lesson
+
+Before HPACK, early experimental protocols such as SPDY compressed HTTP headers using standard DEFLATE (gzip/zlib) stream compression across multiplexed connections. DEFLATE relies on LZ77 algorithm dictionary substitution paired with Huffman coding. When repetitive strings appear within a compression stream, LZ77 replaces duplicate substrings with back-references pointing to earlier occurrences within a sliding window.
+
+In 2012, security researchers Juliano Rizzo and Thai Duong demonstrated the CRIME (Compression Ratio Info-leak Made Easy) attack against TLS and SPDY compression. CRIME proved that an attacker who can inject arbitrary content into an HTTP request (such as malicious JavaScript running in a web browser, or controlled URL parameter paths) and monitor the exact size of encrypted network packets on the wire can extract secret header values (such as authentication session cookies) byte by byte.
+
+```text
+(illustration, sizes are schematic)
+same compression context:
+  Cookie: session=S3CR3T...          <- added by the browser
+  GET /?x=Cookie: session=a          <- attacker-chosen URL
+  -> back-reference covers "Cookie: session=" only
+
+  GET /?x=Cookie: session=S          <- one more matching byte
+  -> back-reference is one byte longer, ciphertext one byte shorter
+```
+
+Because LZ77 works at the byte level with fine-grained partial prefix matches, an attacker observing compressed frame lengths sees the compressed record shrink whenever their guess shares a prefix match with the target secret. By guessing characters sequentially (e.g., trying `a`, `b`, ..., `S`), the attacker observes a drop in packet byte length when a character matches.
+
+To eliminate length-oracle side channels without sacrificing compression performance, protocol designers abandoned byte-level stream sliding windows. HPACK and QPACK operate under explicit architectural guarantees:
+1. Matches are performed exclusively on complete, whole header field names and values, never on partial substrings.
+2. Sensitive headers can be marked with a specific "Never-Indexed" wire representation that prevents them from entering the dynamic compression state entirely.
+
+## HPACK architecture (RFC 7541)
+
+HPACK (RFC 7541) provides header compression for HTTP/2. It maintains a stateful connection context between an encoder and a decoder. Both endpoints maintain a shared static table of pre-defined headers and a dynamic table updated incrementally as header fields flow across the connection.
+
+### Variable-length integer encoding
+
+HPACK uses variable-length prefix integers to encode table indices, string lengths, and table size updates efficiently. An integer starts in the low N bits of an octet (the prefix); the high bits of that octet belong to the representation that carries it.
+
+```text
+  0 1 2 3 4 5 6 7
+ +---+---+---+---+---+---+---+---+
+ | ? | ? | ? | Value (N bits)    |  Value < 2^N - 1
+ +---+---+---+---+---+---+---+---+
+
+ If Value >= (2^N - 1):
+  0 1 2 3 4 5 6 7
+ +---+---+---+---+---+---+---+---+
+ | ? | ? | ? | 1   1   1   1   1 |  Prefix filled with 1s
+ +---+---+---+---+---+---+---+---+
+ +---+---+---+---+---+---+---+---+
+ | 1 | 7-bit continuation value  |  MSB = 1 indicates more octets follow
+ +---+---+---+---+---+---+---+---+
+                ...
+ +---+---+---+---+---+---+---+---+
+ | 0 | 7-bit final value octet   |  MSB = 0 indicates final octet
+ +---+---+---+---+---+---+---+---+
+```
+
+The integer encoding rules are structured as follows:
+- If the value is less than 2^N - 1, it is encoded directly in the N-bit prefix.
+- Otherwise all N prefix bits are set to 1 and the remainder (value minus 2^N - 1) is encoded across subsequent 8-bit octets using 7 bits per octet, where the most significant bit (MSB) acts as a continuation flag (1 = more octets follow, 0 = final octet).
+
+| Value | Prefix size (N) | Encoded Hex Octets | Bit-Level Decoding Mechanics |
+| :--- | :--- | :--- | :--- |
+| `10` | 5 bits | `0a` | 10 < 31, fits in the prefix: `xxx0 1010` |
+| `42` | 8 bits | `2a` | 42 < 255, fits in the 8-bit prefix: `0010 1010` |
+| `1337` | 5 bits | `1f 9a 0a` | Prefix all ones (`1f`), remainder 1337 - 31 = 1306. 1306 mod 128 = 26 (`0x1a`) with the continuation bit set gives `0x9a`; 1306 div 128 = 10 gives the final octet `0x0a`. These are the RFC 7541 C.1 examples. |
+
+### Canonical Huffman coding
+
+HPACK defines a static canonical Huffman code table optimized for HTTP request and response header fields (RFC 7541 Appendix B). The codebook contains 257 symbols: ASCII symbols 0–255 plus an explicit End-of-String (EOS) symbol at index 256.
+
+Key properties of HPACK Huffman coding include:
+- Code lengths run from 5 bits (exactly ten symbols: `0`, `1`, `2`, `a`, `c`, `e`, `i`, `o`, `s`, `t`) through 6 bits for most other lowercase letters and `-`, `.`, `/`, 7 bits for `:`, up to 30 bits for a few control characters and EOS. Punctuation such as `\` (19 bits) or `{` (15 bits) is expensive.
+- A string literal starts with an `H` bit followed by a 7-bit-prefix length; `H=1` means the octets are Huffman coded. The encoder may choose per string.
+- If the Huffman-encoded bit sequence does not align perfectly on an 8-bit octet boundary, it is padded to the next byte boundary with the most significant bits of the EOS code, which in practice means 1 bits.
+- Padding longer than 7 bits, padding that is not a prefix of EOS, and an encoded EOS symbol are all decoding errors (RFC 7541 section 5.2).
+
+### The static and dynamic tables
+
+HPACK combines two tables to map array indices to header field pairs (Name, Value):
+
+1. **Static Table**: A fixed, 61-entry immutable array (indices 1 to 61) populated with ubiquitous protocol headers such as `:authority`, `:method`, `:path`, `:status`, `content-type`, and `user-agent`.
+2. **Dynamic Table**: A stateful First-In, First-Out (FIFO) queue managed per connection. The newest entry is always index 62; every insert pushes older entries to higher indices, and the oldest entries are evicted from the end.
+
+```text
+ Index 1               Index 61  Index 62               Index 62+k
++------------------------------+----------------------------------+
+| Static Table (Entries 1-61)  | Dynamic Table (Entries 0 to k)   |
+| [1 :authority] ... [61 www-.] | [62 newest] ... [62+k oldest]    |
++------------------------------+----------------------------------+
+```
+
+#### Dynamic table capacity and eviction sizing
+The size of an entry in the dynamic table is defined as the sum of its name length in bytes, its value length in bytes, plus an architectural memory overhead of 32 octets:
+
+```text
+entry size = len(name) + len(value) + 32    (octets, without Huffman coding)
+```
+
+The 32 octets are a fixed estimate of per-entry bookkeeping, so the size is the same on every implementation. The decoder announces the most it will accept with `SETTINGS_HEADER_TABLE_SIZE` (default 4096); the encoder picks a size up to that and announces changes in-band with a Dynamic Table Size Update. Before an insert, the oldest entries are evicted until the new entry fits. An entry larger than the whole table empties the table and is not inserted; that is not an error.
+
+### HPACK wire representations
+
+HPACK encodes individual header fields into one of four primary bit-level representations:
+
+```text
+1. Indexed Header Field Representation
+  0 1 2 3 4 5 6 7
+ +---+---+---+---+---+---+---+---+
+ | 1 | Index (7+ bits)           |
+ +---+---+---+---+---+---+---+---+
+
+2. Literal Header Field with Incremental Indexing
+  0 1 2 3 4 5 6 7
+ +---+---+---+---+---+---+---+---+
+ | 0 | 1 | Index (6+ bits)       |
+ +---+---+---+---+---+---+---+---+
+
+3. Literal Header Field Without Indexing
+  0 1 2 3 4 5 6 7
+ +---+---+---+---+---+---+---+---+
+ | 0 | 0 | 0 | 0 | Index (4+ bits)
+ +---+---+---+---+---+---+---+---+
+
+4. Literal Header Field Never-Indexed
+  0 1 2 3 4 5 6 7
+ +---+---+---+---+---+---+---+---+
+ | 0 | 0 | 0 | 1 | Index (4+ bits)
+ +---+---+---+---+---+---+---+---+
+
+5. Dynamic Table Size Update
+  0 1 2 3 4 5 6 7
+ +---+---+---+---+---+---+---+---+
+ | 0 | 0 | 1 | Max Size (5+ bits)
+ +---+---+---+---+---+---+---+---+
+```
+
+- **Indexed Header Field (`1xxxxxxx`)**: Top bit `1`. Points to an exact (Name, Value) pair in the static or dynamic table. Transmitted in 1 or more integer bytes with 0 extra bytes for field names or values.
+- **Literal with Incremental Indexing (`01xxxxxx`)**: Top 2 bits `01`. Emits the header field and immediately inserts it into the dynamic table. The name may be referenced by index or supplied as a literal string.
+- **Literal Without Indexing (`0000xxxx`)**: Top 4 bits `0000`. Emits the header field for the current stream without modifying the dynamic table. An intermediary that re-encodes the field may choose its own representation.
+- **Literal Never-Indexed (`0001xxxx`)**: Top 4 bits `0001`. Emits the header field for the current stream without modifying the dynamic table. An intermediary must use the same never-indexed representation when it re-encodes the field (RFC 7541 section 6.2.3). Use it for values an attacker could guess and confirm, such as short cookies or `authorization` tokens.
+- **Dynamic Table Size Update (`001xxxxx`)**: Top 3 bits `001`. Changes the encoder's table size, up to the decoder's setting. It must come at the start of the first header block after the change.
+
+## Protocol-level vulnerabilities and mitigations
+
+### Decompression amplification (the "HPACK bomb", CVE-2016-6581)
+
+Because HPACK replaces repetitive header entries with 1-byte integer references (`1xxxxxxx`), an attacker can send one large literal that lands in the dynamic table and then reference it thousands of times, one octet per reference. CVE-2016-6581 was this bug in the Python hpack library; the HTTP/2 advisories of August 2016 found the same pattern elsewhere.
+
+```text
+wire: 3009 B   literal with incremental indexing: x-pad: "A" x 4000 (Huffman: 6 bits per A)
+      16000 B  0xbe (indexed, dynamic index 62) repeated 16000 times
+decoded: 16001 fields x (5 + 4000 + 32) = 64,596,037 B of header list (this is lab section 5)
+```
+
+The defence is a budget on the decoded size, checked while decoding rather than after. HTTP/2 lets a receiver advertise it as `SETTINGS_MAX_HEADER_LIST_SIZE` (advisory: the peer may ignore it, so the receiver must still enforce its own limit), measured the same way as table entries:
+
+```text
+header list size = sum over fields of (len(name) + len(value) + 32)
+```
+
+A server over its limit usually answers 431 (Request Header Fields Too Large) or resets the stream; it must still finish decoding the block (or drop the connection) because skipping it would desynchronise the dynamic table. Peers that keep doing it get `ENHANCE_YOUR_CALM` and a closed connection.
+
+### CONTINUATION frame floods (CERT/CC VU#421644)
+
+In HTTP/2, a logical header block that exceeds the maximum frame payload size (`SETTINGS_MAX_FRAME_SIZE`, default 16 KiB) is split across an initial `HEADERS` frame followed by one or more `CONTINUATION` frames.
+
+```text
+[HEADERS frame (END_HEADERS=0, stream 1)] -> [CONTINUATION (END_HEADERS=0)] -> ... -> [CONTINUATION (END_HEADERS=1)]
+```
+
+In April 2024, security advisory VU#421644 identified widespread implementation vulnerabilities across major web servers. Many protocol parsers failed to limit the number or total memory size of consecutive `CONTINUATION` frames received without an `END_HEADERS` flag set. Attackers could send an endless stream of unbuffered or micro-chunked `CONTINUATION` frames on a single HTTP/2 stream, so servers either buffered without limit (memory) or kept HPACK-decoding a header block that never ended (CPU), often outside the request timeouts.
+
+The fix is the same budget idea: count the accumulated header block bytes (and frames) across `HEADERS` + `CONTINUATION` and close the connection when it is exceeded.
+
+## QPACK architecture (RFC 9204)
+
+### Head-of-Line (HoL) blocking over QUIC
+
+HTTP/2 uses a single TCP connection to multiplex streams. Because TCP provides a strict, ordered byte stream, HPACK assumes all compressed header blocks are decoded in the exact sequence they were transmitted.
+
+HTTP/3 runs over QUIC, which orders bytes within each stream but not across streams. If a packet carrying part of stream 4 is lost, stream 8 can still be delivered. If HTTP/3 used HPACK, stream 8's headers might reference a table entry inserted by stream 4's headers, so stream 8 would have to wait for stream 4's retransmission: head-of-line blocking moved from TCP into the compressor. QPACK keeps the possibility but makes it explicit and bounded.
+
+```text
+HTTP/2 over TCP (Strictly Ordered Transport):
+ [Stream 1 Headers] ---> [Stream 3 Headers] ---> [Stream 5 Headers]
+  (Dynamic table state strictly deterministic; single byte-stream)
+
+HTTP/3 over QUIC (Independent Streams):
+ Stream 4 Data: [Header Block (refers to Dynamic Entry 2)] ----X Packet Lost!
+ Stream 8 Data: [Header Block (refers to Dynamic Entry 3)] ----> Arrives safely!
+  (If decoding Stream 8 depends on Stream 4's table updates, Stream 8 BLOCKS)
+```
+
+### QPACK stream separation and instruction set
+
+QPACK moves every table change onto its own unidirectional stream. Each endpoint opens one encoder stream (type 0x02) carrying inserts towards the peer's decoder, and one decoder stream (type 0x03) carrying acknowledgements back:
+
+```text
+                    +------------------------------------+
+                    |  Encoder Unidirectional Stream     |
+                    |  (Stream Type 0x02)                |
+                    +------------------------------------+
+                   /                                      \
+                  /                                        v
+  +-----------------------+                        +-----------------------+
+  |    HTTP/3 Encoder     |                        |    HTTP/3 Decoder     |
+  +-----------------------+                        +-----------------------+
+                  ^                                        \
+                   \                                        v
+                    +------------------------------------+
+                    |  Decoder Unidirectional Stream     |
+                    |  (Stream Type 0x03)                |
+                    +------------------------------------+
+```
+
+#### Encoder Stream Instructions (Type `0x02`)
+- **Set Dynamic Table Capacity**: Modifies maximum dynamic table storage bound.
+- **Insert With Name Reference**: Adds an entry using an existing name from the static or dynamic table plus a literal value.
+- **Insert With Literal Name**: Adds a new entry with explicit literal name and value.
+- **Duplicate**: Re-inserts an existing entry as the newest one, so a popular entry near the eviction end can be kept without resending it.
+
+#### Decoder Stream Instructions (Type `0x03`)
+- **Section Acknowledgment**: Sent after decoding a field section that referenced the dynamic table. It tells the encoder that every insert up to that section's Required Insert Count has arrived.
+- **Stream Cancellation**: Sent when a stream is reset or abandoned, so the encoder stops waiting for an acknowledgement for it.
+- **Insert Count Increment**: Tells the encoder that N more inserts have been received, even if no field section has used them yet.
+
+### Static table and indexing schemes
+
+QPACK expands the static table to 99 entries (indices 0 to 98), chosen from real traffic, so it includes complete common pairs such as `:status 404`, `content-type application/json` and whole `strict-transport-security` and `content-security-policy` values.
+
+Because inserts and field sections travel on different streams, QPACK names dynamic entries three ways:
+
+```text
+Absolute Indexing (Static: 0 to 98; Dynamic: 0 at first entry created, grows up 1, 2, ...):
+ [Static Table 0..98] [Dyn Entry 0] [Dyn Entry 1] [Dyn Entry 2] ...
+                      (Oldest)                    (Newest)
+
+Relative indexing:
+ on the encoder stream: relative 0 = the most recently inserted entry
+ in a field section:    relative 0 = absolute (Base - 1)
+
+Post-base indexing (field sections only):
+ post-base 0 = absolute Base, post-base 1 = Base + 1, ...
+```
+
+### Required Insert Count and Delta Base
+
+Every QPACK stream field section contains a prefix consisting of two elements:
+1. **Required Insert Count (RIC)**: one more than the highest absolute index the section references, i.e. how many inserts the decoder must have received; 0 if the section uses no dynamic entries.
+2. **Sign bit and Delta Base**: Base expressed relative to RIC, so references can be relative (before Base) or post-base (after it).
+
+RIC is sent modulo a window so it stays small (RFC 9204 section 4.5.1.1):
+
+```text
+MaxEntries  = floor(MaxTableCapacity / 32)     # MaxTableCapacity = decoder's SETTINGS_QPACK_MAX_TABLE_CAPACITY
+EncodedRIC  = 0                                if RIC == 0
+            = (RIC mod (2 * MaxEntries)) + 1   otherwise
+```
+
+In Appendix B the capacity is 220, so MaxEntries is 6, and RIC 2 is sent as `03`, the first octet of the B.2 field section `03 81 10 11`.
+
+If the decoder has received fewer inserts than RIC, the stream is blocked: the decoder parks the section until the encoder stream catches up. An encoder may only cause as many blocked streams as the decoder allows.
+
+### Blocked streams and dynamic table draining
+
+Operators control the trade-off between header compression density and head-of-line blocking using two connection settings:
+- `SETTINGS_QPACK_MAX_TABLE_CAPACITY` (default 0): the largest dynamic table the decoder accepts. 0 means static table and literals only: no blocking, no dynamic-table state, weaker compression.
+- `SETTINGS_QPACK_BLOCKED_STREAMS` (default 0): how many streams may be blocked at once. With 0 the encoder may only reference entries the decoder has already acknowledged.
+
+#### Draining entries
+The encoder must not evict an entry that an unacknowledged field section still references, nor one it has inserted but the decoder has not acknowledged. If the oldest entries are pinned, new inserts can fail for lack of space. RFC 9204 section 2.1.1.1 suggests treating the oldest part of the table as draining: stop referencing those entries (use Duplicate or a literal instead) so they are unpinned by the time space is needed.
+
+## The lab
+
+The lab is a small HPACK and QPACK codec in plain Python. It is checked against every worked example in RFC 7541 Appendix C and RFC 9204 Appendix B, then used for experiments. Nothing is installed and nothing needs root; `lab-hpack.sh` fetches `rfc7541.txt` and `rfc9204.txt` from rfc-editor.org once if they are not already next to the scripts, and every table comes from those files.
+
+### Lab files
+
+`lab-hpack.sh`:
+
+```bash
+#!/bin/sh
+# HPACK/QPACK lab: fetch the two RFCs, build tables from them, run the checks.
+set -e
+cd "$(dirname "$0")"
+for r in 7541 9204; do
+  [ -s rfc$r.txt ] || curl -sfLO https://www.rfc-editor.org/rfc/rfc$r.txt
+done
+echo "### $(python3 -V); rfc7541.txt $(sha256sum rfc7541.txt | cut -c1-16); rfc9204.txt $(sha256sum rfc9204.txt | cut -c1-16)"
+echo "### tables"; python3 rfctables.py
+echo; echo "### HPACK test vectors (RFC 7541 Appendix C)"; python3 hpack-vectors.py
+echo; echo "### HPACK experiments"; python3 hpack-experiments.py
+echo; echo "### QPACK"; python3 qpack-lab.py
+```
+
+`rfctables.py`:
+
+```python
+"""Parse the HPACK Huffman code and static tables, and the QPACK static
+table, straight from the RFC text files (rfc7541.txt, rfc9204.txt)."""
+import re, pathlib
+
+def _page_clean(text):
+    # drop RFC page footers/headers so table rows are contiguous
+    return "\n".join(l for l in text.splitlines()
+                     if not re.match(r"^(Peon & Ruellan|Krasic, et al\.|RFC 7541 |RFC 9204 )", l))
+
+def huffman():
+    t = pathlib.Path("rfc7541.txt").read_text()
+    codes = {}
+    for m in re.finditer(r"\(\s*(\d+)\)\s+\|([01|]+)\s+([0-9a-f]+)\s+\[\s*(\d+)\]", t):
+        sym, bits, hexv, n = int(m[1]), m[2].replace("|", ""), int(m[3], 16), int(m[4])
+        assert len(bits) == n and int(bits, 2) == hexv
+        codes[sym] = (hexv, n)
+    assert len(codes) == 257
+    return codes
+
+def hpack_static():
+    t = _page_clean(pathlib.Path("rfc7541.txt").read_text())
+    a = t.rindex("\nAppendix A.  Static Table Definition"); t = t[a:t.index("\nAppendix B.", a)]
+    rows = re.findall(r"^\s+\| (\d+)\s+\| (\S+)\s+\| (.*?)\s*\|$", t, re.M)
+    tbl = [(n, v) for _, n, v in rows]
+    assert len(tbl) == 61
+    return tbl
+
+def qpack_static():
+    t = _page_clean(pathlib.Path("rfc9204.txt").read_text())
+    a = t.rindex("\nAppendix A.  Static Table"); t = t[a:t.index("\nAppendix B.", a)]
+    out = []
+    for line in t.splitlines():
+        m = re.match(r"^\s+\| (\d*)\s*\| (.*?)\s*\| (.*?)\s*\|$", line)
+        if not m:
+            continue
+        idx, name, val = m.groups()
+        if idx == "Index":
+            continue
+        if idx:
+            out.append([name, val])
+        else:  # continuation row of a wrapped cell
+            out[-1][0] += name; out[-1][1] += (" " if val and out[-1][1].endswith(";") else "") + val
+    assert len(out) == 99, len(out)
+    return [tuple(x) for x in out]
+
+if __name__ == "__main__":
+    h = huffman(); s = hpack_static(); q = qpack_static()
+    print(f"Huffman symbols: {len(h)}; shortest {min(n for _, n in h.values())} bits, longest {max(n for _, n in h.values())} bits")
+    print(f"HPACK static table: {len(s)} entries; 1={s[0]} 61={s[60]}")
+    print(f"QPACK static table: {len(q)} entries; 0={q[0]} 98={q[98]}")
+    for i, (n, v) in enumerate(q):
+        if len(v) > 40: print(f"  wrapped QPACK entry {i}: {n}: {v}")
+```
+
+`hpack.py`:
+
+```python
+"""Minimal HPACK (RFC 7541) encoder/decoder: integers, Huffman strings,
+static + dynamic table with eviction, all four field representations."""
+from rfctables import huffman, hpack_static
+
+CODES = huffman()
+STATIC = hpack_static()
+_DEC = {}
+for sym, (code, n) in CODES.items():
+    _DEC[(code, n)] = sym
+
+def enc_int(value, prefix_bits, first_byte_flags=0):
+    limit = (1 << prefix_bits) - 1
+    if value < limit:
+        return bytes([first_byte_flags | value])
+    out = [first_byte_flags | limit]; value -= limit
+    while value >= 128:
+        out.append((value & 0x7f) | 0x80); value >>= 7
+    out.append(value)
+    return bytes(out)
+
+def dec_int(buf, pos, prefix_bits):
+    limit = (1 << prefix_bits) - 1
+    value = buf[pos] & limit; pos += 1
+    if value < limit:
+        return value, pos
+    shift = 0
+    while True:
+        b = buf[pos]; pos += 1
+        value += (b & 0x7f) << shift; shift += 7
+        if not b & 0x80:
+            return value, pos
+
+def huff_encode(data):
+    acc = nbits = 0; out = bytearray()
+    for ch in data:
+        code, n = CODES[ch]
+        acc = (acc << n) | code; nbits += n
+        while nbits >= 8:
+            nbits -= 8; out.append((acc >> nbits) & 0xff)
+    if nbits:
+        out.append(((acc << (8 - nbits)) | ((1 << (8 - nbits)) - 1)) & 0xff)  # pad with EOS prefix (1s)
+    return bytes(out)
+
+def huff_decode(data):
+    out = bytearray(); code = n = 0
+    for byte in data:
+        for i in range(7, -1, -1):
+            code = (code << 1) | ((byte >> i) & 1); n += 1
+            sym = _DEC.get((code, n))
+            if sym is not None:
+                if sym == 256:
+                    raise ValueError("EOS in string")
+                out.append(sym); code = n = 0
+    if n > 7 or code != (1 << n) - 1:
+        raise ValueError("bad Huffman padding")
+    return bytes(out)
+
+def enc_str(s, huff):
+    raw = s.encode()
+    if huff:
+        h = huff_encode(raw)
+        if len(h) <= len(raw):         # use Huffman unless it would be longer
+            return enc_int(len(h), 7, 0x80) + h
+    return enc_int(len(raw), 7, 0) + raw
+
+def dec_str(buf, pos):
+    huff = buf[pos] & 0x80
+    n, pos = dec_int(buf, pos, 7)
+    data = buf[pos:pos + n]
+    return (huff_decode(data) if huff else data).decode(), pos + n
+
+class Table:
+    def __init__(self, max_size=4096):
+        self.dyn, self.size, self.max = [], 0, max_size
+    @staticmethod
+    def entry_size(name, value):
+        return 32 + len(name.encode()) + len(value.encode())
+    def get(self, idx):
+        if idx == 0:
+            raise ValueError("index 0")
+        if idx <= len(STATIC):
+            return STATIC[idx - 1]
+        return self.dyn[idx - len(STATIC) - 1]
+    def add(self, name, value):
+        sz = self.entry_size(name, value)
+        while self.dyn and self.size + sz > self.max:
+            n, v = self.dyn.pop(); self.size -= self.entry_size(n, v)
+        if sz <= self.max:
+            self.dyn.insert(0, (name, value)); self.size += sz
+    def resize(self, new):
+        self.max = new
+        while self.dyn and self.size > self.max:
+            n, v = self.dyn.pop(); self.size -= self.entry_size(n, v)
+    def find(self, name, value):
+        exact = name_idx = None
+        for i, (n, v) in enumerate(STATIC + self.dyn, 1):
+            if n == name:
+                if v == value and exact is None:
+                    exact = i
+                if name_idx is None:
+                    name_idx = i
+        return exact, name_idx
+
+class Encoder:
+    """never_index: names sent as 'never indexed' literals (e.g. authorization)."""
+    def __init__(self, max_size=4096, huffman=True, never_index=(), no_index=()):
+        self.t, self.huff = Table(max_size), huffman
+        self.never, self.noidx = set(never_index), set(no_index)
+        self.pending_resize = None
+    def resize(self, n):
+        self.pending_resize = n
+    def encode(self, headers):
+        out = bytearray()
+        if self.pending_resize is not None:
+            out += enc_int(self.pending_resize, 5, 0x20); self.t.resize(self.pending_resize); self.pending_resize = None
+        for name, value in headers:
+            exact, nidx = self.t.find(name, value)
+            if name in self.never:
+                out += enc_int(nidx or 0, 4, 0x10)
+            elif name in self.noidx:
+                out += enc_int(nidx or 0, 4, 0x00)
+            elif exact:
+                out += enc_int(exact, 7, 0x80); continue
+            else:
+                out += enc_int(nidx or 0, 6, 0x40)
+                self.t.add(name, value)
+            if not nidx:
+                out += enc_str(name, self.huff)
+            out += enc_str(value, self.huff)
+        return bytes(out)
+
+class Decoder:
+    def __init__(self, max_size=4096, max_header_list_size=None):
+        self.t, self.limit = Table(max_size), max_header_list_size
+    def decode(self, buf):
+        pos, headers, list_size = 0, [], 0
+        while pos < len(buf):
+            b = buf[pos]
+            if b & 0x80:
+                idx, pos = dec_int(buf, pos, 7); name, value = self.t.get(idx); kind = "indexed"
+            elif b & 0xe0 == 0x20:
+                n, pos = dec_int(buf, pos, 5); self.t.resize(n); continue
+            else:
+                prefix, kind = (6, "incremental") if b & 0x40 else ((4, "never") if b & 0x10 else (4, "noindex"))
+                idx, pos = dec_int(buf, pos, prefix)
+                if idx:
+                    name = self.t.get(idx)[0]
+                else:
+                    name, pos = dec_str(buf, pos)
+                value, pos = dec_str(buf, pos)
+                if kind == "incremental":
+                    self.t.add(name, value)
+            list_size += Table.entry_size(name, value)   # RFC 9113 SETTINGS_MAX_HEADER_LIST_SIZE accounting
+            if self.limit is not None and list_size > self.limit:
+                raise OverflowError(f"header list exceeds {self.limit} bytes after {len(headers)} fields")
+            headers.append((name, value, kind))
+        return headers, list_size
+```
+
+`hpack-vectors.py`:
+
+```python
+#!/usr/bin/env python3
+"""Check hpack.py against every example in RFC 7541 Appendix C."""
+import re
+from hpack import enc_int, dec_int, Encoder, Decoder
+from rfctables import _page_clean
+
+txt = _page_clean(open("rfc7541.txt").read())
+txt = txt[txt.rindex("\nAppendix C.  Examples"):]
+
+print("C.1 integers:", enc_int(10, 5).hex(), enc_int(1337, 5).hex(), enc_int(42, 8).hex(),
+      "decode 1337 ->", dec_int(enc_int(1337, 5), 0, 5)[0])
+
+def examples(section):
+    blocks = re.split(r"\n(C\.\d\.\d)\.  ", txt)
+    for i in range(1, len(blocks), 2):
+        if blocks[i].startswith(section):
+            body = blocks[i + 1]
+            hl = body.split("Header list to encode:")[1].split("Hex dump")[0]
+            headers = [tuple(l.strip().split(": ", 1)) if ": " in l.strip() else (l.strip().rstrip(":"), "")
+                       for l in hl.strip().splitlines() if l.strip()]
+            hexpart = body.split("Hex dump of encoded data:")[1].split("Decoding process:")[0]
+            hexstr = "".join(re.findall(r"^\s+((?:[0-9a-f]{2,4} ?)+)\s+\|", hexpart, re.M)).replace(" ", "")
+            size = int(re.findall(r"Table size:\s+(\d+)", body)[-1])
+            yield blocks[i], headers, bytes.fromhex(hexstr), size
+
+for sec, huff, tsize in [("C.3", False, 4096), ("C.4", True, 4096), ("C.5", False, 256), ("C.6", True, 256)]:
+    enc, dec = Encoder(tsize, huffman=huff), Decoder(tsize)
+    for name, headers, wire, size in examples(sec):
+        mine = enc.encode(headers)
+        got, _ = dec.decode(wire)
+        ok_enc = mine == wire
+        ok_dec = [(n, v) for n, v, _ in got] == headers
+        print(f"{name}: {len(headers)} fields, wire {len(wire):3d} B, encoder bytes match={ok_enc}, "
+              f"decoded list match={ok_dec}, table size {dec.t.size} (RFC {size}), entries {len(dec.t.dyn)}")
+```
+
+`hpack-experiments.py`:
+
+```python
+#!/usr/bin/env python3
+"""What HPACK's design choices cost and buy on a single HTTP/2 connection."""
+import os, base64
+from hpack import Encoder, Decoder, huff_encode
+
+def h1_size(headers):  # same fields as HTTP/1.1 text, for scale
+    return sum(len(n) + 2 + len(v) + 2 for n, v in headers)
+
+def requests(n):
+    for i in range(n):
+        yield [(":method", "GET"), (":scheme", "https"), (":authority", "shop.example.net"),
+               (":path", f"/api/items/{1000 + i}?page=1"),
+               ("user-agent", "Mozilla/5.0 (X11; Linux x86_64; rv:140.0) Gecko/20100101 Firefox/140.0"),
+               ("accept", "application/json"), ("accept-language", "en-GB,en;q=0.9"),
+               ("accept-encoding", "gzip, deflate, br, zstd"),
+               ("cookie", "session=Y2FmZWJhYmUtZmFjZS1jYWZlLWJhYmUtMTIzNDU2Nzg5MA"),
+               ("authorization", "Bearer eyJhbGciOiJFUzI1NiJ9.eyJzdWIiOiJrMTlnIn0.c2lnbmF0dXJl")]
+
+print("== 1. Ten requests on one connection (4096-byte dynamic table, Huffman on) ==")
+enc = Encoder(4096); total_h1 = total_hp = 0
+for i, h in enumerate(requests(10), 1):
+    b = enc.encode(h); total_h1 += h1_size(h); total_hp += len(b)
+    if i in (1, 2, 3, 10):
+        print(f"request {i:2d}: HTTP/1.1 text {h1_size(h)} B -> HPACK {len(b):3d} B   (table {enc.t.size} B, {len(enc.t.dyn)} entries)")
+print(f"total: {total_h1} B -> {total_hp} B ({100 * total_hp / total_h1:.1f}%)")
+
+print("\n== 2. SETTINGS_HEADER_TABLE_SIZE changes the steady state ==")
+for size in (0, 256, 1024, 4096):
+    enc = Encoder(size); sizes = [len(enc.encode(h)) for h in requests(10)]
+    print(f"table {size:4d} B: first {sizes[0]:3d} B, later requests {min(sizes[1:])}-{max(sizes[1:])} B, total {sum(sizes)} B")
+
+print("\n== 3. Huffman helps text, not random bytes ==")
+samples = {"hostname": "shop.example.net", "path": "/api/items/1000?page=1",
+           "user-agent": "Mozilla/5.0 (X11; Linux x86_64; rv:140.0) Gecko/20100101 Firefox/140.0",
+           "base64url token (48 random bytes)": base64.urlsafe_b64encode(os.urandom(48)).decode(),
+           "hex token (32 random bytes)": os.urandom(32).hex(),
+           "printable punctuation": "{}<>[]^~|\\`" * 4}
+for label, s in samples.items():
+    h = len(huff_encode(s.encode()))
+    print(f"{label:34s}: raw {len(s):3d} B, Huffman {h:3d} B ({100 * h / len(s):5.1f}%) -> encoder picks {'Huffman' if h < len(s) else 'raw'}")
+
+print("\n== 4. Guessing a secret through the shared table (CRIME-style, whole values only) ==")
+secret = "session=Y2FmZWJhYmUtZmFjZS1jYWZlLWJhYmUtMTIzNDU2Nzg5MA"
+guesses = ["session=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+           "session=Y2FmZWJhYmUtZmFjZS1jYWZlLWJhYmUtMTIzNDU2Nzg5MB",   # right except last char
+           secret]
+for policy, kw in [("cookie indexed (default)", {}), ("cookie never-indexed", {"never_index": {"cookie"}})]:
+    print(f"-- encoder policy: {policy}")
+    enc = Encoder(4096, **kw)
+    enc.encode([(":method", "GET"), ("cookie", secret)])               # victim request primes the table
+    for g in guesses:
+        b = enc.encode([("cookie", g)])                                 # attacker-influenced request
+        tag = "correct" if g == secret else ("all but last char" if g[:-1] == secret[:-1] else "wrong")
+        print(f"   guess {tag:17s}: {len(b):2d} B on the wire")
+
+print("\n== 5. Decompression amplification and SETTINGS_MAX_HEADER_LIST_SIZE ==")
+enc = Encoder(4096)
+big = ("x-pad", "A" * 4000)
+block = enc.encode([big])   # literal with incremental indexing: lands in the table
+refs = enc.encode([big])    # every later use is a 1-byte indexed reference  # now 1-byte indexed reference
+payload = block + refs * 16000
+print(f"encoded block: {len(payload)} B ({len(block)} B literal insert + 16000 x {len(refs)}-byte references)")
+fields, size = Decoder(4096).decode(payload)
+print(f"no limit   : {len(fields)} fields, header list size {size} B ({size / len(payload):.0f}x the bytes received)")
+try:
+    Decoder(4096, max_header_list_size=65536).decode(payload)
+except OverflowError as e:
+    print(f"limit 64 KiB: rejected: {e}")
+```
+
+`qpack.py`:
+
+```python
+"""Minimal QPACK (RFC 9204): encoder-stream instructions, field sections
+with Required Insert Count / Base, decoder-stream acknowledgements."""
+from hpack import enc_int, dec_int, huff_encode, huff_decode
+from rfctables import qpack_static
+
+STATIC = qpack_static()
+
+def qstr(s, prefix_bits, flags=0, huff=False):
+    raw = s.encode()
+    h = huff_encode(raw) if huff else None
+    if h is not None and len(h) <= len(raw):
+        return enc_int(len(h), prefix_bits, flags | (1 << prefix_bits)) + h
+    return enc_int(len(raw), prefix_bits, flags) + raw
+
+def qstr_dec(buf, pos, prefix_bits):
+    huff = buf[pos] & (1 << prefix_bits)
+    n, pos = dec_int(buf, pos, prefix_bits)
+    data = buf[pos:pos + n]
+    return (huff_decode(data) if huff else data).decode(), pos + n
+
+def esize(n, v):
+    return 32 + len(n.encode()) + len(v.encode())
+
+class DynTable:
+    def __init__(self):
+        self.entries, self.capacity, self.inserted, self.dropped = [], 0, 0, 0
+    @property
+    def size(self):
+        return sum(esize(n, v) for n, v in self.entries)
+    def insert(self, n, v):
+        while self.entries and self.size + esize(n, v) > self.capacity:
+            self.entries.pop(0); self.dropped += 1
+        self.entries.append((n, v)); self.inserted += 1
+    def absolute(self, a):
+        return self.entries[a - self.dropped]
+    def dump(self):
+        return [(self.dropped + i, n, v) for i, (n, v) in enumerate(self.entries)]
+
+class QDecoder:
+    def __init__(self, max_capacity):
+        self.t, self.max_cap = DynTable(), max_capacity
+        self.blocked = {}
+    def encoder_stream(self, buf):
+        pos, log = 0, []
+        while pos < len(buf):
+            b = buf[pos]
+            if b & 0x80:                                  # Insert With Name Reference
+                static = b & 0x40
+                idx, pos = dec_int(buf, pos, 6)
+                name = STATIC[idx][0] if static else self.t.absolute(self.t.inserted - 1 - idx)[0]
+                value, pos = qstr_dec(buf, pos, 7)
+                self.t.insert(name, value); log.append(f"Insert With Name Reference ({'static' if static else 'dynamic rel'} {idx}) {name}={value}")
+            elif b & 0x40:                                # Insert With Literal Name
+                name, pos = qstr_dec(buf, pos, 5)
+                value, pos = qstr_dec(buf, pos, 7)
+                self.t.insert(name, value); log.append(f"Insert With Literal Name {name}={value}")
+            elif b & 0x20:                                # Set Dynamic Table Capacity
+                cap, pos = dec_int(buf, pos, 5); self.t.capacity = cap; log.append(f"Set Dynamic Table Capacity={cap}")
+            else:                                         # Duplicate
+                idx, pos = dec_int(buf, pos, 5)
+                n, v = self.t.absolute(self.t.inserted - 1 - idx); self.t.insert(n, v); log.append(f"Duplicate rel {idx} -> {n}={v}")
+        return log
+    def required_insert_count(self, enc_ric):
+        if enc_ric == 0:
+            return 0
+        max_entries = self.max_cap // 32
+        full = 2 * max_entries
+        max_value = self.t.inserted + max_entries
+        max_wrapped = (max_value // full) * full
+        ric = max_wrapped + enc_ric - 1
+        if ric > max_value:
+            ric -= full
+        return ric
+    def field_section(self, stream_id, buf):
+        """Returns (fields, decoder-stream bytes) or ('BLOCKED', ric)."""
+        enc_ric, pos = dec_int(buf, 0, 8)
+        ric = self.required_insert_count(enc_ric)
+        sign = buf[pos] & 0x80
+        delta, pos = dec_int(buf, pos, 7)
+        base = ric - delta - 1 if sign else ric + delta
+        if ric > self.t.inserted:
+            self.blocked[stream_id] = buf
+            return "BLOCKED", ric
+        out = []
+        while pos < len(buf):
+            b = buf[pos]
+            if b & 0x80:                                   # Indexed Field Line
+                static = b & 0x40; idx, pos = dec_int(buf, pos, 6)
+                out.append(STATIC[idx] if static else self.t.absolute(base - 1 - idx))
+            elif b & 0x40:                                 # Literal With Name Reference
+                static = b & 0x10; idx, pos = dec_int(buf, pos, 4)
+                name = STATIC[idx][0] if static else self.t.absolute(base - 1 - idx)[0]
+                value, pos = qstr_dec(buf, pos, 7); out.append((name, value))
+            elif b & 0x20:                                 # Literal With Literal Name
+                name, pos = qstr_dec(buf, pos, 3); value, pos = qstr_dec(buf, pos, 7); out.append((name, value))
+            elif b & 0x10:                                 # Indexed Field Line With Post-Base Index
+                idx, pos = dec_int(buf, pos, 4); out.append(self.t.absolute(base + idx))
+            else:                                          # Literal With Post-Base Name Reference
+                idx, pos = dec_int(buf, pos, 3); name = self.t.absolute(base + idx)[0]
+                value, pos = qstr_dec(buf, pos, 7); out.append((name, value))
+        ack = enc_int(stream_id, 7, 0x80) if ric else b""   # Section Acknowledgment only if dynamic refs
+        return out, ack
+
+def section_ack(stream_id):      return enc_int(stream_id, 7, 0x80)
+def stream_cancel(stream_id):    return enc_int(stream_id, 6, 0x40)
+def insert_count_inc(n):         return enc_int(n, 6, 0x00)
+
+def encode_prefix(ric, base, max_capacity):
+    if ric == 0:
+        return b"\x00\x00"
+    enc = ric % (2 * (max_capacity // 32)) + 1
+    p = enc_int(enc, 8)
+    return p + (enc_int(base - ric, 7, 0) if base >= ric else enc_int(ric - base - 1, 7, 0x80))
+
+class QEncoder:
+    """Simple QPACK encoder. allow_blocking=False never references entries the
+    decoder has not acknowledged (SETTINGS_QPACK_BLOCKED_STREAMS = 0)."""
+    def __init__(self, capacity, allow_blocking=True, huff=True):
+        self.cap, self.block, self.huff = capacity, allow_blocking, huff
+        self.table, self.known = [], 0      # entries (abs order), Known Received Count
+        self.enc_stream = enc_int(capacity, 5, 0x20)
+    def _find(self, n, v):
+        for i, e in enumerate(STATIC):
+            if e == (n, v): return ("s", i)
+        for a, e in enumerate(self.table):
+            if e == (n, v): return ("d", a)
+        return None
+    def _static_name(self, n):
+        for i, (sn, _) in enumerate(STATIC):
+            if sn == n: return i
+        return None
+    def encode(self, fields):
+        base = len(self.table); ric = 0; out = b""
+        for n, v in fields:
+            hit = self._find(n, v)
+            if hit and hit[0] == "s":
+                out += enc_int(hit[1], 6, 0xc0); continue
+            if hit is None and sum(esize(*e) for e in self.table) + esize(n, v) <= self.cap:
+                sn = self._static_name(n)
+                self.enc_stream += (enc_int(sn, 6, 0xc0) if sn is not None else qstr(n, 5, 0x40, self.huff)) + qstr(v, 7, 0, self.huff)
+                self.table.append((n, v)); hit = ("d", len(self.table) - 1)
+            if hit and (self.block or hit[1] < self.known):
+                a = hit[1]; ric = max(ric, a + 1)
+                out += enc_int(base - 1 - a, 6, 0x80) if a < base else enc_int(a - base, 4, 0x10)
+            else:
+                sn = self._static_name(n)
+                out += (enc_int(sn, 4, 0x50) if sn is not None else qstr(n, 3, 0x20, self.huff)) + qstr(v, 7, 0, self.huff)
+        return encode_prefix(ric, base, self.cap) + out, ric
+```
+
+`qpack-lab.py`:
+
+```python
+#!/usr/bin/env python3
+"""RFC 9204 Appendix B replayed byte for byte, then blocked streams."""
+from qpack import QDecoder, QEncoder, section_ack, stream_cancel, insert_count_inc
+
+H = bytes.fromhex
+d = QDecoder(max_capacity=220)
+def show(label):
+    print(f"   table after {label}: size={d.t.size} " + ", ".join(f"[{a}] {n}={v}" for a, n, v in d.t.dump()))
+
+print("== 1. RFC 9204 Appendix B, decoder side ==")
+print("B.1 stream 0:", d.field_section(0, H("0000510b2f696e6465782e68746d6c"))[0])
+print("B.2 encoder stream:", *d.encoder_stream(H("3fbd01c00f7777772e6578616d706c652e636f6dc10c2f73616d706c652f70617468")), sep="\n   ")
+show("B.2 inserts")
+f, ack = d.field_section(4, H("03811011"))
+print("B.2 stream 4:", f, "| decoder emits", ack.hex(), "(RFC: 84)")
+print("B.3 encoder stream:", *d.encoder_stream(H("4a637573746f6d2d6b65790c637573746f6d2d76616c7565")))
+print("    decoder emits Insert Count Increment", insert_count_inc(1).hex(), "(RFC: 01)"); show("B.3")
+print("B.4 encoder stream (delayed):", *d.encoder_stream(H("02")))
+show("B.4 duplicate")
+print("B.4 stream 8:", d.field_section(8, H("050080c181"))[0], "| cancel emits", stream_cancel(8).hex(), "(RFC: 48)")
+print("B.5 encoder stream:", *d.encoder_stream(H("810d637573746f6d2d76616c756532")))
+show("B.5 eviction")
+
+print("\n== 2. Encoder side: our encoder reproduces B.2 ==")
+e = QEncoder(220, huff=False)
+sec, ric = e.encode([(":authority", "www.example.com"), (":path", "/sample/path")])
+print("encoder stream:", e.enc_stream.hex(), "\nfield section :", sec.hex(), f"(Required Insert Count {ric})")
+
+print("\n== 3. Head-of-line blocking: field section arrives before the inserts ==")
+d2 = QDecoder(220)
+print("stream 4 first :", d2.field_section(4, sec))
+d2.encoder_stream(e.enc_stream)
+print("after encoder stream arrives, retry:", d2.field_section(4, d2.blocked.pop(4))[0])
+
+print("\n== 4. Cost of SETTINGS_QPACK_BLOCKED_STREAMS = 0 (no references before ack) ==")
+def reqs(n):
+    for i in range(n):
+        yield [(":method", "GET"), (":scheme", "https"), (":authority", "shop.example.net"),
+               (":path", f"/api/items/{1000+i}"), ("user-agent", "Mozilla/5.0 (X11; Linux x86_64; rv:140.0) Gecko/20100101 Firefox/140.0"),
+               ("accept", "application/json"), ("cookie", "session=Y2FmZWJhYmUtZmFjZS1jYWZlLWJhYmUtMTIzNDU2Nzg5MA")]
+for blocking in (True, False):
+    for ack_delay in (1, 4):
+        e = QEncoder(4096, allow_blocking=blocking); sizes, rics, inserts = [], [], []
+        for i, f in enumerate(reqs(10)):
+            # acks for request k arrive ack_delay requests later
+            if i >= ack_delay:
+                e.known = max(e.known, inserts[i - ack_delay])
+            s, r = e.encode(f); sizes.append(len(s)); rics.append(r); inserts.append(len(e.table))
+        could_block = sum(1 for i, r in enumerate(rics) if r > (inserts[i - ack_delay] if i >= ack_delay else 0))
+        print(f"blocking={'allowed' if blocking else 'forbidden':9s} ack after {ack_delay} req: request bytes {sizes[:5]}... total {sum(sizes)} B,"
+              f" encoder stream {len(e.enc_stream)} B, sections that could block: {could_block}")
+```
+
+### Execution output
+
+```text
+### Python 3.13.5; rfc7541.txt 2239d7f8fb839b69; rfc9204.txt 926b4d7e9772b5c3
+### tables
+Huffman symbols: 257; shortest 5 bits, longest 30 bits
+HPACK static table: 61 entries; 1=(':authority', '') 61=('www-authenticate', '')
+QPACK static table: 99 entries; 0=(':authority', '') 98=('x-frame-options', 'sameorigin')
+  wrapped QPACK entry 58: strict-transport-security: max-age=31536000; includesubdomains; preload
+  wrapped QPACK entry 85: content-security-policy: script-src 'none'; object-src 'none'; base-uri 'none'
+
+### HPACK test vectors (RFC 7541 Appendix C)
+C.1 integers: 0a 1f9a0a 2a decode 1337 -> 1337
+C.3.1: 4 fields, wire  20 B, encoder bytes match=True, decoded list match=True, table size 57 (RFC 57), entries 1
+C.3.2: 5 fields, wire  14 B, encoder bytes match=True, decoded list match=True, table size 110 (RFC 110), entries 2
+C.3.3: 5 fields, wire  29 B, encoder bytes match=True, decoded list match=True, table size 164 (RFC 164), entries 3
+C.4.1: 4 fields, wire  17 B, encoder bytes match=True, decoded list match=True, table size 57 (RFC 57), entries 1
+C.4.2: 5 fields, wire  12 B, encoder bytes match=True, decoded list match=True, table size 110 (RFC 110), entries 2
+C.4.3: 5 fields, wire  24 B, encoder bytes match=True, decoded list match=True, table size 164 (RFC 164), entries 3
+C.5.1: 4 fields, wire  70 B, encoder bytes match=True, decoded list match=True, table size 222 (RFC 222), entries 4
+C.5.2: 4 fields, wire   8 B, encoder bytes match=True, decoded list match=True, table size 222 (RFC 222), entries 4
+C.5.3: 6 fields, wire  98 B, encoder bytes match=True, decoded list match=True, table size 215 (RFC 215), entries 3
+C.6.1: 4 fields, wire  54 B, encoder bytes match=True, decoded list match=True, table size 222 (RFC 222), entries 4
+C.6.2: 4 fields, wire   8 B, encoder bytes match=True, decoded list match=True, table size 222 (RFC 222), entries 4
+C.6.3: 6 fields, wire  79 B, encoder bytes match=True, decoded list match=True, table size 215 (RFC 215), entries 3
+
+### HPACK experiments
+== 1. Ten requests on one connection (4096-byte dynamic table, Huffman on) ==
+request  1: HTTP/1.1 text 417 B -> HPACK 230 B   (table 611 B, 8 entries)
+request  2: HTTP/1.1 text 417 B -> HPACK  27 B   (table 670 B, 9 entries)
+request  3: HTTP/1.1 text 417 B -> HPACK  27 B   (table 729 B, 10 entries)
+request 10: HTTP/1.1 text 417 B -> HPACK  27 B   (table 1142 B, 17 entries)
+total: 4170 B -> 473 B (11.3%)
+
+== 2. SETTINGS_HEADER_TABLE_SIZE changes the steady state ==
+table    0 B: first 230 B, later requests 230-230 B, total 2300 B
+table  256 B: first 230 B, later requests 230-230 B, total 2300 B
+table 1024 B: first 230 B, later requests 27-230 B, total 676 B
+table 4096 B: first 230 B, later requests 27-27 B, total 473 B
+
+== 3. Huffman helps text, not random bytes ==
+hostname                          : raw  16 B, Huffman  12 B ( 75.0%) -> encoder picks Huffman
+path                              : raw  22 B, Huffman  16 B ( 72.7%) -> encoder picks Huffman
+user-agent                        : raw  70 B, Huffman  53 B ( 75.7%) -> encoder picks Huffman
+base64url token (48 random bytes) : raw  64 B, Huffman  52 B ( 81.2%) -> encoder picks Huffman
+hex token (32 random bytes)       : raw  64 B, Huffman  45 B ( 70.3%) -> encoder picks Huffman
+printable punctuation             : raw  44 B, Huffman  77 B (175.0%) -> encoder picks raw
+
+== 4. Guessing a secret through the shared table (CRIME-style, whole values only) ==
+-- encoder policy: cookie indexed (default)
+   guess wrong            : 45 B on the wire
+   guess all but last char: 46 B on the wire
+   guess correct          :  1 B on the wire
+-- encoder policy: cookie never-indexed
+   guess wrong            : 46 B on the wire
+   guess all but last char: 47 B on the wire
+   guess correct          : 47 B on the wire
+
+== 5. Decompression amplification and SETTINGS_MAX_HEADER_LIST_SIZE ==
+encoded block: 19009 B (3009 B literal insert + 16000 x 1-byte references)
+no limit   : 16001 fields, header list size 64596037 B (3398x the bytes received)
+limit 64 KiB: rejected: header list exceeds 65536 bytes after 16 fields
+
+### QPACK
+== 1. RFC 9204 Appendix B, decoder side ==
+B.1 stream 0: [(':path', '/index.html')]
+B.2 encoder stream:
+   Set Dynamic Table Capacity=220
+   Insert With Name Reference (static 0) :authority=www.example.com
+   Insert With Name Reference (static 1) :path=/sample/path
+   table after B.2 inserts: size=106 [0] :authority=www.example.com, [1] :path=/sample/path
+B.2 stream 4: [(':authority', 'www.example.com'), (':path', '/sample/path')] | decoder emits 84 (RFC: 84)
+B.3 encoder stream: Insert With Literal Name custom-key=custom-value
+    decoder emits Insert Count Increment 01 (RFC: 01)
+   table after B.3: size=160 [0] :authority=www.example.com, [1] :path=/sample/path, [2] custom-key=custom-value
+B.4 encoder stream (delayed): Duplicate rel 2 -> :authority=www.example.com
+   table after B.4 duplicate: size=217 [0] :authority=www.example.com, [1] :path=/sample/path, [2] custom-key=custom-value, [3] :authority=www.example.com
+B.4 stream 8: [(':authority', 'www.example.com'), (':path', '/'), ('custom-key', 'custom-value')] | cancel emits 48 (RFC: 48)
+B.5 encoder stream: Insert With Name Reference (dynamic rel 1) custom-key=custom-value2
+   table after B.5 eviction: size=215 [1] :path=/sample/path, [2] custom-key=custom-value, [3] :authority=www.example.com, [4] custom-key=custom-value2
+
+== 2. Encoder side: our encoder reproduces B.2 ==
+encoder stream: 3fbd01c00f7777772e6578616d706c652e636f6dc10c2f73616d706c652f70617468 
+field section : 03811011 (Required Insert Count 2)
+
+== 3. Head-of-line blocking: field section arrives before the inserts ==
+stream 4 first : ('BLOCKED', 2)
+after encoder stream arrives, retry: [(':authority', 'www.example.com'), (':path', '/sample/path')]
+
+== 4. Cost of SETTINGS_QPACK_BLOCKED_STREAMS = 0 (no references before ack) ==
+blocking=allowed   ack after 1 req: request bytes [9, 9, 9, 9, 9]... total 90 B, encoder stream 259 B, sections that could block: 10
+blocking=allowed   ack after 4 req: request bytes [9, 9, 9, 9, 9]... total 90 B, encoder stream 259 B, sections that could block: 10
+blocking=forbidden ack after 1 req: request bytes [146, 20, 20, 21, 21]... total 333 B, encoder stream 259 B, sections that could block: 0
+blocking=forbidden ack after 4 req: request bytes [146, 146, 146, 147, 21]... total 711 B, encoder stream 259 B, sections that could block: 0
+```
+
+## Reading the output
+
+### Header and tables
+
+
+`rfctables.py` parses the tables out of the RFC text and checks them as it goes (each Huffman code's bits must equal its hex value and length). The Huffman code has 257 symbols (256 octets + 1 EOS symbol), spanning code lengths from 5 bits to 30 bits. HPACK's static table contains 61 entries, while QPACK's expanded static table contains 99 entries (indices 0 to 98). The two entries printed separately are the ones whose values wrap across lines in the RFC text; getting them right is a check that the parser joins the pieces correctly.
+
+### HPACK test vectors (RFC 7541 Appendix C)
+
+
+All 12 header-block examples in RFC 7541 Appendix C match byte for byte, both directions (our encoder produces the RFC bytes, our decoder produces the RFC header list and table size):
+- **C.1 Integer Encoding**: Verifies integer prefix math. Encoded values `0a` (10 with 5-bit prefix), `1f9a0a` (1337 with 5-bit prefix), and `2a` (42 with 8-bit prefix) decode perfectly.
+- **C.3 Request Examples Without Huffman**: Sequential requests populate the dynamic table. C.3.1 starts with 4 fields taking 20 wire bytes and leaves 1 entry in the table (57 bytes). C.3.2 adds 5 fields (14 wire bytes) by referencing prior indexed entries, expanding table size to 110 bytes across 2 entries.
+- **C.6 Request Examples With Huffman**: Shows Huffman compression efficiency. In C.6.2 the value `307` is the same length raw or Huffman coded (3 octets), and the RFC's encoder chose Huffman; the lab's encoder only reproduced the RFC bytes after the rule became "Huffman unless it is longer" instead of "Huffman only if shorter". C.5 versus C.6 shows Huffman's effect on the same requests: 70 vs 54, 8 vs 8 and 98 vs 79 octets.
+
+### HPACK experiments
+
+#### Experiment 1: Ten requests on one connection
+The first request costs 230 octets and leaves 8 entries (611 octets) in the table: `:authority`, `:path`, `user-agent`, the `accept*` values, `cookie` and `authorization`. Requests 2 to 10 differ only in `:path`, so each is a handful of 1-octet indexed references plus one new `:path` literal, 27 octets. The table grows by one 59-octet `:path` entry per request. Across 10 requests, total wire consumption drops from 4170 bytes to 473 bytes—an 88.7% bandwidth reduction (retaining only 11.3% of original size).
+
+#### Experiment 2: Dynamic table size bounds
+This experiment tests dynamic table capacity limits under varying `SETTINGS_HEADER_TABLE_SIZE` values:
+- **0 and 256 octets**: with 0 nothing is ever stored. With 256 the inserts of one request evict each other before the next request (user-agent alone is 112 octets as an entry), so every request costs the same 230 octets as the first; the static table still helps, which is why it is not 417.
+- **1024 octets**: holds the first request's entries, but each request adds a 59-octet `:path` entry, and once the table reaches 1024 octets the oldest entries (from the first request) are evicted, so later requests have to resend them: the range reaches 230 and the total is 676 octets.
+- **4096 B table**: Fits the full dynamic state without eviction, stabilizing steady-state requests at 27 bytes (totaling 473 bytes).
+
+#### Experiment 3: Huffman encoding efficiency across data types
+Huffman performance varies by character distribution:
+- Text (hostname, path, user-agent) saves about a quarter: most characters are 5 or 6 bits.
+- Random tokens still compress because they are text encodings of random bytes. Hex uses `0`-`9` and `a`-`f`, mostly 5- and 6-bit codes, so 70%; base64url mixes in upper-case letters (6 to 8 bits) and lands at 81%. The tokens are random per run, so those two lines vary slightly between runs.
+- The punctuation string costs 11 to 19 bits per character and would grow 75%, so the encoder sends it raw. That per-string choice is why the `H` bit exists.
+
+#### Experiment 4: CRIME attack mitigation via Never-Indexed representation
+This experiment evaluates side-channel vulnerability under whole-value matching:
+- **Indexed (the default)**: the victim's request put `cookie: <secret>` into the shared table. A wrong guess and an almost-right guess are both full literals (45 and 46 octets; the difference is just Huffman length of the last character, not a partial match). The exact guess collapses to a 1-octet indexed reference. Partial guesses leak nothing, which is the CRIME fix, but a whole guess is still confirmable. That matters for low-entropy values (a 4-digit PIN, a short session id) when the attacker can make the victim's connection send guesses and see the record sizes.
+- **Never indexed**: the secret never enters the table, so the correct guess costs the same 47 octets as the near miss. The one-octet extra over the indexed case is the 4-bit-prefix name index (`0x1f 0x11` for static entry 32, `cookie`).
+
+#### Experiment 5: Decompression amplification attack limits
+A 19,009-octet header block (one 3,009-octet literal of a 4,000-character value, then 16,000 one-octet references to it) decodes into 16,001 fields and a 64,596,037-octet header list, 3,398 times what was received. With a 64 KiB budget checked during decoding, the decoder stops after 16 fields: 16 x 4,037 = 64,592 fits, the 17th would not. A frame-size limit alone would not help: 19 KB fits in two frames.
+
+### QPACK experiments
+
+#### Section 1: RFC 9204 Appendix B trace validation
+Validates QPACK decoding step-by-step against RFC 9204 Appendix B trace data:
+- **B.1**: a field section that uses only the static table (RIC 0) decodes without any encoder-stream data.
+- **B.2**: capacity 220, two inserts by static name reference, table 106 octets. Stream 4 references both and the decoder emits Section Acknowledgment `84` (0x80 | stream 4).
+- **B.3**: an insert with a literal name (table 160 octets). No section uses it yet, so the decoder acknowledges it with Insert Count Increment `01`.
+- **B.4**: Duplicate with relative index 2 re-inserts `:authority` as absolute 3 (217 octets). Stream 8 decodes, then is reset, so the decoder sends Stream Cancellation `48` (0x40 | 8) instead of an acknowledgement.
+- **B.5**: an insert by dynamic name reference (relative 1 = `custom-key`) needs 55 octets, so absolute 0 is evicted to stay within 220; the table is 215 octets, absolute 1 to 4.
+
+#### Section 2: Encoder stream output verification
+The QPACK encoder generates the exact byte sequences specified in RFC 9204 Appendix B.2:
+- `3f bd 01` is Set Dynamic Table Capacity 220 (5-bit prefix: 31 + 189), `c0`/`c1` are inserts with static name references 0 and 1.
+- `03 81 10 11`: encoded RIC 3 (= 2), sign 1 and Delta Base 1 (so Base = 0), then two post-base references `10` and `11`.
+
+#### Section 3: Head-of-Line blocking simulation
+Here stream 4's section is delivered before the encoder stream, as QUIC allows. The decoder has 0 inserts, the section needs 2, so it is parked (`BLOCKED`, 2). When the encoder stream arrives the parked section decodes unchanged. A real decoder also counts parked streams against `SETTINGS_QPACK_BLOCKED_STREAMS` and treats an encoder that exceeds it as a connection error.
+
+#### Section 4: Cost of disabling stream blocking
+This experiment quantifies the trade-off between stream blocking and wire efficiency across 10 requests:
+In this lab's encoder every field goes into the table first and the section then references it, so the encoder stream is 259 octets in every case.
+
+- **Blocking allowed**: every section is 9 octets of references, 90 octets for 10 requests, but every section depends on inserts that might still be in flight; on loss, each could block.
+- **Blocking forbidden**: the encoder may only reference acknowledged entries. With acknowledgements one request behind, only the first request pays (146 octets of literals), 333 total. With acknowledgements four requests behind (a long RTT with many requests in flight) the first four pay, 711 total, nearly 8 times the blocking case, and nothing ever blocks. Which is better depends on loss rate and RTT, which is why it is a decoder setting.
+
+## In production
+
+### Analyzing HTTP/2 header compression with `h2load`
+
+`h2load` is a high-performance HTTP/2 benchmarking tool provided by the `nghttp2` project. It measures protocol compression efficiency under synthetic loads.
+
+```bash
+# (not run here)
+# Execute 1000 requests over a single connection with 10 multiplexed streams
+h2load -n 1000 -c 1 -m 10 https://example.internal/api/v1/resource
+```
+
+At the end `h2load` prints a `traffic:` line that includes the compressed header bytes and a `header space savings` percentage for response headers. Run it with `--header-table-size` (and with `-H` to add a large cookie) to see the effect of the table size on a real server; compare with experiment 2.
+
+### Inspecting raw HPACK frames with `nghttp`
+
+The `nghttp` CLI client displays low-level HTTP/2 frame exchanges, including settings frame parameters and HPACK representation types.
+
+```bash
+# (not run here)
+# Verbose trace of HTTP/2 session showing frame details and header decompressed state
+nghttp -v https://example.internal/
+```
+
+`-v` prints each frame with its length, including the SETTINGS the server sends (look for `SETTINGS_HEADER_TABLE_SIZE` and `SETTINGS_MAX_HEADER_LIST_SIZE`) and the decoded header list of each HEADERS frame. Comparing the HEADERS frame `length=` of the first and second request on one connection shows the dynamic table at work, as in experiment 1. `nghttp` has no option to print the individual HPACK representations; for that, use Wireshark with TLS keys (`SSLKEYLOGFILE`), whose HTTP/2 dissector shows the header block and the decoded fields.
+
+### Inspecting QPACK trace logs via `qlog` and Wireshark
+
+QPACK state is split across the request streams and the two QPACK streams, so you need a tool that sees all of them: a qlog trace from the client or server (many QUIC stacks can write one), or Wireshark with the TLS keys.
+
+In Wireshark, start from the `http3` and `quic` display filters and look at the HTTP/3 SETTINGS frame for the two QPACK settings, then at the unidirectional streams of type 0x02 and 0x03. Field names differ between Wireshark versions, so use the field browser rather than copying a filter. In qlog, the QPACK event names come from the qlog HTTP/3 and QPACK event definitions, which are still Internet-Drafts; check what your stack actually emits.
+
+### Production server configuration guidelines
+
+Protocol operators should tune header compression parameters based on latency goals and available memory:
+
+- **Bound Uncompressed Header Memory**: Limit total uncompressed header sizes (`SETTINGS_MAX_HEADER_LIST_SIZE`) and make sure the proxy enforces it while decoding (HTTP/3 has the same setting as `SETTINGS_MAX_FIELD_SECTION_SIZE`). Check the actual directive names in your proxy's documentation; most expose a maximum request header size.
+- **Limit Frame Chain Continuations**: Run a server version released after April 2024 and confirm it caps the accumulated header block across `CONTINUATION` frames (VU#421644 lists affected implementations and fixed versions).
+- **Control QPACK Table Capacity & Stream Blocking**: On high-concurrency HTTP/3 edge nodes, remember the dynamic table is per connection, so capacity times connections is real memory. Allowing some blocked streams buys compression; 0 removes QPACK blocking at the cost shown in lab section 4.
+- **Enforce Never-Indexed Rules at Edge Proxies**: Check whether your client and proxy libraries mark `authorization` and short cookies never-indexed; many do by default, some only for some headers. QPACK has the same N bit on literals.
+
+## Gotchas
+
+- **Header Field Overhead Accounting**: The memory footprint of a dynamic table entry is not just the byte length of its name and value. It is name length + value length + 32, so even an entry with an empty value costs 32 octets plus its name.
+- **Eviction Before Insertion**: HPACK evicts before inserting. An entry bigger than the table empties it and is not stored, yet the field is still delivered; an implementation that evicts after inserting gets different indices from its peer.
+- **Huffman EOS Padding Strictness**: Padding at the end of a Huffman-encoded string must strictly consist of the most significant bits of the EOS symbol (`1` bits) and must not exceed 7 bits. Any padding containing `0` bits or extending to 8 or more bits must be rejected as a fatal decoding error.
+- **Never-Indexed Persistence across Intermediaries**: Marking a header as `Never-Indexed` (`0001xxxx`) mandates that downstream proxies retain the Never-Indexed flag when re-encoding the frame to upstream servers. Re-encoding it with incremental indexing on the next hop would put the secret back into a shared table.
+- **CONTINUATION Frame Stream Binding**: In HTTP/2, once a `HEADERS` frame without the `END_HEADERS` flag set is transmitted on a stream, no other frame types (including `DATA` or frames for other stream IDs) may be interleaved until all matching `CONTINUATION` frames for that header block are fully delivered.
+- **QPACK Absolute vs Relative Index Scope**: In QPACK, relative indices change based on the current context (`Base` index), whereas absolute indices remain fixed for the lifetime of the connection. Confusing relative and absolute indices during stream decoding leads to header corruption.
+- **QPACK Dynamic Entry Draining Stalls**: An entry in the QPACK dynamic table cannot be evicted until all stream sections referencing that entry have been acknowledged by the decoder via Section Acknowledgment instructions. Failing to process decoder stream acknowledgments can stall the encoder's dynamic table.
+- **QPACK Unidirectional Stream Initialization Failure**: Each endpoint may open at most one encoder and one decoder stream; a second one is a connection error (`H3_STREAM_CREATION_ERROR`), and closing either is `H3_CLOSED_CRITICAL_STREAM` (RFC 9204 section 4.2).
+
+## Exercises
+
+1. **Manual Integer Decoding**: Given the raw HPACK octet sequence `1f 9a 0a` with a 5-bit prefix, manually trace the multi-byte integer decoding algorithm step-by-step and calculate the final decoded integer value.
+2. **Dynamic Table Eviction Calculation**: Assume an empty HTTP/2 dynamic table with `SETTINGS_HEADER_TABLE_SIZE` set to 100 bytes. Trace the exact table state (entries present and total byte size) after sequentially inserting the following three header fields:
+   - Header A: `x-app-id: 12345`
+   - Header B: `cookie: session=abcde12345`
+   - Header C: `user-agent: custom-client`
+3. **Huffman padding**: decode `35 ff`, `35 fe`, `35` and `3f` by hand with the Appendix B table, then check with `hpack.huff_decode`. Which are valid, and why exactly is each invalid one rejected?
+4. **QPACK Blocked Stream State Machine**: Trace the lifecycle of a QPACK decoder receiving Stream Section 12 with `Required Insert Count = 5` when the current local decoder `Insert Count = 3`. List the exact sequence of unidirectional control stream instructions required to unblock and complete decoding of Stream Section 12.
+5. **Whole-value guessing**: extend experiment 4 with a header `x-pin: 4821` and try all 10,000 PINs under both policies. How many requests does the attacker need on average, and what does each policy leak?
+6. **Budget, not frame count**: write a function that consumes HTTP/2 frame headers (9 octets each) and enforces a 64 KiB budget on the accumulated header block across HEADERS and CONTINUATION. Why is a frame-count limit alone not enough?
+
+## Verification
+
+The code examples and operational assertions in this chapter were verified against standard RFC specifications using pure Python standard library scripts:
+
+- Run: `./lab-hpack.sh` on Linux 6.12.94 with Python 3.13.5, standard library only, with `rfc7541.txt` and `rfc9204.txt` from rfc-editor.org. The output above is pasted unchanged.
+- Checked: all 12 RFC 7541 Appendix C header blocks and the C.1 integers, byte for byte in both directions; RFC 9204 Appendix B decoder trace (table sizes 106/160/217/215 and decoder instructions `84`, `01`, `48`) and the B.2 encoder bytes.
+- Not run: `h2load`, `nghttp`, Wireshark and qlog (not installed here); those parts are written from their documentation.
+- Facts about settings, error codes and indexing were checked against the RFC 7541, 9113, 9114 and 9204 texts.
+
+## Sources
+
+- **RFC 7541**: *HPACK: Header Compression for HTTP/2*. RFC Editor, 2015. [https://www.rfc-editor.org/rfc/rfc7541.html](https://www.rfc-editor.org/rfc/rfc7541.html)
+- **RFC 9204**: *QPACK: Field Compression for HTTP/3*. RFC Editor, 2022. [https://www.rfc-editor.org/rfc/rfc9204.html](https://www.rfc-editor.org/rfc/rfc9204.html)
+- **RFC 9113**: *HTTP/2*. RFC Editor, 2022. [https://www.rfc-editor.org/rfc/rfc9113.html](https://www.rfc-editor.org/rfc/rfc9113.html)
+- **RFC 9114**: *HTTP/3*. RFC Editor, 2022. [https://www.rfc-editor.org/rfc/rfc9114.html](https://www.rfc-editor.org/rfc/rfc9114.html)
+- **RFC 9000**: *QUIC: A UDP-Based Multiplexed and Secure Transport*. RFC Editor, 2021. [https://www.rfc-editor.org/rfc/rfc9000.html](https://www.rfc-editor.org/rfc/rfc9000.html)
+- **CVE-2016-6581**: *HPACK Decompression Amplification Vulnerability ("HPACK Bomb")*. National Vulnerability Database (NVD), 2016. [https://nvd.nist.gov/vuln/detail/CVE-2016-6581](https://nvd.nist.gov/vuln/detail/CVE-2016-6581)
+- **CERT/CC Vulnerability Note VU#421644**: *HTTP/2 Implementations Vulnerable to CONTINUATION Frame Denial of Service*. CERT Coordination Center, April 2024. [https://www.kb.cert.org/vuls/id/421644](https://www.kb.cert.org/vuls/id/421644)
+- **CRIME**: J. Rizzo and T. Duong, *The CRIME attack*, Ekoparty 2012. RFC 7541 section 7.1 explains how HPACK's design responds to it.
+- **RFC 9113 section 10.5** (denial-of-service considerations for header blocks) and **RFC 9204 section 7** (security considerations, including the never-indexed bit).
