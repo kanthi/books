@@ -1,0 +1,664 @@
+---
+title: "Captive Portals Done Properly: DHCP Option 114, RA Option 37 and the Captive Portal API"
+author:
+  - name: "K19G"
+  - name: "grok-bot"
+---
+
+# Captive Portals Done Properly: DHCP Option 114, RA Option 37 and the Captive Portal API
+
+For twenty years, guest Wi-Fi networks have told devices they are behind a captive portal by lying to them. A client joins a network, sends a plain HTTP probe to a hardcoded URL, and waits to see whether the answer comes back intact. If a middlebox intercepts the TCP connection and returns a `302` redirect, or spoofs a DNS `A` record to point at a local web server, the operating system guesses that a captive portal is in the way and pops up a login sheet.
+
+That guessing game worked when the web ran on unencrypted HTTP and stub resolvers trusted whatever UDP port 53 handed back. On a modern network stack—where HTTP Strict Transport Security (HSTS) pins origins to HTTPS, DNSSEC validates signatures, and encrypted DNS (DoT or DoH) bypasses local resolvers—interception looks indistinguishable from an active attack or a broken uplink. Instead of seeing a login page, the user sees a dead connection.
+
+The IETF CAPPORT architecture replaces guesswork and interception with explicit signalling. The network tells the client where the portal API lives via DHCPv4 option 114, DHCPv6 option 103, or IPv6 Router Advertisement (RA) option 37 (RFC 8910). The client queries that endpoint over HTTPS using `application/captive+json` (RFC 8908) to learn whether it is captive, where to send the user, and how much time or data remains. Meanwhile, the enforcement device drops or rejects general internet traffic cleanly instead of forging responses.
+
+## Learning goals
+
+After working through this chapter, you will be able to:
+
+- Explain the four components of the RFC 8952 CAPPORT architecture and separate control-plane signalling from data-plane enforcement.
+- Decode DHCPv4 option 114, DHCPv6 option 103, and IPv6 RA option 37 on the wire, including padding rules and the 255-byte length boundary.
+- Distinguish the machine-readable API URI from the human-facing `user-portal-url`, and configure content negotiation (`Accept: application/captive+json`) without falling into the RFC 8910 erratum 6620 trap.
+- Design pre-authentication firewall/routing rules that permit TLS certificate validation (DNS, OCSP/CRL, NTP, and the API host) before captivity is lifted.
+- Diagnose why legacy HTTP/DNS interception breaks HSTS, DNSSEC, and encrypted DNS, and why NAT between client and API server breaks IP-based identity.
+
+## Why legacy detection breaks the modern stack
+
+Legacy captive portal detection relies on a heuristic: every operating system ships with a well-known plain-HTTP probe URL that is expected to return a specific response, such as an HTTP `204 No Content` or a tiny static body. When a device associates with an access point or brings up an Ethernet link, it sends that HTTP GET request. If the probe succeeds, the device assumes the internet is reachable. If the request times out, resets, or receives a `302` redirect to another host, the OS concludes that a captive portal is intercepting traffic.
+
+To make that heuristic trigger—and to catch users who open a browser manually—legacy portals rely on two middlebox tricks:
+
+1. **HTTP interception**: the access controller hijacks outbound TCP port 80 connections and injects an HTTP `302` redirect pointing to the login page.
+2. **DNS interception (DNS spoofing)**: the access controller intercepts UDP/TCP port 53 queries and answers every hostname with the portal's own IP address.
+
+Both tricks collide head-on with modern transport and naming security:
+
+- **HSTS and HTTPS-everywhere**: Most major sites are preloaded in browsers with HSTS, or default to HTTPS. If a portal hijacks TCP port 443 and presents its own certificate, the browser aborts with a certificate mismatch error that the user cannot bypass. If the portal spoofs DNS for an HTTPS site, the same failure occurs.
+- **Encrypted DNS (DoT and DoH)**: As covered in the encrypted DNS chapter, clients configured for strict DNS over TLS or DNS over HTTPS refuse to fall back to plaintext port 53. A portal that only intercepts port 53 never sees the query; a portal that blocks port 853 or 443 causes the client's resolver to fail completely, leaving the OS unable to resolve even the probe hostname.
+- **DNSSEC**: A stub or local validator checking DNSSEC signatures rejects spoofed portal answers as `SERVFAIL` (`BOGUS`), again making the network look broken rather than captive.
+- **Zero visibility into session state**: Even after a user logs in, a legacy portal gives the OS no standard way to ask when the session expires, how many bytes remain, or where to find venue information. The client can only keep polling the probe URL and hope it notices when traffic stops flowing.
+
+```text
+Legacy Interception (fragile)
+-----------------------------
+UE                      Portal Middlebox                  Internet
+ |                             |                             |
+ |-- HTTP GET /generate_204 -->|  (hijacks TCP/80)           |
+ |<-- 302 Location: /login ----|                             |
+ |                             |                             |
+ |-- DNS A example.com ------->|  (spoofs DNS reply)         |
+ |<-- A 10.0.0.1 --------------|                             |
+ |                             |                             |
+ |-- HTTPS example.com ------->|  (forged cert -> HSTS FAIL) |
+ |<-- TLS Alert / Browser Err -|                             |
+
+CAPPORT Architecture (explicit)
+-------------------------------
+UE                      Provisioning / API / Enforcement  Internet
+ |                             |                             |
+ |<-- DHCP Opt 114 / RA Opt 37-|  (API URI via control plane)|
+ |-- HTTPS GET API URI ------->|  (Accept: application/      |
+ |    (validated via PKI)      |   captive+json)             |
+ |<-- 200 {"captive": true} ---|                             |
+ |                             |                             |
+ |-- Probe / Internet -------->|  (cleanly rejected/dropped) |
+ |<-- ICMP Admin Prohibited ---|                             |
+```
+
+CAPPORT turns the relationship right-side up. Instead of pretending to be the destination server, the network announces its own identity in the link-layer provisioning phase and lets the client talk to the portal over an authenticated HTTPS channel.
+
+## The CAPPORT architecture (RFC 8952)
+
+RFC 8952 defines the overall CAPPORT architecture as four functional components plus an optional network signal. In small deployments (such as a single wireless router or the lab later in this chapter), several of these components run on the same box; in large campus or carrier Wi-Fi deployments, they are separated across access points, DHCP servers, policy engines, and RADIUS/802.1X backends.
+
+```text
+                +----------------------+
+                | Provisioning Service |
+                |  (DHCPv4 / DHCPv6 /  |
+                |     IPv6 RA)         |
+                +----------+-----------+
+                           |
+           Option 114 / 103 / RA 37 (API URI)
+                           |
+                           v
++----------------+   HTTPS (API)   +--------------------------+
+| User Equipment |<--------------->| Captive Portal API Server|
+|     (UE)       |                 +------------+-------------+
++-------+--------+                              |
+        |                                       | Policy / State
+        | Data Plane                            | Sync
+        v                                       v
++-----------------------------------+-----------+-------------+
+|          Captive Portal Enforcement Device                  |
+|  (Drops/rejects restricted traffic; permits API, DNS,       |
+|   OCSP/CRL, NTP, and user-portal-url)                       |
++------------------------------+------------------------------+
+                               |
+                               | Unrestricted traffic (post-auth)
+                               v
+                          [ Internet ]
+```
+
+The roles are strictly divided:
+
+- **User Equipment (UE)**: The client device (laptop, phone, IoT node) joining the network. It parses the provisioning option, validates the API server's TLS certificate, queries the JSON API, and—if `captive` is `true`—opens `user-portal-url` in a constrained browser sheet or notifies the user.
+- **Provisioning Service**: The DHCPv4 server, DHCPv6 server, or IPv6 router sending Router Advertisements. Its only CAPPORT job is to deliver the API URI (or the unrestricted URN) to the UE.
+- **Captive Portal API Server**: An HTTPS server that answers client queries with `application/captive+json`. It is the source of truth for whether a given UE is currently captive, what URL the user should visit to authenticate, and what time or byte quotas apply.
+- **Captive Portal Enforcement Device**: The data-plane gatekeeper (firewall, router, or wireless controller). Until the UE satisfies the portal's conditions, the enforcement device blocks or rejects general internet traffic. Crucially, RFC 8952 says the enforcement device SHOULD allow access to any services the UE needs for certificate validation, such as OCSP responders, CRLs and NTP servers. In practice the allowlist also has to include DNS for the API hostname and the API and user-portal hosts themselves, or the UE never gets as far as validating anything.
+- **Captive Portal Signal (optional)**: A lightweight hint from the network (such as an ICMP notification or control-plane trigger) telling the UE that enforcement is active or that its state has changed. Unlike the provisioning service, the signal **does not carry the API URI**; it only prompts the UE to re-query the API it already learned.
+
+| Property | Legacy Interception | CAPPORT (RFC 8952 / 8910 / 8908) |
+| :--- | :--- | :--- |
+| Discovery mechanism | Plain-HTTP probe + middlebox hijack | DHCPv4 opt 114, DHCPv6 opt 103, RA opt 37 |
+| Authentication channel | Plain HTTP or spoofed DNS | HTTPS with standard PKI (`DNS-ID` check) |
+| Open-network fast path | Must still run HTTP probe | `urn:ietf:params:capport:unrestricted` |
+| Session status & quotas | None (guess by re-probing) | `captive`, `seconds-remaining`, `bytes-remaining` |
+| Behaviour on HSTS / DoT | Fails with cert or DNS error | Cleanly separated; API uses its own validated name |
+| Pre-auth internet traffic | Hijacked and forged | Explicitly dropped or rejected (`prohibit`) |
+
+## Provisioning the API URI: RFC 8910
+
+Before a UE can ask whether it is captive, it needs to know where to ask. RFC 8910 (Standards Track, September 2020) standardises how DHCPv4, DHCPv6, and IPv6 Neighbor Discovery Router Advertisements carry that URI.
+
+RFC 8910 obsoletes RFC 7710 and updates RFC 3679. RFC 7710 had originally assigned DHCPv4 option code `160`, but operators later discovered that code `160` was already in active use in the field (notably by Polycom devices). To eliminate the collision, IANA deprecated option `160` and RFC 8910 moved the DHCPv4 option to **code 114**. The IPv6 code points did not change: **DHCPv6 option 103** and **RA option type 37** were already assigned under RFC 7710, and RFC 8910 only updated their references.
+
+### Wire formats
+
+Each of the three provisioning transports encodes the same UTF-8 URI, but their framing differs slightly.
+
+#### DHCPv4 Option 114
+
+```text
+ 0                   1                   2                   3
+ 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|  Code = 114   |    Length     |         URI (UTF-8) ...       |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                     ... URI (not NUL-terminated)              |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+```
+
+- **Code**: `114` (`0x72`).
+- **Length**: 1-byte unsigned integer (`1` to `255`), giving the byte length of the URI.
+- **URI**: UTF-8 encoded string, **not NUL-terminated**. For example, the 37-byte URI `https://portal.example/api/v1/session` starts on the wire with `72 25 68 74 74 70 73 ...` (`0x72` = 114, `0x25` = 37, `0x68 0x74 0x74 0x70 0x73` = `https`).
+- **Requesting the option**: RFC 8910 says clients that support it SHOULD include it in the Parameter Request List (option 55) of their DHCPREQUEST, and DHCP servers MAY send it without an explicit request.
+
+#### DHCPv6 Option 103
+
+```text
+ 0                   1                   2                   3
+ 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|      option-code = 103        |          option-len           |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                        URI (UTF-8) ...                        |
+|                     (not NUL-terminated)                      |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+```
+
+- **option-code**: `103` (`0x0067`, 16 bits).
+- **option-len**: 16-bit length of the URI in bytes.
+- **URI**: UTF-8 encoded string, **not NUL-terminated**. Clients SHOULD include `103` in their DHCPv6 Option Request Option (ORO).
+
+#### IPv6 Router Advertisement Option 37
+
+```text
+ 0                   1                   2                   3
+ 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|   Type = 37   |    Length     |          URI (UTF-8) ...      |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                        ... URI ...                            |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                 ... URI ...   |   NUL Padding (0x00 bytes)    |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+```
+
+Unlike DHCP, IPv6 Neighbor Discovery options (RFC 4861) measure their length in **8-byte (64-bit) units**, including the 1-byte `Type` and 1-byte `Length` fields:
+
+- **Type**: `37` (`0x25`).
+- **Length**: `ceil((2 + len(URI)) / 8)`.
+- **Padding**: Because the option must end on an 8-byte boundary and has no separate byte-length field, any remaining bytes after the URI are padded with `0x00` (NUL) bytes. A 37-byte URI plus 2 header bytes equals 39 bytes, which rounds up to `Length = 5` (40 bytes) with **1 NUL pad byte** at the end. Clients strip trailing `0x00` bytes when parsing.
+
+### Length limits, dual-stack consistency, and the unrestricted URN
+
+Because DHCPv4 options are capped at 255 bytes (RFC 2132), RFC 8910 states that URIs longer than 255 bytes SHOULD NOT be provisioned via DHCPv6 or RA either. That rule can be relaxed on IPv6-only networks, where DHCPv4 does not exist, though keeping the API URI short is always good operational hygiene.
+
+On dual-stack networks, the operator SHOULD ensure the URIs provisioned by each method are equivalent, and RFC 8910 Section 3 goes further: if the URIs learned are not all identical, "it is a network configuration error" that the client should log. The same section leaves precedence between the three methods to the implementation, so if your DHCPv4 server hands out one URI and your router's RAs another, different operating systems will hit different endpoints.
+
+Two semantic rules in RFC 8910 trip up first-time deployments:
+
+1. **API URI, not login page**: The provisioned URI MUST point to the Captive Portal API endpoint, never to the human-facing HTML login page.
+2. **No IP address literals**: The URI SHOULD NOT contain an IP literal (such as `https://10.0.0.1/api`). RFC 8910 allows exceptions for single-address-family networks where DNS does not work until the portal is satisfied, and leaves IP-address certificates out of scope. In practice the client validates the server certificate against whatever host the URI names, so an IP literal only works with a certificate carrying that address as an iPAddress SAN; public CAs do not issue those for private addresses like `10.0.0.1`. Lab step 4 shows the failure.
+
+Finally, RFC 8910 defines a special URN for networks that have **no** captive portal at all:
+
+```text
+urn:ietf:params:capport:unrestricted
+```
+
+When a network provisions `urn:ietf:params:capport:unrestricted` (36 bytes—fitting in a 40-byte RA option 37 with 2 NUL pad bytes, or a 38-byte DHCPv4 option 114), compliant clients know immediately that the network is open and can skip legacy probe heuristics altogether.
+
+### Content negotiation and the RFC 8910 erratum 6620 trap
+
+What happens if a user copies the provisioned API URI into a browser, or an older client treats it as a web page? RFC 8910 allows the portal server to perform HTTP content negotiation:
+
+- If the incoming request includes `Accept: application/captive+json`, the server returns the JSON API payload.
+- If the request lacks that media type in `Accept` (as a normal web browser navigation does), the portal MAY do content negotiation and, if it does, SHOULD redirect the client to `user-portal-url`.
+- Because such responses might be cached, the server SHOULD include an appropriate `Vary` header (covering `Accept`) **or** set `Cache-Control: private` or stricter (`no-store`). The lab server sends both. Without either, a cache could store the `302` redirect and serve it to a later JSON API request, or vice versa.
+
+Here lies one of the sharpest traps in the RFC text. Section 2 of RFC 8910 originally wrote the media type as `application/capport+json`. However, RFC 8908—published alongside it—actually registered `application/captive+json` with IANA. **RFC 8910 Erratum 6620** (verified technical erratum, reported 2021-06-23) corrects RFC 8910 to `application/captive+json`. A portal server implemented strictly from the unpatched RFC 8910 text will look for `application/capport+json`, fail to match real clients sending `application/captive+json`, and redirect every API client to the HTML login page as if it were a browser.
+
+| Method | Code / Type | Length Unit | NUL Padding | Max URI (Dual-Stack) |
+| :--- | :--- | :--- | :--- | :--- |
+| DHCPv4 | Option `114` (`0x72`) | 1 byte (URI bytes) | None | 255 bytes |
+| DHCPv6 | Option `103` (`0x0067`) | 2 bytes (URI bytes) | None | 255 bytes (SHOULD NOT exceed) |
+| IPv6 RA | Option `37` (`0x25`) | 1 byte (8-byte units, incl. 2-byte hdr) | `0x00` to 8-byte boundary | 255 bytes (relaxable on IPv6-only) |
+
+## The Captive Portal API: RFC 8908
+
+Once the UE has the API URI, RFC 8908 (Standards Track, September 2020) defines how it talks to the API server.
+
+### Transport, ports, and certificate validation
+
+The API MUST be accessed over `https://` and SHOULD use the default port (443). Before trusting a single byte of JSON, the client validates the server's TLS certificate:
+
+- The client checks that the certificate's `DNS-ID` matches the provisioned hostname (RFC 8908 cites RFC 6125 for service identity verification, now obsoleted by RFC 9525).
+- If certificate validation fails, the client **MUST NOT** use the API. It cannot simply "click through" an untrusted certificate for the API endpoint.
+
+This requirement has immediate consequences for your enforcement firewall. Because the UE must validate the API server's certificate *while it is still captive*, any dependency of TLS validation must work before authentication:
+
+1. **DNS**: The UE must be able to resolve the API server's hostname (e.g., `portal.example`).
+2. **NTP**: If the UE's clock is wrong (common on embedded devices or laptops with dead CMOS batteries), certificate `NotBefore`/`NotAfter` checks fail. Captive networks SHOULD permit NTP.
+3. **OCSP / CRL**: Captive networks SHOULD permit OCSP and CRL traffic so clients can check revocation. Better yet, the API server SHOULD use **OCSP stapling** so the UE receives the revocation proof inside the TLS handshake without making an extra outbound connection.
+4. **No AIA chasing**: Certificates that require Authority Information Access (AIA) chasing to fetch intermediate CAs SHOULD NOT be used (or the AIA host must be explicitly permitted while captive). Always serve the full intermediate chain in the TLS handshake.
+
+### Media type and JSON schema
+
+Clients SHOULD send `Accept: application/captive+json`, and the server MUST respond with `Content-Type: application/captive+json`. The response body is a JSON object with one required key and several optional keys:
+
+| Key | Type | Requirement | Semantics |
+| :--- | :--- | :--- | :--- |
+| `captive` | boolean | **REQUIRED** | `true` if network access is currently restricted; `false` if unrestricted. |
+| `user-portal-url` | string | Optional | `https://` URI (MUST be TLS) for the human-facing login/status page. |
+| `venue-info-url` | string | Optional | URI (SHOULD be TLS) for venue information (airport gate, hotel portal, etc.). |
+| `can-extend-session` | boolean | Optional | `true` if the user can extend an active session by visiting `user-portal-url`. |
+| `seconds-remaining` | integer | Optional | Seconds left in session. SHOULD be included when `captive` is `false` and time-limited; **SHOULD be omitted when `captive` is `true`**. |
+| `bytes-remaining` | integer | Optional | Bytes left in quota. SHOULD be included when `captive` is `false` and byte-limited; **SHOULD be omitted when `captive` is `true`**. |
+
+Clients MUST ignore unknown keys, allowing future extensions without breaking older devices.
+
+A typical pre-authentication response looks like this:
+
+```json
+{
+  "captive": true,
+  "user-portal-url": "https://portal.example/login",
+  "venue-info-url": "https://portal.example/venue"
+}
+```
+
+Once the user authenticates at `user-portal-url`, the client re-queries the API and receives:
+
+```json
+{
+  "captive": false,
+  "user-portal-url": "https://portal.example/login",
+  "can-extend-session": true,
+  "seconds-remaining": 599
+}
+```
+
+### Client identity and NAT
+
+How does the API server know *which* UE is asking? In the simplest model, it reads the TCP connection's source IP address and looks up that IP in the enforcement device's state table. For this to work, **the same client IP addresses must be visible to both the API server and the enforcement device**.
+
+If a masquerading NAT or a reverse proxy sits between the UE and the API server (without preserving client identity), every UE appears to come from the NAT gateway's IP address, and IP-based lookup collapses. In those topologies, RFC 8908 permits the provisioning service to hand out **per-client URIs**—for example, embedding a unique session token in the URL path provisioned via DHCP or RA—so the API server can identify the client from the URI itself rather than the source IP.
+
+## The lab
+
+To see every piece of CAPPORT working without middlebox guesswork, the lab builds a self-contained three-namespace network on Linux using `unshare -rnm`:
+
+- `U` (User Equipment): receives a DHCPv4 lease (`10.0.0.50`, default router `10.0.0.1`) with option 114, plus IPv6 Router Advertisements with option 37.
+- `P` (Portal router): runs the DHCPv4 server, RA sender, HTTPS API/portal server (`portal.example`, mapped locally to `10.0.0.1` instead of running a separate DNS server), and the enforcement data plane.
+- `I` (Internet): hosts a plain HTTP probe target at `198.51.100.80` returning `204 No Content`.
+
+A private CA generated by `gen-certs.sh` signs the certificate for `portal.example`. Because modern TLS stacks enforce strict PKI validation, the CA certificate includes `basicConstraints = critical, CA:TRUE` and `keyUsage = keyCertSign`, while the server leaf certificate includes a Subject Alternative Name (SAN) for `portal.example`, `keyUsage`, `serverAuth` Extended Key Usage, and `authorityKeyIdentifier`.
+
+Enforcement on `P` uses two `ip rule` policy-routing entries rather than complex firewall NAT or HTTP hijacking:
+
+- `pref 100 iif p-u to 10.0.0.1 lookup main` permits `U` to reach the API and portal server while captive.
+- `pref 900 iif p-u prohibit` rejects all other traffic from `U` with ICMP Administratively Prohibited (which Linux reports to applications as `EHOSTUNREACH` / `No route to host`).
+- When `U` posts credentials to `/login`, `P` installs `pref 150 iif p-u from 10.0.0.50 lookup main`, lifting captivity for `U`'s IP address.
+
+The lab script is pure Python standard library (`ssl`, `http.server`, `http.client`, raw sockets for DHCP and the RA) plus the `openssl` CLI for the certificates; nothing is installed. It exercises five behaviours in sequence: (1) inspecting the DHCPv4 option 114 and RA option 37 wire bytes, (2) verifying pre-login probe failure, API `application/captive+json` responses, browser `302` content negotiation, and the RFC 8910 erratum 6620 typo (`application/capport+json`), (3) authenticating and observing `captive: false` with `seconds-remaining` and a working `204` probe, (4) attempting to connect via the IP literal `https://10.0.0.1/...` and observing strict certificate rejection, and (5) checking the 255-byte DHCPv4 limit and 8-byte RA padding boundary.
+
+```{.bash filename="gen-certs.sh"}
+#!/bin/sh
+# A private CA and a certificate for portal.example (the provisioned API host name).
+set -e
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 30 \
+  -subj "/CN=Lab Captive CA" -addext "basicConstraints=critical,CA:TRUE" \
+  -addext "keyUsage=critical,keyCertSign,cRLSign" -keyout ca.key -out ca.pem 2>/dev/null
+openssl req -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes \
+  -subj "/CN=portal.example" -keyout portal.key -out portal.csr 2>/dev/null
+printf 'subjectAltName=DNS:portal.example\nkeyUsage=critical,digitalSignature\nextendedKeyUsage=serverAuth\nauthorityKeyIdentifier=keyid\n' > san.ext
+openssl x509 -req -in portal.csr -CA ca.pem -CAkey ca.key -CAcreateserial \
+  -days 30 -extfile san.ext -out portal.pem 2>/dev/null
+echo "issued: $(openssl x509 -in portal.pem -noout -subject -ext subjectAltName,extendedKeyUsage | tr '\n' ' ')"
+```
+
+```{.python filename="capport-lab.py"}
+#!/usr/bin/env python3
+"""Captive portal discovery and API (RFC 8910 + RFC 8908), end to end.
+Run: sh gen-certs.sh && unshare -rnm python3 capport-lab.py
+Namespaces: U (user equipment) -- P (portal router: DHCP, RA, API, enforcement) -- I ("internet").
+Enforcement uses only ip rules on P: captive clients may reach the portal, nothing else."""
+import json, os, socket, ssl, struct, subprocess, sys, threading, time, http.server, http.client
+
+SELF = os.path.abspath(__file__); HERE = os.path.dirname(SELF)
+API = 'https://portal.example/api/v1/session'
+PORTAL_IP, CLIENT_IP, WEB_IP = '10.0.0.1', '10.0.0.50', '198.51.100.80'
+HOSTS = {'portal.example': PORTAL_IP}        # the lab's stand-in for DNS
+SESSION = {}                                 # client ip -> expiry (epoch seconds)
+
+def sh(cmd, check=True):
+    r = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+    if check and r.returncode:
+        raise SystemExit(f'FAILED: {cmd}\n{r.stderr}')
+    return (r.stdout + r.stderr).strip()
+
+def build():
+    sh('mount -t tmpfs none /run && mkdir -p /run/netns')
+    for ns in ('U', 'P', 'I'):
+        sh(f'ip netns add {ns}; ip -n {ns} link set lo up')
+    sh('ip link add u0 type veth peer name p-u; ip link add p-i type veth peer name i0')
+    sh('ip link set u0 netns U; ip link set p-u netns P; ip link set p-i netns P; ip link set i0 netns I')
+    for ns, d in (('U', 'u0'), ('P', 'p-u'), ('P', 'p-i'), ('I', 'i0')):
+        sh(f'ip -n {ns} link set {d} up')
+    sh(f'ip -n P addr add {PORTAL_IP}/24 dev p-u; ip -n P addr add 2001:db8:c::1/64 dev p-u nodad')
+    sh('ip -n P addr add 192.0.2.1/30 dev p-i; ip -n I addr add 192.0.2.2/30 dev i0')
+    sh(f'ip -n I addr add {WEB_IP}/32 dev lo; ip -n I route add 10.0.0.0/24 via 192.0.2.1')
+    sh(f'ip -n P route add {WEB_IP}/32 via 192.0.2.2')
+    sh('ip netns exec P sh -c "echo 1 > /proc/sys/net/ipv4/ip_forward"')
+    # Enforcement: traffic arriving from the access side is prohibited unless the
+    # client has a session; the portal's own addresses are always reachable.
+    sh(f'ip -n P rule add pref 100 iif p-u to {PORTAL_IP} lookup main')
+    sh('ip -n P rule add pref 900 iif p-u prohibit')
+
+# ---------- DHCPv4 with option 114 (RFC 8910 2.1) ----------
+MAC = bytes.fromhex('02aabbccdd01')
+def dhcp_pkt(op, xid, mtype, yiaddr='0.0.0.0', opts=()):
+    p = struct.pack('!BBBBIHH4s4s4s4s16s64s128s', op, 1, 6, 0, xid, 0, 0x8000, b'\0' * 4,
+                    socket.inet_aton(yiaddr), b'\0' * 4, b'\0' * 4, MAC + b'\0' * 10, b'', b'')
+    p += b'\x63\x82\x53\x63' + bytes([53, 1, mtype])
+    for code, val in opts:
+        p += bytes([code, len(val)]) + val
+    return p + b'\xff'
+
+def dhcp_opts(p):
+    i, o = 240, {}
+    while i < len(p) and p[i] != 255:
+        if p[i] == 0: i += 1; continue
+        o[p[i]] = p[i + 2:i + 2 + p[i + 1]]; i += 2 + p[i + 1]
+    return o
+
+def dhcp_server(uri):
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE, b'p-u'); s.bind(('0.0.0.0', 67))
+    while True:
+        p, _ = s.recvfrom(1500)
+        o = dhcp_opts(p); xid = struct.unpack('!I', p[4:8])[0]
+        reply = {1: 2, 3: 5}[o[53][0]]                      # DISCOVER->OFFER, REQUEST->ACK
+        opts = [(54, socket.inet_aton(PORTAL_IP)), (51, struct.pack('!I', 3600)),
+                (1, socket.inet_aton('255.255.255.0')), (3, socket.inet_aton(PORTAL_IP))]
+        opts.append((114, uri.encode()))   # sent whether or not option 55 asked (RFC 8910 2: MAY)
+        s.sendto(dhcp_pkt(2, xid, reply, CLIENT_IP, opts), ('255.255.255.255', 68))
+
+def dhcp_client():
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE, b'u0'); s.bind(('0.0.0.0', 68)); s.settimeout(2)
+    prl = (55, bytes([1, 3, 6, 114]))
+    s.sendto(dhcp_pkt(1, 0x1234, 1, opts=[prl]), ('255.255.255.255', 67))
+    offer, _ = s.recvfrom(1500)
+    s.sendto(dhcp_pkt(1, 0x1234, 3, opts=[prl, (50, offer[16:20]), (54, dhcp_opts(offer)[54])]), ('255.255.255.255', 67))
+    ack, _ = s.recvfrom(1500)
+    o = dhcp_opts(ack); yi = socket.inet_ntoa(ack[16:20])
+    raw = bytes([114, len(o[114])]) + o[114]
+    print(f'DHCP ACK yiaddr {yi}, router {socket.inet_ntoa(o[3])}, option 114 ({len(o[114])} bytes): {o[114].decode()}')
+    print(f'  on the wire: {raw[:12].hex(" ")} ... (no NUL terminator)')
+    return yi, o[114].decode()
+
+# ---------- RA with option 37 (RFC 8910 2.3) ----------
+def ra_option37(uri):
+    body = uri.encode(); n = (2 + len(body) + 7) // 8
+    return bytes([37, n]) + body + b'\0' * (n * 8 - 2 - len(body))
+
+def ra_send(uri):
+    msg = struct.pack('!BBHBBHII', 134, 0, 0, 64, 0, 0, 0, 0) + ra_option37(uri)   # lifetime 0: not a default router
+    s = socket.socket(socket.AF_INET6, socket.SOCK_RAW, socket.IPPROTO_ICMPV6)
+    idx = socket.if_nametoindex('p-u')
+    s.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_MULTICAST_HOPS, 255)
+    s.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_MULTICAST_IF, idx)
+    s.sendto(msg, ('ff02::1', 0, 0, idx))
+
+def ra_listen():
+    s = socket.socket(socket.AF_INET6, socket.SOCK_RAW, socket.IPPROTO_ICMPV6)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE, b'u0'); s.settimeout(3)
+    while True:
+        m, a = s.recvfrom(1500)
+        if m[0] != 134: continue
+        i = 16
+        while i < len(m):
+            t, l = m[i], m[i + 1] * 8
+            if t == 37:
+                raw = m[i + 2:i + l]
+                print(f'RA from {a[0].split("%")[0]}: option 37, length {m[i+1]} (x8 = {l} bytes), '
+                      f'{raw.count(0)} NUL pad bytes, URI {raw.rstrip(bytes(1)).decode()}')
+                return
+            i += l
+
+# ---------- the API server and enforcement (RFC 8908) ----------
+class Server(http.server.ThreadingHTTPServer):
+    def server_bind(self):                   # skip getfqdn(): there is no DNS in the lab
+        import socketserver
+        socketserver.TCPServer.server_bind(self)
+        self.server_name, self.server_port = self.server_address[:2]
+
+class Portal(http.server.BaseHTTPRequestHandler):
+    def log_message(self, *a): pass
+    def state(self):
+        ip = self.client_address[0]; left = int(SESSION.get(ip, 0) - time.time())
+        if left > 0:
+            return {'captive': False, 'user-portal-url': 'https://portal.example/login',
+                    'can-extend-session': True, 'seconds-remaining': left}
+        return {'captive': True, 'user-portal-url': 'https://portal.example/login',
+                'venue-info-url': 'https://portal.example/venue'}
+    def do_GET(self):
+        if self.path == '/api/v1/session':
+            if 'application/captive+json' not in self.headers.get('Accept', ''):
+                # RFC 8910 2 (erratum 6620): redirect browsers, and keep caches out of it
+                self.send_response(302); self.send_header('Location', 'https://portal.example/login')
+                self.send_header('Vary', 'Accept'); self.send_header('Cache-Control', 'private')
+                self.end_headers(); return
+            body = json.dumps(self.state()).encode()
+            self.send_response(200); self.send_header('Content-Type', 'application/captive+json')
+            self.send_header('Cache-Control', 'private'); self.send_header('Content-Length', str(len(body)))
+            self.end_headers(); self.wfile.write(body)
+        else:
+            self.send_response(200); self.end_headers(); self.wfile.write(b'<form>Accept terms</form>')
+    def do_POST(self):
+        ip = self.client_address[0]; SESSION[ip] = time.time() + 600
+        sh(f'ip rule add pref 150 iif p-u from {ip} lookup main')
+        self.send_response(204); self.end_headers()
+
+def portal_serve():
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.load_cert_chain(f'{HERE}/portal.pem', f'{HERE}/portal.key')
+    srv = Server((PORTAL_IP, 443), Portal)
+    srv.socket = ctx.wrap_socket(srv.socket, server_side=True)
+    srv.serve_forever()
+
+def web_serve():
+    class H(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *a): pass
+        def do_GET(self):
+            self.send_response(204); self.end_headers()
+    Server((WEB_IP, 80), H).serve_forever()
+
+# ---------- user equipment ----------
+class Pinned(http.client.HTTPSConnection):
+    """Connect to a fixed address but verify TLS against the provisioned host name."""
+    def __init__(self, host, addr, ctx):
+        super().__init__(host, 443, context=ctx, timeout=3); self.addr = addr
+    def connect(self):
+        raw = socket.create_connection((self.addr, 443), self.timeout)
+        self.sock = self._context.wrap_socket(raw, server_hostname=self.host)
+
+def https(host, path, method='GET', accept=None):
+    ctx = ssl.create_default_context(cafile=f'{HERE}/ca.pem')
+    c = Pinned(host, HOSTS.get(host, host), ctx)
+    hdrs = {'Accept': accept} if accept else {}
+    c.request(method, path, headers=hdrs); r = c.getresponse()
+    return r.status, dict(r.getheaders()), r.read()
+
+def probe():
+    try:
+        c = http.client.HTTPConnection(WEB_IP, 80, timeout=2); c.request('GET', '/generate-204')
+        return f'HTTP {c.getresponse().status}'
+    except OSError as e:
+        return f'{type(e).__name__}: {e.strerror or e}'
+
+def ue():
+    print('== 1. Provisioning')
+    yi, uri = dhcp_client()
+    sh(f'ip addr add {yi}/24 dev u0; ip route add default via {PORTAL_IP}')
+    ra_listen()
+    host = uri.split('/')[2]; path = '/' + uri.split('/', 3)[3]
+    print(f'\n== 2. Before login: probe to http://{WEB_IP}/generate-204 -> {probe()}')
+    st, h, b = https(host, path, accept='application/captive+json')
+    print(f'GET {uri} (Accept: application/captive+json) -> {st} {h["Content-Type"]}\n  {b.decode()}')
+    st, h, b = https(host, path)
+    print(f'GET {uri} (no Accept) -> {st} Location: {h["Location"]}, Vary: {h["Vary"]}, Cache-Control: {h["Cache-Control"]}')
+    st, h, b = https(host, path, accept='application/capport+json')
+    print(f'GET with the pre-erratum type application/capport+json -> {st} (treated as a browser)')
+    print('\n== 3. User accepts the terms at user-portal-url')
+    st, h, b = https(host, '/login', method='POST')
+    print(f'POST https://{host}/login -> {st}')
+    st, h, b = https(host, path, accept='application/captive+json')
+    print(f'API now -> {b.decode()}')
+    print(f'probe to http://{WEB_IP}/generate-204 -> {probe()}')
+    print('\n== 4. A URI with an IP literal (RFC 8910 says SHOULD NOT)')
+    try:
+        https(PORTAL_IP, path, accept='application/captive+json')
+    except ssl.SSLCertVerificationError as e:
+        print(f'https://{PORTAL_IP}{path} -> certificate check failed: {e.verify_message}; client MUST NOT use the API')
+
+def main():
+    build()
+    print('kernel', os.uname().release, '| Python', sys.version.split()[0], '|', ssl.OPENSSL_VERSION)
+    print('P# ' + ' | '.join(sh('ip -n P rule show').splitlines()[1:4]))
+    srv = [subprocess.Popen(['ip', 'netns', 'exec', ns, sys.executable, SELF, role]) for ns, role in
+           (('P', 'portal'), ('I', 'web'))]
+    time.sleep(0.8)
+    sh(f'ip netns exec P {sys.executable} {SELF} ra-later >/dev/null 2>&1 &')
+    try:
+        print(sh(f'ip netns exec U {sys.executable} {SELF} ue'))
+    finally:
+        for p in srv: p.kill()
+    print('\nP# ' + ' | '.join(sh('ip -n P rule show').splitlines()[1:5]))
+    print('\n== 5. Encoding limits')
+    for u in (API, 'urn:ietf:params:capport:unrestricted', 'https://portal.example/' + 'x' * 240):
+        o37 = ra_option37(u); fits = len(u.encode()) <= 255
+        print(f'  {len(u):3d}-byte URI: DHCPv4 option 114 {"fits" if fits else "does NOT fit (max 255)"}; '
+              f'RA option 37 length {o37[1]} ({len(o37)} bytes)')
+    for p in srv: p.kill()
+
+if __name__ == '__main__':
+    role = sys.argv[1] if len(sys.argv) > 1 else None
+    if role == 'portal':
+        threading.Thread(target=dhcp_server, args=(API,), daemon=True).start()
+        portal_serve()
+    elif role == 'web': web_serve()
+    elif role == 'ra-later':
+        time.sleep(1.5); ra_send(API)
+    elif role == 'ue': ue()
+    else: main()
+```
+Run the certificate script once, then the lab. No root and no packages: three namespaces inside `unshare -rnm`, a tiny DHCPv4 server and RA sender, an HTTPS API server and enforcement made of nothing but `ip rule`. Output from Linux 6.12, Python 3.13.5 and OpenSSL 3.5.7 (a real run, unedited):
+
+```text
+$ sh gen-certs.sh && unshare -rnm python3 capport-lab.py
+issued: subject=CN=portal.example X509v3 Subject Alternative Name:      DNS:portal.example X509v3 Extended Key Usage:      TLS Web Server Authentication 
+kernel 6.12.94+ | Python 3.13.5 | OpenSSL 3.5.7 9 Jun 2026
+P# 100:	from all to 10.0.0.1 iif p-u lookup main | 900:	from all iif p-u prohibit | 32766:	from all lookup main
+== 1. Provisioning
+DHCP ACK yiaddr 10.0.0.50, router 10.0.0.1, option 114 (37 bytes): https://portal.example/api/v1/session
+  on the wire: 72 25 68 74 74 70 73 3a 2f 2f 70 6f ... (no NUL terminator)
+RA from fe80::87a:a8ff:fe2a:7436: option 37, length 5 (x8 = 40 bytes), 1 NUL pad bytes, URI https://portal.example/api/v1/session
+
+== 2. Before login: probe to http://198.51.100.80/generate-204 -> OSError: No route to host
+GET https://portal.example/api/v1/session (Accept: application/captive+json) -> 200 application/captive+json
+  {"captive": true, "user-portal-url": "https://portal.example/login", "venue-info-url": "https://portal.example/venue"}
+GET https://portal.example/api/v1/session (no Accept) -> 302 Location: https://portal.example/login, Vary: Accept, Cache-Control: private
+GET with the pre-erratum type application/capport+json -> 302 (treated as a browser)
+
+== 3. User accepts the terms at user-portal-url
+POST https://portal.example/login -> 204
+API now -> {"captive": false, "user-portal-url": "https://portal.example/login", "can-extend-session": true, "seconds-remaining": 599}
+probe to http://198.51.100.80/generate-204 -> HTTP 204
+
+== 4. A URI with an IP literal (RFC 8910 says SHOULD NOT)
+https://10.0.0.1/api/v1/session -> certificate check failed: IP address mismatch, certificate is not valid for '10.0.0.1'.; client MUST NOT use the API
+
+P# 100:	from all to 10.0.0.1 iif p-u lookup main | 150:	from 10.0.0.50 iif p-u lookup main | 900:	from all iif p-u prohibit | 32766:	from all lookup main
+
+== 5. Encoding limits
+   37-byte URI: DHCPv4 option 114 fits; RA option 37 length 5 (40 bytes)
+   36-byte URI: DHCPv4 option 114 fits; RA option 37 length 5 (40 bytes)
+  263-byte URI: DHCPv4 option 114 does NOT fit (max 255); RA option 37 length 34 (272 bytes)
+```
+
+Read the output top to bottom. The DHCP ACK carries option 114 as `72 25 ...` with no terminator, and the RA option 37 for the same 37-byte URI is `length 5` with exactly one NUL pad byte. Before login the probe dies with `No route to host` (the `prohibit` rule's ICMP error, delivered quickly instead of a timeout), while the API answers `captive: true` because rule 100 lets `U` reach `10.0.0.1`. The same URL without the media type gets the `302` with `Vary: Accept` and `Cache-Control: private`, and the pre-erratum `application/capport+json` is treated as a browser. After the `POST`, rule 150 appears in the second `ip rule` dump, the API switches to `captive: false` with `seconds-remaining`, and the probe gets its `204`. The IP-literal URI fails certificate validation exactly as RFC 8908 expects, and the encoding check shows a 263-byte URI that cannot fit in DHCPv4 at all.
+
+## Gotchas
+
+### The trap: provisioning the login page instead of the API URI
+
+Operators often paste `https://portal.example/login` into DHCP option 114 because that is the URL users need to see. A compliant CAPPORT client sends `Accept: application/captive+json` to that URI expecting JSON; instead it gets `200 OK` with `text/html`. The client fails to parse JSON, treats CAPPORT as broken, and falls back to legacy HTTP probing (or gives up). Always provision the API endpoint, and let the API return `user-portal-url`.
+
+### The trap: using an IP literal in the API URI
+
+Provisioning `https://10.0.0.1/api/v1/session` violates RFC 8910's `SHOULD NOT` rule. As demonstrated in the lab, a certificate issued for `portal.example` fails validation against `10.0.0.1` (`IP address mismatch`), and RFC 8908 requires the client to abort API usage immediately. Always use a real DNS name and ensure DNS resolution to that name is permitted while captive.
+
+### The trap: breaking TLS validation while the client is captive
+
+If your pre-authentication firewall blocks DNS, NTP, or OCSP/CRL, or if your API server serves an incomplete certificate chain that forces AIA chasing, clients will fail certificate validation before they can ever read `user-portal-url`. Enable OCSP stapling on the API server, serve the full intermediate chain, and permit DNS, NTP, and any required revocation endpoints in your pre-auth allowlist.
+
+### The trap: mismatched URIs across DHCPv4, DHCPv6, and RA
+
+On a dual-stack network, handing out `https://portal-v4.example/api` in DHCPv4 option 114 and `https://portal-v6.example/api` (or nothing at all) in RA option 37 creates split-brain behaviour. Because RFC 8910 leaves method precedence to the client, Android, iOS, macOS, and Windows may pick different endpoints—or an IPv6-preferred client may never see option 114. Keep the URI identical across all three provisioning mechanisms.
+
+### The trap: NAT or a reverse proxy between the UE and the API server
+
+If the enforcement device keys policy on the UE's IP (`10.0.0.50`) but a NAT gateway or reverse proxy rewrites the source IP before the request reaches the API server, the API server either sees the proxy's IP or cannot match the UE to an enforcement rule. Either place the API server where it sees the UE's un-NATed address (or reads a trusted proxy header from a co-located proxy), or provision per-client URIs with an embedded token.
+
+### The trap: MAC randomisation vs session state
+
+Modern mobile operating systems randomise their Wi-Fi MAC addresses per SSID or on a schedule. If your enforcement device or DHCP server binds a portal session exclusively to a MAC address without handling MAC rotation or short lease times, a device that rotates its MAC mid-visit loses its session and is dropped back into captivity.
+
+### The trap: DNS interception vs DNSSEC, DoT, and DoH
+
+Do not spoof DNS replies to redirect users to your portal. Clients using strict DoT (port 853) or DoH (port 443) will fail name resolution entirely, and DNSSEC-validating stubs will treat forged answers as `BOGUS`. Use CAPPORT provisioning so the UE resolves the real `portal.example` name cleanly.
+
+### The trap: HSTS breaking HTTP-to-HTTPS redirect hacks
+
+Even if you keep a legacy fallback for older devices, never expect a forged `302` on port 443 to work for modern browsers. HSTS prevents users from bypassing certificate warnings on preloaded or previously visited domains. Cleanly rejecting restricted traffic (e.g. with ICMP Administratively Prohibited or TCP RST) lets clients fail fast and rely on the CAPPORT sheet.
+
+### The trap: returning `seconds-remaining` while still captive
+
+RFC 8908 specifies that `seconds-remaining` and `bytes-remaining` SHOULD be included when `captive` is `false` and a limit applies, and **SHOULD be omitted when `captive` is `true`**. Sending `seconds-remaining: 0` before login confuses client UIs that display countdown timers only after authentication.
+
+### The trap: missing `Vary: Accept` and `Cache-Control: private` on redirects
+
+If your API endpoint redirects browsers (`302` to `user-portal-url`) when `Accept: application/captive+json` is absent, omit `Vary: Accept` or `Cache-Control: private` at your peril. Any intermediary cache—or the OS's own HTTP stack—can cache the `302` and hand it to the CAPPORT daemon, turning an API query into an HTML redirect loop.
+
+### The trap: implementing the RFC 8910 erratum typo
+
+Checking for `Accept: application/capport+json` (from the unpatched RFC 8910 Section 2 text) instead of `application/captive+json` (RFC 8908, corrected by Erratum 6620) causes your server to treat every compliant CAPPORT client as a web browser and return a `302` redirect instead of JSON.
+
+### The trap: forgetting IPv6-only guest networks
+
+On an IPv6-only network (or when a client disables IPv4), DHCPv4 option 114 is never received. You must provision the API URI via RA option 37 or DHCPv6 option 103. Note that some clients support SLAAC + RDNSS + RA option 37 without running a stateful DHCPv6 client at all, making RA option 37 essential on IPv6 guest SSIDs.
+
+### The trap: omitting `urn:ietf:params:capport:unrestricted` on open networks
+
+If you run an open network with no captive portal, provisioning `urn:ietf:params:capport:unrestricted` in option 114 / 103 / RA 37 tells compliant clients not to waste time or battery firing legacy HTTP probes.
+
+## The boring rule
+
+Provision the exact same HTTPS API URI (using a real DNS name, never an IP literal) across DHCPv4 option 114, DHCPv6 option 103, and RA option 37; serve `application/captive+json` with OCSP stapling and `Vary: Accept`; and reject restricted traffic cleanly instead of forging DNS or HTTPS.
+
+## Exercises
+
+1. **DHCPv6 Option 103 wire encoding**: Write out the exact hexadecimal wire bytes for DHCPv6 option 103 carrying `https://portal.example/api/v1/session` (37 bytes). Compare the total option byte count against DHCPv4 option 114 and IPv6 RA option 37, and calculate the maximum URI length that fits inside an RA option 37 if you keep it within the dual-stack 255-byte recommendation.
+2. **Implementing `bytes-remaining` and quota exhaustion**: Extend the CAPPORT API server and enforcement model so that each authenticated client starts with a 1 MiB byte quota (`bytes-remaining: 1048576`). Describe how the enforcement device tracks bytes transferred, how the API computes `bytes-remaining` on each poll, and what state transition occurs (both in `ip rule` / firewall state and in the JSON payload) when the quota hits `0`.
+3. **Dual-stack URI mismatch and client precedence**: Suppose a dual-stack network provisions `https://v4.portal.example/api` in DHCPv4 option 114 and `https://v6.portal.example/api` in RA option 37. Trace what happens if a client prefers IPv6 for the API connection while its IPv4 traffic is enforced separately. How should an operator structure provisioning and enforcement state so dual-stack clients do not end up half-authenticated?
+4. **Session expiry and re-captivity**: Modify a portal session to issue a 15-second TTL (`seconds-remaining: 15`, `can-extend-session: false`). Trace the sequence of API responses and internet probe outcomes at $t = 0\text{ s}$, $t = 10\text{ s}$, and $t = 16\text{ s}$, noting when `seconds-remaining` must disappear from the JSON response.
+5. **Breaking IP-based identity with NAT**: Place a masquerading NAT gateway between `U` (`10.0.0.50`) and the API server while `P` continues to enforce based on `U`'s pre-NAT IP. Explain why login succeeds from the API server's perspective yet `U`'s internet probe still fails with `EHOSTUNREACH`, and design a per-client URI scheme (RFC 8908) that fixes it.
+6. **Pre-authentication PKI allowlist**: You are deploying CAPPORT on a network where the API certificate uses a third-party CA whose OCSP responder lives at `http://ocsp.ca.example` and whose clients sync time via `pool.ntp.org`. Write out the minimal pre-authentication allowlist required on the enforcement device so RFC 8908 certificate validation succeeds without opening general internet access.
+
+## Sources
+
+- [RFC 8952: Captive Portal Architecture](https://www.rfc-editor.org/rfc/rfc8952) (Informational, November 2020)
+- [RFC 8910: Captive-Portal Identification in DHCP and Router Advertisements (RAs)](https://www.rfc-editor.org/rfc/rfc8910) (Standards Track, September 2020)
+- [RFC 8910 Erratum 6620](https://www.rfc-editor.org/errata/eid6620) (Verified technical erratum: `application/captive+json`)
+- [RFC 8908: Captive Portal API](https://www.rfc-editor.org/rfc/rfc8908) (Standards Track, September 2020)
+- [RFC 7710: Captive-Portal Identification Using DHCP or Router Advertisements (RAs)](https://www.rfc-editor.org/rfc/rfc7710) (Obsoleted by RFC 8910)
+- [RFC 2132: DHCP Options and BOOTP Vendor Extensions](https://www.rfc-editor.org/rfc/rfc2132)
+- [RFC 4861: Neighbor Discovery for IP version 6 (IPv6)](https://www.rfc-editor.org/rfc/rfc4861)
+- [RFC 9525: Service Identity in TLS](https://www.rfc-editor.org/rfc/rfc9525) (Obsoletes [RFC 6125](https://www.rfc-editor.org/rfc/rfc6125), which is cited by RFC 8908)
+- [IANA Media Types Registry: `application/captive+json`](https://www.iana.org/assignments/media-types/application/captive+json)
