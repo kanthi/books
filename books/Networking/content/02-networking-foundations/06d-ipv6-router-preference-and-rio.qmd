@@ -1,0 +1,516 @@
+---
+title: "IPv6 Hosts with More Than One Router: Router Preference, Route Information Options and Failover"
+author:
+  - name: "K19G"
+  - name: "grok-bot"
+---
+
+# IPv6 Hosts with More Than One Router: Router Preference, Route Information Options and Failover
+
+Putting two IPv6 routers on the same broadcast domain is easy; getting a host to pick the right one—and switch cleanly when it dies—requires understanding three mechanisms that interact in non-obvious ways. Under base Neighbor Discovery (RFC 4861), a host that receives Router Advertisements (RAs) from two gateways places both in its Default Router List with no built-in way for the network operator to say "prefer router A, keep router B as backup, and send `2001:db8:ff::/48` via router B." Without help, the host picks whichever router happens to sit first in its list or whichever answered last.
+
+RFC 4191 adds two tools to the RA packet to fix this: a 2-bit Default Router Preference (`Prf`) in the RA header, and the Route Information Option (RIO, option type 24) for advertising more-specific prefixes. Neither tool overrides basic IP routing rules. Longest-prefix match still beats preference, Neighbor Unreachability Detection (NUD) still overrides preference when a router stops answering, and on Linux, RIOs are silently ignored by default unless you raise a sysctl ceiling.
+
+When the two routers belong to different upstreams with different address prefixes, a third problem appears: egress source-address matching (RFC 8028). Sending a packet sourced from ISP A's prefix through ISP B's router triggers ingress filtering (BCP 38) drops. Knowing where RFC 4191 stops, where NUD takes over, and what Linux does—and does not—automate from RAs is the difference between deterministic failover and silent blackholing.
+
+## Learning goals
+
+- Decode the 2-bit `Prf` field in an RA header and predict how a host handles `High`, `Medium`, `Low`, `Reserved`, and zero-lifetime advertisements.
+- Calculate the wire length and parse the fields of a Route Information Option (ND option type 24) for arbitrary prefix lengths.
+- Configure Linux `accept_ra_rtr_pref`, `accept_ra_rt_info_max_plen`, `accept_ra_rt_info_min_plen`, `ra_defrtr_metric`, and `router_probe_interval` to control which RA routes enter the kernel FIB.
+- Trace how Neighbor Unreachability Detection (`REACHABLE`, `STALE`, `DELAY`, `PROBE`, `FAILED`) drives failover when a `pref high` router disappears without withdrawing its route.
+- Separate Router Lifetime from RIO Route Lifetime so withdrawing a default gateway does not accidentally drop specific routes (or vice versa).
+- Design source-specific default routing on Linux for multi-prefix multihomed hosts where RFC 8028 behaviour is not automatic.
+
+## Why one default router is rarely enough
+
+Single-router subnets are simple until you need maintenance windows, dual-ISP resilience, or a local lab gateway alongside the corporate default route. In IPv4, you hand out a single default gateway via DHCP Option 3 and push extra static routes with DHCP Option 121 (covered in *DHCP Option 121 and VPN Route Leaks*); failover between two IPv4 default gateways usually requires a first-hop redundancy protocol (VRRP or HSRP) presenting one virtual MAC and one virtual IP.
+
+IPv6 takes a different approach. Hosts are built to listen to multiple routers directly on the link via Router Advertisements. Three common topologies put multiple routers on one L2 segment:
+
+1. **Active/standby WAN gateways**: Two edge routers (`fe80::1` and `fe80::2`) advertise the same `/64` Prefix Information Option (PIO) for SLAAC. You want all normal traffic to leave through `fe80::1` and only fail over to `fe80::2` if `fe80::1` dies.
+2. **Default gateway plus local reachability router**: A primary router provides internet access (`::/0`), while a second router on the same VLAN leads to a lab enclave, VPN concentrator, or management subnet (`2001:db8:ff::/48`). Pushing `::/0` from the second router would hijacks internet traffic; you need it to advertise only its more-specific prefix.
+3. **Multi-prefix multihoming**: Two independent upstream routers each advertise their own provider-assigned prefix (`2001:db8:1::/64` from R1, `2001:db8:2::/64` from R2). Hosts receive addresses from both prefixes and have two default routes.
+
+Base Neighbor Discovery (RFC 4861) handles topology 1 poorly—it has no preference field—and cannot express topology 2 at all because RAs only carry PIOs (on-link prefixes for address autoconfiguration and local subnet reachability, not off-link routed prefixes). RFC 4191 fills both gaps inside the RA itself, while RFC 8028 addresses the source-routing problem in topology 3.
+
+## Default router preference: the 2-bit Prf field (RFC 4191)
+
+RFC 4191 repurposes two previously reserved bits in the standard ICMPv6 Router Advertisement header (Type 134). Right after the `M` (Managed address configuration) and `O` (Other configuration) flags covered in *SLAAC, the RA M/O Flags and DHCPv6*, bits 3 and 4 of the flags byte hold the 2-bit signed-style Default Router Preference (`Prf`):
+
+```text
+ 0                   1                   2                   3
+ 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|     Type      |     Code      |          Checksum             |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+| Cur Hop Limit |M|O|H|Prf|Resvd|       Router Lifetime         |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                         Reachable Time                        |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                          Retrans Timer                        |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|   Options ...
++-+-+-+-+-+-+-+-+-+-+-+-
+```
+
+*(Bit 2 `H` is the Mobile IPv6 Home Agent flag; bits 3–4 are `Prf`; bits 5–7 are reserved.)*
+
+The 2-bit encoding is asymmetric rather than monotonic, which trips up anyone reading raw packet hex dumps for the first time:
+
+| `Prf` bits (binary) | Meaning | `ip -6 route` display | Notes |
+| :--- | :--- | :--- | :--- |
+| `01` | High | `pref high` | Preferred over Medium and Low |
+| `00` | Medium | `pref medium` | Default value (matches legacy RFC 4861 RAs) |
+| `11` | Low | `pref low` | Used only when no reachable High/Medium router exists |
+| `10` | Reserved | `pref medium` | Sender MUST NOT send; receiver MUST treat as Medium |
+
+Because `00` is Medium, any legacy router that zeroes the reserved bits in its RA header automatically advertises Medium preference. A host following RFC 4191 MUST treat the reserved pattern `10` identically to `00` (Medium)—which is worth verifying in packet captures if you ever debug buggy embedded firmware.
+
+One strict rule governs zero-lifetime RAs: if a router sets `Router Lifetime` to `0` (meaning "do not use me as a default router"), it MUST set `Prf` to `00` on transmission, and receivers MUST ignore `Prf` on that header. A router cannot withdraw itself as a default gateway while simultaneously asking to be `High` preference.
+
+### Host Types A, B, and C
+
+RFC 4191 classifies hosts into three conformance levels so older stacks do not break on newer RAs:
+
+- **Type A**: Ignores `Prf` and ignores Route Information Options entirely. Behaves as pure RFC 4861.
+- **Type B**: Honours `Prf` in the RA header for default router selection, but ignores Route Information Options.
+- **Type C**: Honours `Prf` in the RA header and processes Route Information Options.
+
+Modern Linux kernels can behave as Type A, Type B, or Type C depending on per-interface sysctls under `/proc/sys/net/ipv6/conf/<iface>/`:
+
+| Sysctl | Default | Effect |
+| :--- | :--- | :--- |
+| `accept_ra` | `1` | `0` = ignore RAs; `1` = accept if `forwarding=0`; `2` = accept even if `forwarding=1` |
+| `accept_ra_defrtr` | `1` | `1` = learn default router (`::/0`) from RA; `0` = ignore RA default router |
+| `accept_ra_rtr_pref` | `1` | `1` = honour `Prf` (Type B/C); `0` = ignore `Prf` and also block new RIOs (Type A) |
+| `accept_ra_rt_info_max_plen` | `0` (or `-1` if `accept_ra_rtr_pref=0`) | Maximum prefix length accepted in an RIO; `0` means only `::/0` RIOs are accepted |
+| `accept_ra_rt_info_min_plen` | `0` | Minimum prefix length accepted in an RIO |
+| `ra_defrtr_metric` | `1024` | Route metric assigned to RA-learned default and RIO routes |
+| `router_probe_interval` | `60` | Interval (seconds) for probing routers whose reachability is unknown (`CONFIG_IPV6_ROUTER_PREF`) |
+
+Notice the default combination on Linux: `accept_ra_rtr_pref=1` and `accept_ra_rt_info_max_plen=0`. Out of the box, Linux acts as a **Type B** host for any specific prefix (`> /0`): it honours default router preference (`pref high`, `pref medium`, `pref low`), marks RA routes with `proto ra`, assigns metric `1024`, and tracks `expires <N>sec`, while silently discarding any RIO more specific than `::/0`.
+
+## Route Information Options (RIO): more-specific routes in RAs
+
+When a router needs to advertise reachability to a specific off-link prefix—such as `2001:db8:ff::/48` behind a lab gateway or a split-tunnel VPN prefix—it appends one or more Route Information Options (ND option type `24`) to its Router Advertisement:
+
+```text
+ 0                   1                   2                   3
+ 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|     Type=24   |    Length     | Prefix Length |Resvd|Prf|Resvd|
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                        Route Lifetime                         |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                   Prefix (0, 8, or 16 bytes)                  |
+|                        (variable length)                      |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+```
+
+The fields work as follows:
+
+- **Type**: `24`.
+- **Length**: Total option length in **8-byte units**, valid values `1`, `2`, or `3`. Because the fixed header (Type, Length, Prefix Length, Flags, Route Lifetime) already takes 8 bytes, the variable `Prefix` field is padded to 0, 8, or 16 bytes depending on `Prefix Length`:
+
+| `Prefix Length` range | Prefix bytes on wire | Total option bytes | `Length` field value |
+| :--- | :--- | :--- | :--- |
+| `0` (`::/0`) | `0` | `8` | `1` |
+| `1` – `64` | `8` | `16` | `2` |
+| `65` – `128` | `16` | `24` | `3` |
+
+Any bits in the `Prefix` field beyond `Prefix Length` MUST be zeroed by the sender and ignored by the receiver.
+
+- **Prf**: Same 2-bit encoding as the RA header (`01` High, `00` Medium, `11` Low, `10` Reserved treated as Medium). This allows two routers to advertise the *same* more-specific prefix with different preferences, giving you active/standby failover for a specific subnet as well as for `::/0`.
+- **Route Lifetime**: 32-bit unsigned integer in seconds. `0` means remove/do not use this route; `0xffffffff` means infinite lifetime.
+
+### Why Linux ignores RIOs by default
+
+Linux sets `accept_ra_rt_info_max_plen` to `0` by default when `accept_ra_rtr_pref=1` (and `-1` when `accept_ra_rtr_pref=0`). That is a defensive choice: accepting arbitrary more-specific routes from an untrusted L2 neighbour lets any host on the LAN inject a `/128` or `/48` override and intercept traffic without even needing to win a default-router race (see *DHCP Option 121 and VPN Route Leaks* for the IPv4 parallel, and the IPv6 first-hop security chapter for RA Guard).
+
+When `accept_ra_rt_info_max_plen` is `0`, only an RIO with prefix length `0` (`::/0`) is within range. An RIO for `2001:db8:ff::/48` is parsed and dropped without an error log. To make Linux a full **Type C** host for `/48` or `/64` RIOs, you must explicitly raise the ceiling on that interface—for example, `accept_ra_rt_info_max_plen = 64` (or `128` if host routes are expected).
+
+Two interactions catch operators off guard:
+
+1. **`accept_ra_rtr_pref=0` gates RIOs too**: Disabling `accept_ra_rtr_pref` does not merely flatten `Prf` to `medium`. It also blocks installation of *new* RIO routes, even if `accept_ra_rt_info_max_plen` was previously raised. Any RIO routes already in the table keep their existing `pref` until their `Route Lifetime` expires.
+2. **Router Lifetime and Route Lifetime are independent**: A router can send an RA with `Router Lifetime = 0` (removing itself as a default gateway) while still including an RIO with `Route Lifetime = 600`. On Linux, the `::/0` route via that router disappears immediately, while the RIO route stays installed and continues to forward traffic for that prefix. Conversely, if a router stops advertising an RIO or sets its `Route Lifetime` to `0`, only that specific route is withdrawn.
+
+And remember the fundamental rule of IP forwarding: **longest-prefix match always beats preference**. A `/48` RIO installed with `pref low` still beats a `::/0` default route with `pref high` for any destination inside that `/48`.
+
+## Reachability, NUD, and what actually happens during failover
+
+Preference is only a tie-breaker among routers that are reachable or probably reachable. RFC 4191 explicitly subordinates `Prf` to reachability: a `High`-preference router that is dead MUST lose to a `Low`-preference router that is reachable.
+
+```text
+Packet to dst ──► Longest-Prefix Match in FIB
+                         │
+                         ▼
+          Multiple routes for winning prefix?
+              ├── No  ──► Use that next-hop
+              └── Yes ──► Filter to REACHABLE / STALE / DELAY / PROBE
+                                │
+                                ├── Any alive? ──► Pick highest Prf (High > Med > Low)
+                                └── All FAILED? ─► Fall back / probe
+                                        │
+                                        ▼
+                          NUD on chosen next-hop
+                REACHABLE ──(idle)──► STALE ──(traffic)──► DELAY ──► PROBE
+                                                                       │
+                                                           (no NA) ────▼
+                                                                    FAILED
+```
+
+Look closely at what happens on Linux when the `pref high` router (`fe80::1`) dies silently—for example, its link-local address is removed or its interface is unplugged behind a switch—while a `pref low` backup (`fe80::2`) remains alive:
+
+1. **Both default routes remain in the routing table.** The kernel does *not* delete `default via fe80::1 dev eth0 proto ra metric 1024 expires 1790sec pref high` when `fe80::1` stops answering. That route entry stays in the FIB until its `Router Lifetime` (for example, `1800` seconds) counts down to zero.
+2. **Failover happens in the neighbour table, not the route table.** When traffic flows (or when `router_probe_interval` fires), the kernel's Neighbor Unreachability Detection (NUD) transitions `fe80::1` from `REACHABLE` or `STALE` through `DELAY` and `PROBE`, sending unicast Neighbor Solicitations. When those probes go unanswered, the neighbour entry becomes `fe80::1 router FAILED`.
+3. **Route lookup consults neighbour state.** Once `fe80::1` is `FAILED`, `ip -6 route get` skips `fe80::1` despite its `pref high` and selects `fe80::2` (`pref low`), whose neighbour state is `REACHABLE` (or `STALE`).
+4. **Failover speed is NUD speed.** If no traffic is flowing and `router_probe_interval` (default `60` s) has not fired, the host does not notice the dead router at all. Once traffic triggers NUD, failover takes several seconds—governed by `delay_first_probe_time`, `retrans_time_ms`, and `ucast_solicit` (detailed in *ARP, ND, and Local Resolution*).
+
+When `fe80::1` comes back online and sends a new RA (or answers a probe), its neighbour entry leaves `FAILED` and the kernel returns traffic to `fe80::1` because `pref high` still outranks `pref low`.
+
+One more caveat on tie-breaking: if two routers advertise the *same* preference (for instance, both `pref medium`) and both are reachable, **do not assume ECMP load sharing**. Linux selects one of the equal-preference RA default routers per lookup (it can rotate among them as neighbour state changes) rather than hashing flows across both gateways; lab step 1 shows `route get` answering `fe80::1` with both at `medium`. If you want deterministic active/standby behaviour, set explicit `High` and `Low` (or `Medium` and `Low`) preferences.
+
+## Multi-prefix multihoming and source-address selection (RFC 8028)
+
+Router preference solves active/standby selection when both routers front the *same* prefix. It breaks down when two routers connect to two different ISPs, each delegating its own prefix to the LAN:
+
+```text
+  2001:db8:1::/64 (ISP 1)              2001:db8:2::/64 (ISP 2)
+            │                                    │
+       ┌────┴────┐                          ┌────┴────┐
+       │   R1    │ fe80::1                  │   R2    │ fe80::2
+       └────┬────┘                          └────┬────┘
+            │  RA: PIO 2001:db8:1::/64           │  RA: PIO 2001:db8:2::/64
+            │      Prf=medium                    │      Prf=medium
+            └──────────────────┬─────────────────┘
+                               │  L2 Segment
+                          ┌────┴────┐
+                          │  Host H │
+                          │  eth0   │
+                          └─────────┘
+```
+
+Host `H` configures two global addresses via SLAAC: `2001:db8:1::a` and `2001:db8:2::b`. Now suppose `H` opens a connection to `2001:db8:99::1`. Under standard destination-only routing, `H` looks up `::/0`, picks `fe80::2` (because both are `pref medium`), and then runs RFC 6724 source-address selection (covered in *IPv6 Essentials*). RFC 6724 Rule 5.5 says: *prefer source addresses in a prefix advertised by the next-hop router*. That rule would help new outbound connections, but it is optional in RFC 6724 and Linux's source-address selection does not implement it: the kernel's rules cover scope, preferred vs deprecated, outgoing interface, labels, privacy addresses and longest matching prefix, with no knowledge of which router advertised which prefix.
+
+Even where Rule 5.5 is implemented, it does not save you when:
+- An application explicitly binds `2001:db8:1::a` (for example, a server replying to an inbound connection that arrived via R1, or a socket pinned to a specific source IP).
+- The routing decision picks `fe80::2` (R2) for a packet whose source is `2001:db8:1::a` (ISP 1's prefix).
+
+When ISP 2 receives a packet sourced from `2001:db8:1::a`, BCP 38 ingress filtering drops it on the floor.
+
+**RFC 8028** (*First-Hop Router Selection by Hosts in a Multi-Prefix Network*, updating RFC 4861) addresses this directly: in a multi-prefix multihomed network, a host SHOULD select the first-hop router based on the packet's **source address**, sending packets sourced from `2001:db8:1::/64` only to the router that advertised `2001:db8:1::/64` (R1).
+
+**Crucial Linux reality**: Linux does **not** automatically build source-specific default routes from RAs. Even though the kernel sees that `fe80::1` advertised `2001:db8:1::/64` and `fe80::2` advertised `2001:db8:2::/64`, it installs two plain `::/0` routes with no `from` qualifier.
+
+To implement RFC 8028 behaviour on a Linux host, you must configure source-specific routing yourself—either with IPv6 subtree routes (requires kernel `CONFIG_IPV6_SUBTREES`, standard in modern distribution kernels):
+
+```text
+ip -6 route add default from 2001:db8:1::/64 via fe80::1 dev eth0
+ip -6 route add default from 2001:db8:2::/64 via fe80::2 dev eth0
+```
+
+*(Static configuration example, not run.)*
+
+Or with `ip -6 rule` policy routing tables matching `from 2001:db8:1::/64 lookup 101` and `from 2001:db8:2::/64 lookup 102`, each containing its own `default via` route. Note also that if you mix static default routes with RA-learned default routes, remember `ra_defrtr_metric` defaults to `1024`; a static `ip -6 route add default` without a metric defaults to `1024` as well, creating a metric tie unless you set an explicit lower or higher metric.
+
+## Configuring routers to advertise preference and RIOs
+
+On the router side, RA preference and RIOs are configured per interface. FRRouting can set the default router preference (`ipv6 nd router-preference high|medium|low`) and the router lifetime (`ipv6 nd ra-lifetime`), but its `ipv6 nd` command set has no Route Information Option. radvd supports both; per radvd.conf(5) a router advertising `high` default preference plus an RIO for `2001:db8:ff::/48` looks like this:
+
+```text
+# radvd.conf, from the docs, not run
+interface eth0 {
+    AdvSendAdvert on;
+    AdvDefaultPreference high;
+    prefix 2001:db8:1::/64 { };
+    route 2001:db8:ff::/48 {
+        AdvRoutePreference high;
+        AdvRouteLifetime 600;
+    };
+};
+```
+
+`AdvRouteLifetime` defaults to 3 × `MaxRtrAdvInterval`, and `RemoveRoute on` (the default) re-announces the route with lifetime 0 when radvd shuts down, which is the graceful withdrawal discussed below.
+
+If you want a router to advertise *only* a more-specific route via an RIO and **not** act as a default gateway, set its router lifetime to `0` (`AdvDefaultLifetime 0` in radvd; radvd.conf(5) says a lifetime of 0 means the router "should not appear on the default router list") while keeping the `route` block. Clients with `accept_ra_rt_info_max_plen` raised to at least the RIO prefix length install the specific route without adding a `::/0` entry for that router; lab step 7 shows exactly that.
+
+## The lab
+
+To observe RFC 4191, Linux sysctls, and NUD failover without needing physical routers or root privileges on the host, the lab uses an unprivileged user and network namespace (`unshare -rnm`) on Linux 6.12.94 with `iproute2` 6.15.0 and Python 3.13.5. Namespace `R` holds two link-local addresses (`fe80::1` and `fe80::2`) on one end of a `veth` pair, acting as two independent routers on the same L2 segment. Host namespace `H` sits on the other end (`h0`). A Python script opens a raw ICMPv6 socket (`AF_INET6`, `SOCK_RAW`, `IPPROTO_ICMPV6`) with hop limit `255` to `ff02::1`, sending crafted RAs that always include a PIO for `2001:db8:1::/64` alongside varying `Prf` bits, `Router Lifetime` values, and RIOs.
+
+```{.python filename="rtrpref-lab.py"}
+#!/usr/bin/env python3
+"""IPv6 hosts with more than one router: RFC 4191 router preference and
+Route Information Options on a Linux host. Run: unshare -rnm python3 rtrpref-lab.py
+One veth link: namespace R plays two routers (link-local fe80::1 and
+fe80::2 on the same interface); namespace H is an ordinary host."""
+import os, socket, struct, subprocess, sys, time
+
+SELF = os.path.abspath(__file__)
+PRF = {'high': 1, 'medium': 0, 'low': 3, 'reserved': 2}
+
+def sh(cmd, check=True):
+    r = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+    if check and r.returncode:
+        raise SystemExit(f'FAILED: {cmd}\n{r.stderr}')
+    return (r.stdout + r.stderr).strip()
+
+def sysctl(ns, key, val=None):
+    path = '/proc/sys/' + key.replace('.', '/')
+    if val is None:
+        return sh(f'ip netns exec {ns} cat {path}')
+    sh(f'ip netns exec {ns} sh -c "echo {val} > {path}"')
+
+def build():
+    sh('mount -t tmpfs none /run && mkdir -p /run/netns')
+    for ns in ('R', 'H'):
+        sh(f'ip netns add {ns}; ip -n {ns} link set lo up')
+    sh('ip link add r0 type veth peer name h0')
+    sh('ip link set r0 netns R; ip link set h0 netns H')
+    sysctl('R', 'net.ipv6.conf.all.forwarding', 1)
+    sysctl('R', 'net.ipv6.conf.r0.addr_gen_mode', 1)      # no automatic link-local
+    sh('ip -n R link set r0 up')
+    sh('ip -n R addr add fe80::1/64 dev r0 nodad')
+    sh('ip -n R addr add fe80::2/64 dev r0 nodad')
+    sh('ip -n R addr add 2001:db8:1::1/64 dev r0 nodad')
+    sysctl('H', 'net.ipv6.conf.h0.accept_dad', 0)
+    sh('ip -n H link set h0 up')
+    time.sleep(0.5)
+
+def ra(src, prf, lifetime=1800, rio=None):
+    """Send one Router Advertisement from link-local `src` (runs inside R).
+    rio = (prefix, plen, prf, lifetime) adds an RFC 4191 Route Information Option."""
+    flags = PRF[prf] << 3                              # Prf is bits 3-4 of the flags byte
+    msg = struct.pack('!BBHBBHII', 134, 0, 0, 64, flags, int(lifetime), 0, 0)
+    pfx = socket.inet_pton(socket.AF_INET6, '2001:db8:1::')
+    msg += struct.pack('!BBBBIII', 3, 4, 64, 0xC0, 86400, 14400, 0) + pfx   # PIO, L+A
+    if rio:
+        p, plen, rprf, rlt = rio
+        body = socket.inet_pton(socket.AF_INET6, p)[: (plen + 63) // 64 * 8]
+        olen = 1 + len(body) // 8
+        msg += struct.pack('!BBBBI', 24, olen, plen, PRF[rprf] << 3, rlt) + body
+    s = socket.socket(socket.AF_INET6, socket.SOCK_RAW, socket.IPPROTO_ICMPV6)
+    idx = socket.if_nametoindex('r0')
+    s.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_MULTICAST_HOPS, 255)
+    s.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_MULTICAST_IF, idx)
+    s.bind((src, 0, 0, idx))
+    s.sendto(msg, ('ff02::1', 0, 0, idx))
+
+def send(src, prf, lifetime=1800, rio=None):
+    args = ['ra', src, prf, str(lifetime)] + (list(map(str, rio)) if rio else [])
+    sh(' '.join(['ip netns exec R', sys.executable, SELF] + args))
+    time.sleep(0.3)
+
+def show(*dsts):
+    print('H# ip -6 route show (RA-learned)')
+    for line in sh('ip -n H -6 route show proto ra').splitlines():
+        w = line.split()
+        if 'expires' in w:                       # drop the ticking timer
+            i = w.index('expires'); del w[i:i + 2]
+        print('   ' + ' '.join(w))
+    for d in dsts:
+        out = sh(f'ip -n H -6 route get {d}').split('\n')[0]
+        print(f'H# route get {d}: ' + ' '.join(out.split()[:5]))
+
+def poke(dst, n=20):
+    s = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
+    for _ in range(n):
+        try:
+            s.sendto(b'x', (dst, 9))
+        except OSError as e:
+            pass
+        time.sleep(0.5)
+
+def main():
+    build()
+    print('kernel', os.uname().release, '| ' + sh('ip -V'))
+    print('H defaults: accept_ra_rtr_pref=%s accept_ra_rt_info_max_plen=%s accept_ra_rt_info_min_plen=%s' % (
+        sysctl('H', 'net.ipv6.conf.h0.accept_ra_rtr_pref'),
+        sysctl('H', 'net.ipv6.conf.h0.accept_ra_rt_info_max_plen'),
+        sysctl('H', 'net.ipv6.conf.h0.accept_ra_rt_info_min_plen')))
+
+    print('\n== 1. Two routers, both Prf=medium')
+    send('fe80::1', 'medium'); send('fe80::2', 'medium')
+    show('2001:db8:99::1')
+
+    print('\n== 2. fe80::1 says high, fe80::2 says low')
+    send('fe80::1', 'high'); send('fe80::2', 'low')
+    show('2001:db8:99::1')
+
+    print('\n== 3. fe80::2 adds an RIO for 2001:db8:ff::/48 (Prf=high); host defaults')
+    send('fe80::2', 'low', rio=('2001:db8:ff::', 48, 'high', 600))
+    show('2001:db8:ff::1')
+
+    print('\n== 4. Same RA after accept_ra_rt_info_max_plen=64')
+    sysctl('H', 'net.ipv6.conf.h0.accept_ra_rt_info_max_plen', 64)
+    send('fe80::2', 'low', rio=('2001:db8:ff::', 48, 'high', 600))
+    show('2001:db8:ff::1', '2001:db8:99::1')
+
+    print('\n== 5. A low-preference router advertises the reserved Prf value (10)')
+    send('fe80::2', 'reserved')
+    show('2001:db8:99::1')
+    send('fe80::2', 'low')
+
+    print('\n== 6. fe80::1 (high) stops answering Neighbor Solicitations')
+    sh('ip -n R addr del fe80::1/64 dev r0')
+    t0 = time.time()
+    sh(f'ip netns exec H {sys.executable} {SELF} poke 2001:db8:99::1')
+    print(f'H# after {time.time() - t0:.0f} s of traffic: neigh ' +
+          ' | '.join(sh('ip -n H -6 neigh show dev h0').splitlines()))
+    show('2001:db8:99::1')
+
+    print('\n== 7. fe80::2 withdraws itself as a default router (Router Lifetime 0)')
+    sh('ip -n R addr add fe80::1/64 dev r0 nodad')
+    send('fe80::1', 'high')
+    send('fe80::2', 'low', lifetime=0, rio=('2001:db8:ff::', 48, 'high', 600))
+    show('2001:db8:ff::1', '2001:db8:99::1')
+
+    print('\n== 8. accept_ra_rtr_pref=0, and fe80::2 now also advertises 2001:db8:fe::/48')
+    sysctl('H', 'net.ipv6.conf.h0.accept_ra_rtr_pref', 0)
+    send('fe80::1', 'high'); send('fe80::2', 'low', rio=('2001:db8:fe::', 48, 'high', 600))
+    show('2001:db8:fe::1')
+
+if __name__ == '__main__':
+    if len(sys.argv) > 1 and sys.argv[1] == 'ra':
+        a = sys.argv[2:]
+        rio = (a[3], int(a[4]), a[5], int(a[6])) if len(a) > 3 else None
+        ra(a[0], a[1], int(a[2]), rio)
+    elif len(sys.argv) > 1 and sys.argv[1] == 'poke':
+        poke(sys.argv[2])
+    else:
+        main()
+```
+No root and no packages: the script builds two namespaces inside `unshare -rnm` and sends the Router Advertisements itself from a raw ICMPv6 socket. The host side is the unmodified Linux kernel. Output from Linux 6.12, iproute2 6.15.0, Python 3.13.5 (a real run, unedited):
+
+```text
+$ unshare -rnm python3 rtrpref-lab.py
+kernel 6.12.94+ | ip utility, iproute2-6.15.0, libbpf 1.5.0
+H defaults: accept_ra_rtr_pref=1 accept_ra_rt_info_max_plen=0 accept_ra_rt_info_min_plen=0
+
+== 1. Two routers, both Prf=medium
+H# ip -6 route show (RA-learned)
+   default via fe80::1 dev h0 metric 1024 hoplimit 64 pref medium
+   default via fe80::2 dev h0 metric 1024 hoplimit 64 pref medium
+H# route get 2001:db8:99::1: 2001:db8:99::1 from :: via fe80::1
+
+== 2. fe80::1 says high, fe80::2 says low
+H# ip -6 route show (RA-learned)
+   default via fe80::1 dev h0 metric 1024 hoplimit 64 pref high
+   default via fe80::2 dev h0 metric 1024 hoplimit 64 pref low
+H# route get 2001:db8:99::1: 2001:db8:99::1 from :: via fe80::1
+
+== 3. fe80::2 adds an RIO for 2001:db8:ff::/48 (Prf=high); host defaults
+H# ip -6 route show (RA-learned)
+   default via fe80::1 dev h0 metric 1024 hoplimit 64 pref high
+   default via fe80::2 dev h0 metric 1024 hoplimit 64 pref low
+H# route get 2001:db8:ff::1: 2001:db8:ff::1 from :: via fe80::1
+
+== 4. Same RA after accept_ra_rt_info_max_plen=64
+H# ip -6 route show (RA-learned)
+   2001:db8:ff::/48 via fe80::2 dev h0 metric 1024 pref high
+   default via fe80::1 dev h0 metric 1024 hoplimit 64 pref high
+   default via fe80::2 dev h0 metric 1024 hoplimit 64 pref low
+H# route get 2001:db8:ff::1: 2001:db8:ff::1 from :: via fe80::2
+H# route get 2001:db8:99::1: 2001:db8:99::1 from :: via fe80::1
+
+== 5. A low-preference router advertises the reserved Prf value (10)
+H# ip -6 route show (RA-learned)
+   2001:db8:ff::/48 via fe80::2 dev h0 metric 1024 pref high
+   default via fe80::1 dev h0 metric 1024 hoplimit 64 pref high
+   default via fe80::2 dev h0 metric 1024 hoplimit 64 pref medium
+H# route get 2001:db8:99::1: 2001:db8:99::1 from :: via fe80::1
+
+== 6. fe80::1 (high) stops answering Neighbor Solicitations
+H# after 10 s of traffic: neigh fe80::1 router FAILED  | fe80::2 lladdr ea:b9:1d:9c:00:34 router REACHABLE
+H# ip -6 route show (RA-learned)
+   2001:db8:ff::/48 via fe80::2 dev h0 metric 1024 pref high
+   default via fe80::1 dev h0 metric 1024 hoplimit 64 pref high
+   default via fe80::2 dev h0 metric 1024 hoplimit 64 pref low
+H# route get 2001:db8:99::1: 2001:db8:99::1 from :: via fe80::2
+
+== 7. fe80::2 withdraws itself as a default router (Router Lifetime 0)
+H# ip -6 route show (RA-learned)
+   2001:db8:ff::/48 via fe80::2 dev h0 metric 1024 pref high
+   default via fe80::1 dev h0 metric 1024 hoplimit 64 pref high
+H# route get 2001:db8:ff::1: 2001:db8:ff::1 from :: via fe80::2
+H# route get 2001:db8:99::1: 2001:db8:99::1 from :: via fe80::1
+
+== 8. accept_ra_rtr_pref=0, and fe80::2 now also advertises 2001:db8:fe::/48
+H# ip -6 route show (RA-learned)
+   2001:db8:ff::/48 via fe80::2 dev h0 metric 1024 pref high
+   default via fe80::1 dev h0 metric 1024 hoplimit 64 pref medium
+   default via fe80::2 dev h0 metric 1024 hoplimit 64 pref medium
+H# route get 2001:db8:fe::1: 2001:db8:fe::1 from :: via fe80::2
+```
+
+The eight lab steps confirm the exact kernel behaviour:
+
+1. **Equal Medium (`Prf=00` on both)**: Both `fe80::1` and `fe80::2` appear as `metric 1024 hoplimit 64 pref medium`; `ip -6 route get 2001:db8:99::1` picks `fe80::1`.
+2. **High vs Low (`fe80::1` High, `fe80::2` Low)**: The FIB displays `pref high` and `pref low`; `route get` selects `fe80::1`.
+3. **RIO with host defaults (`accept_ra_rt_info_max_plen=0`)**: `fe80::2` advertises an RIO for `2001:db8:ff::/48` (`Prf=high`, `Route Lifetime=600`). Nothing is installed in the FIB, and `route get 2001:db8:ff::1` still goes via `fe80::1`.
+4. **Raising `accept_ra_rt_info_max_plen=64`**: Re-sending the same RA installs `2001:db8:ff::/48 via fe80::2 dev h0 metric 1024 pref high`. `route get 2001:db8:ff::1` now goes via `fe80::2`, while `2001:db8:99::1` stays on `fe80::1`—longest-prefix match wins.
+5. **Reserved `Prf=10`**: `fe80::2` sends `Prf=10`; Linux installs its default route as `pref medium`, obeying RFC 4191.
+6. **Silent router death (NUD failover)**: `fe80::1` (`pref high`) removes its address and stops answering Neighbor Solicitations while `H` sends traffic for 10 seconds. `ip -6 neigh` marks `fe80::1 router FAILED` and `fe80::2 router REACHABLE`. Both default routes remain in `ip -6 route show` (with `fe80::1` still `pref high`), yet `route get` switches to `fe80::2`.
+7. **Zero Router Lifetime with RIO**: the lab first restores `fe80::1` (so `2001:db8:99::1` goes back to it), then `fe80::2` sends `Router Lifetime=0` while keeping the `2001:db8:ff::/48` RIO. Its `::/0` route vanishes immediately, but `2001:db8:ff::/48 via fe80::2` stays installed and active.
+8. **Disabling `accept_ra_rtr_pref=0`**: New RAs install both defaults as `pref medium`, and a new RIO for `2001:db8:fe::/48` is not installed even though `max_plen` was `64` (`route get 2001:db8:fe::1` still answers `via fe80::2`, but only because that is now one of two equal `medium` defaults). Meanwhile, the earlier `2001:db8:ff::/48` RIO remains (`pref high`) until its own lifetime expires.
+
+## Gotchas
+
+### The trap: RIOs are silently ignored by default on Linux
+You configure a router to send an RIO for `2001:db8:ff::/48`, confirm the option in `tcpdump`, and find nothing in `ip -6 route show` on the host. No error is logged anywhere. By default, `accept_ra_rt_info_max_plen` is `0`, which drops every RIO longer than `::/0`. You must raise `accept_ra_rt_info_max_plen` (for example to `64` or `128`) on the receiving interface before any more-specific RIOs take effect.
+
+### The trap: Forwarding hosts ignore all RAs
+As soon as you enable `net.ipv6.conf.<iface>.forwarding=1` (or `net.ipv6.conf.all.forwarding=1`) on a host—common on container hosts, VPN gateways, or Kubernetes nodes—`accept_ra=1` stops accepting RAs altogether, including `Prf` and RIOs. If a forwarding machine still needs to learn upstream routes from RAs, set `accept_ra=2` on the upstream interface.
+
+### The trap: Preference is a tie-breaker, not a routing policy
+Setting `pref high` on a default router will not override a `/48` RIO from another router, nor will it keep traffic on a router whose neighbour entry is `FAILED`. Longest-prefix match always wins first, and reachability (NUD) always wins second.
+
+### The trap: Dead routes stay in the FIB for the full Router Lifetime
+When a `pref high` router dies without sending a `Router Lifetime = 0` RA, `ip -6 route show` continues to display it as `pref high` for up to 1800 seconds (or whatever lifetime it last advertised). Do not judge failover by `ip -6 route show` alone; check `ip -6 neigh show` for `FAILED` and `ip -6 route get <dst>` for the actual active next hop.
+
+### The trap: Failover only triggers when traffic or `router_probe_interval` probes
+NUD does not continuously ping routers in the background when an interface is idle. If no packets are leaving the host, a `STALE` router stays `STALE` until `router_probe_interval` (default `60` s) fires or new outbound traffic pushes the neighbour entry through `DELAY` and `PROBE`. Expect multi-second failover, not sub-second convergence.
+
+### The trap: `Router Lifetime = 0` withdraws `::/0` but leaves RIOs intact
+Setting `Router Lifetime = 0` on an RA tells the host to stop using that sender as a default router, but it does **not** revoke RIOs carried in the same or earlier RAs. To withdraw an RIO immediately, advertise that specific RIO with `Route Lifetime = 0`.
+
+### The trap: `accept_ra_rtr_pref=0` also disables new RIOs
+Setting `accept_ra_rtr_pref=0` does more than ignore the 2-bit `Prf` field—it gates RIO processing as well, blocking any new RIOs from being installed while leaving previously installed RIOs in the table until their `Route Lifetime` expires.
+
+### The trap: Static default metric collides with `ra_defrtr_metric`
+Linux assigns `ra_defrtr_metric` (`1024`) to RA-learned routes. If you add a static `ip -6 route add default via ...` without specifying `metric`, it also defaults to `1024`, creating an unintended tie. Always set an explicit metric (e.g., `metric 100` to beat RAs, or `metric 2048` to act as a fallback) on static IPv6 default routes.
+
+### The trap: A `pref low` backup still attracts traffic, and a rogue `pref high` RA hijacks it
+Marking a router `pref low` only keeps traffic off it while a `High` or `Medium` router is reachable; if the primary fails, traffic flows to the `Low` router. Conversely, any host on the same L2 segment that can forge an RA with `Prf=high` and `Router Lifetime > 0` will immediately steal default traffic from a legitimate `Medium` router. Deploy RA Guard on access switches as covered in the IPv6 first-hop security chapter.
+
+### The trap: Multi-prefix multihoming + BCP 38 without RFC 8028
+Linux does not automatically tie an RA-learned default route to the PIO advertised by that same router. In a dual-ISP multi-prefix setup, a host with addresses from both prefixes can easily send ISP 1's source address through ISP 2's router and get dropped by BCP 38. Use `ip -6 route add default from <prefix> via <gw>` (`CONFIG_IPV6_SUBTREES`) or `ip -6 rule` policy tables whenever two upstreams delegate separate prefixes onto the same host interface.
+
+### The trap: Equal-preference RA defaults are not ECMP
+If two routers advertise `pref medium` on the same link, do not assume the kernel load-balances flows across both gateways. Test and design for single-active selection—or set explicit `High` and `Low` preferences so failover is predictable.
+
+## Exercises
+
+1. **RIO wire length calculation**: Compute the exact `Length` field (in 8-byte units), total option size in bytes, and prefix byte count on the wire for RIOs advertising `::/0`, `2001:db8:ff::/48`, `2001:db8:1::/64`, and `2001:db8:1::10/96`. Verify why `/64` and `/48` share the same `Length` value while `/96` jumps by 1.
+2. **Source-specific routing for dual-ISP multihoming**: A Linux host on `eth0` receives `2001:db8:1::/64` from `fe80::1` and `2001:db8:2::/64` from `fe80::2`. Write the `ip -6 route` commands (using `from <prefix>`) to enforce RFC 8028 source-based first-hop selection, and explain what happens to a packet sourced from `2001:db8:1::50` if `fe80::1` dies while `fe80::2` is still up.
+3. **NUD failover timing**: On a Linux interface with `delay_first_probe_time = 5` seconds, `retrans_time_ms = 1000` ms, and `ucast_solicit = 3`, calculate the worst-case time between the first packet sent after a `pref high` router dies silently (starting from `STALE`) and the neighbour entry transitioning to `FAILED`. How does `router_probe_interval = 60` interact if no traffic is flowing?
+4. **RIO `::/0` vs RA header `Router Lifetime`**: Suppose a router sends an RA with `Router Lifetime = 0` and includes an RIO for `::/0` with `Prf = high` and `Route Lifetime = 600`. On a Linux host with `accept_ra_rtr_pref = 1` and `accept_ra_rt_info_max_plen = 0`, what enters the routing table, and why?
+5. **Sysctl audit for a split-tunnel VPN host**: A dual-homed workstation connects to a corporate LAN on `eth0` (receiving a default router `pref medium`) and a tunnel/lab router on `eth1` that advertises `2001:db8:100::/48` via an RIO and sets `Router Lifetime = 0`. List the exact per-interface sysctls required on `eth0` and `eth1` so `eth0` remains Type B (ignoring any unexpected RIOs) while `eth1` installs the `/48` RIO without adding a second default route.
+6. **Silent failure vs graceful withdrawal**: Compare the kernel FIB (`ip -6 route show`), neighbour table (`ip -6 neigh show`), and forwarding path (`ip -6 route get`) 5 seconds and 120 seconds after a `pref high` router (`Router Lifetime = 1800`) either (a) crashes silently or (b) sends a final RA with `Router Lifetime = 0` before shutting down.
+
+## The boring rule
+
+Treat `Prf` and RIOs as explicit tie-breakers, verify `accept_ra_rt_info_max_plen` before trusting any specific RA route, and always test failover against `ip -6 neigh` and `ip -6 route get`—never assume a clean `ip -6 route show` tells the whole story.
+
+## Sources
+
+- [RFC 4191: Default Router Preferences and More-Specific Routes](https://datatracker.ietf.org/doc/html/rfc4191)
+- [RFC 4861: Neighbor Discovery for IP version 6 (IPv6)](https://datatracker.ietf.org/doc/html/rfc4861)
+- [RFC 4862: IPv6 Stateless Address Autoconfiguration](https://datatracker.ietf.org/doc/html/rfc4862)
+- [RFC 6724: Default Address Selection for Internet Protocol Version 6 (IPv6)](https://datatracker.ietf.org/doc/html/rfc6724)
+- [RFC 8028: First-Hop Router Selection by Hosts in a Multi-Prefix Network](https://datatracker.ietf.org/doc/html/rfc8028)
+- [Linux Kernel IP Sysctl Documentation](https://docs.kernel.org/networking/ip-sysctl.html)
+- [ip-route(8) — Linux manual page](https://man7.org/linux/man-pages/man8/ip-route.8.html)
+- [radvd.conf(5)](https://github.com/radvd-project/radvd/blob/master/radvd.conf.5.man)
+- [FRRouting: IPv6 Support (Router Advertisement commands)](https://docs.frrouting.org/en/latest/ipv6.html)
