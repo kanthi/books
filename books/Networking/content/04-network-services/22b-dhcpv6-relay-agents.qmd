@@ -1,0 +1,663 @@
+---
+title: "DHCPv6 Relay Agents: Relay-Forw Nesting, Link-Address, Interface-Id, Remote-Id and Lightweight Relays"
+author:
+  - name: "K19G"
+  - name: "grok-bot"
+---
+
+# DHCPv6 Relay Agents: Relay-Forw Nesting, Link-Address, Interface-Id, Remote-Id and Lightweight Relays
+
+A DHCPv6 client starts every conversation by sending UDP datagrams from its link-local address to the link-local multicast group `ff02::1:2` (`All_DHCP_Relay_Agents_and_Servers`). Because link-local traffic never crosses a router, any deployment where the DHCPv6 server sits off-link needs at least one relay agent on the client's segment—or an access switch acting as a Layer 2 relay in front of that router.
+
+Unlike DHCPv4, which mutates a single flat packet in place by overwriting `giaddr` and appending Option 82 suboptions, DHCPv6 relays never touch the client's bytes. Instead, each relay wraps the received message inside a new `Relay-forw` (type 12) envelope, prepending a 34-octet header and its own metadata options. The server unwraps the stack to decide which pool the client belongs to, then builds a matching stack of `Relay-repl` (type 13) envelopes so every hop back to the client knows which interface and link-local peer to transmit on.
+
+When a relayed DHCPv6 exchange silently times out, the fault almost always sits in one of three places: an empty or link-local `link-address` that the server cannot map to a pool, a missing or stripped `Interface-Id` option on the return path, or a trust boundary mistake where an upstream relay accepts forged `Relay-forw` envelopes from a client port.
+
+## Learning goals
+
+- Decode the 34-octet `Relay-forw` and `Relay-repl` header and trace how `OPTION_RELAY_MSG` nests multiple relay hops.
+- Explain how a DHCPv6 server selects a client link from `link-address` and `Interface-Id` across nested envelopes.
+- Distinguish an L3 relay agent (RFC 9915) from a Layer 2 Lightweight DHCPv6 Relay Agent (LDRA, RFC 6221) and apply LDRA port trust and message-filtering rules.
+- Use `Interface-Id` (18), `Remote-Id` (37), `Subscriber-Id` (38), and `Relay-Port` (135) without breaking return-path forwarding or trusting unverified client input.
+- Diagnose silent DHCPv6 relay failures in packet captures and server logs.
+
+## Why DHCPv6 relays wrap instead of rewriting
+
+In IPv6, clients listen on UDP port 546 and send to `ff02::1:2` on UDP port 547 (`All_DHCP_Relay_Agents_and_Servers`, RFC 9915). Relays and servers both listen on UDP port 547. As covered in the *SLAAC, RA flags and DHCPv6* chapter, a host uses DHCPv6 when the router's RA sets the `M` or `O` flag (or when requesting a prefix via `IA_PD`, covered in *DHCPv6 Prefix Delegation*). At that moment the client may not have a globally routable address yet, so its source IPv6 address is `fe80::/10`.
+
+A router sitting on that link cannot simply route the packet onward: `ff02::1:2` is link-local multicast and `fe80::...` is link-local source. Even if the router changed the destination to a unicast server IP, the server would have no way to reply to a link-local address on a remote segment.
+
+DHCPv4 solved a similar problem (covered in *DHCP Relay and NAT* and *DHCP Option 82*) by writing the router's interface IP into `giaddr` and appending Option 82 directly to the client's BOOTP/DHCP packet. That single-layer design gets awkward as soon as two relays sit in series—for example, a DSLAM or OLT at Layer 2 followed by a BNG or access router at Layer 3—because there is only one `giaddr` field and one flat option 82, so RFC 3046 has to spell out who may stamp it and who must leave it alone.
+
+DHCPv6 avoids that collision by encapsulation. (A note on references: DHCPv6 is now specified by RFC 9915, published January 2026 as STD 102, which obsoletes RFC 8415. The relay rules this chapter relies on keep the same section numbers and wording; RFC 9915 adds that a relay SHOULD insert the Client Link-Layer Address option (79, RFC 6939) when relaying a client message, and it retires IA_TA and the server-unicast option.) Each relay leaves the incoming message untouched inside `OPTION_RELAY_MSG` (option 9) and adds its own outer header and options.
+
+| Concept | DHCPv4 Relay | DHCPv6 Relay (RFC 9915 / RFC 6221) |
+| :--- | :--- | :--- |
+| Client destination | Broadcast `255.255.255.255` (UDP 67) | Link-local multicast `ff02::1:2` (UDP 547) |
+| Client source | `0.0.0.0` (or assigned IP) | Link-local `fe80::/10` (UDP 546) |
+| Relay forwarding | Rewrites `giaddr`, forwards same packet | Wraps packet in `Relay-forw` (12) |
+| Link identifier | `giaddr` (4 octets) | `link-address` (16 octets) or `Interface-Id` (18) |
+| Client peer address | `chaddr` / `ciaddr` | `peer-address` (16 octets, datagram source) |
+| Port / circuit tag | Option 82 suboption 1 (`circuit-id`) | `OPTION_INTERFACE_ID` (18) |
+| Remote / line tag | Option 82 suboption 2 (`remote-id`) | `OPTION_REMOTE_ID` (37) |
+| Multi-hop relays | Flat option append; single `giaddr` | Nested `Relay-forw` / `Relay-repl` envelopes |
+
+If no unicast server address is configured on a DHCPv6 relay, RFC 9915 section 19 specifies that the relay sends `Relay-forw` to `ff05::1:3` (`All_DHCP_Servers`, site-local multicast). In practice, relying on `ff05::1:3` requires site-scoped multicast routing across every router between the relay and the server. Operators almost always configure explicit unicast server addresses on the relay instead.
+
+## The Relay-Forw and Relay-Repl wire format
+
+Unlike standard client-server DHCPv6 messages (which have a 4-octet header: 1-octet `msg-type` and 3-octet `transaction-id`), `Relay-forw` (type 12) and `Relay-repl` (type 13) use a fixed **34-octet header** followed by DHCPv6 options (RFC 9915 section 9):
+
+```text
+ 0                   1                   2                   3
+ 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|   msg-type    |   hop-count   |                               |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+                               +
+|                                                               |
+|                         link-address                          |
+|                         (16 octets)                           |
+|                                                               |
++                               +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                               |                               |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+                               +
+|                                                               |
+|                         peer-address                          |
+|                         (16 octets)                           |
+|                                                               |
++                               +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                               |                               |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+                               +
+.                                                               .
+.            options (variable; MUST include option 9)          .
+.                                                               .
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+```
+
+The four header fields are:
+
+- `msg-type` (1 octet): `12` for `Relay-forw`, `13` for `Relay-repl`.
+- `hop-count` (1 octet): Number of relay agents that have already processed this message. Set to `0` by the relay closest to the client; incremented by `1` at each subsequent relay. Any relay receiving a `Relay-forw` with `hop-count >= HOP_COUNT_LIMIT` (`8`) MUST discard it (RFC 9915 section 19.1.2).
+- `link-address` (16 octets): An IPv6 address the server can use to identify the link where the client sits, or `::` (all zeros) when the relay has no suitable address for that link.
+- `peer-address` (16 octets): The IPv6 source address of the datagram from which the relay received the message—either the client's address (usually link-local) or the previous relay's source address.
+
+The options section MUST include `OPTION_RELAY_MSG` (option 9, RFC 9915 section 21.10), which holds the entire encapsulated message—either the client's original DHCPv6 message (`Solicit`, `Request`, `Renew`, `Release`, etc.) or another `Relay-forw` / `Relay-repl` packet. A relay can also attach `OPTION_INTERFACE_ID` (18), `OPTION_REMOTE_ID` (37), `OPTION_SUBSCRIBER_ID` (38), or `OPTION_RELAY_PORT` (135) at its own envelope layer.
+
+When the server constructs a response (RFC 9915 section 19.3), it does not guess the network topology. It copies `hop-count`, `link-address`, and `peer-address` directly from each `Relay-forw` layer into a matching `Relay-repl` layer, echoes any `Interface-Id` from that layer, and places its `Advertise` or `Reply` inside the innermost `OPTION_RELAY_MSG`.
+
+## How link-address, peer-address, and Interface-Id place the client
+
+Every DHCPv6 relay follows four distinct rules in RFC 9915 section 19 depending on whether it is receiving from a client, receiving from a downstream relay, or returning a reply from the server.
+
+### 1. Relaying directly from a client (RFC 9915 s19.1.1)
+
+When a relay receives a non-relay DHCPv6 message on a client-facing interface:
+
+1. It sets `hop-count = 0`.
+2. It sets `peer-address` to the source IPv6 address of the client's datagram.
+3. It sets `link-address` to a globally scoped unicast address (GUA or ULA) from a prefix assigned to the link on which the client should receive leases.
+4. If no GUA or ULA is available on that interface, the relay may use a link-local address of the receiving interface. RFC 9915 says this is *not recommended*, because it may require additional information in the server configuration (it points to RFC 7969 section 3.2 for the details): a link-local `link-address` carries no prefix the server can match.
+5. It SHOULD add the Client Link-Layer Address option (79, RFC 6939) so the server sees the client's MAC address without parsing the DUID.
+6. If the relay cannot use `link-address` to identify the egress interface when the reply comes back (for instance, when `link-address` is link-local, or several interfaces are unnumbered), it MUST include `OPTION_INTERFACE_ID` (18).
+
+### 2. Relaying an existing Relay-forw (RFC 9915 s19.1.2)
+
+When an upstream relay receives a `Relay-forw` message (type 12):
+
+1. If `hop-count >= 8` (`HOP_COUNT_LIMIT`), it discards the packet silently.
+2. Otherwise, it wraps the entire received `Relay-forw` inside a new `OPTION_RELAY_MSG` in a new `Relay-forw`.
+3. It sets `hop-count = received_hop_count + 1`.
+4. It sets `peer-address` to the source IPv6 address of the received datagram (the downstream relay's source address).
+5. If that `peer-address` is a GUA or ULA, the upstream relay sets `link-address` to `::` (unspecified), because the downstream relay already sits on a routable prefix or has already populated an inner `link-address`. If the datagram's source was link-local (for example, from an L2 relay), the upstream relay sets `link-address` to a GUA/ULA on its receiving interface (or `Interface-Id` if none exists).
+
+### 3. Server link selection (RFC 9915 s13.1)
+
+When the server receives a `Relay-forw` stack, it unwraps the layers and inspects `link-address`:
+
+- Per RFC 6221 and RFC 9915 section 13.1, the server MUST ignore any `link-address` equal to `::` (all zeros).
+- The usable `link-address` can come from any layer in the `Relay-forw` stack; in general, the **most encapsulated** (innermost, closest to the client) non-zero `link-address` carries the most specific link information.
+- If no layer has a usable GUA/ULA `link-address` (for instance, all layers have `::` or `fe80::...`), a server configured with an `Interface-Id` mapping can still place the client into the right subnet. A server that selects subnets by `link-address` alone cannot choose a pool and ignores the request; the client just times out.
+
+### 4. Unwrapping Relay-repl on the return path (RFC 9915 s19.2)
+
+When a relay receives a `Relay-repl` (type 13) from the server or an upstream relay:
+
+1. It extracts the inner payload from `OPTION_RELAY_MSG` and MUST NOT modify that inner message.
+2. It determines the egress interface: if the `Relay-repl` contains `OPTION_INTERFACE_ID`, it transmits on the interface identified by that option; otherwise, if `link-address` is non-zero, it transmits on the link matching `link-address`.
+3. It sends the extracted message as a UDP datagram to `peer-address`—using port 546 if the inner message is a client-bound reply (`Advertise`, `Reply`, `Reconfigure`), or port 547 if the inner message is another `Relay-repl` bound for a downstream relay (unless `OPTION_RELAY_PORT` specifies another port).
+
+Notice why `Interface-Id` echoing is non-negotiable whenever `link-address` is `::` or link-local: a link-local address like `fe80::1` is only unique per link (a router may even use the same one on every interface), and `::` identifies no interface at all. If the server strips or forgets to echo `Interface-Id`, a relay that cannot map the `link-address` back to an interface (like the one in the lab) has no egress for `peer-address` and drops the `Relay-repl`.
+
+```text
+  Client (c1)              LDRA (L2)                 L3 Relay (r)              Server (s)
+ fe80::c1                  fe80::ldra                2001:db8:a::1             2001:db8:f::547
+    |                         |                         |                         |
+    |-- Solicit ------------->|                         |                         |
+    |   src: fe80::c1         |                         |                         |
+    |   dst: ff02::1:2:547    |                         |                         |
+    |                         |-- Relay-forw (hop 0) -->|                         |
+    |                         |   link-addr: ::         |                         |
+    |                         |   peer-addr: fe80::c1   |                         |
+    |                         |   Interface-Id: port-7  |                         |
+    |                         |   Relay-Msg(Solicit)    |                         |
+    |                         |                         |-- Relay-forw (hop 1) -->|
+    |                         |                         |   link-addr: 2001:db8:a::1
+    |                         |                         |   peer-addr: fe80::ldra
+    |                         |                         |   Interface-Id: ra      |
+    |                         |                         |   Relay-Msg(            |
+    |                         |                         |     Relay-forw(Solicit))|
+    |                         |                         |                         |
+    |                         |                         |<-- Relay-repl (hop 1) --|
+    |                         |                         |    link-addr: 2001:db8:a::1
+    |                         |                         |    peer-addr: fe80::ldra
+    |                         |                         |    Interface-Id: ra     |
+    |                         |                         |    Relay-Msg(           |
+    |                         |                         |      Relay-repl(Adv))   |
+    |                         |<-- Relay-repl (hop 0) --|                         |
+    |                         |    src: fe80::r:547     |                         |
+    |                         |    dst: fe80::ldra:547  |                         |
+    |                         |    link-addr: ::        |                         |
+    |                         |    peer-addr: fe80::c1  |                         |
+    |                         |    Interface-Id: port-7 |                         |
+    |                         |    Relay-Msg(Advertise) |                         |
+    |<-- Advertise -----------|                         |                         |
+    |    dst: fe80::c1:546    |                         |                         |
+```
+
+## Lightweight DHCPv6 Relay Agents (RFC 6221)
+
+Access switches, OLTs, and DSLAMs sit between subscribers and the first IPv6 router. They operate at Layer 2: they have no IPv6 routing table, no GUA/ULA configured on every subscriber VLAN, and no ability to forward routed IPv6 unicast packets to a distant DHCPv6 server. Yet operators still need those L2 boxes to stamp subscriber port and line identifiers onto DHCPv6 requests before they hit the L3 relay or BNG.
+
+RFC 6221 defines the **Lightweight DHCPv6 Relay Agent (LDRA)** for exactly this role:
+
+- **Zeroed `link-address`**: Because an LDRA has no L3 link prefix, its `Relay-forw` MUST set `link-address` to `::` (the unspecified address).
+- **Mandatory `Interface-Id`**: The LDRA MUST set `peer-address` to the client's source address and MUST include `OPTION_INTERFACE_ID` (18) so it knows which access port to send the reply back down. It MAY also include `OPTION_REMOTE_ID` (37) or `OPTION_SUBSCRIBER_ID` (38).
+- **Server echo requirement**: the server MUST include the LDRA's `Interface-ID` option in the `Relay-Reply`, so the LDRA knows which access port to use.
+- **Network-side interception**: On its network-facing (uplink) interfaces, the LDRA intercepts link-local-to-link-local UDP port 547 `Relay-repl` traffic addressed to it and unwraps it toward the client port.
+- **Strict client-facing filtering**: To stop clients from spoofing servers or injecting fake relay metadata, RFC 6221 mandates two filtering rules on client-facing interfaces:
+  1. An LDRA MUST discard `ADVERTISE` (2), `REPLY` (7), `RECONFIGURE` (10), and `RELAY-REPL` (13) received on any client-facing interface.
+  2. Every client-facing interface MUST be configurable as **trusted** or **untrusted** (per interface, SHOULD). On an **untrusted** interface, the LDRA MUST discard `RELAY-FORW` (12). Make untrusted your default for subscriber ports.
+
+That second rule is the DHCPv6 equivalent of DHCPv4 Snooping / Option 82 trust (covered in *DHCP Option 82*). Without it, a hostile host on an access port can craft its own `Relay-forw` carrying another subscriber's `Remote-Id` or `Interface-Id`, pass it to the LDRA, and let the LDRA wrap it cleanly inside a legitimate outer envelope.
+
+## Relay identity options and non-standard ports
+
+Beyond `OPTION_RELAY_MSG` (9), four options govern how relays identify ports, subscribers, and return sockets.
+
+### OPTION_INTERFACE_ID (18)
+
+Defined in RFC 9915 section 21.18, `Interface-Id` is an opaque byte string chosen by the relay to identify the interface on which the client message arrived. The server MUST treat it as opaque and echo it unchanged in the matching `Relay-repl`. Servers like Kea can also match `Interface-Id` explicitly when `link-address` is unavailable.
+
+### OPTION_REMOTE_ID (37)
+
+Defined in RFC 4649, `OPTION_REMOTE_ID` carries an administrative identifier for the remote line or circuit:
+
+```text
+ 0                   1                   2                   3
+ 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|          option-code (37)     |         option-len            |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                       enterprise-number                       |
+|                          (4 octets)                           |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                                                               |
+.                           remote-id                           .
+.                     (variable, opaque)                        .
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+```
+
+The 4-octet `enterprise-number` is the IANA Private Enterprise Number of the vendor or operator (in lab examples, `32473` is reserved for documentation per RFC 5612), followed by an opaque `remote-id` such as `olt3/pon2/ont17`. RFC 4649 specifies that servers SHOULD treat the payload as opaque and match it only by exact byte comparison.
+
+### OPTION_SUBSCRIBER_ID (38)
+
+Defined in RFC 4580, `OPTION_SUBSCRIBER_ID` carries an opaque subscriber identifier assigned by the operator (for example, an account or service ID) rather than a physical port name. RFC 4580 notes that using NVT ASCII, as the DHCPv4 Subscriber-ID suboption does, can help where both protocols run. Like Remote-Id, it is only worth anything if a trusted relay added it.
+
+### OPTION_RELAY_PORT (135)
+
+Standard DHCPv6 relays listen and send on UDP port 547. RFC 8357's motivation is large systems where relay functions run as several processes (for example, one per line card or switch node) that share one IP address and cannot all own port 547; it introduces `OPTION_RELAY_PORT` (option 135, length 2 octets, carrying a 16-bit "Downstream Source Port"). If a relay uses a source port other than 547, it sets that port (or `0` if only this relay uses a non-547 port, signalling the server/upstream to reply to the UDP packet's actual source port rather than 547). The server and any upstream relay then send `Relay-repl` back to that recorded port instead of hardcoding destination port 547.
+
+### Prefix delegation through a relay (RFC 8987)
+
+When a client requests an `IA_PD` prefix through a relay on a PE router or BNG, leasing the prefix is only half the job: the relay's router must also route the delegated prefix toward the requesting router. RFC 8987 lists the requirements for such delegating relays: maintain a routing table entry per delegated lease with the same prefix length as the IA_PD and remove it on release or expiry (R-1, R-2), install matching anti-spoofing ingress filters (R-3), optionally drop looping packets on PD client-facing interfaces (R-5), and survive restarts by Bulk Leasequery or persistent storage (S-1). Those routing mechanics are covered in full in *DHCPv6 Prefix Delegation*.
+
+## Production relay and server configuration
+
+In production Linux and ISP deployments, the relay and server roles are typically split across `dhcrelay` (or vendor NOS relays on switches/routers) and Kea DHCPv6. The snippets below are **from the docs, not run**.
+
+With ISC `dhcrelay -6`, you bind lower (client-facing) interfaces with `-l` and upper (server-facing) interfaces with `-u`, optionally specifying a unicast server address on the upper interface:
+
+```text
+# from the docs, not run
+dhcrelay -6 -l eth1 -u 2001:db8:f::547%eth0
+```
+
+On the server side, ISC Kea DHCPv6 (`kea-dhcp6`) selects subnets from `link-address` by matching the relay's IP against `"relay": {"ip-addresses": [...]}` or by matching `"interface-id"`. Client classification (and therefore class-guarded subnets, pools and `flex-id` reservations) can inspect any nesting depth using `relay6[nest].option[code].hex`. The Kea ARM defines `nest` 0 as the relay closest to the server and negative values counting from the client, with `-1` the relay closest to the client:
+
+```json
+// from the docs, not run
+{
+  "Dhcp6": {
+    "subnet6": [
+      {
+        "id": 10,
+        "subnet": "2001:db8:a::/64",
+        "relay": { "ip-addresses": [ "2001:db8:a::1" ] },
+        "pools": [ { "pool": "2001:db8:a::100 - 2001:db8:a::1ff" } ]
+      },
+      {
+        "id": 20,
+        "subnet": "2001:db8:b::/64",
+        "interface-id": "rb",
+        "pools": [ { "pool": "2001:db8:b::100 - 2001:db8:b::1ff" } ]
+      }
+    ],
+    "client-classes": [
+      {
+        "name": "ont17",
+        "test": "relay6[-1].option[37].hex == 0x00007ed96f6c74332f706f6e322f6f6e743137"
+      }
+    ]
+  }
+}
+```
+
+Here `0x00007ed9` is enterprise number `32473` in big-endian hex followed by the ASCII bytes for `olt3/pon2/ont17`.
+
+## The lab
+
+This lab runs inside unprivileged Linux network namespaces (`unshare -rnm`) with Python 3.13 standard library sockets—no root, no containers, and no external DHCP packages required. Two clients sit on separate links: `c1` behind an RFC 6221 LDRA (`ldra`) and an L3 relay (`r`), and `c2` directly behind `r` on a link that has only a link-local address. The toy server `s` listens on `2001:db8:f::547`, serves pools `2001:db8:a::/64` and `2001:db8:b::/64`, holds reservations keyed on the innermost `Remote-Id` (`olt3/pon2/ont17 -> 2001:db8:a::17`, `victim-line -> 2001:db8:a::77`), and answers `Solicit` with `Advertise` only.
+
+```text
+  +----+  c1e   lc  +------+  ln   ra  +---+  rs   se  +---+
+  | c1 |------------| ldra |-----------| r |-----------| s |
+  +----+            +------+           +---+           +---+
+                    ifid: ldra-port-7    | rb          2001:db8:f::547
+                    remote: 32473:       | (LL only)
+                    olt3/pon2/ont17      |
+                                         | c2e
+                                       +----+
+                                       | c2 |
+                                       +----+
+```
+
+```{.python filename="v6relay.py"}
+#!/usr/bin/env python3
+"""DHCPv6 relay agents measured: Relay-Forw/Relay-Repl nesting, link-address, Interface-Id,
+Remote-Id, a lightweight relay (RFC 6221) and hop-count. Run: unshare -rnm python3 v6relay.py
+Namespaces: c1 -- ldra -- r -- s   and   c2 -- r   (stdlib only, toy server)."""
+import os, socket, struct, subprocess, sys, time, json, select, ipaddress
+
+SELF = os.path.abspath(__file__)
+ALL_RS = 'ff02::1:2'
+SOLICIT, ADVERTISE, RELAY_FORW, RELAY_REPL = 1, 2, 12, 13
+O_CLIENTID, O_IA_NA, O_IAADDR, O_RELAY_MSG, O_INTERFACE_ID, O_REMOTE_ID = 1, 3, 5, 9, 18, 37
+PEN = 32473   # documentation enterprise number (RFC 5612)
+NAMES = {1: 'Solicit', 2: 'Advertise', 12: 'Relay-forw', 13: 'Relay-repl'}
+
+def sh(c, check=True):
+    r = subprocess.run(c, shell=True, capture_output=True, text=True)
+    if check and r.returncode: raise SystemExit(f'FAILED {c}: {r.stderr}')
+    return r.stdout.strip()
+
+def opt(code, data): return struct.pack('!HH', code, len(data)) + data
+def parse_opts(b):
+    out, i = [], 0
+    while i + 4 <= len(b):
+        c, l = struct.unpack('!HH', b[i:i + 4]); out.append((c, b[i + 4:i + 4 + l])); i += 4 + l
+    return out
+
+def relay_forw(hop, link, peer, inner, extra=()):
+    hdr = bytes([RELAY_FORW, hop]) + ipaddress.IPv6Address(link).packed + ipaddress.IPv6Address(peer).packed
+    return hdr + b''.join(extra) + opt(O_RELAY_MSG, inner)
+
+def unwrap(msg):
+    """Return list of relay layers (outermost first) and the client message."""
+    layers = []
+    while msg[0] in (RELAY_FORW, RELAY_REPL):
+        link = str(ipaddress.IPv6Address(msg[2:18])); peer = str(ipaddress.IPv6Address(msg[18:34]))
+        opts = parse_opts(msg[34:]); inner = None; d = {}
+        for c, v in opts:
+            if c == O_RELAY_MSG: inner = v
+            elif c == O_INTERFACE_ID: d['ifid'] = v.decode()
+            elif c == O_REMOTE_ID: d['remote'] = f'{struct.unpack("!I", v[:4])[0]}:{v[4:].decode()}'
+        layers.append(dict(type=NAMES[msg[0]], hop=msg[1], link=link, peer=peer, **d))
+        msg = inner
+    return layers, msg
+
+# ------------------------------------------------------------------ topology
+def build():
+    sh('mount -t tmpfs none /run && mkdir -p /run/netns')
+    for n in ('c1', 'c2', 'ldra', 'r', 's'):
+        sh(f'ip netns add {n}')
+        sh(f'ip netns exec {n} sh -c "echo 0 > /proc/sys/net/ipv6/conf/default/accept_dad; echo 0 > /proc/sys/net/ipv6/conf/all/accept_dad"')
+        sh(f'ip -n {n} link set lo up')
+    links = [('c1', 'c1e', 'ldra', 'lc'), ('ldra', 'ln', 'r', 'ra'), ('c2', 'c2e', 'r', 'rb'), ('r', 'rs', 's', 'se')]
+    for a, ai, b, bi in links:
+        sh(f'ip link add {ai} netns {a} type veth peer name {bi} netns {b}')
+        sh(f'ip -n {a} link set {ai} up; ip -n {b} link set {bi} up')
+    sh('ip -n r addr add 2001:db8:a::1/64 dev ra nodad')
+    sh('ip -n r addr add 2001:db8:f::1/64 dev rs nodad')
+    sh('ip -n s addr add 2001:db8:f::547/64 dev se nodad')
+    # rb (link B) deliberately has only a link-local address
+    time.sleep(0.5)
+
+def ll(ns, dev):
+    out = sh(f'ip -n {ns} -6 -o addr show dev {dev} scope link')
+    return out.split()[3].split('/')[0]
+
+# ------------------------------------------------------------------ roles
+def mcast_sock(port, ifaces):
+    s = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_RECVPKTINFO, 1)
+    s.bind(('::', port))
+    for i in ifaces:
+        idx = socket.if_nametoindex(i)
+        s.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_JOIN_GROUP, socket.inet_pton(socket.AF_INET6, ALL_RS) + struct.pack('@I', idx))
+    return s
+
+def recv(s, timeout):
+    r, _, _ = select.select([s], [], [], timeout)
+    if not r: return None
+    data, anc, _, addr = s.recvmsg(4096, 256)
+    ifidx = None
+    for lvl, typ, d in anc:
+        if lvl == socket.IPPROTO_IPV6 and typ == socket.IPV6_PKTINFO:
+            ifidx = struct.unpack('@I', d[16:20])[0]
+    return data, addr, socket.if_indextoname(ifidx) if ifidx else None
+
+def role_client(a):
+    dev, label, secs = a[0], a[1], float(a[2])
+    spoof = a[3] if len(a) > 3 else ''
+    s = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM); s.bind(('::', 546))
+    xid = os.urandom(3)
+    duid = struct.pack('!HH', 3, 1) + bytes.fromhex('02000000' + label)
+    sol = bytes([SOLICIT]) + xid + opt(O_CLIENTID, duid) + opt(O_IA_NA, struct.pack('!III', 1, 0, 0))
+    if spoof == 'hop8':
+        sol = relay_forw(8, '::', 'fe80::bad', sol, [opt(O_INTERFACE_ID, b'x')])
+        s.close(); s = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM); s.bind(('::', 547))
+        spoof = ''
+    if spoof:   # a client pretending to be a relay, forging Interface-Id/Remote-Id
+        sol = relay_forw(0, '::', 'fe80::bad', sol, [opt(O_INTERFACE_ID, b'ldra-port-1'),
+                                                    opt(O_REMOTE_ID, struct.pack('!I', PEN) + b'victim-line')])
+        s.close(); s = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM); s.bind(('::', 547))
+    s.sendto(sol, (ALL_RS, 547, 0, socket.if_nametoindex(dev)))
+    s.settimeout(secs)
+    try:
+        d, addr = s.recvfrom(4096)
+        res = dict(got=NAMES.get(d[0], d[0]))
+        if d[0] == RELAY_REPL:
+            d = unwrap(d)[1]; res['got'] += ' wrapping ' + NAMES.get(d[0], str(d[0]))
+        for c, v in parse_opts(d[4:]):
+            if c == O_IA_NA:
+                for c2, v2 in parse_opts(v[12:]):
+                    if c2 == O_IAADDR: res['addr'] = str(ipaddress.IPv6Address(v2[:16]))
+        print(json.dumps(res))
+    except socket.timeout:
+        print(json.dumps(dict(got='nothing (timeout)')))
+
+def role_ldra(a):
+    trust_client_relay = a[0] == 'trusted'
+    s = mcast_sock(547, ['lc', 'ln'])
+    end = time.time() + float(a[1])
+    while time.time() < end:
+        m = recv(s, 0.2)
+        if not m: continue
+        data, addr, dev = m
+        if dev == 'lc':
+            if data[0] == RELAY_FORW and not trust_client_relay:
+                print(json.dumps(dict(ldra='dropped Relay-forw from untrusted client port lc')), flush=True); continue
+            fw = relay_forw(0, '::', addr[0].split('%')[0], data,
+                            [opt(O_INTERFACE_ID, b'ldra-port-7'), opt(O_REMOTE_ID, struct.pack('!I', PEN) + b'olt3/pon2/ont17')])
+            s.sendto(fw, (ALL_RS, 547, 0, socket.if_nametoindex('ln')))
+        elif dev == 'ln' and data[0] == RELAY_REPL:
+            layers, inner = unwrap(data)
+            peer = layers[0]['peer']
+            if layers[0].get('ifid') == 'ldra-port-7':
+                inner = [v for c, v in parse_opts(data[34:]) if c == O_RELAY_MSG][0]
+                s.sendto(inner, (peer, 547 if inner[0] == RELAY_REPL else 546, 0, socket.if_nametoindex('lc')))
+
+def role_relay(a):
+    mode, secs = a[0], float(a[1])
+    gua = {'ra': '2001:db8:a::1', 'rb': None}
+    s = mcast_sock(547, ['ra', 'rb'])
+    up = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM); up.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); up.bind(('2001:db8:f::1', 547))
+    end = time.time() + secs
+    while time.time() < end:
+        r, _, _ = select.select([s, up], [], [], 0.2)
+        for sock in r:
+            if sock is s:
+                data, addr, dev = recv(s, 0)
+                src = addr[0].split('%')[0]
+                if data[0] == RELAY_FORW:
+                    if data[1] >= 8:
+                        print(json.dumps(dict(relay=f'discarded Relay-forw with hop-count {data[1]} (HOP_COUNT_LIMIT 8)')), flush=True); continue
+                    hop = data[1] + 1
+                else:
+                    hop = 0
+                link = gua[dev] or src_ll(dev)   # RFC 9915 (was 8415) s19.1.1: link-local allowed but not recommended
+                if mode == 'noifid' and gua[dev]:
+                    extra = []
+                else:
+                    extra = [opt(O_INTERFACE_ID, dev.encode())]
+                fw = relay_forw(hop, link, src, data, extra)
+                up.sendto(fw, ('2001:db8:f::547', 547))
+            else:
+                data, addr = up.recvfrom(4096)
+                layers, _ = unwrap(data)
+                L = layers[0]
+                inner = [v for c, v in parse_opts(data[34:]) if c == O_RELAY_MSG][0]
+                if 'ifid' in L: dev = L['ifid']
+                else:
+                    dev = next((d for d, g in gua.items() if g and ipaddress.IPv6Address(g) in ipaddress.IPv6Network(L['link'] + '/64', strict=False)), None)
+                if not dev:
+                    print(json.dumps(dict(relay=f"Relay-repl without Interface-Id, link-address {L['link']} matches no relay GUA -> cannot pick a link, dropped")), flush=True); continue
+                port = 547 if inner[0] == RELAY_REPL else 546
+                s.sendto(inner, (L['peer'], port, 0, socket.if_nametoindex(dev)))
+
+LL_CACHE = {}
+def src_ll(dev):
+    if dev not in LL_CACHE:
+        out = subprocess.run(['ip', '-6', '-o', 'addr', 'show', 'dev', dev, 'scope', 'link'], capture_output=True, text=True).stdout
+        LL_CACHE[dev] = out.split()[3].split('/')[0]
+    return LL_CACHE[dev]
+
+def role_server(a):
+    echo_ifid, ifid_map, secs = a[0] == 'echo', a[1] == 'ifidmap', float(a[2])
+    pools = {'2001:db8:a::/64': '2001:db8:a::100', '2001:db8:b::/64': '2001:db8:b::100'}
+    ifid_pools = {'rb': '2001:db8:b::/64'}
+    s = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM); s.bind(('2001:db8:f::547', 547))
+    end = time.time() + secs
+    while time.time() < end:
+        r, _, _ = select.select([s], [], [], 0.2)
+        if not r: continue
+        data, addr = s.recvfrom(4096)
+        layers, client = unwrap(data)
+        # subnet selection: first non-zero, non-link-local link-address from the innermost layer outwards
+        subnet, how = None, ''
+        for L in reversed(layers):
+            la = ipaddress.IPv6Address(L['link'])
+            if not la.is_unspecified and not la.is_link_local:
+                subnet = next((p for p in pools if la in ipaddress.IPv6Network(p)), None); how = f"link-address {L['link']}"; break
+        if not subnet and ifid_map:
+            for L in layers:
+                if L.get('ifid') in ifid_pools: subnet = ifid_pools[L['ifid']]; how = f"Interface-Id {L['ifid']}"; break
+        rid = next((L['remote'].split(':', 1)[1] for L in reversed(layers) if 'remote' in L), None)
+        addr6 = RESERVATIONS.get(rid) if subnet == '2001:db8:a::/64' and rid in RESERVATIONS else (pools[subnet] if subnet else None)
+        print(json.dumps(dict(server_saw=layers, client_msg=NAMES[client[0]], subnet=subnet, chosen_by=how,
+                              lease=addr6, reservation_key=rid if rid in RESERVATIONS else None)), flush=True)
+        if not subnet: continue
+        xid = client[1:4]
+        ia = opt(O_IA_NA, struct.pack('!III', 1, 0, 0) + opt(O_IAADDR, ipaddress.IPv6Address(addr6).packed + struct.pack('!II', 3600, 7200)))
+        reply = bytes([ADVERTISE]) + xid + ia
+        # build Relay-repl layers mirroring the Relay-forw layers (outermost last built)
+        msg = reply
+        raw = data; raws = []
+        while raw[0] == RELAY_FORW:
+            raws.append(raw); raw = [v for c, v in parse_opts(raw[34:]) if c == O_RELAY_MSG][0]
+        for fw in reversed(raws):
+            extra = [opt(c, v) for c, v in parse_opts(fw[34:]) if c == O_INTERFACE_ID and echo_ifid]
+            msg = bytes([RELAY_REPL, fw[1]]) + fw[2:34] + b''.join(extra) + opt(O_RELAY_MSG, msg)
+        s.sendto(msg, addr)
+
+RESERVATIONS = {'olt3/pon2/ont17': '2001:db8:a::17', 'victim-line': '2001:db8:a::77'}   # keyed on innermost Remote-Id
+
+ROLES = dict(client=role_client, ldra=role_ldra, relay=role_relay, server=role_server)
+
+def bg(ns, *a):
+    return subprocess.Popen(['ip', 'netns', 'exec', ns, sys.executable, SELF, *a], stdout=subprocess.PIPE, text=True)
+
+def scenario(title, client_ns, client_dev, label, relay_mode='normal', server_echo='echo', server_map='nomap', ldra='untrusted', spoof='', with_ldra=True):
+    print(f'\n== {title}')
+    srv = bg('s', 'server', server_echo, server_map, '3')
+    rel = bg('r', 'relay', relay_mode, '3')
+    ld = bg('ldra', 'ldra', ldra, '3') if with_ldra else None
+    time.sleep(0.6)
+    cl = subprocess.run(['ip', 'netns', 'exec', client_ns, sys.executable, SELF, 'client', client_dev, label, '1.5'] + ([spoof] if spoof else []),
+                        capture_output=True, text=True)
+    for p in [x for x in (srv, rel, ld) if x]:
+        p.wait()
+    for name, p in (('ldra', ld), ('relay', rel), ('server', srv)):
+        if not p: continue
+        for line in p.stdout.read().splitlines():
+            d = json.loads(line)
+            if 'server_saw' in d:
+                rk = f'; reservation by Remote-Id "{d["reservation_key"]}"' if d.get('reservation_key') else ''
+                print(f'  server: {d["client_msg"]} inside {len(d["server_saw"])} relay layer(s); subnet {d["subnet"]} ({d["chosen_by"] or "no match"}); lease {d["lease"]}{rk}')
+                for i, L in enumerate(d['server_saw']):
+                    extras = ' '.join(f'{k}={L[k]}' for k in ('ifid', 'remote') if k in L)
+                    print(f'    layer {i} (outermost first): hop {L["hop"]} link-address {L["link"]} peer-address {L["peer"]} {extras}')
+            else:
+                print(f'  {name}: {list(d.values())[0]}')
+    print(f'  client: {cl.stdout.strip() or cl.stderr.strip()[-200:]}')
+
+def main():
+    if len(sys.argv) > 1: return ROLES[sys.argv[1]](sys.argv[2:])
+    build()
+    scenario('1. Client c1 behind an LDRA (RFC 6221) and an L3 relay with a GUA on the link', 'c1', 'c1e', '0000c101')
+    scenario('2. Client c2 on link B where the relay has only a link-local address (server selects subnets by link-address only)',
+             'c2', 'c2e', '0000c201', with_ldra=False)
+    scenario('3. Same, server also maps Interface-Id "rb" to 2001:db8:b::/64', 'c2', 'c2e', '0000c201', server_map='ifidmap', with_ldra=False)
+    scenario('4. Link B again, server does NOT echo Interface-Id', 'c2', 'c2e', '0000c201', server_map='ifidmap', server_echo='noecho', with_ldra=False)
+    scenario('5. c1 forges its own Relay-forw (fake Interface-Id/Remote-Id); LDRA port untrusted', 'c1', 'c1e', '0000c101', spoof='1')
+    scenario('6. Same forgery with the LDRA port marked trusted', 'c1', 'c1e', '0000c101', spoof='1', ldra='trusted')
+    scenario('7. c2 sends a Relay-forw with hop-count 8 straight to the L3 relay', 'c2', 'c2e', '0000c201', spoof='hop8', with_ldra=False)
+
+if __name__ == '__main__':
+    main()
+```
+No root, no packages, no DHCP software: the script builds five namespaces inside `unshare -rnm` and plays every role itself with stdlib sockets. Link-local addresses are random, so yours will differ. Output from Linux 6.12, iproute2 6.15.0, Python 3.13.5 (a real run, unedited):
+
+```text
+$ unshare -rnm python3 v6relay.py
+
+== 1. Client c1 behind an LDRA (RFC 6221) and an L3 relay with a GUA on the link
+  server: Solicit inside 2 relay layer(s); subnet 2001:db8:a::/64 (link-address 2001:db8:a::1); lease 2001:db8:a::17; reservation by Remote-Id "olt3/pon2/ont17"
+    layer 0 (outermost first): hop 1 link-address 2001:db8:a::1 peer-address fe80::ec78:1ff:fe81:e3af ifid=ra
+    layer 1 (outermost first): hop 0 link-address :: peer-address fe80::d07a:aaff:fe59:ba78 ifid=ldra-port-7 remote=32473:olt3/pon2/ont17
+  client: {"got": "Advertise", "addr": "2001:db8:a::17"}
+
+== 2. Client c2 on link B where the relay has only a link-local address (server selects subnets by link-address only)
+  server: Solicit inside 1 relay layer(s); subnet None (no match); lease None
+    layer 0 (outermost first): hop 0 link-address fe80::b806:8bff:fe0c:1b89 peer-address fe80::84fa:a5ff:fec5:76a2 ifid=rb
+  client: {"got": "nothing (timeout)"}
+
+== 3. Same, server also maps Interface-Id "rb" to 2001:db8:b::/64
+  server: Solicit inside 1 relay layer(s); subnet 2001:db8:b::/64 (Interface-Id rb); lease 2001:db8:b::100
+    layer 0 (outermost first): hop 0 link-address fe80::b806:8bff:fe0c:1b89 peer-address fe80::84fa:a5ff:fec5:76a2 ifid=rb
+  client: {"got": "Advertise", "addr": "2001:db8:b::100"}
+
+== 4. Link B again, server does NOT echo Interface-Id
+  relay: Relay-repl without Interface-Id, link-address fe80::b806:8bff:fe0c:1b89 matches no relay GUA -> cannot pick a link, dropped
+  server: Solicit inside 1 relay layer(s); subnet 2001:db8:b::/64 (Interface-Id rb); lease 2001:db8:b::100
+    layer 0 (outermost first): hop 0 link-address fe80::b806:8bff:fe0c:1b89 peer-address fe80::84fa:a5ff:fec5:76a2 ifid=rb
+  client: {"got": "nothing (timeout)"}
+
+== 5. c1 forges its own Relay-forw (fake Interface-Id/Remote-Id); LDRA port untrusted
+  ldra: dropped Relay-forw from untrusted client port lc
+  client: {"got": "nothing (timeout)"}
+
+== 6. Same forgery with the LDRA port marked trusted
+  server: Solicit inside 3 relay layer(s); subnet 2001:db8:a::/64 (link-address 2001:db8:a::1); lease 2001:db8:a::77; reservation by Remote-Id "victim-line"
+    layer 0 (outermost first): hop 1 link-address 2001:db8:a::1 peer-address fe80::ec78:1ff:fe81:e3af ifid=ra
+    layer 1 (outermost first): hop 0 link-address :: peer-address fe80::d07a:aaff:fe59:ba78 ifid=ldra-port-7 remote=32473:olt3/pon2/ont17
+    layer 2 (outermost first): hop 0 link-address :: peer-address fe80::bad ifid=ldra-port-1 remote=32473:victim-line
+  client: {"got": "Relay-repl wrapping Advertise", "addr": "2001:db8:a::77"}
+
+== 7. c2 sends a Relay-forw with hop-count 8 straight to the L3 relay
+  relay: discarded Relay-forw with hop-count 8 (HOP_COUNT_LIMIT 8)
+  client: {"got": "nothing (timeout)"}
+```
+
+Walk through the seven scenarios in the output above to see each RFC rule in action:
+
+1. **Two-layer nesting (`c1` behind LDRA + L3 relay)**: `ldra` receives `c1`'s `Solicit` on `lc`, builds layer 1 with `hop-count 0`, `link-address ::`, `peer-address fe80::...` (`c1`), `Interface-Id` `ldra-port-7`, and `Remote-Id` `32473:olt3/pon2/ont17`. It multicasts that `Relay-forw` to `ff02::1:2` on its uplink `ln`. Because `ldra`'s source address is link-local, `r` (per RFC 9915 s19.1.2) sets `link-address` to its GUA `2001:db8:a::1` on `ra`, `hop-count 1`, `Interface-Id` `ra`, and forwards to `s`. The server skips the inner `::`, selects `2001:db8:a::/64` from the outer `link-address`, matches `Remote-Id` `"olt3/pon2/ont17"`, and returns a two-layer `Relay-repl` giving `c1` `2001:db8:a::17`.
+2. **Link-local `link-address` without `Interface-Id` mapping**: On link B, `r` has no GUA/ULA on `rb`, so it falls back to its link-local `fe80::...` in `link-address` and adds `Interface-Id` `rb`. When `s` is configured to select subnets by GUA/ULA `link-address` only, it finds no match and drops the request. `c2` times out silently.
+3. **Fixing link B with `Interface-Id` mapping**: With `rb -> 2001:db8:b::/64` enabled on `s`, the server matches `Interface-Id` `rb`, allocates `2001:db8:b::100`, echoes `Interface-Id` `rb` in `Relay-repl`, and `c2` receives its `Advertise`.
+4. **Server fails to echo `Interface-Id`**: Even though `s` successfully allocates `2001:db8:b::100`, it omits `Interface-Id` from `Relay-repl`. When `r` receives the `Relay-repl`, `link-address` is `fe80::...`, which matches no relay GUA and cannot disambiguate the egress link. `r` drops the reply, and `c2` times out despite the server logging a successful lease.
+5. **Client-forged `Relay-forw` on an untrusted LDRA port**: `c1` crafts a `Relay-forw` claiming `Remote-Id` `32473:victim-line` and sends it to `lc`. Because `lc` is untrusted per RFC 6221, `ldra` drops the `Relay-forw` immediately; `s` never sees it.
+6. **Same forgery with `lc` marked trusted**: With trust enabled on `lc`, `ldra` accepts `c1`'s forged `Relay-forw` and wraps it inside two more layers, producing a 3-layer stack at `s`. Because `s` keys reservations on the innermost `Remote-Id` (`layer 2`), it matches `victim-line` and hands `2001:db8:a::77` back to the attacker—wrapped in `Relay-repl`! This is the exact DHCPv6 equivalent of the Option 82 trust failure.
+7. **Hop-count limit (`HOP_COUNT_LIMIT = 8`)**: `c2` sends a `Relay-forw` with `hop-count 8` straight to `r`. Per RFC 9915 s19.1.2, `r` discards it before forwarding, preventing relay loops from multiplying traffic across the network.
+
+## Gotchas
+
+### The trap: relay with no GUA on the client link
+An L3 relay interface with only a link-local address puts `fe80::...` into `link-address`. Unless the server explicitly maps that relay's `Interface-Id` to a subnet, the server cannot match any IPv6 pool and silently drops the request. Always assign a GUA/ULA on the relay's client-facing interface or configure explicit `Interface-Id` subnet mapping on the server.
+
+### The trap: Interface-Id stripped or rewritten in transit
+If a relay sets `link-address` to `::` (as every LDRA does) or to a link-local address, it depends entirely on `Interface-Id` coming back unchanged in `Relay-repl`. A buggy server or middlebox that drops or normalises `Interface-Id` causes the relay to drop the reply—even when server logs show a lease was granted.
+
+### The trap: trusting Remote-Id or Interface-Id from client ports
+If an LDRA or L3 relay accepts `Relay-forw` from an untrusted subscriber port, a client can prepend a forged envelope with another customer's `Remote-Id`. If the server reads the *innermost* `Remote-Id`, the attacker steals the victim's reservation or policy class. Keep subscriber ports untrusted per RFC 6221, and if a server must tolerate nested relays, be deliberate about whether it reads the outermost trusted layer or enforces trust at every hop.
+
+### The trap: firewall rules blocking link-local or relay-to-server UDP 547
+Operators often permit UDP 547 only between the server and the relay's loopback, forgetting that: (a) clients send to `ff02::1:2:547` from `fe80::/10:546` and expect replies to `fe80::/10:546`, (b) LDRAs multicast to `ff02::1:2` on UDP 547 upstream and receive link-local unicast UDP 547 back from the L3 relay, and (c) the relay's egress source IP toward the server must be permitted both ways on UDP 547.
+
+### The trap: relying on `ff05::1:3` without site-scoped multicast routing
+Leaving the server address unconfigured makes a relay target `ff05::1:3` (`All_DHCP_Servers`, RFC 9915 s19). Without PIM/multicast routing enabled for `ff05::/16` across every intermediate router, those packets die at the first L3 hop. Always configure explicit unicast server addresses on relays.
+
+### The trap: non-547 source ports without RFC 8357
+A relay running behind a socket constraint or port-translated path that sends `Relay-forw` from an ephemeral source port (instead of 547) will never receive `Relay-repl` if the server replies to hardcoded port 547. Both the relay and server must support `OPTION_RELAY_PORT` (135, RFC 8357), or the relay must bind UDP 547.
+
+### The trap: intermediate relay setting `link-address` to `::`
+Per RFC 9915 s19.1.2, an upstream relay sets `link-address` to `::` whenever the downstream relay's datagram arrived from a GUA/ULA. If the downstream relay *also* sent `link-address` as `::` (for example, an LDRA misconfigured to use a GUA source), every layer in the stack has `link-address = ::` and the server cannot place the client unless `Interface-Id` is mapped.
+
+### The trap: delegating prefixes through a relay without route injection
+When an `IA_PD` lease passes through an L3 relay that is not the DHCPv6 server itself, the server knows about the delegated prefix, but the relay router's RIB does not. Without RFC 8987 route injection (and null-route loop prevention), return traffic for the delegated prefix gets blackholed or bounced in a loop.
+
+### The trap: hitting `HOP_COUNT_LIMIT = 8` in deep aggregation chains
+The first relay writes `hop-count` 0 and every later relay adds 1, so a message that has already crossed nine relays arrives with `hop-count` 8 and is silently discarded by the tenth. That is generous for normal access networks, but daisy-chained switches or stacked virtual relays in lab or carrier topologies can get there.
+
+### The trap: server keying on the wrong nesting layer
+In multi-relay topologies, the outermost layer identifies the L3 aggregation router while the innermost layer identifies the subscriber's access port. A server configured to match `relay6[0]` when it meant `relay6[-1]` (or vice versa) will either apply the BNG's identity to every subscriber or let a client-injected inner envelope override the access switch's tag.
+
+### The trap: egress interface selection for link-local `peer-address`
+DHCPv6 has no broadcast flag games like DHCPv4, because `Relay-repl` targets the client's `peer-address` directly. However, because `peer-address` is almost always `fe80::/10`, a relay daemon cannot simply call `sendto(peer_address)` without a scope ID—the kernel needs the exact egress interface index derived from `Interface-Id` or `link-address`.
+
+## The boring rule
+
+Every relay layer must leave an unambiguous way to reach the client on the way back (`Interface-Id` or a real GUA/ULA `link-address`), and every subscriber-facing port must drop `Relay-forw` before it enters the trust domain.
+
+## Exercises
+
+1. **Decode a two-layer `Relay-forw` header**: A server receives a `Relay-forw` packet whose outer 34-octet header has `hop-count = 1`, `link-address = 2001:db8:20::1`, and `peer-address = fe80::200:5eff:fe00:5301`. Inside its `OPTION_RELAY_MSG` (9) sits another `Relay-forw` with `hop-count = 0`, `link-address = ::`, `peer-address = fe80::abcd:1`, and `OPTION_INTERFACE_ID = "pon1/3"`. Identify which device added each layer, explain why the outer `link-address` is non-zero, and trace the exact headers the server must build in its `Relay-repl`.
+2. **Diagnose a silent `Relay-repl` drop**: In packet captures, you see `Solicit` leave the client, two-layer `Relay-forw` reach the server, and a two-layer `Relay-repl` return to the L3 relay—yet the client never receives `Advertise`. The L3 relay's client-facing interface has only a link-local address. What field in the `Relay-repl` do you inspect first, and why?
+3. **Design an LDRA trust policy**: An access switch runs an RFC 6221 LDRA with ports `ge-0/0/1` through `ge-0/0/24` facing residential ONTs and `xe-0/1/0` facing the BNG. List every DHCPv6 message type that must be dropped on `ge-0/0/1–24`, state which ports must be marked untrusted for `Relay-forw`, and explain what attack succeeds if `ge-0/0/5` is accidentally left trusted.
+4. **Server classification in Kea**: Suppose you operate the two-layer topology from the lab (`ldra` adding `Remote-Id` with enterprise number `32473`, `r` adding `link-address 2001:db8:a::1`). Explain the operational difference between matching `relay6[0].option[37]` versus `relay6[-1].option[37]` if a third relay is inserted upstream, versus if a client manages to inject a forged inner `Relay-forw`.
+5. **Non-547 relay sockets**: A containerised relay sits behind a rootless port-mapping layer and sends `Relay-forw` from UDP source port `45470` instead of `547`. Describe what happens without RFC 8357, what `OPTION_RELAY_PORT` (135) value the relay should insert, and how both the upstream relay and the server behave on the return path.
+6. **Hop-count boundary**: A `Relay-forw` arrives at a relay with `hop-count = 7`. Does the relay forward or discard it? What `hop-count` value does it write if it forwards, and what happens at the next relay?
+
+## Sources
+
+- [RFC 9915: Dynamic Host Configuration Protocol for IPv6 (DHCPv6), STD 102, January 2026](https://www.rfc-editor.org/rfc/rfc9915) — sections 7, 9, 13.1, 19, 21.10 and 21.18 (obsoletes RFC 8415; the relay sections keep the same numbers)
+- [RFC 6939: Client Link-Layer Address Option in DHCPv6](https://www.rfc-editor.org/rfc/rfc6939)
+- [RFC 6221: Lightweight DHCPv6 Relay Agent](https://datatracker.ietf.org/doc/html/rfc6221)
+- [RFC 4649: Dynamic Host Configuration Protocol for IPv6 (DHCPv6) Relay Agent Remote-ID Option](https://datatracker.ietf.org/doc/html/rfc4649)
+- [RFC 4580: Dynamic Host Configuration Protocol for IPv6 (DHCPv6) Relay Agent Subscriber-ID Option](https://datatracker.ietf.org/doc/html/rfc4580)
+- [RFC 8357: Generalized UDP Source Port for DHCP Relay](https://datatracker.ietf.org/doc/html/rfc8357)
+- [RFC 8987: DHCPv6 Prefix Delegating Relay Requirements](https://datatracker.ietf.org/doc/html/rfc8987)
+- [RFC 7969: Customizing DHCP Configurations on the Basis of Network Topology](https://datatracker.ietf.org/doc/html/rfc7969) — section 3.2
+- [RFC 5612: Enterprise Number for Documentation Use](https://datatracker.ietf.org/doc/html/rfc5612)
+- [ISC Kea Administrator Reference Manual: DHCPv6 Relays, Subnet Selection, and Client Classification](https://kea.readthedocs.io/en/latest/arm/dhcp6-srv.html)
+- [ISC `dhcrelay(8)` Manual Page](https://kb.isc.org/docs/isc-dhcp-44-manual-pages-dhcrelay)
