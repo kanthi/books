@@ -1,0 +1,564 @@
+---
+title: "Geneve: Extensible Overlay Headers, Critical Options and What Transit Must Ignore"
+author:
+  - name: "K19G"
+  - name: "grok-bot"
+---
+
+# Geneve: Extensible Overlay Headers, Critical Options and What Transit Must Ignore
+
+Fixed overlay headers age poorly. VXLAN, covered in the VXLAN Data Plane chapter, gives you 24 bits of Virtual Network Identifier inside a rigid 8-byte shim and nothing else. The moment you need to carry security group tags, service-chaining metadata, or in-band telemetry alongside the tenant frame, a fixed header forces you to repurpose reserved bits and hope no hardware on the path cares.
+
+Geneve (Generic Network Virtualization Encapsulation, RFC 8926) solves that problem by splitting the overlay header into an 8-byte base header and a variable list of Type-Length-Value (TLV) options. The base header handles multiplexing, protocol identification, and entropy; the TLV chain carries extensible metadata up to 252 bytes long.
+
+The price of extensibility is a strict contract between tunnel endpoints and the transit underlay. Endpoints must validate what they receive, honour a per-option critical bit, and drop anything they cannot safely process. Transit routers must do the exact opposite: leave the Geneve header alone, hash on the outer UDP tuple, and forward packets regardless of options or flags they do not understand.
+
+## Learning goals
+
+By the end of this chapter, you will be able to:
+
+- Decode every field of the 8-byte Geneve base header and calculate total header length from `Opt Len`.
+- Parse Geneve TLV options, verify option length consistency, and enforce the critical bit (`C`) rules on an endpoint.
+- Distinguish tunnel endpoint drop obligations from transit router neutrality requirements across control packets, unknown versions, and unknown options.
+- Compute outer UDP source port entropy, validate UDP checksum behaviour, and budget inner MTU as options grow from 0 to 252 bytes.
+- Identify major allocations in the IANA Geneve Option Class registry and isolate experimental option classes (`0xFF00`–`0xFFFF`) to a single administrative domain.
+
+## Why Geneve exists: fixed headers hit a wall
+
+As introduced in the Why Encapsulate chapter, overlays decouple tenant addressing from the physical underlay by wrapping inner traffic in an outer IP and UDP envelope. In VXLAN (RFC 7348), that envelope is minimal: an 8-byte header with flags, a 24-bit VNI, and reserved fields, always carrying an inner Ethernet frame over UDP destination port 4789.
+
+That simplicity makes VXLAN easy to implement in silicon, but it leaves no room for per-packet metadata. Operators and controller vendors wanted to attach policy identifiers, tenant context, or path telemetry to individual packets without inventing incompatible header hacks. Geneve (RFC 8926, Standards Track, November 2020) keeps the 24-bit VNI and UDP encapsulation model while replacing the fixed payload assumption with an EtherType field and adding an extensible TLV option stack.
+
+| Property | VXLAN (RFC 7348) | Geneve (RFC 8926) |
+| :--- | :--- | :--- |
+| Outer UDP destination port | `4789` | `6081` |
+| Encapsulation header length | Fixed `8` bytes | Variable `8` to `260` bytes |
+| Virtual network identifier | `24` bits (VNI) | `24` bits (VNI) |
+| Inner payload types | Ethernet only | Any EtherType (`0x6558` Ethernet, `0x0800` IPv4, `0x86DD` IPv6, etc.) |
+| Extensible metadata | None (fixed reserved bits) | Up to `252` bytes of 4-byte-aligned TLV options |
+| Critical option signalling | Not applicable | Base `C` bit plus per-option critical bit |
+| Control packet flag | Not standardised | Base `O` bit |
+
+VXLAN remains common in campus and data-centre fabrics where pure Layer 2 extension is all you need, and you will see how control planes like EVPN advertise reachability for overlays in the EVPN Control-Plane Intro chapter. When software virtual switches, cloud hypervisors, or Kubernetes CNIs need to carry per-packet state across the wire, Geneve is usually the tunnel format they reach for.
+
+## The 8-byte base header
+
+A Geneve packet rides inside outer IP (IPv4 or IPv6) and outer UDP targeting destination port `6081`. Immediately following the 8-byte outer UDP header sits the 8-byte Geneve base header, optionally followed by 0 to 63 four-byte words of TLV options, and then the inner payload.
+
+```text
+ 0                   1                   2                   3
+ 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|Ver|  Opt Len  |O|C|    Rsvd.  |          Protocol Type        |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|        Virtual Network Identifier (VNI)       |    Reserved   |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                                                               |
+~                    Variable-Length Options                    ~
+|                                                               |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+```
+
+Every field in those first 8 bytes has a precise job and an explicit failure mode:
+
+- **Ver (2 bits):** Protocol version. The current version is `0`. A receiving tunnel endpoint **MUST** drop packets carrying an unknown version. Transit devices do not parse the Geneve header and treat unknown versions as opaque UDP payloads.
+- **Opt Len (6 bits):** Length of the variable options area in 4-byte words, **excluding** the 8-byte base header. Because `Opt Len` is a 6-bit unsigned integer (`0` to `63`), the options section ranges from `0` to `252` bytes, making the total Geneve header `8` to `260` bytes. If `Opt Len` exceeds what an endpoint is capable of processing, that endpoint **MUST** drop the packet. Transit devices **MUST** keep forwarding and ECMP behaviour independent of `Opt Len`.
+- **O (1 bit, Control Packet):** When set (`1`), the packet is a control message rather than tenant traffic. A receiving endpoint **MUST NOT** forward the payload of an `O=1` packet into the tenant network; it either consumes the control message locally or drops it. Transit devices **MUST NOT** interpret the `O` bit or alter forwarding because of it.
+- **C (1 bit, Critical Options Present):** Signals whether one or more TLV options in the header carry the per-option critical bit. If `C` is set (`1`), a receiving endpoint **MUST** parse the options; an endpoint that cannot parse options at all **MUST** drop the packet. If `C` is clear (`0`), an endpoint that does not wish to inspect options **MAY** skip or strip the entire options block using `Opt Len` and proceed directly to the payload. Transit devices **MUST NOT** drop packets based on the `C` bit.
+- **Rsvd. (6 bits):** Reserved header bits. Transmitters set them to zero; receivers ignore them on receipt.
+- **Protocol Type (16 bits):** Standard IEEE EtherType identifying the inner payload immediately following the Geneve header (and any options). Common values are `0x6558` for Transparent Ethernet Bridging (a full inner Ethernet frame), `0x0800` for raw IPv4, and `0x86DD` for raw IPv6. Unlike VXLAN, Geneve does not force you to burn 14 bytes on an inner Ethernet header when both endpoints only route IP.
+- **Virtual Network Identifier (VNI, 24 bits):** Identifies the isolated tenant or virtual network, matching VXLAN's 16-million-segment address space. If an endpoint receives a packet for a VNI it does not serve, it drops the packet.
+- **Reserved (8 bits):** Trailing reserved byte in the base header, zeroed on transmission and ignored on receipt.
+
+Notice how `Opt Len` and `C` work together to protect fast-path receivers. An endpoint that only needs the VNI and inner packet can jump straight over `Opt Len * 4` bytes whenever `C=0`. The moment `C=1` appears on the wire, that shortcut is forbidden: the endpoint must walk the TLV chain or drop the packet.
+
+## TLV options and the critical bit
+
+When `Opt Len` is non-zero, the bytes immediately after the 8-byte base header consist of one or more Type-Length-Value (TLV) options. Each option is aligned to a 4-byte boundary and begins with a 4-byte option header.
+
+```text
+ 0                   1                   2                   3
+ 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|          Option Class         |      Type     |R|R|R| Length  |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                                                               |
+~                  Variable-Length Option Data                  ~
+|                                                               |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+```
+
+The four fields of a Geneve option are defined as follows:
+
+- **Option Class (16 bits):** Namespace identifying the organisation or standard that defines the option's `Type` values. Managed in the IANA "Geneve Option Class" registry.
+- **Type (8 bits):** Option identifier within the given `Option Class`. The **high-order bit (bit 0 in network bit order, mask `0x80`) is the critical bit** for that individual option. For example, within a class, type `0x05` is non-critical, whereas type `0x85` is critical.
+- **R (3 bits):** Reserved bits within the option header, set to zero by senders and ignored by receivers.
+- **Length (5 bits):** Length of the `Option Data` in 4-byte words, **excluding** the 4-byte option header. Because `Length` is 5 bits (`0` to `31`), an option carries `0` to `124` bytes of data, giving a total option size of `4` to `128` bytes.
+
+An endpoint walking the TLV chain must enforce three strict invariants:
+
+1. **Base `C` bit consistency:** If any option in the packet has its Type high-order bit set (`Type & 0x80 != 0`), the sender **MUST** set the base header `C` bit to `1`.
+2. **Unknown critical option drop:** If a receiving endpoint encounters an option it does not understand and that option's critical bit is set, the endpoint **MUST** drop the packet. If the unknown option is non-critical (`Type & 0x80 == 0`), the endpoint ignores it and continues parsing the next option.
+3. **Total length match:** The sum of all parsed option lengths (each `4 + Length * 4` bytes) must equal `Opt Len * 4`. If the option chain ends early, overruns `Opt Len * 4`, or leaves trailing bytes, the header is malformed and an endpoint that processes options **MUST** silently drop the packet.
+
+In hardware-accelerated endpoints (such as SmartNICs or switch ASICs), the silicon fast path might not implement full TLV parsing. RFC 8926 notes that the drop requirement for unknown critical options applies to the **endpoint system as a whole**: an ASIC may punt packets with `C=1` or unfamiliar options to a CPU slow path, and it is acceptable for that CPU path to perform the final parse and drop decision. What is never acceptable is silently forwarding the inner payload when an unrecognised critical option is present.
+
+## Transit neutrality: what the underlay must ignore
+
+Overlay networks fail operationally when intermediate routers start acting like tunnel endpoints. A transit router sits on the underlay path between tunnel endpoints; its only job is to forward outer IP packets toward the destination VTEP IP.
+
+RFC 8926 is explicit about what transit devices **MUST NOT** do:
+
+- Transit devices **MUST NOT** drop packets because of unknown Geneve options, even when the critical bit (`C`) or an option's critical bit is set.
+- Transit devices **MUST NOT** modify option contents or reorder options.
+- Transit devices **MUST NOT** vary forwarding or ECMP path selection based on `Opt Len`.
+- Transit devices **MUST NOT** interpret the `O` bit or change forwarding behaviour for control packets.
+- Transit devices **MUST NOT** drop packets with an unknown Geneve `Ver`; to transit, it is just an outer IP/UDP packet.
+
+| Field or Condition | Receiving Tunnel Endpoint | Transit Underlay Router |
+| :--- | :--- | :--- |
+| Unknown `Ver` (`!= 0`) | **MUST** drop | Forward as opaque UDP; do not drop |
+| `Opt Len` exceeds capability | **MUST** drop | Forward; ECMP/forwarding independent of `Opt Len` |
+| `O` bit set (`1`) | **MUST NOT** forward payload to tenant | Ignore; forward normally |
+| `C` bit set (`1`), cannot parse options | **MUST** drop | Ignore; do **NOT** drop |
+| `C` bit clear (`0`), skips options | **MAY** strip options using `Opt Len` | Ignore; forward normally |
+| Unknown option with critical bit set | **MUST** drop | Ignore; do **NOT** drop or modify |
+| Unknown option without critical bit | Ignore and continue parsing | Ignore; do **NOT** drop or modify |
+| Sum of option lengths `!= Opt Len * 4` | **MUST** silently drop (if processing options) | Ignore; do not parse options |
+| Unserved VNI | Drop | Ignore |
+
+This separation is what makes Geneve deployable over existing IP Clos fabrics. You can roll out a new option class between two hypervisors or container hosts without upgrading every leaf and spine switch in the middle, provided the underlay switches treat UDP port `6081` as ordinary ECMP-eligible traffic.
+
+## Entropy, UDP checksums, and MTU math
+
+### Outer source port entropy
+
+Because all Geneve packets target UDP destination port `6081` and travel between a relatively small number of VTEP IP addresses, ECMP hashing on `(outer src IP, outer dst IP, proto=UDP, dst port=6081)` alone would pin all tenant flows between two hosts onto a single underlay link.
+
+To spread tenant flows across parallel underlay paths, RFC 8926 Section 3.3 specifies that the outer UDP source port **SHOULD** be derived from a hash of the inner packet headers (such as inner protocol, addresses, and ports), and **MAY** use the entire 16-bit port range. When encapsulating over IPv6, the outer IPv6 Flow Label may also carry flow entropy.
+
+Two operational properties matter for that hash:
+
+1. **Stability per flow:** All packets belonging to the same inner 5-tuple must map to the same outer UDP source port so that underlay ECMP does not reorder packets within a TCP or QUIC stream.
+2. **Spread across flows:** Distinct inner flows between the same pair of VTEPs should land on distinct outer source ports so underlay switches distribute load evenly.
+
+Receiving endpoints do not inspect the outer source port for demultiplexing; they key on destination port `6081` and the Geneve VNI.
+
+### UDP checksums
+
+RFC 8926 Section 3.3 says the outer UDP checksum **SHOULD** be used to protect the Geneve header, options and payload, and that it **MUST** be generated by default as specified in RFC 768. A receiving endpoint **MUST** validate any non-zero UDP checksum and drop the packet if it is wrong. Under certain conditions the checksum **MAY** be zero; Section 4.3 discusses when. The lab's endpoints use ordinary kernel UDP sockets, so every outer packet carried a kernel-computed checksum.
+
+Zero UDP checksums (`0x0000`) are permitted in IPv4, though discouraged because they leave the outer IP/UDP/Geneve headers unprotected against silent corruption. Over IPv6, IPv6 headers have no IP-layer header checksum; RFC 8926 Section 4.3.1 references the strict conditions of RFC 6935 and RFC 6936 for any deployment that attempts zero UDP checksums over IPv6. In practice, leaving UDP checksum generation enabled (and offloaded to the NIC) is the safest default.
+
+### MTU and header budget
+
+Every byte of outer header and every TLV option eats directly into the inner payload MTU. On a standard 1500-byte IPv4 underlay (with no outer IP options):
+
+$$\text{Inner MTU} = 1500 - 20\text{ (outer IPv4)} - 8\text{ (outer UDP)} - 8\text{ (Geneve base)} - \text{option bytes}$$
+
+If the Geneve `Protocol Type` is `0x6558` (Transparent Ethernet Bridging), the inner Ethernet header consumes another 14 bytes (18 bytes if 802.1Q tagged) from the inner IP MTU. If the `Protocol Type` is `0x0800` or `0x86DD` (raw Layer 3 IPv4 or IPv6), those 14 bytes are saved.
+
+| Geneve Header Configuration | Total Geneve Header | Outer Overhead (IPv4 + UDP + Geneve) | Inner L3 MTU (`0x0800`/`0x86DD`) | Inner L3 MTU (`0x6558` Ethernet) |
+| :--- | :--- | :--- | :--- | :--- |
+| Plain (`Opt Len = 0`, 0 B options) | `8` bytes | `36` bytes | `1464` bytes | `1450` bytes |
+| One 4-byte option (`Opt Len = 2`, 8 B options) | `16` bytes | `44` bytes | `1456` bytes | `1442` bytes |
+| Two 4-byte options (`Opt Len = 4`, 16 B options) | `24` bytes | `52` bytes | `1448` bytes | `1434` bytes |
+| Maximum options (`Opt Len = 63`, 252 B options) | `260` bytes | `288` bytes | `1212` bytes | `1198` bytes |
+
+Notice how quickly maximum options shrink a 1500-byte underlay: 252 bytes of options leave only 1212 bytes for an IPv4 packet (or 1198 bytes inside Ethernet), which is even tighter than IPv6's 1280-byte minimum MTU. Production Geneve fabrics that carry options almost always run jumbo frames (such as 9000-byte underlay MTU) to avoid inner fragmentation.
+
+## Who uses which option class
+
+IANA maintains the official **Geneve Option Class** registry under `nvo3` (`https://www.iana.org/assignments/nvo3/nvo3.xhtml`). Each 16-bit Option Class gives its assignee 256 option `Type` values (`0x00`–`0x7F` non-critical, `0x80`–`0xFF` critical).
+
+| Option Class | Assignee / Purpose |
+| :--- | :--- |
+| `0x0000`–`0x00FF` | Unassigned |
+| `0x0100` | Linux |
+| `0x0101` | Open vSwitch |
+| `0x0102` | OVN (Open Virtual Network) |
+| `0x0103` | In-band Network Telemetry (INT) |
+| `0x0104` | VMware |
+| `0x0105`, `0x0108`–`0x0110` | Amazon |
+| `0x0106`, `0x0130`–`0x0131` | Cisco |
+| `0x014B` | Cilium |
+| `0xFF00`–`0xFFFF` | Reserved for Experimental Use |
+
+On Linux hosts with the kernel `geneve` module loaded, you create a Geneve interface with `ip link` (from `ip-link(8)`, not run):
+
+```text
+ip link add gnv0 type geneve id 5001 remote 10.0.2.1
+```
+
+In kernel `external` (metadata) mode, `lwtunnel` and `tc` rules attach or inspect TLV options dynamically per packet. When a kernel build omits the `geneve` module—or when you want to inspect and test malformed headers, unknown critical options, and mismatched `Opt Len` values that a kernel driver would refuse to emit—a user-space endpoint attached to a `TUN` device gives you complete control over every bit on the wire.
+
+## The lab
+
+This lab runs on Linux 6.12.94 with Python 3.13.5 inside isolated network namespaces (`unshare -rnm`) using a three-node topology: `L --10.0.1.0/24-- T --10.0.2.0/24-- R`. Node `T` is a plain IPv4 transit router tapping its egress interface with a `TPACKET` ring to observe every packet on the wire without touching the Geneve header. Nodes `L` and `R` run user-space Geneve endpoints over `TUN` interfaces named `gnv0` (`192.168.10.0/24`), encapsulating raw IPv4 payloads (`Protocol Type 0x0800`) to UDP port `6081` with VNI `5001`, outer source port `49152 + crc32(inner proto, addresses, ports) mod 16384`, and `gnv0` MTU computed dynamically as `1500 - 20 - 8 - 8 - option_bytes`. Receiver `R` is configured to understand only option class `0xFF00`, type `0x01`, and the inner workload sends 100-byte UDP echo payloads.
+
+```{.python filename="geneve-lab.py"}
+#!/usr/bin/env python3
+"""A user-space Geneve tunnel (RFC 8926) over a real routed underlay.
+Run: unshare -rnm python3 geneve-lab.py      (no root, no packages)
+L --(10.0.1.0/24)-- T --(10.0.2.0/24)-- R. L and R are tunnel endpoints:
+each owns a TUN device (inner 192.168.10.0/24) and a UDP socket on port 6081.
+T is a plain router that also taps the wire."""
+import fcntl, json, os, select, signal, socket, struct, subprocess, sys, time, zlib
+
+SELF = os.path.abspath(__file__)
+PORT, VNI = 6081, 5001
+KNOWN = {(0xFF00, 0x01)}                    # options this receiver understands
+TUNSETIFF, IFF_TUN, IFF_NO_PI = 0x400454CA, 0x0001, 0x1000
+
+def sh(cmd, check=True):
+    r = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+    if check and r.returncode:
+        raise SystemExit(f'FAILED: {cmd}\n{r.stderr}')
+    return (r.stdout + r.stderr).strip()
+
+def build():
+    sh('mount -t tmpfs none /run && mkdir -p /run/netns')
+    for ns in ('L', 'T', 'R'):
+        sh(f'ip netns add {ns}; ip -n {ns} link set lo up')
+    sh('ip link add l-t type veth peer name t-l; ip link add t-r type veth peer name r-t')
+    sh('ip link set l-t netns L; ip link set t-l netns T; ip link set t-r netns T; ip link set r-t netns R')
+    for ns, d, a in (('L', 'l-t', '10.0.1.1/24'), ('T', 't-l', '10.0.1.254/24'),
+                     ('T', 't-r', '10.0.2.254/24'), ('R', 'r-t', '10.0.2.1/24')):
+        sh(f'ip -n {ns} addr add {a} dev {d}; ip -n {ns} link set {d} up')
+    sh('ip -n L route add default via 10.0.1.254; ip -n R route add default via 10.0.2.254')
+    sh('ip netns exec T sh -c "echo 1 > /proc/sys/net/ipv4/ip_forward"')
+
+# ---------------- Geneve encoding ----------------
+def opt(cls, typ, data=b''):
+    assert len(data) % 4 == 0 and len(data) <= 124
+    return struct.pack('!HBB', cls, typ, len(data) // 4) + data
+
+def geneve(inner, vni=VNI, opts=b'', ver=0, crit=None, optlen=None, oam=0, proto=0x0800):
+    if crit is None:                         # C bit: set if any option has its critical bit set
+        crit, i = 0, 0
+        while i < len(opts):
+            crit |= opts[i + 2] >> 7; i += 4 + (opts[i + 3] & 0x1F) * 4
+    ol = len(opts) // 4 if optlen is None else optlen
+    hdr = struct.pack('!BBHI', (ver << 6) | ol, (oam << 7) | (crit << 6), proto, vni << 8)
+    return hdr + opts + inner
+
+def parse(g):
+    b0, b1, proto, v = struct.unpack('!BBHI', g[:8])
+    ver, ol, oam, crit, vni = b0 >> 6, b0 & 0x3F, b1 >> 7, (b1 >> 6) & 1, v >> 8
+    opts, i, end = [], 8, 8 + ol * 4
+    while i < end and i + 4 <= len(g):
+        cls, typ, ln = struct.unpack('!HBB', g[i:i + 4]); ln = (ln & 0x1F) * 4
+        opts.append((cls, typ, g[i + 4:i + 4 + ln])); i += 4 + ln
+    return dict(ver=ver, optlen=ol, oam=oam, crit=crit, proto=proto, vni=vni, opts=opts,
+                consumed=i - 8, payload=g[end:])
+
+def entropy_port(inner):
+    """RFC 8926 3.3: derive the outer source port from the inner flow (here the IPv4 5-tuple)."""
+    ihl = (inner[0] & 0xF) * 4
+    key = inner[9:10] + inner[12:20] + inner[ihl:ihl + 4]
+    return 49152 + zlib.crc32(key) % 16384
+
+# ---------------- tunnel endpoint ----------------
+def endpoint(local, remote, inner_addr, mode):
+    tun = os.open('/dev/net/tun', os.O_RDWR)
+    fcntl.ioctl(tun, TUNSETIFF, struct.pack('16sH', b'gnv0', IFF_TUN | IFF_NO_PI))
+    sh('echo 1 > /proc/sys/net/ipv6/conf/gnv0/disable_ipv6')   # keep IPv6 RS/MLD out of the tunnel
+    sh(f'ip addr add {inner_addr}/24 dev gnv0; ip link set gnv0 mtu {1500 - 20 - 8 - 8 - MODES[mode][1]} up')
+    u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); u.bind((local, PORT))
+    stats = {'encap': 0, 'decap': 0, 'drop': {}}
+    def bye(*_):
+        print(json.dumps(stats)); sys.stdout.flush(); os._exit(0)
+    signal.signal(signal.SIGTERM, bye)
+    while True:
+        r, _, _ = select.select([tun, u], [], [])
+        if tun in r:
+            inner = os.read(tun, 65535)
+            u2 = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            u2.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            u2.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+            u2.bind((local, entropy_port(inner)))
+            u2.sendto(MODES[mode][0](inner), (remote, PORT)); u2.close()
+            stats['encap'] += 1
+        if u in r:
+            g, _ = u.recvfrom(65535)
+            why = check(parse(g), len(g))
+            if why:
+                stats['drop'][why] = stats['drop'].get(why, 0) + 1
+            else:
+                try:
+                    os.write(tun, parse(g)['payload']); stats['decap'] += 1
+                except OSError:
+                    stats['drop']['inner packet rejected by TUN'] = stats['drop'].get('inner packet rejected by TUN', 0) + 1
+
+def check(p, n):
+    """Receiving tunnel endpoint rules from RFC 8926 3.4-3.5."""
+    if p['ver'] != 0: return 'unknown version'
+    if p['vni'] != VNI: return f"unknown VNI {p['vni']}"
+    if p['consumed'] != p['optlen'] * 4: return 'option lengths != Opt Len'
+    for cls, typ, _ in p['opts']:
+        if (cls, typ) not in KNOWN and typ & 0x80: return f'unknown critical option {cls:#06x}/{typ:#04x}'
+    if p['oam']: return 'O bit (control message): payload not forwarded'
+    return None
+
+TAG = opt(0xFF00, 0x01, b'\x00\x00\x00\x2a')               # understood: "tenant 42"
+MODES = {   # name: (encapsulate(inner) -> bytes, option bytes for the MTU)
+    'plain':       (lambda i: geneve(i), 0),
+    'known':       (lambda i: geneve(i, opts=TAG), 8),
+    'noncrit':     (lambda i: geneve(i, opts=TAG + opt(0xFF00, 0x05, b'\xde\xad\xbe\xef')), 16),
+    'crit':        (lambda i: geneve(i, opts=TAG + opt(0xFF00, 0x85, b'\xde\xad\xbe\xef')), 16),
+    'badlen':      (lambda i: geneve(i, opts=TAG, optlen=1), 8),
+    'ver1':        (lambda i: geneve(i, ver=1), 0),
+    'othervni':    (lambda i: geneve(i, vni=5002), 0),
+    'oam':         (lambda i: geneve(i, oam=1), 0),
+    'max':         (lambda i: geneve(i, opts=opt(0xFF00, 0x01, b'\0' * 124) + opt(0xFF00, 0x01, b'\0' * 120)), 252),
+}
+
+# ---------------- transit tap (TPACKET ring, copies at capture time) ----------------
+def tap(ifname, seconds):
+    import mmap
+    sk = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(3))   # ETH_P_ALL: needed to see transmitted frames
+    sk.setsockopt(263, 10, 1)                                   # PACKET_VERSION = TPACKET_V2
+    sk.setsockopt(263, 5, struct.pack('IIII', 4096, 128, 4096, 128))   # PACKET_RX_RING
+    ring = mmap.mmap(sk.fileno(), 4096 * 128); sk.bind((ifname, 0))
+    end, i, seen = time.time() + float(seconds), 0, []
+    while time.time() < end:
+        b = i * 4096
+        if not struct.unpack_from('I', ring, b)[0] & 1:
+            time.sleep(0.01); continue
+        _, _, snap, mac = struct.unpack_from('IIIH', ring, b)
+        if ring[b + 32 + 10] == socket.PACKET_OUTGOING:
+            f = bytes(ring[b + mac:b + mac + snap]); ip = f[14:]
+            if f[12:14] == b'\x08\x00' and ip[9] == 17 and struct.unpack('!H', ip[22:24])[0] == PORT:
+                sport = struct.unpack('!H', ip[20:22])[0]; p = parse(ip[28:])
+                o = ','.join(f'{c:#06x}/{t:#04x}/{len(d)}B' for c, t, d in p['opts']) or '-'
+                s = (f"{socket.inet_ntoa(ip[12:16])}:{sport} > {socket.inet_ntoa(ip[16:20])}:6081 len {struct.unpack('!H', ip[2:4])[0]} "
+                     f"| ver {p['ver']} optlen {p['optlen']} O {p['oam']} C {p['crit']} proto {p['proto']:#06x} vni {p['vni']} opts {o}")
+                if s not in seen: seen.append(s)
+        struct.pack_into('I', ring, b, 0); i = (i + 1) % 128
+    print('\n'.join(seen))
+
+def echo():
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    for _ in range(50):                      # wait for the endpoint to configure gnv0
+        try:
+            s.bind(('192.168.10.2', 7)); break
+        except OSError:
+            time.sleep(0.1)
+    while True:
+        d, a = s.recvfrom(9000); s.sendto(d, a)
+
+def client(n, size, sport0):
+    ok = 0
+    for k in range(int(n)):
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.settimeout(0.5)
+        s.bind(('192.168.10.1', int(sport0) + k))
+        try:
+            s.sendto(b'x' * int(size), ('192.168.10.2', 7)); s.recvfrom(9000); ok += 1
+        except socket.timeout:
+            pass
+        except OSError as e:
+            print(f'send {size} B: {e.strerror}'); break
+    print(f'{ok}/{n} echoed')
+
+def nsx(ns, *a, bg=False):
+    c = ['ip', 'netns', 'exec', ns, sys.executable, SELF, *a]
+    return subprocess.Popen(c, stdout=subprocess.PIPE, text=True) if bg else subprocess.run(c, capture_output=True, text=True).stdout.strip()
+
+def scenario(title, mode, n=3, size=100, taps=True):
+    print(f'\n== {title}')
+    L = nsx('L', 'endpoint', '10.0.1.1', '10.0.2.1', '192.168.10.1', mode, bg=True)
+    R = nsx('R', 'endpoint', '10.0.2.1', '10.0.1.1', '192.168.10.2', 'plain', bg=True)
+    time.sleep(0.8)
+    E = nsx('R', 'echo', bg=True)
+    t = nsx('T', 'tap', 't-r', '2', bg=True) if taps else None
+    time.sleep(0.3)
+    print('L# ' + nsx('L', 'client', str(n), str(size), '40000'))
+    if t: print('T saw (towards R):\n  ' + t.communicate()[0].strip().replace('\n', '\n  '))
+    for p in (L, R): p.terminate()
+    st = {k: json.loads(p.communicate()[0]) for k, p in (('L', L), ('R', R))}
+    print(f"R endpoint: decap {st['R']['decap']} encap {st['R']['encap']} drops {st['R']['drop'] or '{}'}")
+    E.kill()
+    return st
+
+def main():
+    build()
+    print('kernel', os.uname().release, '| Python', sys.version.split()[0])
+    scenario('1. No options', 'plain')
+    scenario('2. One option R understands (class 0xff00, type 0x01)', 'known')
+    scenario('3. Plus an unknown NON-critical option (type 0x05)', 'noncrit')
+    scenario('4. Plus an unknown CRITICAL option (type 0x85)', 'crit')
+    scenario('5. Opt Len says 1 word, but the option is 2 words', 'badlen', taps=False)
+    scenario('6. Version 1', 'ver1', taps=False)
+    scenario('7. VNI 5002, which R does not serve', 'othervni', taps=False)
+    scenario('8. O bit set (control message)', 'oam', taps=False)
+    scenario('9. Entropy: four inner flows, outer source port follows the inner 5-tuple', 'plain', n=4)
+    print('\n== 10. Header budget and inner MTU on a 1500-byte IPv4 underlay')
+    for m in ('plain', 'known', 'crit', 'max'):
+        g = MODES[m][0](b'\x45' + b'\0' * 19)
+        print(f'  {m:8} Geneve header {len(g) - 20:3d} B -> inner MTU {1500 - 20 - 8 - (len(g) - 20)}')
+    scenario('11. A 1500-byte inner UDP datagram, gnv0 MTU 1464: the sender fragments it', 'plain', n=1, size=1500, taps=False)
+
+if __name__ == '__main__':
+    a = sys.argv[1:]
+    if not a: main()
+    elif a[0] == 'endpoint': endpoint(*a[1:5])
+    elif a[0] == 'tap': tap(*a[1:3])
+    elif a[0] == 'echo': echo()
+    elif a[0] == 'client': client(*a[1:4])
+```
+No root, no packages and no kernel Geneve module: the endpoints are user-space Python processes that read and write TUN devices and speak Geneve over real UDP sockets across a routed underlay. Output from Linux 6.12, Python 3.13.5 (a real run, unedited):
+
+```text
+$ unshare -rnm python3 geneve-lab.py
+kernel 6.12.94+ | Python 3.13.5
+
+== 1. No options
+L# 3/3 echoed
+T saw (towards R):
+  10.0.1.1:53773 > 10.0.2.1:6081 len 164 | ver 0 optlen 0 O 0 C 0 proto 0x0800 vni 5001 opts -
+  10.0.1.1:63546 > 10.0.2.1:6081 len 164 | ver 0 optlen 0 O 0 C 0 proto 0x0800 vni 5001 opts -
+  10.0.1.1:50787 > 10.0.2.1:6081 len 164 | ver 0 optlen 0 O 0 C 0 proto 0x0800 vni 5001 opts -
+R endpoint: decap 3 encap 3 drops {}
+
+== 2. One option R understands (class 0xff00, type 0x01)
+L# 3/3 echoed
+T saw (towards R):
+  10.0.1.1:53773 > 10.0.2.1:6081 len 172 | ver 0 optlen 2 O 0 C 0 proto 0x0800 vni 5001 opts 0xff00/0x01/4B
+  10.0.1.1:63546 > 10.0.2.1:6081 len 172 | ver 0 optlen 2 O 0 C 0 proto 0x0800 vni 5001 opts 0xff00/0x01/4B
+  10.0.1.1:50787 > 10.0.2.1:6081 len 172 | ver 0 optlen 2 O 0 C 0 proto 0x0800 vni 5001 opts 0xff00/0x01/4B
+R endpoint: decap 3 encap 3 drops {}
+
+== 3. Plus an unknown NON-critical option (type 0x05)
+L# 3/3 echoed
+T saw (towards R):
+  10.0.1.1:53773 > 10.0.2.1:6081 len 180 | ver 0 optlen 4 O 0 C 0 proto 0x0800 vni 5001 opts 0xff00/0x01/4B,0xff00/0x05/4B
+  10.0.1.1:63546 > 10.0.2.1:6081 len 180 | ver 0 optlen 4 O 0 C 0 proto 0x0800 vni 5001 opts 0xff00/0x01/4B,0xff00/0x05/4B
+  10.0.1.1:50787 > 10.0.2.1:6081 len 180 | ver 0 optlen 4 O 0 C 0 proto 0x0800 vni 5001 opts 0xff00/0x01/4B,0xff00/0x05/4B
+R endpoint: decap 3 encap 3 drops {}
+
+== 4. Plus an unknown CRITICAL option (type 0x85)
+L# 0/3 echoed
+T saw (towards R):
+  10.0.1.1:53773 > 10.0.2.1:6081 len 180 | ver 0 optlen 4 O 0 C 1 proto 0x0800 vni 5001 opts 0xff00/0x01/4B,0xff00/0x85/4B
+  10.0.1.1:63546 > 10.0.2.1:6081 len 180 | ver 0 optlen 4 O 0 C 1 proto 0x0800 vni 5001 opts 0xff00/0x01/4B,0xff00/0x85/4B
+  10.0.1.1:50787 > 10.0.2.1:6081 len 180 | ver 0 optlen 4 O 0 C 1 proto 0x0800 vni 5001 opts 0xff00/0x01/4B,0xff00/0x85/4B
+R endpoint: decap 0 encap 0 drops {'unknown critical option 0xff00/0x85': 3}
+
+== 5. Opt Len says 1 word, but the option is 2 words
+L# 0/3 echoed
+R endpoint: decap 0 encap 0 drops {'option lengths != Opt Len': 3}
+
+== 6. Version 1
+L# 0/3 echoed
+R endpoint: decap 0 encap 0 drops {'unknown version': 3}
+
+== 7. VNI 5002, which R does not serve
+L# 0/3 echoed
+R endpoint: decap 0 encap 0 drops {'unknown VNI 5002': 3}
+
+== 8. O bit set (control message)
+L# 0/3 echoed
+R endpoint: decap 0 encap 0 drops {'O bit (control message): payload not forwarded': 3}
+
+== 9. Entropy: four inner flows, outer source port follows the inner 5-tuple
+L# 4/4 echoed
+T saw (towards R):
+  10.0.1.1:53773 > 10.0.2.1:6081 len 164 | ver 0 optlen 0 O 0 C 0 proto 0x0800 vni 5001 opts -
+  10.0.1.1:63546 > 10.0.2.1:6081 len 164 | ver 0 optlen 0 O 0 C 0 proto 0x0800 vni 5001 opts -
+  10.0.1.1:50787 > 10.0.2.1:6081 len 164 | ver 0 optlen 0 O 0 C 0 proto 0x0800 vni 5001 opts -
+  10.0.1.1:60500 > 10.0.2.1:6081 len 164 | ver 0 optlen 0 O 0 C 0 proto 0x0800 vni 5001 opts -
+R endpoint: decap 4 encap 4 drops {}
+
+== 10. Header budget and inner MTU on a 1500-byte IPv4 underlay
+  plain    Geneve header   8 B -> inner MTU 1464
+  known    Geneve header  16 B -> inner MTU 1456
+  crit     Geneve header  24 B -> inner MTU 1448
+  max      Geneve header 260 B -> inner MTU 1212
+
+== 11. A 1500-byte inner UDP datagram, gnv0 MTU 1464: the sender fragments it
+L# 1/1 echoed
+R endpoint: decap 2 encap 2 drops {}
+```
+
+Walk through what the 11 lab scenarios demonstrate on the wire and at the receiver:
+
+1. **Baseline (no options):** Three echo packets succeed (`3/3`). Transit `T` sees `10.0.1.1:53773 > 10.0.2.1:6081 len 164 | ver 0 optlen 0 O 0 C 0 proto 0x0800 vni 5001`. Three distinct inner flows produce outer source ports `53773`, `63546`, and `50787`.
+2. **Known option (`0xff00/0x01`, 4 bytes data):** Total packet length grows by 8 bytes to `172`, `optlen` becomes `2` (two 4-byte words: 4-byte option header + 4-byte data), and `3/3` echoes succeed.
+3. **Plus unknown non-critical option (`0xff00/0x05`):** Total length grows to `180`, `optlen` is `4`, and `C` remains `0`. Receiver `R` ignores the unknown non-critical option and forwards all `3/3` inner packets.
+4. **Plus unknown critical option (`0xff00/0x85`):** Because type `0x85` has its high-order critical bit set, `L` sets `C=1` on the wire. Transit `T` forwards all three packets untouched, while `R` drops all `3` with `unknown critical option 0xff00/0x85` (`0/3` echoed).
+5. **Malformed `Opt Len` mismatch:** `L` sends `Opt Len = 1` word while encoding a 2-word option. Receiver `R` detects `option lengths != Opt Len` and silently drops all `3` packets.
+6. **Unknown version (`Ver = 1`):** `R` drops all `3` packets with `unknown version`.
+7. **Unserved VNI (`5002`):** `R` only serves VNI `5001`, so it drops all `3` packets.
+8. **Control packet (`O = 1`):** `R` recognises the `O` bit and drops all `3` packets rather than forwarding the payload into `gnv0`.
+9. **Stable flow-hash entropy:** Sending four inner flows (inner source ports `40000`–`40003`) yields outer source ports `53773`, `63546`, `50787`, and `60500`. Notice that the first three flows map to the exact same outer source ports as in scenario 1—proving the hash is deterministic per flow.
+10. **Header budget on a 1500-byte IPv4 underlay:** Plain 8-byte header yields `gnv0` MTU `1464`; one 4-byte option (16-byte Geneve header) yields `1456`; two 4-byte options (24-byte header) yield `1448`; maximum options (252 bytes, 260-byte header) drop `gnv0` MTU to `1212`. With an Ethernet payload (`0x6558`), subtract another 14 bytes for the inner Ethernet header.
+11. **Inner fragmentation:** Sending a 1500-byte inner UDP datagram across `gnv0` with MTU `1464` causes the sender's IP stack to fragment the inner packet into 2 IPv4 fragments before encapsulation. Both fragments are tunnelled independently, `R` decapsulates `2` packets, the receiver reassembles them, and the echo succeeds.
+
+## Gotchas
+
+### The trap: options quietly eat your MTU
+
+Adding a few 4-byte TLV options feels free until a TCP session stalls or a path MTU discovery blackhole appears. Two 8-byte options shrink an IPv4 underlay's inner L3 MTU from `1464` to `1448` bytes; 252 bytes of options shrink it to `1212` bytes (`1198` bytes inside Ethernet). If the control plane turns on a new telemetry or security option after deployment without recalculating interface MTUs or enabling jumbo frames on the underlay, packets that previously fit will suddenly fragment or drop.
+
+### The trap: transit "helpful" filtering on the `C` bit
+
+Security appliances, ACLs, or programmable switches in the underlay sometimes try to inspect Geneve headers and drop packets when `C=1` or when they see unfamiliar options. That violates RFC 8926. Transit devices have no business parsing TLV options or dropping on `C`; only the destination tunnel endpoint knows which option classes it supports.
+
+### The trap: ECMP hashing that depends on `Opt Len`
+
+Underlay switches that attempt deep-packet inspection past the outer UDP header to hash on inner headers will break if they assume a fixed 8-byte shim like VXLAN. If a switch reads bytes `8..20` after UDP assuming an inner Ethernet or IP header, any Geneve packet with `Opt Len > 0` feeds TLV option bytes into the hash—or worse, causes the switch to misread `Opt Len` and hash inconsistently. Keep transit ECMP strictly on the outer 5-tuple (and IPv6 Flow Label if used).
+
+### The trap: fixed-header NIC offloads and middleboxes
+
+Older NICs and middleboxes built for VXLAN often hardcode an 8-byte overlay offset for checksum offload or inner RSS/GRO. When Geneve packets carry options (`Opt Len > 0`), those offloads either disable themselves—forcing single-core CPU processing—or compute offsets relative to the wrong byte boundary. Verify NIC Geneve option-length support before enabling variable options at line rate.
+
+### The trap: experimental option classes leaking across domains
+
+Option classes `0xFF00`–`0xFFFF` are reserved by IANA for experimental use. Two different teams or vendors can pick `0xFF00` for completely incompatible formats. Never allow experimental option classes to cross administrative boundaries; strip or block them at domain borders, and register or use an assigned IANA Option Class for anything that leaves a lab.
+
+### The trap: marking non-critical hints as critical (or vice versa)
+
+Setting the critical bit (`Type & 0x80`) on an optional telemetry hint guarantees that any endpoint lacking that telemetry parser will drop production traffic. Conversely, clearing the critical bit on a mandatory security policy or tenant-isolation tag lets an older endpoint strip `Opt Len` and forward traffic without enforcing the policy. Use critical options only when silent skipping would violate correctness or security.
+
+### The trap: VXLAN vs Geneve port confusion in firewalls
+
+Underlay firewalls and host `iptables`/`nftables` rules built by muscle memory often permit UDP `4789` (VXLAN) and forget UDP `6081` (Geneve). Because outer packets still carry valid IP headers, `traceroute` and `ping` between VTEP IPs succeed while all overlay traffic silently dies at the stateless ACL.
+
+### The trap: zero UDP checksums over IPv6
+
+Sending `checksum = 0` over IPv4 is tolerated (though discouraged), but over IPv6 an outer UDP zero checksum leaves the outer destination IP, outer ports, and Geneve header completely unverified against bit flips. Unless your deployment explicitly satisfies the narrow tunnel-endpoint and middlebox conditions in RFC 6935 and RFC 6936 (referenced by RFC 8926 Section 4.3.1), keep outer UDP checksums enabled.
+
+### The trap: narrow hash entropy port ranges
+
+If your VTEP hashes all inner flows into a tiny bucket of outer source ports—or worse, uses a static source port like `6081`—underlay ECMP collapses onto one physical path per VTEP pair. Hash the full inner flow tuple across a wide 16-bit ephemeral or full 16-bit range, and verify that distinct inner flows land on distinct outer source ports.
+
+### The trap: inner fragmentation vs outer DF
+
+When an inner packet exceeds the overlay MTU, fragmenting **before** encapsulation (inner IPv4 fragmentation, as in scenario 11) keeps outer packets under the underlay MTU and avoids underlay fragmentation. If you instead fragment the **outer** UDP packet, every outer fragment except the first lacks the outer UDP header and the Geneve header—breaking stateless firewalls and outer ECMP hashing.
+
+### The trap: exceeding a peer's option-length capability
+
+RFC 8926 Section 3.5.1 warns that an endpoint **MUST** drop a packet if `Opt Len` exceeds its processing capability. Because hardware switches and SmartNICs often cap the total Geneve header size they can parse in silicon, the control plane must know or negotiate each peer's maximum supported `Opt Len` before pushing long option chains.
+
+## The boring rule
+
+Keep transit switches dumb about overlays: hash on the outer 5-tuple, never inspect `C` or `Opt Len`, and push all option validation to the tunnel endpoints where it belongs.
+
+## Exercises
+
+1. **Encapsulate native IPv6 (`0x86DD`):** Extend a user-space Geneve sender and receiver to carry raw IPv6 packets using `Protocol Type 0x86DD`. Verify that the outer UDP source port hash incorporates the IPv6 addresses and Flow Label or L4 ports, and measure the resulting inner MTU on a 1500-byte IPv4 underlay with `Opt Len = 0` and `Opt Len = 4`.
+2. **Implement `C=0` option stripping:** Modify a receiver so that when `C=0` and `Opt Len > 0`, it skips `Opt Len * 4` bytes without parsing individual TLVs, then test it against both a valid non-critical option and a packet with `C=1`. Confirm it forwards the `C=0` packet and drops the `C=1` packet.
+3. **Enforce outer UDP checksum validation:** Add outer UDP checksum generation (RFC 0768) and strict receiver validation over IPv4. Flip a single bit in the Geneve `VNI` field on the transit node `T` and confirm the receiver drops the packet on checksum failure before touching the VNI table.
+4. **Construct an OVN-style TLV header by hand:** Given IANA Option Class `0x0102` (OVN), a non-critical option type `0x01`, and 4 bytes of option data (`0x00010002`), write out the exact 16-byte Geneve header in hexadecimal (base header + TLV option) for `Ver=0`, `O=0`, `Protocol Type 0x6558`, and `VNI 100`. Repeat the exercise with the option's critical bit set (`0x81`).
+5. **Measure entropy spread across 1,000 flows:** Generate 1,000 distinct inner 5-tuples and compute `49152 + crc32(tuple) % 16384`. Plot or tabulate how many flows collide on the same outer source port and how evenly they distribute across 8 modulo-8 ECMP buckets.
+6. **Diagnose a silent `Opt Len` mismatch:** You capture a Geneve packet on the wire with `Opt Len = 3` (12 bytes of options), containing two TLV options whose `Length` fields are `0` and `1` (4 bytes and 8 bytes respectively, total 12 bytes). Another capture shows `Opt Len = 3` with two options whose `Length` fields are `1` and `1` (8 bytes and 8 bytes, total 16 bytes). Explain what a compliant endpoint must do with each packet and why a transit router will forward both.
+
+## Sources
+
+- [RFC 8926: Geneve: Generic Network Virtualization Encapsulation](https://www.rfc-editor.org/rfc/rfc8926)
+- [RFC 7348: Virtual eXtensible Local Area Network (VXLAN)](https://www.rfc-editor.org/rfc/rfc7348)
+- [RFC 0768: User Datagram Protocol](https://www.rfc-editor.org/rfc/rfc768)
+- [RFC 6935: IPv6 and UDP Checksums for Tunneled Packets](https://www.rfc-editor.org/rfc/rfc6935)
+- [RFC 6936: Applicability Statement for the Use of IPv6 UDP Datagrams with Zero Checksums](https://www.rfc-editor.org/rfc/rfc6936)
+- [IANA Network Virtualization Overlays (NVO3) / Geneve Option Class Registry](https://www.iana.org/assignments/nvo3/nvo3.xhtml)
+- [ip-link(8) — Linux manual page](https://man7.org/linux/man-pages/man8/ip-link.8.html)
