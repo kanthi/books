@@ -1,0 +1,686 @@
+---
+title: "Syslog on the Wire: RFC 3164 vs 5424, UDP Limits, TCP Framing and TLS"
+author:
+  - name: "K19G"
+  - name: "grok-bot"
+---
+
+# Syslog on the Wire: RFC 3164 vs 5424, UDP Limits, TCP Framing and TLS
+
+Most operators treat syslog as a fire-and-forget pipe: point a router or daemon at port 514, open a log viewer, and assume every event lands intact. On the wire, syslog is a loose family of protocols with sharp edges. An unframed UDP datagram has no acknowledgement, no retransmission, and no congestion control. A message that exceeds the path MTU fragments into multiple IP packets, where dropping a single fragment erases the entire log line. Even over TCP, newline-delimited framing splits a multi-line stack trace into bogus records, while a stalled collector can back-pressure the sender if you do not understand how your daemon queues.
+
+The format itself is just as unforgiving. Legacy BSD syslog (RFC 3164) omits the year and the timezone, caps packets at 1024 bytes, and leaves collectors guessing when clocks jump or relays rewrite headers. Modern syslog (RFC 5424) fixes the grammar with RFC 3339 timestamps, explicit field lengths, structured key-value data, and UTF-8 support, yet many application libraries still emit bare `<PRI>message` strings with a trailing NUL byte. Moving to TLS on TCP port 6514 (RFC 5425, updated by RFC 9662) solves confidentiality and authenticity, provided your framing is octet-counted and your certificates survive strict X.509 validation.
+
+As introduced in the Name, Time, and Log Hygiene chapter, a reliable pipeline runs from device or application through a local forwarder to a central collector. This chapter goes beneath that diagram to examine the bytes on the wire, why logs silently disappear, and how to make a collector trustworthy.
+
+## Learning goals
+
+After working through this chapter, you will be able to:
+
+- Decode and compute syslog `PRI` values from facility and severity codes, and spot non-standard sender encodings on the wire.
+- Distinguish RFC 3164, RFC 5424, and bare library payloads in a packet capture, including `STRUCTURED-DATA` escaping rules and field limits.
+- Predict when UDP syslog will fragment, truncate, or drop silently, and verify those drops using Linux `/proc/net/snmp` counters (`Udp RcvbufErrors`, `Udp InErrors`, `Ip ReasmFails`).
+- Explain why newline-delimited TCP framing corrupts multi-line messages and verify octet-counted framing per RFC 6587 and RFC 5425.
+- Configure and troubleshoot syslog over TLS (port 6514) under modern strict X.509 verification rules, including required CA extensions and mutual authentication.
+
+## The PRI field and facility-severity arithmetic
+
+Every syslog message—whether RFC 3164, RFC 5424, or a minimal library emit—begins with a `PRI` part. On the wire, `PRI` is an ASCII decimal integer wrapped in angle brackets (`<` and `>`), occupying 3 to 5 characters (`<0>` through `<191>`). There is no space between the closing `>` and the next field.
+
+The integer inside the brackets is `PRIVAL`, computed as:
+
+```text
+PRIVAL = (Facility * 8) + Severity
+```
+
+Because `Severity` ranges from `0` to `7` (3 bits), multiplying `Facility` by 8 shifts the facility code left by 3 bits and packs both values into a single number. To decode a `PRIVAL` from a packet capture, divide by 8: the quotient is the facility and the remainder is the severity.
+
+| Facility Code | Keyword | Typical Source |
+| :--- | :--- | :--- |
+| `0` | `kern` | Kernel messages |
+| `1` | `user` | User-level messages |
+| `2` | `mail` | Mail system |
+| `3` | `daemon` | System daemons |
+| `4` | `auth` | Security/authorization messages |
+| `5` | `syslog` | Messages generated internally by `syslogd` |
+| `6` | `lpr` | Line printer subsystem |
+| `7` | `news` | Network news subsystem |
+| `8` | `uucp` | UUCP subsystem |
+| `9` | `cron` | Clock daemon |
+| `10` | `authpriv` | Security/authorization messages (private) |
+| `11` | `ftp` | FTP daemon |
+| `12` | `ntp` | NTP subsystem |
+| `13` | `audit` | Log audit |
+| `14` | `alert` | Log alert |
+| `15` | `clock` | Clock daemon (note: 9 and 15 vary by platform) |
+| `16`–`23` | `local0`–`local7` | Locally used facilities (network gear defaults) |
+
+Severities run from `0` (most critical) to `7` (least critical):
+
+| Severity Code | Keyword | Meaning |
+| :--- | :--- | :--- |
+| `0` | `emerg` | System is unusable |
+| `1` | `alert` | Action must be taken immediately |
+| `2` | `crit` | Critical conditions |
+| `3` | `err` | Error conditions |
+| `4` | `warning` | Warning conditions |
+| `5` | `notice` | Normal but significant condition |
+| `6` | `info` | Informational messages |
+| `7` | `debug` | Debug-level messages |
+
+Take a classic network device event: `local4.warning`. `local4` is facility `20`, and `warning` is severity `4`:
+
+```text
+PRIVAL = (20 * 8) + 4 = 164   ->   on the wire: <164>
+```
+
+Similarly, `user.notice` is `(1 * 8) + 5 = 13` (`<13>`), and `local4.notice` is `(20 * 8) + 5 = 165` (`<165>`). Network operating systems often default to `local7` (`23`) or `local4` (`20`) for operational logs, while Linux daemons tend to use `daemon` (`3`) or `authpriv` (`10`). If a collector's filter rules match on facility, you must verify what integer the sender actually puts in `<...>`, because some platforms swap or alias facilities `4`/`10` and `9`/`15`.
+
+## RFC 3164 vs RFC 5424 on the wire
+
+RFC 3164 (published as Informational in 2001, and later obsoleted by RFC 5424) documented the de facto BSD syslog packet format already in the wild. It is minimal and ambiguous by modern standards:
+
+```text
+RFC 3164 Wire Layout (total packet <= 1024 bytes):
+
++-------+------------------+----+----------+----+---------------------+
+|  PRI  |    TIMESTAMP     | SP | HOSTNAME | SP |         MSG         |
++-------+------------------+----+----------+----+---------------------+
+|<164>  |Nov 16 12:10:05   |    |h1        |    |lab: link flap on... |
++-------+------------------+----+----------+----+---------------------+
+  3-5 B   15 B (no year/TZ)  1B              1B   TAG + CONTENT
+```
+
+Three constraints in RFC 3164 cause constant operational friction:
+
+1. **No year and no timezone:** `TIMESTAMP` is `Mmm dd hh:mm:ss` in the sender's local time (with a leading space for single-digit days, e.g., `Nov  6`). When a device logs across midnight on 31 December, or across a Daylight Saving Time fallback, the collector has to guess both the year and the offset.
+2. **Loose `HOSTNAME` and `MSG` boundaries:** `HOSTNAME` should be the hostname without domain or an IPv4/IPv6 address, followed by a space, then `MSG` (often starting with a `TAG` like `lab:` or `sshd[1234]:`). When an uncompliant sender omits the timestamp or hostname, a relay or collector either misparses the first word of the message as a hostname or prepends its own header.
+3. **1024-byte ceiling:** RFC 3164 states the total packet MUST be 1024 bytes or less. Anything longer is either truncated by the sender, truncated by the relay, or rejected by strict parsers.
+
+RFC 5424 (Standards Track, March 2009) replaced that guesswork with a strict ABNF grammar:
+
+```text
+SYSLOG-MSG = HEADER SP STRUCTURED-DATA [SP MSG]
+HEADER     = PRI VERSION SP TIMESTAMP SP HOSTNAME SP APP-NAME SP PROCID SP MSGID
+```
+
+On the wire, the fields look like this:
+
+```text
+RFC 5424 Wire Layout:
+
+<164>1 2026-11-16T12:10:06.477531+05:30 h1 lab - LINK [timeQuality ...] link flap on eth1
+|    | |                                |  |   | |    |                 |
+|    | |                                |  |   | |    |                 +-- MSG (optional, UTF-8)
+|    | |                                |  |   | |    +-- STRUCTURED-DATA (or "-")
+|    | |                                |  |   | +-- MSGID (<= 32 ASCII)
+|    | |                                |  |   +-- PROCID (<= 128 ASCII, "-" = NILVALUE)
+|    | |                                |  +-- APP-NAME (<= 48 ASCII)
+|    | |                                +-- HOSTNAME (<= 255 ASCII)
+|    | +-- TIMESTAMP (RFC 3339, mandatory TZ offset)
+|    +-- VERSION ("1")
++-- PRI
+```
+
+Every header field has an explicit maximum length and a defined `NILVALUE` (`-`) when a value is unknown or inapplicable:
+
+| Field | RFC 3164 | RFC 5424 |
+| :--- | :--- | :--- |
+| `PRI` | `<0>`–`<191>` | `<0>`–`<191>` |
+| `VERSION` | None | `"1"` immediately after `>` |
+| `TIMESTAMP` | `Mmm dd hh:mm:ss` (local, no year/TZ) | RFC 3339 with mandatory TZ (`Z` or `±hh:mm`) |
+| `HOSTNAME` | Unbounded, often omitted | Up to 255 printable US-ASCII chars (or `-`) |
+| `APP-NAME` | Embedded in `MSG` as `TAG` | Up to 48 printable US-ASCII chars (or `-`) |
+| `PROCID` | Embedded in `TAG[pid]` | Up to 128 printable US-ASCII chars (or `-`) |
+| `MSGID` | None | Up to 32 printable US-ASCII chars (or `-`) |
+| `STRUCTURED-DATA` | None | `-` or one or more `[SD-ID k="v" ...]` elements |
+| `MSG` encoding | Unspecified (effectively ASCII) | Free-form; may start with UTF-8 BOM (`EF BB BF`) |
+| Packet/Msg size | MUST be `<= 1024` bytes | Receivers MUST accept 480 octets, SHOULD accept 2048, MAY accept more |
+
+### Structured data and escaping
+
+`STRUCTURED-DATA` lets a sender attach machine-parseable key-value pairs without brittle regexes on `MSG`. Each element is enclosed in square brackets: `[SD-ID param="value" ...]`. Multiple elements are concatenated with no space between `]` and `[`, as in `[timeQuality tzKnown="1" isSynced="0"][ifEvent@32473 ifName="eth1" state="down"]`.
+
+`SD-ID` names come in two flavours:
+
+- **IANA-registered IDs** without an `@`, such as `timeQuality` (carrying `tzKnown` and `isSynced` so a collector knows whether the sender's clock was synchronized when the event fired), `origin`, and `meta`.
+- **Private enterprise IDs** using `name@<PEN>`, where `<PEN>` is an IANA Private Enterprise Number. In documentation and labs, `32473` is the reserved documentation PEN (e.g., `ifEvent@32473`).
+
+Inside `PARAM-VALUE`, three characters are special and MUST be backslash-escaped: `"` (`\"`), `\` (`\\`), and `]` (`\]`). If an unescaped `]` appears inside a parameter value, the parser treats it as the end of the structured-data element and corrupts the rest of the frame.
+
+### Same event, three wire encodings
+
+To see how much senders differ in practice, look at the exact bytes emitted for the identical event—`"link flap on eth1"` at `local4.warning` (`PRI = 164`)—by three common senders in our lab:
+
+1. **`logger --rfc3164` (util-linux 2.41.5):**
+   `b'<164>Nov 16 12:10:05 h1 lab: link flap on eth1'` (46 bytes).
+2. **`logger --rfc5424` with `--msgid LINK` and `--sd-id ifEvent@32473`:**
+   `b'<164>1 2026-11-16T12:10:06.477531+05:30 h1 lab - LINK [timeQuality tzKnown="1" isSynced="0"][ifEvent@32473 ifName="eth1" state="down"] link flap on eth1'` (152 bytes). Notice that `logger` injected `[timeQuality tzKnown="1" isSynced="0"]` on its own; `isSynced="0"` is honest, because the lab namespace runs no time daemon.
+3. **Python `logging.handlers.SysLogHandler`:**
+   `b'<164>link flap on eth1\x00'` (23 bytes). No timestamp, no hostname, no version, and a trailing NUL byte (`\x00`).
+
+A collector expecting RFC 5424 will reject or misclassify the Python payload unless it either normalizes incoming messages on a dedicated port or uses a parser that falls back cleanly.
+
+## UDP transport: ports, MTU, fragmentation, and silent loss
+
+RFC 5426 specifies UDP transport for syslog on destination port `514`. Its design reflects a harsh reality: syslog over UDP has no acknowledgements, no sequence-based retransmission, and no flow control. Once a sender calls `sendto()`, the kernel hands the datagram to the network stack and returns success, regardless of whether the packet survives the path or fits in the collector's receive buffer.
+
+### Size limits, MTU, and IP fragmentation
+
+RFC 5426 sets clear floors and recommendations for message sizes:
+
+- IPv4 receivers MUST accept messages up to **480 octets**; IPv6 receivers MUST accept up to **1180 octets** (reflecting IPv6's 1280-octet minimum link MTU minus headers).
+- All receivers SHOULD accept messages up to **2048 octets**, and MAY accept larger ones.
+- Senders are RECOMMENDED to keep datagrams within the path MTU. When the path MTU is unknown, senders should restrict messages to 480 octets (IPv4) or 1180 octets (IPv6).
+- Senders MUST NOT disable UDP checksums.
+
+Why does path MTU matter so much? On a standard 1500-byte Ethernet link, an IPv4 packet carrying a 1472-byte UDP payload (1500 minus 20-byte IP header and 8-byte UDP header) fits in a single frame. Push a 3000-byte message over UDP, and the sender's IP layer slices it into three IP fragments (for example, 1500, 1500, and 74 bytes total IP length):
+
+```text
+Sender (MTU 1500)                     Network                      Collector
+3006-byte UDP payload
+  |-- Frag 1 (1500 B IP) ---------->  [ OK ]   ------------------> Reassembly
+  |-- Frag 2 (1500 B IP) ---------->  [ DROP ]   X                 buffer
+  |-- Frag 3 (  74 B IP) ---------->  [ OK ]   ------------------> [TIMEOUT!]
+                                                                   Ip ReasmFails +1
+  sendto() returned 3006 bytes!                                    0 messages delivered
+```
+
+Losing *any* single fragment invalidates the entire datagram. Even if all fragments arrive, the collector's kernel must hold them in an IP fragment reassembly cache until the last fragment lands. Under a log burst or a tight reassembly memory limit, the kernel evicts incomplete fragments, increments `Ip ReasmFails` in `/proc/net/snmp`, and delivers zero bytes to the syslog daemon. Meanwhile, the sender has no idea anything went wrong.
+
+Senders also impose their own silent limits. `util-linux` `logger` defaults to a 1 KiB (`-S`/`--size`) message limit; sending a 3000-character message without `-S 4000` silently truncates the payload to 1113 bytes on the wire (header plus 1 KiB of message). RFC 5424 says a transport receiver that gets a message larger than it supports SHOULD truncate (or MAY discard) it, and if it truncates, the truncation MUST occur at the end of the message, so the header and structured data stay parseable. Its security considerations warn that truncation can be misused to hide vital log data, so keep the important words early.
+
+### Socket buffer overflows at the collector
+
+Fragmentation is not the only silent killer. Every UDP socket has a kernel receive buffer (`SO_RCVBUF`). If a burst of datagrams arrives faster than the collector's user-space process calls `recvfrom()`—for instance, during a BGP flap, a firewall deny storm, or a brief GC/disk-flush pause in the collector—the socket buffer fills up and the kernel drops every subsequent datagram on the floor:
+
+```text
+5000 UDP datagrams ---> [ Kernel SO_RCVBUF ] ---> recvfrom() (paused 1 s)
+                               |
+                               +--> Buffer full: 4743+ dropped!
+                                    Udp RcvbufErrors +4743
+                                    Udp InErrors     +4743
+```
+
+In our lab, a 1-second pause on the collector while 5000 datagrams arrived caused:
+
+- With `SO_RCVBUF` requested at 4096 bytes (kernel doubled to 8192): **10 of 5000** received, `Udp RcvbufErrors` jumped by **+4990**.
+- With the default Linux buffer (`212992` bytes): **257 of 5000** received, `Udp RcvbufErrors` jumped by **+4743**.
+
+In both cases, the sender saw zero errors. On Linux collectors, `/proc/net/snmp` (specifically the `Udp:` line's `InErrors` and `RcvbufErrors` columns, and the `Ip:` line's `ReasmFails` column) is the ground truth for whether your collector is losing UDP syslog before the daemon even sees it.
+
+## TCP framing: LF vs octet counting
+
+Moving syslog onto TCP eliminates IP fragmentation (TCP segments to the MSS) and socket-level packet loss on healthy links, but TCP is a byte stream, not a message stream. You must define where one `SYSLOG-MSG` ends and the next begins.
+
+RFC 6587 (Historic) documents the two TCP framing methods deployed in the wild:
+
+1. **Non-transparent framing (trailer-based):** Each `SYSLOG-MSG` is terminated by a trailer character, almost always `LF` (`\n`, `0x0A`), though some legacy implementations use `NUL` or `CR LF`.
+2. **Octet counting:** Each message is prefixed by its exact byte length in ASCII digits, followed by a single space (`SP`, `0x20`), followed by that many bytes of `SYSLOG-MSG`:
+
+```text
+SYSLOG-FRAME = MSG-LEN SP SYSLOG-MSG
+```
+
+The difference becomes obvious the moment an application logs a multi-line message, such as a Python traceback or a multi-line configuration diff:
+
+```text
+Non-transparent (LF) framing:
+  <13>1 ... Traceback (most recent call last):\n  File "app.py", line 4\nValueError: bad\n<13>1 ... second msg\n
+  Parser splits on every \n -> 4 records (3 bogus fragments + 1 real)
+
+Octet counting (lengths illustrative):
+  95 <13>1 ... Traceback (most recent call last):\n  File "app.py", line 4\nValueError: bad24 <13>1 ... second msg
+  |-- reads 95 bytes intact (embedded \n ignored) -------------------------||-- reads 24 bytes --|
+  Parser reads exact byte counts -> 2 intact records
+```
+
+Notice that in octet counting, there is **no** trailing `\n` after the message—the next `MSG-LEN` begins immediately after the last byte of the previous `SYSLOG-MSG`. RFC 6587 notes that octet-counting is reliable and has not been seen to cause problems, whereas non-transparent framing breaks whenever a message contains the trailer byte. It also says a receiver can assume octet counting when a frame starts with a digit, which is how some receivers support both on one port.
+
+In `util-linux` `logger`, passing `-T` enables TCP, and adding `--octet-count` switches from LF framing to octet counting, producing wire frames like:
+
+```text
+113 <13>1 2026-11-16T... h1 lab - - [timeQuality ...] via logger --octet-count
+```
+
+If you configure daemons like `rsyslog` or `syslog-ng` for TCP, both ends must agree on the framing mode. Below are generic configuration snippets for reference (from the docs, not run):
+
+```text
+# rsyslog (from the docs, not run) — octet-counted TCP sender and receiver
+# Sender (omfwd):
+action(type="omfwd" target="10.0.0.2" port="601" protocol="tcp"
+       TCP_Framing="octet-counted")
+
+# Receiver (imtcp):
+input(type="imtcp" port="601" supportOctetCountedFraming="on")
+```
+
+```text
+# syslog-ng (from the docs, not run) — octet-counted TCP (RFC 5424/6587 framing)
+# Sender:
+destination d_tcp {
+    syslog("10.0.0.2" port(601) transport("tcp"));
+};
+# Note: syslog() driver uses RFC 5424 + octet-counted framing;
+# network() driver defaults to RFC 3164 + LF framing unless configured otherwise.
+```
+
+*(Note: RFC 6587 says plain TCP syslog has no standardized port; the most frequently observed choice is `514/tcp`, which IANA actually assigns to the shell protocol. TCP `601` is registered for RFC 3195 syslog-conn (BEEP) and is reused by some products; `6514` belongs to syslog over TLS. Pick one, document it, and open it on firewalls deliberately.)*
+
+## TLS transport on port 6514 and certificate hygiene
+
+Plaintext TCP protects against packet loss, not against eavesdropping or spoofed senders. RFC 5425 defines syslog transport over TLS on TCP port **6514**, and it standardizes framing by mandating **octet counting**:
+
+```text
+TLS Record Payload:
++-------------------------------------------------------+
+| MSG-LEN | SP | SYSLOG-MSG                             |
++-------------------------------------------------------+
+```
+
+There is no ambiguity on port 6514: RFC 5425 does not allow LF-delimited framing inside the TLS stream.
+
+### Cipher suites and TLS versions (RFC 5425 and RFC 9662)
+
+RFC 5425 was published in 2009 and originally specified TLS 1.2 with `TLS_RSA_WITH_AES_128_CBC_SHA`. In October 2024, **RFC 9662** updated both RFC 5425 (TLS syslog) and RFC 6012 (DTLS syslog):
+
+- The mandatory-to-implement cipher suites are now `TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256` and `TLS_RSA_WITH_AES_128_CBC_SHA`; implementations SHOULD offer the ECDHE suite and MAY offer the RSA-CBC one.
+- TLS 1.2 stays mandatory to implement for RFC 5425, but following RFC 9325 (BCP 195) implementations SHOULD support TLS 1.3 and, if they do, MUST prefer it. In the lab below, both ends are Python 3.13 on OpenSSL 3.5.7, so they negotiate TLS 1.3 with `TLS_AES_256_GCM_SHA384`.
+- For DTLS syslog (RFC 6012), RFC 9662 says implementations MUST NOT use DTLS 1.0 (deprecated by RFC 8996) and MUST use DTLS 1.2, SHOULD support DTLS 1.3 and prefer it when implemented.
+
+### Mutual authentication and strict X.509 validation
+
+RFC 5425 is designed around **mutual certificate authentication (mTLS)**: the client verifies the collector's certificate to prevent log exfiltration to a rogue server, and the collector verifies the client's certificate so an attacker on the LAN cannot inject forged audit events.
+
+In practice, homemade PKIs frequently break modern TLS stacks. Starting with Python 3.13, `ssl.create_default_context()` enables `VERIFY_X509_STRICT` by default (backed by OpenSSL 3.x). A quick self-signed CA created with `openssl req -x509` and only `basicConstraints=critical,CA:TRUE` (no `keyUsage`) is rejected immediately with:
+
+```text
+CA cert does not include key usage extension
+```
+
+To pass strict validation, your PKI needs:
+
+1. **CA certificate:** `basicConstraints = critical, CA:TRUE` and `keyUsage = critical, keyCertSign, cRLSign` (plus a Subject Key Identifier).
+2. **Leaf certificates:** a **Subject Alternative Name (SAN)** matching the name or IP the peer connects to (`DNS:col.lab.example` in the lab), an `extendedKeyUsage` that fits the role (`serverAuth` for collectors, `clientAuth` for senders in mutual TLS), and Subject/Authority Key Identifiers (`SKI`/`AKI`). That is exactly what the lab's passing leaf carries; adding `basicConstraints = CA:FALSE` and a `keyUsage` of `digitalSignature` is good hygiene.
+3. **Trust store:** Clients must explicitly trust your private CA (or an internal enterprise CA). A client trusting only the OS system store will fail with `unable to get local issuer certificate`.
+
+A forwarder-side TLS configuration in rsyslog looks like this (from the docs, not run):
+
+```text
+# rsyslog (from the docs, not run) — TLS with octet-counted framing:
+global(DefaultNetstreamDriverCAFile="/etc/rsyslog.d/ca.pem"
+       DefaultNetstreamDriverCertFile="/etc/rsyslog.d/client-cert.pem"
+       DefaultNetstreamDriverKeyFile="/etc/rsyslog.d/client-key.pem")
+
+action(type="omfwd" target="10.0.0.2" port="6514" protocol="tcp"
+       StreamDriver="gtls" StreamDriverMode="1"
+       StreamDriverAuthMode="x509/name"
+       StreamDriverPermittedPeers="col.lab.example"
+       TCP_Framing="octet-counted")
+```
+
+## The lab
+
+The lab runs inside an isolated Linux network and mount namespace (`unshare -rnmu`) with two virtual hosts connected by a veth pair at MTU 1500: `h1` (sender, `10.0.0.1`, hostname `h1`) and `col` (collector, `10.0.0.2`). It uses standard-library Python 3.13.5 receivers, `util-linux` `logger` 2.41.5, and OpenSSL 3.5.7, requiring no external daemons or root privileges on the host.
+
+```{.bash filename="gen-certs.sh"}
+#!/bin/sh
+# Lab-only certificates for syslog-lab.py (OpenSSL 3.x). Never reuse these keys.
+set -e
+# 1. "quick" CA: basicConstraints only, no keyUsage (Python 3.13's strict default rejects it)
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 30 \
+  -keyout ca-quick.key -out ca-quick.crt -subj "/CN=Lab Syslog CA" \
+  -addext "basicConstraints=critical,CA:TRUE" -addext "subjectKeyIdentifier=hash"
+# 2. proper CA: adds keyUsage keyCertSign,cRLSign
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 30 \
+  -keyout ca.key -out ca.crt -subj "/CN=Lab Syslog CA" \
+  -addext "basicConstraints=critical,CA:TRUE" -addext "keyUsage=critical,keyCertSign,cRLSign" \
+  -addext "subjectKeyIdentifier=hash"
+# 3. collector leaf certs (SAN col.lab.example, serverAuth, SKI/AKI), one from each CA
+cat > leaf.cnf <<'X'
+subjectAltName=DNS:col.lab.example
+extendedKeyUsage=serverAuth
+subjectKeyIdentifier=hash
+authorityKeyIdentifier=keyid,issuer
+X
+for ca in ca ca-quick; do
+  leaf=$( [ "$ca" = ca ] && echo col || echo col-quick )
+  openssl req -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -keyout $leaf.key -out $leaf.csr -subj "/CN=col.lab.example"
+  openssl x509 -req -in $leaf.csr -CA $ca.crt -CAkey $ca.key -CAcreateserial -days 30 -extfile leaf.cnf -out $leaf.crt
+done
+```
+
+```{.python filename="syslog-lab.py"}
+#!/usr/bin/env python3
+"""Syslog on the wire. Run: sh gen-certs.sh && unshare -rnmu python3 syslog-lab.py
+Two namespaces: h1 (sender, 10.0.0.1) and col (collector, 10.0.0.2), veth MTU 1500."""
+import os, re, socket, ssl, struct, subprocess, sys, time, json, logging, logging.handlers
+
+SELF = os.path.abspath(__file__)
+HERE = os.path.dirname(SELF)
+FAC = ['kern','user','mail','daemon','auth','syslog','lpr','news','uucp','cron','authpriv',
+       'ftp','ntp','audit','alert','clock','local0','local1','local2','local3','local4',
+       'local5','local6','local7']
+SEV = ['emerg','alert','crit','err','warning','notice','info','debug']
+
+def sh(c, check=True):
+    r = subprocess.run(c, shell=True, capture_output=True, text=True)
+    if check and r.returncode: raise SystemExit(f'FAILED {c}: {r.stderr}')
+    return (r.stdout + r.stderr).strip()
+
+def ns(n, *a, **kw):
+    return subprocess.Popen(['ip', 'netns', 'exec', n, sys.executable, SELF, *a],
+                            stdout=subprocess.PIPE, text=True, **kw)
+
+def build():
+    sh('mount -t tmpfs none /run && mkdir -p /run/netns')
+    for n in ('h1', 'col'):
+        sh(f'ip netns add {n}'); sh(f'ip -n {n} link set lo up')
+    sh('ip link add v1 type veth peer name v2')
+    sh('ip link set v1 netns h1; ip link set v2 netns col')
+    sh('ip -n h1 addr add 10.0.0.1/24 dev v1; ip -n col addr add 10.0.0.2/24 dev v2')
+    sh('ip -n h1 link set v1 up; ip -n col link set v2 up')
+    sh('hostname h1')
+
+def decode_pri(raw):
+    m = re.match(rb'<(\d{1,3})>', raw)
+    if not m: return 'no PRI'
+    p = int(m.group(1)); return f'PRI {p} = {FAC[p >> 3]}.{SEV[p & 7]} (facility {p >> 3} x 8 + severity {p & 7})'
+
+# ------------- roles -------------
+def udp_rx(argv):
+    secs, rcvbuf, delay = float(argv[0]), int(argv[1]), float(argv[2])
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    if rcvbuf: s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, rcvbuf)
+    s.bind(('10.0.0.2', 514)); print('READY', flush=True)
+    time.sleep(delay); s.settimeout(0.3); got = []
+    end = time.time() + secs
+    while time.time() < end:
+        try: d, a = s.recvfrom(70000); got.append(d.hex())
+        except socket.timeout: pass
+    print(json.dumps(dict(rcvbuf=s.getsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF), got=got)))
+
+def snmp_udp():
+    lines = open('/proc/net/snmp').read().splitlines()
+    out = {}
+    for proto in ('Udp:', 'Ip:'):
+        h, v = [l.split() for l in lines if l.startswith(proto)]
+        out.update({f'{proto}{k}': int(x) for k, x in zip(h[1:], v[1:])})
+    return out
+
+def frag_cap(argv):
+    s = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.ntohs(0x0800))
+    s.bind(('v2', 0)); s.settimeout(0.2); n = 0; end = time.time() + float(argv[0]); sizes = []
+    print('READY', flush=True)
+    while time.time() < end:
+        try: p = s.recv(70000)
+        except socket.timeout: continue
+        ip = p[14:]
+        if ip[9] != 17: continue
+        fo = struct.unpack('!H', ip[6:8])[0]
+        sizes.append(dict(len=struct.unpack('!H', ip[2:4])[0], mf=bool(fo & 0x2000), off=(fo & 0x1fff) * 8))
+    print(json.dumps(sizes))
+
+def tcp_rx(argv):
+    mode, port = argv[0], int(argv[1])
+    s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s.bind(('10.0.0.2', port)); s.listen(); print('READY', flush=True); s.settimeout(5)
+    c, _ = s.accept(); buf = b''
+    c.settimeout(1)
+    while True:
+        try:
+            d = c.recv(65535)
+        except socket.timeout: break
+        if not d: break
+        buf += d
+    recs = []
+    if mode == 'lf':
+        recs = [r for r in buf.split(b'\n') if r]
+    else:
+        i = 0
+        while i < len(buf):
+            sp = buf.index(b' ', i); n = int(buf[i:sp]); recs.append(buf[sp + 1:sp + 1 + n]); i = sp + 1 + n
+    print(json.dumps(dict(raw=buf.decode(errors='replace'), records=[r.decode() for r in recs])))
+
+def tls_rx(argv):
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.load_cert_chain(os.path.join(HERE, argv[0] + '.crt'), os.path.join(HERE, argv[0] + '.key'))
+    s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s.bind(('10.0.0.2', 6514)); s.listen(); print('READY', flush=True); s.settimeout(5)
+    for _ in range(1):
+        c, _ = s.accept()
+        try:
+            t = ctx.wrap_socket(c, server_side=True); ver, ciph = t.version(), t.cipher()[0]; t.settimeout(1); buf = b''
+            while True:
+                try: d = t.recv(65535)
+                except (socket.timeout, ssl.SSLError, OSError): break
+                if not d: break
+                buf += d
+            print(json.dumps(dict(ok=True, version=ver, cipher=ciph, data=buf.decode())), flush=True)
+        except (ssl.SSLError, OSError) as e:
+            print(json.dumps(dict(ok=False, err=str(e))), flush=True)
+
+def tls_tx(argv):
+    trust = argv[0]
+    ctx = ssl.create_default_context(cafile=os.path.join(HERE, trust + '.crt') if trust != 'system' else None)
+    s = socket.create_connection(('10.0.0.2', 6514))
+    msg = b'<165>1 2026-11-16T12:00:00.000+05:30 h1 lab - TLS01 - framed over TLS'
+    try:
+        t = ctx.wrap_socket(s, server_hostname='col.lab.example')
+        t.sendall(str(len(msg)).encode() + b' ' + msg); t.close()
+        print(json.dumps(dict(ok=True)))
+    except ssl.SSLError as e:
+        print(json.dumps(dict(ok=False, err=f'{type(e).__name__}: {getattr(e, "verify_message", e.reason)}')))
+
+def py_udp(argv):
+    h = logging.handlers.SysLogHandler(address=('10.0.0.2', 514), facility=argv[0])
+    lg = logging.getLogger('lab'); lg.addHandler(h); lg.setLevel(logging.DEBUG)
+    lg.warning(argv[1] if len(argv) > 1 else 'link flap on eth1')
+
+def burst(argv):
+    n = int(argv[0]); s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    for i in range(n):
+        s.sendto(b'<134>1 - h1 burst - - - msg %06d' % i, ('10.0.0.2', 514))
+
+def tcp_tx(argv):
+    mode, port = argv[0], int(argv[1])
+    s = socket.create_connection(('10.0.0.2', port))
+    msgs = [b'<163>1 - h1 app - TB - Traceback (most recent call last):\n  File "x.py", line 1\nValueError: bad',
+            b'<166>1 - h1 app - OK - second message']
+    for m in msgs:
+        s.sendall(m + b'\n' if mode == 'lf' else str(len(m)).encode() + b' ' + m)
+    s.close()
+
+ROLES = dict(udp_rx=udp_rx, frag_cap=frag_cap, tcp_rx=tcp_rx, tls_rx=tls_rx, tls_tx=tls_tx,
+             py_udp=py_udp, burst=burst, tcp_tx=tcp_tx)
+
+def wait_ready(p):
+    assert p.stdout.readline().strip() == 'READY'
+
+def rx_udp_run(sender_cmd, secs=1.5, rcvbuf=0, delay=0.0):
+    rx = ns('col', 'udp_rx', str(secs), str(rcvbuf), str(delay)); wait_ready(rx)
+    sh(sender_cmd)
+    return json.loads(rx.communicate()[0])
+
+def main():
+    if len(sys.argv) > 1: return ROLES[sys.argv[1]](sys.argv[2:])
+    build()
+    print('== 1. Same event, three senders, raw bytes as the collector receives them (UDP 514)')
+    senders = [
+        ('logger --rfc3164', 'ip netns exec h1 logger --rfc3164 -d -n 10.0.0.2 -P 514 -p local4.warning -t lab "link flap on eth1"'),
+        ('logger --rfc5424', 'ip netns exec h1 logger --rfc5424 -d -n 10.0.0.2 -P 514 -p local4.warning -t lab --msgid LINK '
+                             '--sd-id ifEvent@32473 --sd-param \'ifName="eth1"\' --sd-param \'state="down"\' "link flap on eth1"'),
+        ('python SysLogHandler', f'ip netns exec h1 {sys.executable} {SELF} py_udp local4'),
+    ]
+    for name, cmd in senders:
+        r = rx_udp_run(cmd, secs=0.8)
+        for h in r['got']:
+            raw = bytes.fromhex(h)
+            print(f'  {name}:\n    {raw!r}\n    {decode_pri(raw)}; {len(raw)} bytes')
+
+    print('\n== 2. Size: a 3000-character message over UDP across a 1500-byte MTU link')
+    big = 'X' * 3000
+    r = rx_udp_run(f'ip netns exec h1 logger --rfc5424 -d -n 10.0.0.2 -P 514 -t lab {big}', secs=0.8)
+    print(f'  logger (default --size): collector got {[len(bytes.fromhex(h)) for h in r["got"]]} bytes')
+    r = rx_udp_run(f'ip netns exec h1 logger --rfc5424 -d -n 10.0.0.2 -P 514 -S 4000 -t lab {big}', secs=0.8)
+    print(f'  logger -S 4000:              collector got {[len(bytes.fromhex(h)) for h in r["got"]]} bytes')
+    cap = ns('col', 'frag_cap', '1.5'); wait_ready(cap)
+    rx = ns('col', 'udp_rx', '1.0', '0', '0'); wait_ready(rx)
+    sh(f'ip netns exec h1 {sys.executable} {SELF} py_udp local4 {big}')
+    got = json.loads(rx.communicate()[0]); frags = json.loads(cap.communicate()[0])
+    print(f'  python SysLogHandler:       collector got {[len(bytes.fromhex(h)) for h in got["got"]]} bytes; '
+          f'on the wire {len(frags)} IPv4 fragments: ' + ', '.join(f"len={f['len']} off={f['off']} MF={int(f['mf'])}" for f in frags))
+    before = snmp_col()
+    sh('ip netns exec col sh -c "echo 0 > /proc/sys/net/ipv4/ipfrag_time; echo 1 > /proc/sys/net/ipv4/ipfrag_low_thresh; echo 2 > /proc/sys/net/ipv4/ipfrag_high_thresh"')
+    rx = ns('col', 'udp_rx', '1.0', '0', '0'); wait_ready(rx)
+    sh(f'ip netns exec h1 {sys.executable} {SELF} py_udp local4 {big}')
+    got = json.loads(rx.communicate()[0]); after = snmp_col()
+    print(f'  same send, collector reassembly memory starved: got {len(got["got"])} messages; '
+          f'Ip ReasmFails +{after["Ip:ReasmFails"] - before["Ip:ReasmFails"]}, ReasmReqds +{after["Ip:ReasmReqds"] - before["Ip:ReasmReqds"]}; sender saw no error')
+    sh('ip netns exec col sh -c "echo 4194304 > /proc/sys/net/ipv4/ipfrag_high_thresh; echo 3145728 > /proc/sys/net/ipv4/ipfrag_low_thresh; echo 30 > /proc/sys/net/ipv4/ipfrag_time"')
+
+    print('\n== 3. Burst: 5000 datagrams while the collector is busy for 1 s, SO_RCVBUF 4096 vs default')
+    for rb in (4096, 0):
+        before = snmp_col()
+        rx = ns('col', 'udp_rx', '2.0', str(rb), '1.0'); wait_ready(rx)
+        sh(f'ip netns exec h1 {sys.executable} {SELF} burst 5000')
+        r = json.loads(rx.communicate()[0]); after = snmp_col()
+        print(f'  SO_RCVBUF requested {rb or "default"} (kernel reports {r["rcvbuf"]}): received {len(r["got"])}/5000, '
+              f'Udp RcvbufErrors +{after["Udp:RcvbufErrors"] - before["Udp:RcvbufErrors"]}, InErrors +{after["Udp:InErrors"] - before["Udp:InErrors"]}')
+
+    print('\n== 4. TCP framing: a multi-line message, LF framing vs RFC 6587 octet counting')
+    for mode, port in (('lf', 601), ('octet', 602)):
+        rx = ns('col', 'tcp_rx', mode, str(port)); wait_ready(rx)
+        sh(f'ip netns exec h1 {sys.executable} {SELF} tcp_tx {mode} {port}')
+        r = json.loads(rx.communicate()[0])
+        print(f'  {mode}: collector parsed {len(r["records"])} records')
+        for i, rec in enumerate(r['records'], 1):
+            print(f'    [{i}] {rec!r}')
+    rx = ns('col', 'tcp_rx', 'octet', '603'); wait_ready(rx)
+    sh('ip netns exec h1 logger --rfc5424 -T -n 10.0.0.2 -P 603 --octet-count -t lab "via logger --octet-count"')
+    r = json.loads(rx.communicate()[0])
+    print(f'  logger -T --octet-count raw stream: {r["raw"]!r}')
+
+    print('\n== 5. TLS (RFC 5425 port 6514, octet-counted inside TLS)')
+    for cert, trust in (('col-quick', 'ca-quick'), ('col', 'ca'), ('col', 'system')):
+        tls = ns('col', 'tls_rx', cert); wait_ready(tls)
+        out = subprocess.run(['ip', 'netns', 'exec', 'h1', sys.executable, SELF, 'tls_tx', trust], capture_output=True, text=True).stdout
+        line = tls.stdout.readline(); tls.wait()
+        srv = json.loads(line) if line.strip() else {'server': 'no output'}
+        print(f'  server cert {cert}.crt, client trusts {trust + ".crt" if trust != "system" else "system store only"}: client {out.strip()}')
+        print(f'    collector: {json.dumps(srv)}')
+
+def snmp_col():
+    return json.loads(subprocess.run(['ip', 'netns', 'exec', 'col', sys.executable, '-c',
+        'import json,sys; sys.path.insert(0, "%s"); import importlib.util as u; '
+        's=u.spec_from_file_location("m","%s"); m=u.module_from_spec(s); s.loader.exec_module(m); print(json.dumps(m.snmp_udp()))' % (HERE, SELF)],
+        capture_output=True, text=True).stdout)
+
+if __name__ == '__main__':
+    main()
+```
+Run the certificate script once, then the lab. `-u` adds a UTS namespace so the sender can call itself `h1` without touching the host name. Output from Linux 6.12, iproute2 6.15.0, Python 3.13.5, util-linux 2.41.5 and OpenSSL 3.5.7 (a real run, unedited):
+
+```text
+$ sh gen-certs.sh && unshare -rnmu python3 syslog-lab.py
+== 1. Same event, three senders, raw bytes as the collector receives them (UDP 514)
+  logger --rfc3164:
+    b'<164>Nov 16 12:10:05 h1 lab: link flap on eth1'
+    PRI 164 = local4.warning (facility 20 x 8 + severity 4); 46 bytes
+  logger --rfc5424:
+    b'<164>1 2026-11-16T12:10:06.477531+05:30 h1 lab - LINK [timeQuality tzKnown="1" isSynced="0"][ifEvent@32473 ifName="eth1" state="down"] link flap on eth1'
+    PRI 164 = local4.warning (facility 20 x 8 + severity 4); 152 bytes
+  python SysLogHandler:
+    b'<164>link flap on eth1\x00'
+    PRI 164 = local4.warning (facility 20 x 8 + severity 4); 23 bytes
+
+== 2. Size: a 3000-character message over UDP across a 1500-byte MTU link
+  logger (default --size): collector got [1113] bytes
+  logger -S 4000:              collector got [3089] bytes
+  python SysLogHandler:       collector got [3006] bytes; on the wire 3 IPv4 fragments: len=1500 off=0 MF=1, len=1500 off=1480 MF=1, len=74 off=2960 MF=0
+  same send, collector reassembly memory starved: got 0 messages; Ip ReasmFails +3, ReasmReqds +3; sender saw no error
+
+== 3. Burst: 5000 datagrams while the collector is busy for 1 s, SO_RCVBUF 4096 vs default
+  SO_RCVBUF requested 4096 (kernel reports 8192): received 10/5000, Udp RcvbufErrors +4990, InErrors +4990
+  SO_RCVBUF requested default (kernel reports 212992): received 257/5000, Udp RcvbufErrors +4743, InErrors +4743
+
+== 4. TCP framing: a multi-line message, LF framing vs RFC 6587 octet counting
+  lf: collector parsed 4 records
+    [1] '<163>1 - h1 app - TB - Traceback (most recent call last):'
+    [2] '  File "x.py", line 1'
+    [3] 'ValueError: bad'
+    [4] '<166>1 - h1 app - OK - second message'
+  octet: collector parsed 2 records
+    [1] '<163>1 - h1 app - TB - Traceback (most recent call last):\n  File "x.py", line 1\nValueError: bad'
+    [2] '<166>1 - h1 app - OK - second message'
+  logger -T --octet-count raw stream: '113 <13>1 2026-11-16T12:10:19.883488+05:30 h1 lab - - [timeQuality tzKnown="1" isSynced="0"] via logger --octet-count'
+
+== 5. TLS (RFC 5425 port 6514, octet-counted inside TLS)
+  server cert col-quick.crt, client trusts ca-quick.crt: client {"ok": false, "err": "SSLCertVerificationError: CA cert does not include key usage extension"}
+    collector: {"ok": false, "err": "[SSL: SSLV3_ALERT_CERTIFICATE_UNKNOWN] ssl/tls alert certificate unknown (_ssl.c:1029)"}
+  server cert col.crt, client trusts ca.crt: client {"ok": true}
+    collector: {"ok": true, "version": "TLSv1.3", "cipher": "TLS_AES_256_GCM_SHA384", "data": "69 <165>1 2026-11-16T12:00:00.000+05:30 h1 lab - TLS01 - framed over TLS"}
+  server cert col.crt, client trusts system store only: client {"ok": false, "err": "SSLCertVerificationError: unable to get local issuer certificate"}
+    collector: {"ok": false, "err": "[SSL: TLSV1_ALERT_UNKNOWN_CA] tlsv1 alert unknown ca (_ssl.c:1029)"}
+```
+
+The script executes five controlled experiments that mirror real-world failure modes:
+
+1. **Wire format comparison:** Sends `"link flap on eth1"` at `local4.warning` (`PRI 164`) via `logger --rfc3164` (46 bytes), `logger --rfc5424` with `--msgid LINK` and `--sd-id ifEvent@32473` (152 bytes, with `timeQuality` added by `logger`), and Python's `SysLogHandler` (23 bytes ending in `\x00`).
+2. **UDP size, truncation, and fragmentation:** Sends a 3000-character message. Default `logger` truncates at 1 KiB (1113 bytes received); `logger -S 4000` sends 3089 bytes; `SysLogHandler` sends 3006 bytes as three IPv4 fragments (`1500`/`1500`/`74` bytes). Starving the collector's IP fragment reassembly cache drops all messages (`0` received, `Ip ReasmFails +3`) with zero error reported to the sender.
+3. **UDP burst and `SO_RCVBUF` exhaustion:** Sends 5000 datagrams while the collector sleeps for 1 second. With a small `SO_RCVBUF` (`4096` requested, `8192` kernel-adjusted), only `10/5000` arrive (`Udp RcvbufErrors +4990`); with the default `212992`-byte buffer, `257/5000` arrive (`RcvbufErrors +4743`). Again, the sender sees no error.
+4. **TCP LF framing vs octet counting:** Sends a 3-line Python traceback followed by a second message. Under LF framing, the collector parses `4` records (splitting the traceback into 3 broken lines). Under octet counting, it parses `2` intact records; `logger -T --octet-count` emits the length-prefixed frame directly.
+5. **TLS on port 6514 and strict X.509:** Connects over TLS with octet counting inside. A CA without `keyUsage` fails immediately (`CA cert does not include key usage extension`); a client using only the system store fails (`unable to get local issuer certificate`); a proper CA (`keyCertSign,cRLSign`) plus leaf with SAN and `AKI`/`SKI` negotiates `TLSv1.3` (`TLS_AES_256_GCM_SHA384`) and delivers `69 <165>1 2026-11-16T12:00:00.000+05:30 h1 lab - TLS01 - framed over TLS`.
+
+## Gotchas
+
+- **The trap: RFC 3164 timestamps have no year or timezone.**
+  At `23:59:59` on 31 December, or during a Daylight Saving Time fallback hour, `Nov 16 12:10:05` gives the collector no way to distinguish UTC from local time or this year from last year. Collectors guess using their own wall clock, which scrambles event ordering across timezones. *Fix:* Configure RFC 5424 everywhere possible so timestamps carry RFC 3339 offsets.
+
+- **The trap: Relays and NAT rewrite the source identity.**
+  A collector that logs the UDP/TCP source IP instead of the `HOSTNAME` field inside the syslog header will attribute every log behind a NAT gateway or relay to the proxy's IP. Conversely, a misconfigured relay may overwrite `HOSTNAME` with its own name. *Fix:* Configure intermediate relays to preserve the original `HOSTNAME` and `TIMESTAMP`, and index on the parsed header field rather than the socket peer address.
+
+- **The trap: UDP syslog loss is completely invisible to the sender.**
+  Neither `logger`, nor `SysLogHandler`, nor a router's `logging` engine gets any feedback when a collector's `SO_RCVBUF` overflows or IP fragments time out. *Fix:* Monitor `Udp RcvbufErrors`, `Udp InErrors`, and `Ip ReasmFails` in `/proc/net/snmp` on every collector, raise `net.core.rmem_max` and daemon socket buffers, keep UDP payloads within path MTU, and move critical streams to TCP or TLS.
+
+- **The trap: TCP protects against packet loss, but a stalled collector can block the sender.**
+  When a TCP collector stops reading (due to a full disk or hung parser), TCP flow control closes the receive window (`RWND = 0`). Once the sender's kernel send buffer fills, a naive synchronous logger blocks the application thread itself. *Fix:* Use a local forwarder (`rsyslog` or `syslog-ng`) with an explicit memory-plus-disk queue (`queue.type="LinkedList"` or disk-assisted queues) so applications log to a local Unix socket and never stall on a remote collector.
+
+- **The trap: Mixing LF framing and octet counting on the same TCP port.**
+  If one client sends `113 <13>1 ...` (no trailing `\n`) to an LF-only listener, the listener buffers forever waiting for a newline or merges multiple messages into one giant line. If an LF client sends `<13>1 ...\n` to a strict octet-counting listener, it cannot read `<13>1` as a byte count and either drops the connection or discards data. Receivers that auto-detect (frame starts with a digit means octet counting, as RFC 6587 describes) cope, but only if every message starts cleanly. *Fix:* Dedicate separate ports (e.g., `6514` strictly for TLS + octet counting, `514` for legacy) and enforce one framing per listener.
+
+- **The trap: Unescaped characters in `STRUCTURED-DATA` break parsers.**
+  If an application interpolates raw user input or Windows file paths into a `PARAM-VALUE` without escaping `"`, `\`, and `]`, the first unescaped `]` prematurely closes the `[SD-ID ...]` block. *Fix:* Use a compliant RFC 5424 library to serialize `STRUCTURED-DATA` rather than string formatting.
+
+- **The trap: Assuming facility names and severities match across vendors.**
+  One vendor's "notice" on a link flap might be another vendor's "info" or "warning", and facilities `9`/`15` or `4`/`10` are frequently swapped. *Fix:* Capture a sample packet from each platform, compute `PRIVAL` directly, and document the exact `<PRI>` your SIEM rules expect.
+
+- **The trap: Skipping clock synchronization on senders.**
+  Even RFC 5424 timestamps are useless for incident correlation if the sender's clock is off by minutes or hours, and `timeQuality` will faithfully report `isSynced="0"`. *Fix:* Treat NTP or NTS (covered in the NTP and NTS chapters) as a prerequisite for trustworthy syslog.
+
+## The boring rule
+
+Treat syslog as an untrusted, lossy transport until proven otherwise: enforce RFC 5424 for timestamps and structured data, never trust UDP without watching kernel drop counters, always pair TCP or TLS with octet-counted framing, and automate strict X.509 certificate issuance before deploying port 6514.
+
+## Exercises
+
+1. **Decode `PRI` values from a capture:** You capture three packets beginning with `<38>`, `<134>`, and `<191>`. Calculate the facility code, facility keyword, severity code, and severity keyword for each. Why is `<192>` invalid on the wire?
+2. **Audit a legacy sender:** An application logs via Python's `SysLogHandler` to a central collector expecting RFC 5424. Show the exact bytes `SysLogHandler` puts on the wire for `local4.warning` and explain two ways a local forwarder on the same host solves the missing timestamp, missing hostname, and trailing NUL byte without modifying the application.
+3. **Calculate safe UDP payload sizes:** A branch router reaches your collector over a GRE/IPsec tunnel with an effective path MTU of 1380 bytes. Using IPv4 (20-byte header) and UDP (8-byte header), what is the maximum `SYSLOG-MSG` size before fragmentation occurs? What happens to delivery probability if a 2800-byte RFC 5424 message is sent over UDP across a link with 2% packet loss?
+4. **Diagnose silent collector drops:** Operators report missing firewall logs during a DDoS event, even though CPU on the collector is at 15% and the firewall reports no errors. Which three counters in `/proc/net/snmp` do you check first, what does an increment in each indicate, and which two kernel/daemon parameters fix each cause?
+5. **Debug a broken TCP stream:** A collector on port 601 receives `95 <13>1 2026-11-16T12:00:00Z h1 app - - - line1\nline2` and stores two separate events: `"95 <13>1 ... line1"` and `"line2"`. Identify the configuration mismatch between sender and collector, and explain what happens in the reverse mismatch (an LF-framed sender hitting an octet-counting collector).
+6. **Fix a rejected TLS collector certificate:** A newly deployed Python 3.13 client fails to connect to your syslog-over-TLS collector with `CA cert does not include key usage extension`. List the exact X.509 v3 extensions required on both the CA certificate and the collector leaf certificate to pass `VERIFY_X509_STRICT` and hostname/IP verification.
+
+## Sources
+
+- [RFC 3164: The BSD Syslog Protocol](https://datatracker.ietf.org/doc/html/rfc3164)
+- [RFC 5424: The Syslog Protocol](https://datatracker.ietf.org/doc/html/rfc5424)
+- [RFC 5426: Transmission of Syslog Messages over UDP](https://datatracker.ietf.org/doc/html/rfc5426)
+- [RFC 6587: Transmission of Syslog Messages over TCP](https://datatracker.ietf.org/doc/html/rfc6587)
+- [RFC 5425: Transport Layer Security (TLS) Transport Mapping for Syslog](https://datatracker.ietf.org/doc/html/rfc5425)
+- [RFC 6012: Datagram Transport Layer Security (DTLS) Transport Mapping for Syslog](https://datatracker.ietf.org/doc/html/rfc6012)
+- [RFC 9662: Updates to TLS and DTLS Transport Mappings for Syslog](https://datatracker.ietf.org/doc/html/rfc9662)
+- [logger(1) — util-linux manual page](https://man7.org/linux/man-pages/man1/logger.1.html)
+- [Python `logging.handlers` — SysLogHandler documentation](https://docs.python.org/3/library/logging.handlers.html#sysloghandler)
+- [Python `ssl` — TLS/SSL wrapper and `VERIFY_X509_STRICT` documentation](https://docs.python.org/3/library/ssl.html)
+- [Linux `/proc/net/snmp` kernel networking counters (`proc_net_snmp` / `proc(5)`)](https://man7.org/linux/man-pages/man5/proc.5.html)
