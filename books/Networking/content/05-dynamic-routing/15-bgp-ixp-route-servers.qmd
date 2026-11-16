@@ -1,0 +1,452 @@
+---
+title: "IXP Route Servers: Transparent eBGP, Path Hiding, Per-Client RIBs and Member Hygiene"
+author:
+  - name: "K19G"
+  - name: "grok-bot"
+---
+
+# IXP Route Servers: Transparent eBGP, Path Hiding, Per-Client RIBs and Member Hygiene
+
+If fifty networks connect to an Internet Exchange Point (IXP) and peer bilaterally, a full mesh requires $50 \times 49 / 2 = 1{,}225$ eBGP sessions. Every time a new member joins the switch fabric, fifty operations teams have to exchange emails, update prefix filters, and provision a new neighbour. An IXP route server replaces that $O(N^2)$ bilateral mesh with an $O(N)$ star: each participating member maintains a single eBGP session to the route server (or two, for redundancy) and exchanges routes with every other participating member through it.
+
+The catch is that standard eBGP—the protocol specified in RFC 4271—assumes every eBGP speaker sits in the forwarding path. A route server does not. Packets never touch the route server; they cross the Layer 2 IXP fabric directly from one member's border router to another's. To make an eBGP speaker act as a pure control-plane broker without pulling traffic onto itself, the route server must deliberately break several fundamental RFC 4271 rules on `NEXT_HOP`, `AS_PATH`, `MED`, and communities.
+
+Breaking those rules solves the session-scaling problem, but it immediately introduces three harder operational problems: members' routers reject the resulting updates unless configured to expect them, per-client export policies create silent path hiding inside a shared `Loc-RIB`, and a single misconfigured member can inject hijacked next hops or leaked routes into dozens of peers at once. This chapter covers the protocol mechanics of RFC 7947 and RFC 7948, how path hiding works and how per-client RIBs fix it, the hygiene stack route-server operators run, and the configuration you need on your own border router when you plug into an IXP.
+
+## Learning goals
+
+By the end of this chapter, you will be able to:
+
+- Explain how multilateral peering via an IXP route server reduces $N(N-1)/2$ bilateral sessions to $N$ sessions while keeping the route server out of the forwarding path.
+- Identify the exact RFC 4271 eBGP attribute rules that RFC 7947 overrides (`NEXT_HOP`, `AS_PATH`, `MED`, and communities) and configure a member router to accept transparent updates (`no enforce-first-as`).
+- Trace how per-client export filtering causes path hiding in a single `Loc-RIB` and compare the three standard mitigations: per-client `Loc-RIB`s, diverse paths (RFC 6774), and send-only ADD-PATH (RFC 7911).
+- Estimate the $O(P \times N)$ CPU/memory scaling of per-client `Loc-RIB`s and describe how view merging, destination splitting, and simplified `NEXT_HOP` resolution keep route-server resource usage bounded.
+- Order the inbound and outbound hygiene checks an IXP route server applies—strict next-hop validation, prefix-length bounds, IRR `as-set` filtering, RPKI ROV, RFC 9234 `OTC` leak prevention, max-prefix limits, and community-based export steering (including 32-bit ASN handling).
+- Troubleshoot control-plane versus data-plane mismatches on an IXP LAN, including non-transitive Layer 2 reachability failures and `LOCAL_PREF` interactions with bilateral peering.
+
+## Multilateral peering and the control-plane-only design
+
+At an IXP, members connect their border routers to a shared Ethernet broadcast domain—the IXP peering LAN. Each member receives one or more IPv4 and IPv6 addresses from that LAN's subnet. With bilateral peering, Member A establishes an eBGP session directly to Member B, another to Member C, and so on. With multilateral peering, each member instead establishes an eBGP session to the IXP's route server (RS), which sits on the same peering LAN.
+
+```text
+Bilateral full mesh (N = 4: 6 sessions)      Multilateral via Route Server (N = 4: 4 sessions)
+
+   [AS64501] ---------- [AS64502]               [AS64501]                  [AS64502]
+       |  \          /  |                           \                          /
+       |   \        /   |                            \   eBGP control plane   /
+       |    \      /    |                             v                      v
+       |     \    /     |                                  +------------+
+       |      \  /      |                                  |  RS AS64500|
+       |       \/       |                                  +------------+
+       |       /\       |                             ^                      ^
+       |      /  \      |                            /                        \
+       |     /    \     |                           /                          \
+   [AS64503] ---------- [AS64504]               [AS64503]                  [AS64504]
+
+                                                Data plane: [AS64501] ====> [AS64504]
+                                                (directly across IXP L2 switch fabric)
+```
+
+Notice the separation of planes in the right-hand diagram. The route server exchanges BGP `UPDATE` messages with all four members, yet no transit packet ever visits the route server's interface. When `AS64501` sends traffic to a prefix announced by `AS64504`, `AS64501`'s router resolves the `NEXT_HOP` (`AS64504`'s IP on the IXP LAN) via ARP or NDP, and the Ethernet frame travels straight across the IXP switch fabric to `AS64504`'s port.
+
+In production, IXPs commonly run open-source BGP daemons such as BIRD or OpenBGPD as their route servers, often driven by a configuration generator such as `arouteserver` that pulls member metadata from PeeringDB, IRR databases, and RPKI validators to emit deterministic, identical policies across redundant servers.
+
+## How RFC 7947 deliberately breaks RFC 4271
+
+If you take an off-the-shelf eBGP daemon and peer it with four members, it will immediately try to put itself in the forwarding path and stamp its own identity onto every route. RFC 7947 (*Internet Exchange BGP Route Server*, September 2016, Standards Track) and its companion operational document RFC 7948 (*Route Server Operations*, September 2016, Informational) define how a route server must deviate from standard RFC 4271 eBGP to remain transparent.
+
+Under RFC 7947 Section 2.1, a route server **MUST** accept all `UPDATE`s received from its clients into its `Adj-RIB-In`, though those routes **MAY** be left out of one or more `Loc-RIB`s by policy filters (which is where the hygiene stack later in this chapter lives). From there, Section 2.2 establishes attribute transparency: the route server **SHOULD NOT** update well-known attributes by default, and **SHOULD** pass optional attributes along unmodified.
+
+The four critical deviations from standard RFC 4271 eBGP are summarized below:
+
+| Attribute / Behaviour | Standard eBGP (RFC 4271) | IXP Route Server (RFC 7947) | Operational Reason |
+| :--- | :--- | :--- | :--- |
+| `NEXT_HOP` | Rewritten to the speaker's own interface IP on eBGP export. | **MUST** be passed unmodified (third-party next hop, RFC 4271 Section 5.1.3). | Keeps the RS out of the forwarding path; traffic flows directly between members. |
+| `AS_PATH` (RS side) | Speaker prepends its own ASN on eBGP export. | **SHOULD NOT** prepend the RS's own ASN or modify the path (a recommendation rather than a requirement only so legacy clients keep working). | Preserves true AS-path length and avoids making the RS look like a transit hop. |
+| `AS_PATH` (Client side) | Client may reject `UPDATE`s whose leftmost AS is not the peer's ASN. | Client **MUST** accept `UPDATE`s where the leftmost AS is not the RS's ASN; if checked, **MUST** allow disabling it (**SHOULD** per peer). | Because the RS did not prepend its ASN, the leftmost AS is the originating member's ASN. |
+| `MED` | Optional non-transitive; a MED received from a neighbouring AS MUST NOT be propagated to other neighbouring ASes (RFC 4271 Section 5.1.4). | **SHOULD** be propagated unmodified. | Allows a multi-homed member on the IXP to signal exit preference to peers. |
+| Communities | Standard/extended communities may be scrubbed or rewritten by policy. | **SHOULD NOT** be modified, processed or removed except by local policy; communities meant for the RS itself **MAY** be modified or removed. | Preserves member-to-member signalling while letting members steer RS export policy. |
+
+### The `AS_PATH` first-AS trap on the member router
+
+Because the route server does not prepend its own ASN (`AS64500`, say) to the `AS_PATH`, an `UPDATE` arriving at `AS64501` from `AS64500` for a route originated by `AS64504` will carry an `AS_PATH` starting with `64504`, not `64500`.
+
+Many BGP implementations enforce a sanity check on eBGP sessions—often called `enforce-first-as`—that drops any `UPDATE` whose leftmost ASN does not match the configured remote neighbour ASN. On a bilateral eBGP session, that check is a useful safeguard against misconfiguration. On a route-server session, it drops every single route the route server sends you.
+
+RFC 7947 Section 2.2.2.2 says a client implementation that has this check MUST allow it to be disabled and SHOULD allow that per peer, so bilateral sessions on the same router keep the protection; RFC 7948 Section 4.5 RECOMMENDS that clients disable it towards the route server. In FRRouting (FRR), `bgp enforce-first-as` is enabled by default, and the FRR documentation notes that if you peer with a route server you "most likely MUST disable the first AS enforcement":
+
+```text
+! From the FRR docs, not run
+! Client router (member side) facing the IXP route server:
+router bgp 64501
+ no neighbor 2001:db8:ffff::1 enforce-first-as
+```
+
+If you build a small route server with FRR, the per-neighbour `route-server-client` flag (configured inside the address family) keeps the server's own ASN out of the `AS_PATH` and leaves `NEXT_HOP` untouched. The command exists in FRR's `bgpd` source but is not described in the current user guide, so treat this as a sketch and test it; production IXPs normally run BIRD or OpenBGPD generated by `arouteserver`:
+
+```text
+! Sketch, not run
+! Route server side facing a member client:
+router bgp 64500
+ neighbor 2001:db8:ffff::11 remote-as 64501
+ address-family ipv6 unicast
+  neighbor 2001:db8:ffff::11 activate
+  neighbor 2001:db8:ffff::11 route-server-client
+ exit-address-family
+```
+
+Note that RFC 7947 makes omitting the RS ASN a `SHOULD NOT` rather than a `MUST NOT` solely to accommodate legacy client routers that cannot disable the first-AS check. If a legacy client is physically incapable of accepting an `AS_PATH` without the RS ASN, the RS can prepend its ASN only towards that client, at the cost of inflating path length by one hop for that client's view.
+
+## Path hiding and per-client RIBs
+
+Transparent attributes alone are not enough. As soon as members use export policies—for example, Member B tells the route server "announce my prefixes to everyone *except* Member A"—a route server built on a single `Loc-RIB` suffers from **path hiding** (RFC 7947 Section 2.3).
+
+Consider a route server `AS64500` with a single `Loc-RIB`:
+
+1. `AS64502` announces `2001:db8:200::/48` with `AS_PATH` `64502 64510` and attaches a community `0:64501` ("do not announce to `AS64501`").
+2. `AS64504` also announces `2001:db8:200::/48`, with a longer `AS_PATH` `64504 64520 64510` and no restriction communities.
+3. Both routes enter `Adj-RIB-In`. The route server runs its best-path selection in the single `Loc-RIB`. `AS64502`'s path is shorter (2 hops vs 3 hops), so `AS64502` wins.
+4. When the route server builds `Adj-RIB-Out` for `AS64501`, the export filter sees `0:64501` on the single best path and blocks it.
+
+The result: `AS64501` receives **no route at all** for `2001:db8:200::/48`, even though `AS64504` offered a completely valid, policy-compliant path.
+
+```text
+Single Loc-RIB (Path Hiding):
+  AS64502: 2001:db8:200::/48 [64502 64510] (0:64501) --+
+                                                       |--> [Single Loc-RIB]
+  AS64504: 2001:db8:200::/48 [64504 64520 64510] ------+      best = AS64502
+                                                                   |
+                                            Export filter to AS64501 drops 0:64501
+                                                                   |
+                                                                   v
+                                                        AS64501 gets NOTHING
+
+Per-Client Loc-RIBs (RFC 7947 2.3.2.1):
+  Adj-RIB-In ---> [Filter for AS64501] ---> [Loc-RIB for AS64501] ---> AS64501 gets
+                  (drops AS64502 route)      best = AS64504            AS64504's path
+             ---> [Filter for AS64503] ---> [Loc-RIB for AS64503] ---> AS64503 gets
+                  (keeps both)               best = AS64502            AS64502's path
+```
+
+RFC 7947 Section 2.3.2 describes three ways to eliminate path hiding:
+
+- **Per-client `Loc-RIB`s (RFC 7947 Section 2.3.2.1):** The route server applies each client's export policy *before* best-path selection—between `Adj-RIB-In` and that client's dedicated `Loc-RIB`. Because `AS64502`'s route is filtered out before `AS64501`'s `Loc-RIB` runs best-path, `AS64504`'s path wins for `AS64501` while `AS64502`'s path still wins for everyone else. This is the most portable solution because client routers need zero protocol extensions; every client still receives at most one best path per prefix.
+- **Diverse paths (RFC 6774, RFC 7947 Section 2.3.2.2):** The route server maintains multiple BGP sessions to a client—one for the primary best path, plus shadow sessions for the second-best (or $k$-th best) paths. This works with older routers that lack ADD-PATH, but multiplying sessions per member reintroduces operational complexity.
+- **ADD-PATH (RFC 7911, RFC 7947 Section 2.3.2.2):** The route server advertises multiple paths per prefix over a single session. Note that on a route server, ADD-PATH should be configured as **send-only** towards clients; the route server does not need clients to send multiple paths per prefix over the same session, and clients must explicitly support and enable ADD-PATH receive. (Compare this with internal BGP route reflectors, covered in the BGP Route Reflectors chapter, where ADD-PATH is commonly used inside a single AS.)
+
+### Scaling per-client `Loc-RIB`s
+
+Per-client `Loc-RIB`s are clean for clients, but they shift the computational burden onto the route server. As RFC 7948 Section 4.2 notes, evaluating $P$ prefixes/paths across $N$ separate `Loc-RIB`s scales roughly as $O(P \times N)$ in CPU and memory, where $P$ is the number of unique paths and $N$ the number of clients that need their own `Loc-RIB`. Separately, the theoretical bandwidth to send those routes out scales as $O(P_{tot} \times N)$, which becomes $O(N^2)$ if every client brings a similar number of prefixes, each with its own attribute set. With $200{,}000$ unique paths and $800$ members, a naive implementation evaluates $160{,}000{,}000$ path entries.
+
+In practice, route servers stay well below that worst case because most members use the IXP's default open peering policy rather than custom per-peer filters. RFC 7948 Section 4.2.1 documents three optimizations that production route servers use to keep resource usage manageable:
+
+1. **View merging / decomposition (Section 4.2.1.1):** Clients that share the exact same import/export policy view do not need separate `Loc-RIB`s. The daemon groups identical views into a single shared `Loc-RIB` and fans out updates from it.
+2. **Destination splitting (Section 4.2.1.2):** Clients connect to several route servers and each server handles a non-overlapping set of prefixes (clients send everything; each server filters its share with inbound filters or Outbound Route Filtering, RFC 5291), so the quadratic cost applies to several smaller prefix sets.
+3. **Simplified `NEXT_HOP` resolution (Section 4.2.1.3):** A normal BGP router resolves every `NEXT_HOP` recursively against an IGP and a full RIB. Because every client sits on one Layer 2 LAN, the route server can replace recursive resolution with a simple check that each `NEXT_HOP` is an address in the IXP LAN range; the stricter "matches the sending client" check is the hijack defence covered below.
+
+## Member hygiene: the route server import and export stack
+
+Because a route server redistributes routes from one member to potentially hundreds of others, an unvalidated announcement—a typo in a prefix list, a leaked transit table, or a spoofed `NEXT_HOP`—amplifies across the entire exchange. Production route servers therefore run a strict, layered hygiene stack on ingress before any route is considered for any `Loc-RIB`, followed by community-driven export steering.
+
+Note that this chapter assumes you already understand how IRR `as-set`s, RPKI Route Origin Validation (ROV), and BGP Roles work internally; see the BGP Security part of this book for the mechanics of ROAs, VRPs, and route-leak prevention. Here, the focus is how a route server wires those checks together.
+
+### The inbound filter stack
+
+In order, a well-configured route server (such as one generated by `arouteserver` for BIRD or OpenBGPD) evaluates each incoming `UPDATE` from a client against these gates:
+
+| Stage | Check | What it catches | Reference / `arouteserver` default |
+| :--- | :--- | :--- | :--- |
+| 1. `NEXT_HOP` | Does `NEXT_HOP` equal the client's peering IP? | Next-hop hijacking (diverting traffic to another member's port). | RFC 7948 4.8; `arouteserver` `next_hop` policy `strict` (default). |
+| 2. Prefix length | Is prefix length within `8–24` (IPv4) or `12–48` (IPv6)? | Default routes, bogons, and deaggregated `/25+` or `/49+` noise. | `arouteserver` default prefix-length bounds. |
+| 3. First AS | Is the leftmost AS in `AS_PATH` equal to the client's ASN? | Spoofed or misconfigured `AS_PATH` on ingress to the RS. | Standard eBGP ingress check (the RS enforces it *inbound*). |
+| 4. RFC 9234 `OTC` | Does the route from an `RS-Client` already carry an `OTC` attribute? | Route leaks (a client leaking a route learned from its own provider or peer). | RFC 9234 (May 2022): route with `OTC` from `RS-Client` is ineligible. |
+| 5. IRR `as-set` | Are the prefix and origin ASN authorized in the client's IRR `as-set`? | Fat-fingered static routes or unauthorized customer prefixes. | RFC 7948 4.3; `arouteserver` `enforce_origin_in_as_set`. |
+| 6. RPKI ROV | Is `(prefix, length, origin AS)` `Invalid` against VRP cache? | Origin hijacks and mis-originated prefixes. | `arouteserver` `rpki_bgp_origin_validation` (off by default in `general.yml`; when enabled, `reject_invalid: True` drops Invalid and keeps Valid and NotFound). |
+| 7. Max-prefix | Has the client exceeded its per-session prefix ceiling? | Full-table leaks or runaway route generation. | RFC 7948 4.3 `maximum-prefix` limit (session teardown or warning). |
+
+A few subtleties in this stack deserve closer attention:
+
+- **Next-hop hijacking (RFC 7948 Section 4.8):** Because the route server passes `NEXT_HOP` unmodified, a malicious or misconfigured client at `2001:db8:ffff::13` could announce a prefix with `NEXT_HOP 2001:db8:ffff::12`. If the route server accepted that `UPDATE`, every member would send traffic for that prefix to `::12`—overloading or blackholing `AS64502`. Setting `arouteserver`'s `next_hop` policy to `strict` (the default) rejects any `UPDATE` whose `NEXT_HOP` does not match the sending client's interface address. (`arouteserver` also supports `same-as`, allowing other LAN addresses owned by the same ASN, and `authorized_addresses` for explicit exceptions.)
+- **RFC 9234 BGP Roles and `OTC`:** RFC 9234 defines five BGP Role values exchanged in the BGP OPEN capability: `Provider` (0), `RS` (1), `RS-Client` (2), `Customer` (3), and `Peer` (4). Allowed peering pairs include `RS <-> RS-Client`. On ingress to the route server from an `RS-Client`, any route that already carries the `Only to Customer` (`OTC`) attribute is a route leak (it came from an upstream provider or peer of that client) and is marked ineligible. On egress from the route server to an `RS-Client`, the route server adds `OTC = <RS ASN>` if `OTC` is absent—ensuring that if the receiving client accidentally re-advertises the route to its own upstream provider or peer, that downstream speaker's RFC 9234 check will catch the leak. (Recall from RFC 9234 that routes carrying `OTC` must never be sent to Providers, Peers, or Route Servers.)
+- **Max-prefix counting:** RFC 7948 Section 4.3 recommends per-client max-prefix limits *and* inbound prefix filtering, noting that prefix filtering is the stronger control. Be aware that BGP implementations differ on whether prefixes rejected by inbound filters count toward the `maximum-prefix` threshold. If a member leaks a full table and your daemon counts only *accepted* prefixes, the session may stay up while burning CPU filtering 900,000 routes; if it counts *received* prefixes, the session tears down immediately. Check your daemon's behaviour.
+- **IRR drift monitoring:** RFC 7948 Section 4.3 also recommends comparing `Adj-RIB-In` against registered IRR prefix lists periodically. When a member forgets to update its `as-set` before announcing a new customer, the route server silently drops the prefix; surfacing that delta in a member portal or report prevents hours of blind troubleshooting.
+
+### Export policy and BGP communities
+
+Once a route clears inbound hygiene, members often want to control which other members on the IXP receive it—for example, to maintain selective peering with certain networks while using the route server for everyone else. RFC 7948 Section 4.6 lists three mechanisms for expressing export policy: BGP communities, IRR/RPSL (RFC 2622), or a client-accessible database.
+
+BGP communities are by far the most common mechanism in day-to-day operations. In `arouteserver`, operators configure community names such as `do_not_announce_to_peer`, `announce_to_peer`, and `do_not_announce_to_any`. Those names are **configurable**—each IXP chooses its own numeric values, though a widespread convention uses `0:peer_as` for "do not announce to `peer_as`", `rs_as:peer_as` for "announce to `peer_as`" (often combined with `0:rs_as` for "do not announce to any" to build an allow-list), and `0:rs_as` for "do not announce to anyone". Never assume those numbers without checking your IXP's published community scheme first.
+
+There is also a hard 16-bit ceiling to watch for: standard BGP communities (RFC 1997) are 32 bits wide (`16:16`), so the second 16-bit half cannot encode a 32-bit (4-byte) peer ASN (RFC 6793). As RFC 7948 Section 4.6 points out, any community-based export scheme must support 4-byte ASNs. Modern IXPs solve this with **BGP Large Communities** (RFC 8092, `32:32:32`, such as `rs_as:0:peer_as`), or—where legacy routers lack Large Community support—by publishing a 16-bit mapping value for each 32-bit member ASN.
+
+## Member-side configuration and redundancy
+
+Operating *as* a route-server member is much simpler than running the route server itself, provided you get four things right on your border router:
+
+1. **Peer with both route servers:** RFC 7948 Section 4.4 recommends running multiple route servers per IXP LAN—ideally different implementations (such as BIRD and OpenBGPD) configured equivalently from the same policy source. If a single route server reboots or drops your session, you lose every multilateral route on that IXP unless you have a session to the secondary route server.
+2. **Disable `enforce-first-as` towards the route servers:** As shown earlier, `no neighbor <rs-ip> enforce-first-as` is mandatory on FRR (and its equivalent on other NOSes) so your router accepts routes whose leftmost AS is the originating member's ASN rather than the route server's ASN.
+3. **Configure your RFC 9234 role (carefully):** In FRR, the member side sets `rs-client` while the route server sets `rs-server`:
+
+```text
+! From the FRR docs, not run
+! Member router configuring RFC 9234 role towards the route server:
+router bgp 64501
+ neighbor 2001:db8:ffff::1 local-role rs-client
+! Add 'strict-mode' only after verifying the RS advertises 'rs-server':
+! neighbor 2001:db8:ffff::1 local-role rs-client strict-mode
+```
+
+Note the spelling in FRR: the route-server side is `rs-server`, not `rs`. Adding `strict-mode` tells BGP to tear down the session if the remote peer does not advertise the matching `rs-server` role capability in `OPEN`—useful once you know the IXP supports RFC 9234, fatal if they have not deployed it yet.
+
+4. **Separate `LOCAL_PREF` between bilateral and RS sessions:** Many operators assign a slightly higher `LOCAL_PREF` to direct bilateral peering sessions on the IXP than to routes learned from the route server, or vice versa depending on traffic-engineering policy. Preferring bilateral sessions over the route server is a common design choice: it keeps traffic flowing on the direct session if the route server restarts and lets you apply bilateral-specific policies cleanly. Whatever you choose, make it deliberate rather than leaving both at the default `100` and letting tie-breakers decide.
+
+### Non-transitive Layer 2 reachability
+
+One failure mode unique to route servers is **non-transitive Layer 2 reachability** (RFC 7948 Section 4.7, which blames Ethernet switch forwarding bugs). Suppose Member A and Member B both have healthy, `Established` eBGP sessions to the route server, so the route server exchanges routes between them. However, a misconfigured port ACL, a MAC-address limit, or a partial switch-fabric failure blocks Ethernet frames directly between Member A's port and Member B's port.
+
+Because the route server is not in the forwarding path, neither BGP session notices anything wrong. Member A installs Member B's prefixes pointing at Member B's LAN IP, sends packets, and drops them into a silent blackhole. Running BFD (RFC 5881) between clients can detect a dead L2 path, but as RFC 7948 Section 4.7 notes, BFD only partially helps: it is bilateral, nothing configures it automatically between route-server clients, and even when it fires the client can only mark the route-server path unusable. Because the route server sends one best path per prefix, that can mean sub-optimal routing or no route at all unless another session supplies an alternative.
+
+## The lab
+
+To see how a route server's RIBs, hygiene checks, and community steering behave without standing up a full container lab of BGP daemons, the lab uses a pure-Python standard-library model of an IXP peering LAN (`2001:db8:ffff::/64`). The route server (`AS64500` at `::1`) peers with four members using documentation ASNs and prefixes: `AS64501` (`::11`), `AS64502` (`::12`), `AS64503` (`::13`, with `maximum-prefix` set to 6 and IRR prefix `2001:db8:400::/46`), and `AS64504` (`::14`, with IRR prefixes `2001:db8:200::/48` and `2001:db8:300::/48`), plus RPKI VRPs for `2001:db8:200::/48-48 AS64510` and `2001:db8:300::/48-48 AS64504`. The model's decision process evaluates shortest `AS_PATH`, lowest `MED`, and lowest `NEXT_HOP`, and runs six scenarios: single `Loc-RIB` path hiding, per-client `Loc-RIB` resolution, client-side `enforce-first-as` behaviour, `AS64503`'s "bad hour" hitting each hygiene gate and `maximum-prefix`, community-based export steering, and $O(P \times N)$ scaling numbers.
+
+```{.python filename="ixp-rs.py"}
+#!/usr/bin/env python3
+"""A model IXP route server (RFC 7947/7948, RFC 9234 roles/OTC).
+Run: python3 ixp-rs.py   (standard library only; no BGP daemon)
+IXP peering LAN 2001:db8:ffff::/64; route server AS64500 at 2001:db8:ffff::1.
+All prefixes and ASNs are documentation values (RFC 3849, RFC 5398)."""
+import ipaddress as ipa
+
+RS_AS, LAN = 64500, ipa.ip_network('2001:db8:ffff::/64')
+MEMBERS = {   # asn: (lan address, IRR-registered prefixes (the as-set expansion), max-prefix)
+    64501: ('2001:db8:ffff::11', ['2001:db8:100::/48'], 10),
+    64502: ('2001:db8:ffff::12', ['2001:db8:200::/48'], 10),
+    64503: ('2001:db8:ffff::13', ['2001:db8:400::/46'], 6),
+    64504: ('2001:db8:ffff::14', ['2001:db8:200::/48', '2001:db8:300::/48'], 10),
+}
+VRPS = [('2001:db8:200::/48', 48, 64510), ('2001:db8:300::/48', 48, 64504)]   # (prefix, maxLength, origin)
+
+def rov(prefix, origin):
+    p = ipa.ip_network(prefix); covered = False
+    for vp, ml, asn in VRPS:
+        vp = ipa.ip_network(vp)
+        if p.subnet_of(vp):
+            covered = True
+            if p.prefixlen <= ml and asn == origin:
+                return 'valid'
+    return 'invalid' if covered else 'not-found'
+
+def route(peer, prefix, path, nh=None, med=None, comms=(), otc=None):
+    return dict(peer=peer, prefix=prefix, path=list(path), nh=nh or MEMBERS[peer][0],
+                med=med, comms=set(comms), otc=otc)
+
+def import_check(r, counts):
+    """RS ingress filters, in the order a typical IXP applies them."""
+    peer, p = r['peer'], ipa.ip_network(r['prefix'])
+    counts[peer] = counts.get(peer, 0) + 1
+    if counts[peer] > MEMBERS[peer][2]:
+        return 'max-prefix exceeded: session would be torn down'
+    if r['nh'] != MEMBERS[peer][0]:
+        return f"NEXT_HOP {r['nh']} is not the sender's LAN address (RFC 7948 4.8)"
+    if not 12 <= p.prefixlen <= 48:
+        return f'prefix length /{p.prefixlen} outside 12-48'
+    if r['path'][0] != peer:
+        return f"first AS {r['path'][0]} != peer AS {peer}"
+    if r['otc'] is not None:
+        return f"OTC={r['otc']} received from an RS-Client: route leak (RFC 9234 5, ingress 1)"
+    if not any(p.subnet_of(ipa.ip_network(x)) for x in MEMBERS[peer][1]):
+        return 'not covered by the IRR as-set expansion'
+    state = rov(r['prefix'], r['path'][-1])
+    if state == 'invalid':
+        return 'RPKI ROV invalid'
+    r['rov'] = state
+    return None
+
+def best(paths):
+    """Enough of the decision process for this lab: shortest AS_PATH, then lowest MED, then lowest peer address."""
+    return min(paths, key=lambda r: (len(r['path']), r['med'] or 0, ipa.ip_address(r['nh'])))
+
+def export_ok(r, client):
+    c = r['comms']
+    if r['peer'] == client: return False
+    if f'0:{client}' in c: return False                       # do not announce to this peer
+    if f'0:{RS_AS}' in c and f'{RS_AS}:{client}' not in c: return False   # announce to none, except...
+    return True
+
+def advertise(r):
+    """What the client receives: attributes passed through, OTC added (RFC 9234 egress 1)."""
+    return dict(prefix=r['prefix'], path=r['path'], nh=r['nh'], med=r['med'],
+                comms=sorted(r['comms']), otc=r['otc'] if r['otc'] is not None else RS_AS)
+
+def run(routes, per_client_ribs):
+    counts, adj_in = {}, []
+    print(f"-- import ({len(routes)} UPDATEs)")
+    for r in routes:
+        why = import_check(r, counts)
+        tag = 'ACCEPT' if not why else 'REJECT'
+        print(f"  {tag:6} AS{r['peer']} {r['prefix']:<20} path {' '.join(map(str, r['path'])):<18} nh {r['nh']:<18} " + (why or f"(ROV {r['rov']})"))
+        if not why: adj_in.append(r)
+    out = {}
+    prefixes = sorted({r['prefix'] for r in adj_in})
+    for client in MEMBERS:
+        out[client] = []
+        for p in prefixes:
+            cands = [r for r in adj_in if r['prefix'] == p]
+            if per_client_ribs:
+                cands = [r for r in cands if export_ok(r, client)]
+                if cands: out[client].append(advertise(best(cands)))
+            else:
+                b = best(cands)
+                if export_ok(b, client): out[client].append(advertise(b))
+    return out
+
+def show(out, clients=MEMBERS):
+    for c in clients:
+        rows = out[c]
+        print(f'  to AS{c}: ' + ('; '.join(f"{a['prefix']} path {' '.join(map(str, a['path']))} nh {a['nh']} otc {a['otc']}"
+                                         + (f" comms {','.join(a['comms'])}" if a['comms'] else '') for a in rows) or '(nothing)'))
+
+def client_accepts(adv, enforce_first_as):
+    if enforce_first_as and adv['path'][0] != RS_AS:
+        return f"rejected: enforce-first-as (first AS {adv['path'][0]} != neighbour AS {RS_AS})"
+    if not ipa.ip_address(adv['nh']) in LAN:
+        return 'rejected: next hop not on the IXP LAN'
+    return 'accepted'
+
+print('== 1. Normal day: transparent route server, single Loc-RIB')
+day = [route(64501, '2001:db8:100::/48', [64501], med=50),
+       route(64502, '2001:db8:200::/48', [64502, 64510], comms=['0:64501']),
+       route(64504, '2001:db8:200::/48', [64504, 64520, 64510]),
+       route(64504, '2001:db8:300::/48', [64504])]
+out = run([dict(r, comms=set(r['comms'])) for r in day], per_client_ribs=False)
+show(out)
+print('  AS64501 has no route to 2001:db8:200::/48 although AS64504 offered a usable one (path hiding)')
+
+print('\n== 2. Path hiding fixed with per-client Loc-RIBs (RFC 7947 2.3.2.1)')
+out2 = run([dict(r, comms=set(r['comms'])) for r in day], per_client_ribs=True)
+show(out2, [64501])
+
+print('\n== 3. What AS64501\'s router does with the route server\'s UPDATE')
+adv = out2[64501][0]
+for efa in (True, False):
+    print(f"  enforce-first-as {'on ' if efa else 'off'}: {adv['prefix']} path {' '.join(map(str, adv['path']))} -> {client_accepts(adv, efa)}")
+
+
+print('\n== 4. A bad hour for AS64503 (max-prefix 6; this model counts every prefix received)')
+bad = [route(64503, '2001:db8:400::/48', [64503]),
+       route(64503, '2001:db8:200::/48', [64503, 64510], nh='2001:db8:ffff::12'),
+       route(64503, '2001:db8:401::/56', [64503]),
+       route(64503, '2001:db8:200::/48', [64503, 64502, 64510], otc=64502),
+       route(64503, '2001:db8:300::/48', [64503]),
+       route(64503, '2001:db8:402::/48', [64510, 64503]),
+       route(64503, '2001:db8:403::/48', [64503])]
+run(bad, per_client_ribs=True)
+
+print('\n== 5. Community steering (0:peer, rs:peer, 0:rs) for one prefix from AS64501')
+for comms in ([], ['0:64502'], [f'0:{RS_AS}'], [f'0:{RS_AS}', f'{RS_AS}:64504']):
+    r = route(64501, '2001:db8:100::/48', [64501], comms=comms)
+    got = [f'AS{c}' for c in MEMBERS if export_ok(r, c)]
+    print(f"  comms {','.join(comms) or '(none)':<22} -> announced to {', '.join(got) or 'nobody'}")
+
+print('\n== 6. Scale (RFC 7948 4.2): paths the decision process must evaluate')
+for n in (50, 200, 800):
+    print(f'  {n} clients, 200000 unique paths: single Loc-RIB 200000; all per-client Loc-RIBs {200000 * n:,}')
+```
+This is a policy model, not a BGP daemon: it needs only Python, and every decision below comes from the rules written into the script. Output from Python 3.13.5 (a real run, unedited):
+
+```text
+$ python3 ixp-rs.py
+== 1. Normal day: transparent route server, single Loc-RIB
+-- import (4 UPDATEs)
+  ACCEPT AS64501 2001:db8:100::/48    path 64501              nh 2001:db8:ffff::11  (ROV not-found)
+  ACCEPT AS64502 2001:db8:200::/48    path 64502 64510        nh 2001:db8:ffff::12  (ROV valid)
+  ACCEPT AS64504 2001:db8:200::/48    path 64504 64520 64510  nh 2001:db8:ffff::14  (ROV valid)
+  ACCEPT AS64504 2001:db8:300::/48    path 64504              nh 2001:db8:ffff::14  (ROV valid)
+  to AS64501: 2001:db8:300::/48 path 64504 nh 2001:db8:ffff::14 otc 64500
+  to AS64502: 2001:db8:100::/48 path 64501 nh 2001:db8:ffff::11 otc 64500; 2001:db8:300::/48 path 64504 nh 2001:db8:ffff::14 otc 64500
+  to AS64503: 2001:db8:100::/48 path 64501 nh 2001:db8:ffff::11 otc 64500; 2001:db8:200::/48 path 64502 64510 nh 2001:db8:ffff::12 otc 64500 comms 0:64501; 2001:db8:300::/48 path 64504 nh 2001:db8:ffff::14 otc 64500
+  to AS64504: 2001:db8:100::/48 path 64501 nh 2001:db8:ffff::11 otc 64500; 2001:db8:200::/48 path 64502 64510 nh 2001:db8:ffff::12 otc 64500 comms 0:64501
+  AS64501 has no route to 2001:db8:200::/48 although AS64504 offered a usable one (path hiding)
+
+== 2. Path hiding fixed with per-client Loc-RIBs (RFC 7947 2.3.2.1)
+-- import (4 UPDATEs)
+  ACCEPT AS64501 2001:db8:100::/48    path 64501              nh 2001:db8:ffff::11  (ROV not-found)
+  ACCEPT AS64502 2001:db8:200::/48    path 64502 64510        nh 2001:db8:ffff::12  (ROV valid)
+  ACCEPT AS64504 2001:db8:200::/48    path 64504 64520 64510  nh 2001:db8:ffff::14  (ROV valid)
+  ACCEPT AS64504 2001:db8:300::/48    path 64504              nh 2001:db8:ffff::14  (ROV valid)
+  to AS64501: 2001:db8:200::/48 path 64504 64520 64510 nh 2001:db8:ffff::14 otc 64500; 2001:db8:300::/48 path 64504 nh 2001:db8:ffff::14 otc 64500
+
+== 3. What AS64501's router does with the route server's UPDATE
+  enforce-first-as on : 2001:db8:200::/48 path 64504 64520 64510 -> rejected: enforce-first-as (first AS 64504 != neighbour AS 64500)
+  enforce-first-as off: 2001:db8:200::/48 path 64504 64520 64510 -> accepted
+
+== 4. A bad hour for AS64503 (max-prefix 6; this model counts every prefix received)
+-- import (7 UPDATEs)
+  ACCEPT AS64503 2001:db8:400::/48    path 64503              nh 2001:db8:ffff::13  (ROV not-found)
+  REJECT AS64503 2001:db8:200::/48    path 64503 64510        nh 2001:db8:ffff::12  NEXT_HOP 2001:db8:ffff::12 is not the sender's LAN address (RFC 7948 4.8)
+  REJECT AS64503 2001:db8:401::/56    path 64503              nh 2001:db8:ffff::13  prefix length /56 outside 12-48
+  REJECT AS64503 2001:db8:200::/48    path 64503 64502 64510  nh 2001:db8:ffff::13  OTC=64502 received from an RS-Client: route leak (RFC 9234 5, ingress 1)
+  REJECT AS64503 2001:db8:300::/48    path 64503              nh 2001:db8:ffff::13  not covered by the IRR as-set expansion
+  REJECT AS64503 2001:db8:402::/48    path 64510 64503        nh 2001:db8:ffff::13  first AS 64510 != peer AS 64503
+  REJECT AS64503 2001:db8:403::/48    path 64503              nh 2001:db8:ffff::13  max-prefix exceeded: session would be torn down
+
+== 5. Community steering (0:peer, rs:peer, 0:rs) for one prefix from AS64501
+  comms (none)                 -> announced to AS64502, AS64503, AS64504
+  comms 0:64502                -> announced to AS64503, AS64504
+  comms 0:64500                -> announced to nobody
+  comms 0:64500,64500:64504    -> announced to AS64504
+
+== 6. Scale (RFC 7948 4.2): paths the decision process must evaluate
+  50 clients, 200000 unique paths: single Loc-RIB 200000; all per-client Loc-RIBs 10,000,000
+  200 clients, 200000 unique paths: single Loc-RIB 200000; all per-client Loc-RIBs 40,000,000
+  800 clients, 200000 unique paths: single Loc-RIB 200000; all per-client Loc-RIBs 160,000,000
+```
+
+Notice how the model reproduces every protocol interaction cleanly: in the single `Loc-RIB` run, `AS64501` receives no route to `2001:db8:200::/48` at all because `AS64502`'s shorter path wins best-path and is then blocked by `0:64501`. Switching to per-client `Loc-RIB`s surfaces `AS64504`'s `64504 64520 64510` path for `AS64501` while keeping `AS64502`'s shorter path for `AS64503` and `AS64504`—and `AS64501`'s router only installs that route once `enforce-first-as` is turned off.
+
+## Gotchas
+
+- **The trap: leaving `enforce-first-as` enabled towards the route server.** Your BGP session comes up `Established`, you see prefixes advertised in the IXP's looking glass, and your own router's RIB stays empty. Because a transparent route server does not prepend its ASN, every `UPDATE` fails the first-AS check until you disable it per peer (`no neighbor <rs-ip> enforce-first-as` in FRR).
+- **The trap: assuming `Established` BGP means Layer 2 reachability.** Because the route server is not in the forwarding path, Member A and Member B can both have healthy sessions to the route server while L2 frames between A and B are silently dropped (RFC 7948 Section 4.7). Always verify data-plane reachability (ping/traceroute to the peer's LAN IP, ARP/NDP entry) when debugging a blackhole, not just the BGP session to the RS.
+- **The trap: unvalidated `NEXT_HOP` attributes.** If a route server does not enforce `next_hop` `strict` (checking that `NEXT_HOP` equals the sending client's peering IP), a single misconfigured or malicious member can set `NEXT_HOP` to *another* member's IP and divert traffic across the LAN (RFC 7948 Section 4.8).
+- **The trap: single `Loc-RIB` path hiding.** If an operator runs a plain BGP daemon without per-client RIBs, diverse paths, or send-only ADD-PATH, any member excluded by the winning peer's export community loses reachability to that prefix even when valid alternative paths exist in `Adj-RIB-In`.
+- **The trap: peering with only one route server.** Losing your single RS session drops every multilateral route at once. Peer with both route servers on the IXP LAN (RFC 7948 Section 4.4) and verify that both advertise equivalent policies.
+- **The trap: mis-sizing `maximum-prefix` and ignoring how filtered routes count.** Set `maximum-prefix` too low and normal growth tears down your RS session; set it too high and a full-table leak slips through. Know whether your BGP implementation counts *received* prefixes (before inbound filter) or *accepted* prefixes (after inbound filter) against the limit.
+- **The trap: IRR `as-set` drift.** If you add a new customer or originate a new block without updating your IRR `as-set`, the route server's inbound filter will drop your announcement. Compare your `Adj-RIB-In` announcements against your registered IRR objects regularly (RFC 7948 Section 4.3).
+- **The trap: trying to fit a 32-bit peer ASN into a standard `16:16` community.** Standard 32-bit communities cannot represent a 4-byte ASN (RFC 6793, RFC 7948 Section 4.6). Use the IXP's BGP Large Communities (RFC 8092) or its published 16-bit mapping table for 32-bit peers.
+- **The trap: sending internal customer communities to the route server expecting action.** The route server passes unknown communities transparently (RFC 7947 Section 2.2.4); only communities explicitly defined in the IXP's published scheme trigger RS export actions.
+- **The trap: leaving `LOCAL_PREF` identical across bilateral and RS sessions.** If you maintain both a bilateral session and an RS session with a peer and leave both at default `LOCAL_PREF`, subtle tie-breakers decide which path wins. Decide explicitly—many operators prefer bilateral sessions over RS-learned routes—and set `LOCAL_PREF` accordingly.
+- **The trap: sending `NO_EXPORT` (RFC 1997) to a route server.** By RFC 7947, a route server passes communities transparently by default, yet RFC 1997 defines `NO_EXPORT` as "do not advertise outside an AS or confederation boundary." Many route servers will not export routes tagged `NO_EXPORT` to other clients; check your IXP's route-server policy before relying on `NO_EXPORT` on routes you originate towards an RS.
+- **The trap: enabling `local-role rs-client strict-mode` before checking the RS.** In FRR, `strict-mode` tears down the BGP session if the route server does not advertise the `rs-server` role in its `OPEN` message. Verify RFC 9234 support on the IXP's route servers before turning on `strict-mode`.
+
+## The boring rule
+
+Treat an IXP route server like a shared control-plane bus, not a transit router: check your `NEXT_HOP`s, keep your IRR `as-set` and RPKI ROAs current, disable `enforce-first-as` only on the RS peers, and peer with both route servers.
+
+## Exercises
+
+1. **Diagnosing path hiding:** Suppose `AS64502` announces `2001:db8:200::/48` with `AS_PATH` `64502 64510` and `MED` `50`, tagged with `0:64501`. `AS64504` announces `2001:db8:200::/48` with `AS_PATH` `64504 64510` and `MED` `100`, with no communities. Trace what `AS64501` receives on (a) a single-`Loc-RIB` route server, (b) a per-client-`Loc-RIB` route server, and (c) a single-`Loc-RIB` route server with send-only ADD-PATH enabled towards `AS64501`. Explain why (a) fails and compare the client-router requirements of (b) versus (c).
+2. **Scaling math and view merging:** An IXP route server receives $250{,}000$ unique paths across $600$ connected members. Calculate the total path evaluations required if every member has a dedicated `Loc-RIB`. Now suppose $540$ of those members share the exact same open peering policy, while $60$ members use custom per-peer export communities. Using RFC 7948 Section 4.2.1.1 (view merging), how many distinct `Loc-RIB` views does the route server actually need, and what is the new evaluation count?
+3. **`OTC` leak prevention walk-through:** A member `AS64503` (configured as `rs-client`) accidentally leaks a prefix learned from its transit provider `AS64599` to the IXP route server `AS64500` (`rs-server`). Trace what happens in two cases: (a) `AS64599` and `AS64503` both run RFC 9234 (`Provider` / `Customer`), and (b) `AS64599` does not run RFC 9234, but `AS64500` and `AS64501` do. In case (b), how does `AS64500` marking `OTC = 64500` on egress to `AS64501` protect the rest of the Internet?
+4. **32-bit ASN community steering:** Your network has ASN `4200000101` and you want to announce `2001:db8:100::/48` via an IXP route server (`AS64500`) to everyone *except* `AS4200000202`, while announcing `2001:db8:101::/48` *only* to `AS4200000202`. Explain why `0:4200000202` is invalid in standard BGP communities (RFC 1997 / RFC 6793), write out the equivalent logic using BGP Large Communities (RFC 8092) assuming an IXP scheme where `rs_as:0:peer_as` means "do not announce to peer", `rs_as:1:peer_as` means "announce to peer", and `rs_as:0:0` means "do not announce to any", and explain what you would check if a router on the IXP did not support Large Communities.
+5. **Silent blackhole triage:** Your border router (`AS64501`) has an `Established` IPv6 BGP session to both IXP route servers (`::1` and `::2`), and `show bgp ipv6 unicast` shows `2001:db8:300::/48` via `2001:db8:ffff::14` (`AS64504`) as best path. Yet traffic to `2001:db8:300::1` times out. List the exact control-plane and data-plane checks you would run to distinguish between (a) a non-transitive L2 failure between `::11` and `::14` (RFC 7948 Section 4.7), (b) a missing return route on `AS64504`, and (c) a next-hop hijack.
+6. **Member-side FRR hardening:** Write the FRR BGP configuration snippet (label it "from the FRR docs, not run") for `AS64501` peering with two IXP route servers at `2001:db8:ffff::1` and `2001:db8:ffff::2` (both `AS64500`). Include disabling `enforce-first-as`, setting the RFC 9234 `local-role`, and explaining why you should verify RS role support before adding `strict-mode`, as well as how you would set `LOCAL_PREF` relative to a bilateral session with `AS64504` at `2001:db8:ffff::14`.
+
+## Sources
+
+- [RFC 7947: Internet Exchange BGP Route Server](https://datatracker.ietf.org/doc/html/rfc7947)
+- [RFC 7948: Route Server Operations](https://datatracker.ietf.org/doc/html/rfc7948)
+- [RFC 9234: Route Leak Prevention and Detection Using Roles in UPDATE and OPEN Messages](https://datatracker.ietf.org/doc/html/rfc9234)
+- [RFC 4271: A Border Gateway Protocol 4 (BGP-4)](https://datatracker.ietf.org/doc/html/rfc4271)
+- [RFC 1997: BGP Communities Attribute](https://datatracker.ietf.org/doc/html/rfc1997)
+- [RFC 8092: BGP Large Communities Attribute](https://datatracker.ietf.org/doc/html/rfc8092)
+- [RFC 7911: Advertisement of Multiple Paths in BGP (ADD-PATH)](https://datatracker.ietf.org/doc/html/rfc7911)
+- [RFC 6774: Distribution of Diverse BGP Paths](https://datatracker.ietf.org/doc/html/rfc6774)
+- [RFC 6793: BGP Support for Four-Octet Autonomous System (AS) Number Space](https://datatracker.ietf.org/doc/html/rfc6793)
+- [RFC 5881: Bidirectional Forwarding Detection (BFD) for IPv4 and IPv6 (Single Hop)](https://datatracker.ietf.org/doc/html/rfc5881)
+- [RFC 2622: Routing Policy Specification Language (RPSL)](https://datatracker.ietf.org/doc/html/rfc2622)
+- [ARouteServer Documentation](https://arouteserver.readthedocs.io/)
+- [BIRD Internet Routing Daemon Documentation](https://bird.network.cz/)
+- [OpenBGPD Documentation](https://www.openbgpd.org/)
+- [FRRouting BGP Documentation](https://docs.frrouting.org/en/latest/bgp.html)
