@@ -1,0 +1,519 @@
+---
+title: "IGP Convergence Timing: SPF Back-off (RFC 8405), LSA Throttling and Microloops"
+author:
+  - name: "K19G"
+  - name: "grok-bot"
+---
+
+# IGP Convergence Timing: SPF Back-off (RFC 8405), LSA Throttling and Microloops
+
+Sub-second failure detection does not give you sub-second convergence. You can tune BFD down to tens of milliseconds and still drop packets—or worse, bounce them back and forth across a link—for hundreds of milliseconds or several seconds after a failure. Detection is only the first term in a pipeline of timers, flooding delays, shortest-path calculations, and hardware forwarding updates.
+
+Every router in an OSPF area or IS-IS level runs that pipeline independently. They do not hear about a topology change at the exact same microsecond, they do not always run SPF on the same schedule, and they certainly do not program their Forwarding Information Bases (FIBs) at the same speed. When one router installs the post-failure next-hop while its neighbour is still using the pre-failure next-hop, packets loop between them until the slower router catches up.
+
+Understanding IGP convergence means treating it as a distributed timing problem rather than a single knob. You need to know where each millisecond goes, how RFC 8405 keeps routers aligned during multi-event storms, why LSA/LSP throttling silently caps your reaction speed, and how local convergence delay (RFC 8333) closes the microloop window when fast reroute is already in place.
+
+## Learning goals
+
+- Decompose end-to-end IGP convergence into its six sequential stages and identify which stage dominates on small versus large routing tables.
+- Trace the RFC 8405 SPF back-off state machine (`QUIET`, `SHORT_WAIT`, `LONG_WAIT`) across single failures, node failures, and flapping links.
+- Explain why time-based back-off (`TIME_TO_LEARN_INTERVAL`) prevents timer skew between routers where count-based back-off diverges.
+- Configure and distinguish LSA/LSP origination throttling (`MinLSInterval`, `MinLSArrival`, `lsp-gen-interval`) from SPF delay timers.
+- Predict the exact start and end times of a transient microloop on a small topology given detection, flooding, SPF delay, and FIB programming times.
+- Apply RFC 8333 local convergence delay alongside TI-LFA fast reroute and recognise the scenarios where RFC 8333 cannot help.
+
+## The Anatomy of IGP Convergence
+
+When a link or node fails in a link-state IGP, traffic does not move cleanly from the old path to the new path at a single instant. Instead, the network walks through six distinct phases before forwarding is loop-free again:
+
+```text
+t=0 (Link fails)
+ |
+ +--[1. Detection]--------> BFD timeout or physical loss of signal
+ |
+ +--[2. Origination]------> Adjacent router generates updated LSA/LSP (throttled)
+ |
+ +--[3. Flooding]---------> LSA/LSP propagates hop-by-hop across the area/level
+ |
+ +--[4. SPF Delay]--------> Each router waits out its SPF back-off timer
+ |
+ +--[5. SPF Run]----------> Dijkstra computes the new shortest-path tree
+ |
+ +--[6. RIB / FIB Update]-> Best routes go to RIB and are pushed to hardware FIB
+```
+
+Each stage has a different cost profile depending on your hardware, topology size, and configuration:
+
+| Stage | Typical Scale | Driven By | Can It Dominate? |
+| :--- | :--- | :--- | :--- |
+| 1. Failure detection | 0–150 ms (LOS / BFD) or seconds (hellos) | Interface hardware, BFD intervals | Yes, if relying on IGP hellos |
+| 2. LSA / LSP origination | 0 ms (first event) to 5 s (re-origination) | `MinLSInterval` / LSP gen throttle | Yes, during rapid flaps |
+| 3. Flooding | 1–20 ms per hop | Propagation delay, pacing, CPU | Rarely, except on congested control planes |
+| 4. SPF delay (back-off) | 0–50 ms (initial) to 5–10 s (held down) | RFC 8405 or vendor back-off timers | Yes, after repeated topology changes |
+| 5. SPF run | 1–50 ms | LSDB size, number of nodes/links, CPU | Rarely on modern CPUs unless using full-mesh scale |
+| 6. RIB / FIB update | 10 ms to several seconds | Prefix count, ASIC/linecard programming rate | **Yes—often the dominant term on big tables** |
+
+As covered in the BFD chapter, aggressive detection compresses stage 1 from seconds down to tens of milliseconds. That is necessary for fast convergence, but it does not compress stages 2 through 6. On a router carrying tens of thousands of IGP prefixes—or BGP routes resolving over IGP next-hops—stage 6 (`RIB / FIB update`) frequently dwarfs everything else. A high-end route processor can finish Dijkstra in 5 ms and then spend 300 ms downloading updated next-hops into linecard hardware.
+
+Crucially, stages 3 through 6 happen *per router*. A router with 500 prefixes and a fast control plane finishes in 70 ms; a core router two hops away with 20,000 prefixes and a loaded linecard might finish in 260 ms. That 190 ms gap is where forwarding breaks.
+
+## LSA and LSP Throttling: Controlling the Input
+
+Before a router can run SPF, it must receive an updated Link-State Advertisement (OSPF) or Link-State PDU (IS-IS) describing the failure. The router adjacent to the failed link originates that update, and every other router floods it. Without rate-limiting at the originator and receiver, a flapping interface would flood the entire domain with continuous updates and keep every router's CPU pinned.
+
+OSPF defines two foundational rate limits in RFC 2328 (Appendix D):
+
+1. **`MinLSInterval`** (default: **5 seconds / 5000 ms**): The minimum time a router must wait before originating a *new instance* of the same LSA. On the very first failure event, if the LSA has not been originated recently, the router can originate it immediately (0 ms delay). If the link bounces back up 100 ms later, the router must hold the second update until `MinLSInterval` expires—meaning the rest of the network learns about the recovery up to 5 seconds late.
+2. **`MinLSArrival`** (default: **1 second / 1000 ms**): The minimum time a router will accept a *new instance* of the same LSA from a neighbour. If an LSA arrives sooner than `MinLSArrival` after the previous instance of that same LSA, the receiving router **drops it**.
+
+IS-IS (ISO 10589 / RFC 1195) applies equivalent controls to LSP generation, pacing, and flooding. An LSP generator throttles how often it regenerates a given LSP fragment, while interface pacing prevents bursts from overwhelming slower neighbours.
+
+### Configuration in FRR
+
+In FRR `ospfd` (from the docs, not run), LSA origination and arrival throttling are tuned in milliseconds under `router ospf`:
+
+```text
+! From FRR ospfd docs (not run)
+router ospf
+ timers throttle lsa all 5000
+ timers lsa min-arrival 1000
+```
+
+Here, `timers throttle lsa all (0-5000)` sets `MinLSInterval` (default 5000 ms), and `timers lsa min-arrival (0-5000)` sets `MinLSArrival` (default 1000 ms).
+
+In FRR `isisd` (from the docs, not run), LSP generation throttling is configured in seconds via `lsp-gen-interval` under `router isis`:
+
+```text
+! From FRR isisd docs (not run)
+router isis CORE
+ lsp-gen-interval 2
+```
+
+Other NOS platforms expose their own throttling commands and defaults (some use adaptive exponential back-off for LSA generation rather than a flat `MinLSInterval`). Always check your NOS documentation and align origination and arrival limits across the domain: if Router A is configured to originate LSAs every 200 ms (`MinLSInterval 200`), while Router B still enforces a 1000 ms `MinLSArrival`, Router B will silently discard Router A's rapid updates and run with a stale LSDB until the next periodic refresh or retransmission.
+
+## SPF Back-off and RFC 8405
+
+Once an updated LSA or LSP arrives, a router must decide *when* to run SPF.
+
+Running SPF immediately on every single LSA/LSP is dangerous during correlated failures. When a router fails, four or five neighbours detect the loss at slightly different times and originate separate LSAs/LSPs over a 50–150 ms window. If you run SPF on the first LSA, you waste CPU computing a partial tree and trigger a premature FIB update, only to tear it down milliseconds later when the remaining neighbours' LSAs arrive.
+
+Conversely, waiting a flat 2 seconds before every SPF protects the CPU but destroys your convergence SLA on clean, isolated link failures.
+
+The historical answer was **SPF back-off**: start with a short delay for the first event, then increase the delay if more events keep arriving. Before 2018, vendors implemented this differently—most commonly by counting how many SPF runs had occurred inside a window and doubling the wait time after each run.
+
+### Why Count-Based Back-off Diverges
+
+Count-based back-off has a subtle flaw in multi-vendor or even homogeneous networks: **routers see topology events at different times**.
+
+Suppose a node failure generates four LSAs at `0 ms`, `20 ms`, `45 ms`, and `300 ms`. Router R1 receives the first three LSAs closely enough that it batches them into a single SPF run, then sees the `300 ms` LSA and runs a second SPF. Router R2, located a few hops away across slower links, sees the third LSA arrive slightly later—at `60 ms`—just after its first SPF finished at `50 ms`. R2 therefore runs *two* SPFs before `300 ms`, while R1 has only run *one*.
+
+When the `300 ms` LSA arrives, R1's count-based algorithm is on step 2 of its doubling ladder, while R2 is on step 3. They pick different back-off delays, run their next SPF at completely different times, and keep their FIBs out of sync longer than necessary.
+
+### The RFC 8405 State Machine
+
+RFC 8405 (*SPF Back-Off Delay Algorithm for Link-State IGPs*, Standards Track, June 2018) solves this by driving the back-off state machine with **wall-clock time since the first event** (`TIME_TO_LEARN_INTERVAL`) rather than the number of SPF runs executed (Section 4). Because routers agree closely enough on elapsed time from the initial trigger, they transition between back-off tiers together regardless of how individual LSAs happened to batch along the way.
+
+RFC 8405 defines three states, three timers, and five configurable parameters:
+
+**States:**
+- `QUIET`: No recent topology events. The network is stable.
+- `SHORT_WAIT`: Topology events began recently; the router is still within `TIME_TO_LEARN_INTERVAL`, waiting for correlated LSAs/LSPs to arrive.
+- `LONG_WAIT`: Topology instability has lasted past `TIME_TO_LEARN_INTERVAL`; the router backs off aggressively to dampen churn.
+
+**Timers:**
+- `SPF_TIMER`: Counts down to the next SPF computation.
+- `LEARN_TIMER`: Set to `TIME_TO_LEARN_INTERVAL` on the first event; its expiry marks the end of the initial burst window.
+- `HOLDDOWN_TIMER`: Set to `HOLDDOWN_INTERVAL` on every event; its expiry returns the FSM to `QUIET`.
+
+```text
+                      (1) IGP event:
+                          start SPF_TIMER(INITIAL) if not running
+                          start LEARN_TIMER
+                          start HOLDDOWN_TIMER
+              +------------------------------------------+
+              |                                          v
+          +-------+  (6) HOLDDOWN_TIMER expires:     +------------+
+          |       |      deactivate LEARN_TIMER      |            |
+          | QUIET |<---------------------------------| SHORT_WAIT |
+          |       |                                  |            |
+          +-------+                                  +------------+
+              ^                                          |   ^
+              |                                          |   | (2) IGP event:
+              | (5) HOLDDOWN_TIMER                       |   | reset HOLDDOWN
+              |     expires                              |   | start SPF_TIMER(SHORT)
+              |                                          |   |   if not running
+              |                                          v   |
+              |                                      +-----------+
+              +--------------------------------------|           |
+                                                     | LONG_WAIT |
+                                                     |           |
+                                                     +-----------+
+                                                       |       ^
+                                                       +-------+
+                                                       (4) IGP event:
+                                                           reset HOLDDOWN
+                                                           start SPF_TIMER(LONG)
+                                                             if not running
+
+  (3) LEARN_TIMER expires in SHORT_WAIT -> move to LONG_WAIT
+  (7, 8, 9) SPF_TIMER expires in QUIET / SHORT_WAIT / LONG_WAIT -> compute SPF, stay in state
+```
+
+Every transition is deterministic:
+
+| Transition | Current State | Trigger | Actions | Next State |
+| :--- | :--- | :--- | :--- | :--- |
+| 1 | `QUIET` | IGP event | Start `SPF_TIMER` (`INITIAL_SPF_DELAY`) if not running; start `LEARN_TIMER`; start `HOLDDOWN_TIMER` | `SHORT_WAIT` |
+| 2 | `SHORT_WAIT` | IGP event | Reset `HOLDDOWN_TIMER`; start `SPF_TIMER` (`SHORT_SPF_DELAY`) if not running | `SHORT_WAIT` |
+| 3 | `SHORT_WAIT` | `LEARN_TIMER` expires | None | `LONG_WAIT` |
+| 4 | `LONG_WAIT` | IGP event | Reset `HOLDDOWN_TIMER`; start `SPF_TIMER` (`LONG_SPF_DELAY`) if not running | `LONG_WAIT` |
+| 5 | `LONG_WAIT` | `HOLDDOWN_TIMER` expires | None | `QUIET` |
+| 6 | `SHORT_WAIT` | `HOLDDOWN_TIMER` expires | Deactivate `LEARN_TIMER` | `QUIET` |
+| 7–9 | Any | `SPF_TIMER` expires | Compute SPF | Unchanged |
+
+Notice two critical details in RFC 8405:
+- **`HOLDDOWN_INTERVAL` MUST be longer than `TIME_TO_LEARN_INTERVAL`.** If `HOLDDOWN_TIMER` expired before `LEARN_TIMER`, the router could never reach `LONG_WAIT`. (Transition 6 still handles the edge case safely by deactivating `LEARN_TIMER` if `HOLDDOWN_TIMER` ever fires in `SHORT_WAIT`.)
+- **Running `SPF_TIMER` is never overwritten.** If `SPF_TIMER` is already counting down when a new event arrives (Transitions 1, 2, or 4), the router leaves the running timer alone. It only starts `SPF_TIMER` if it is currently idle.
+
+RFC 8405 Section 6 specifies recommended defaults if the algorithm is enabled by default, along with parameter constraints:
+
+- `INITIAL_SPF_DELAY`: **50 ms**
+- `SHORT_SPF_DELAY`: **200 ms**
+- `LONG_SPF_DELAY`: **5000 ms**
+- `TIME_TO_LEARN_INTERVAL`: **500 ms**
+- `HOLDDOWN_INTERVAL`: **10000 ms**
+
+Section 6 also says all parameters MUST be configurable per protocol instance and MAY be configurable per LSDB (an OSPF area or IS-IS level), SHOULD have millisecond granularity (MUST have at least a tenth of a second), and SHOULD be configurable from 0 ms to at least 6000 ms. Sections 6 and 7 RECOMMEND that all routers in the IGP domain, or at least in the same area/level, run the same algorithm with exactly the same values (and migrate at roughly the same time); the whole point is lost if one router runs a different back-off.
+
+### FRR and Other Implementations
+
+In FRR, `isisd` implements RFC 8405 directly. You can see the `QUIET`, `SHORT_WAIT`, and `LONG_WAIT` state machine in `lib/spf_backoff.c`, exposed through `isisd/isis_cli.c` and the `frr-isisd` YANG model (from the docs/source, not run):
+
+```text
+! From FRR isisd docs (not run)
+router isis CORE
+ spf-delay-ietf init-delay 50 short-delay 200 long-delay 5000 holddown 10000 time-to-learn 500
+```
+
+Each parameter accepts `0–60000` ms. `isisd` also retains `spf-interval` (in seconds) for basic interval limiting when RFC 8405 is not used.
+
+FRR `ospfd`, by contrast, does **not** implement RFC 8405. Instead, it uses an adaptive hold-time throttle (from the docs, not run):
+
+```text
+! From FRR ospfd docs (not run)
+router ospf
+ timers throttle spf 200 400 10000
+```
+
+The syntax is `timers throttle spf DELAY INITIAL-HOLDTIME MAX-HOLDTIME` (all in milliseconds, `0–600000`). On the first event, SPF waits `DELAY` (200 ms). Subsequent events inside the hold window cause the hold time to grow by `INITIAL-HOLDTIME` (400 ms) per event up to `MAX-HOLDTIME` (10000 ms), resetting back to the initial state only after a quiet hold period.
+
+Because different NOS vendors—and even different daemons within the same suite—implement different back-off models, you must check your NOS documentation and configure consistent effective delays across every router in the same IGP area or level.
+
+## Microloops and Loop-Free Convergence
+
+Even with identical RFC 8405 timers on every router, transient microloops still happen. As noted in the *Dynamic routing ideas* chapter, a microloop is a short-lived forwarding loop caused by inconsistent FIBs while routers converge at different speeds.
+
+Consider a simple square topology carrying traffic from `A` to `D`:
+
+```text
+      1          1
+  A -------- B -------- D
+  |                     |
+  | 1                   | 10
+  |                     |
+  +--------- C ---------+
+
+  Pre-failure path A -> D:  A -> B -> D  (cost 2)
+  Link B-D fails at t=0.
+  Post-failure path A -> D: A -> C -> D  (cost 11)
+  Post-failure path B -> D: B -> A -> C -> D (cost 12)
+```
+
+Before `t = 0`, `A` forwards traffic for `D` toward `B`, and `B` forwards it directly to `D`. When link `B-D` fails:
+1. `B` detects the failure immediately (`0 ms`), runs SPF (`50 ms`), and updates its FIB (`20 ms`). At **`t = 70 ms`**, `B` now points `D` back toward `A` (`B -> A -> C -> D`).
+2. `C` receives the LSA/LSP and finishes its FIB update at `t = 90 ms`.
+3. `A` receives the flooded update at `10 ms`, waits `50 ms` for its SPF delay, and spends `200 ms` programming a large FIB. `A` does not update its FIB until **`t = 260 ms`**.
+
+Between `t = 70 ms` and `t = 260 ms`, `A` still sends `D`-bound packets to `B`, and `B` sends them right back to `A`. Every packet for `D` bounces across `A-B` until its TTL expires or `A` finally finishes its FIB write at `260 ms`.
+
+### Why Fast Reroute Does Not Prevent Post-SPF Microloops
+
+You might assume that enabling TI-LFA (covered in the TI-LFA chapters) eliminates this problem. It does not. TI-LFA installs a loop-free repair path on `B` at `t = 0` to protect traffic *before* `B` runs SPF. That eliminates the `0–70 ms` blackhole while `B` waits to converge.
+
+However, at `t = 70 ms`, `B` finishes its own SPF, tears down the TI-LFA repair, and installs the normal post-convergence path (`B -> A`). Because `A` will not finish until `t = 260 ms`, the **`70–260 ms` microloop between `A` and `B` still occurs**. Fast reroute protects against detection and SPF delay; it does not synchronise FIB updates across remote routers.
+
+### RFC 5715 and RFC 8333
+
+RFC 5715 (*A Framework for Loop-Free Convergence*, Informational) categorises four ways to handle microloops:
+1. **Mitigation**: Slowing or shaping convergence so loops are rare or brief.
+2. **Prevention**: Enforcing a strict order on FIB updates (for example, ordered FIB / oFIB, where leaves update before upstream routers) so loops cannot form.
+3. **Suppression**: Holding traffic or using tunnelled/segment-routed paths until convergence completes.
+4. **Network design**: Reducing blast radius, avoiding asymmetric high-cost backup links that reverse traffic direction, or using redundant equal-cost paths.
+
+RFC 8333 (*Micro-loop Prevention by Introducing a Local Convergence Delay*, Standards Track) provides a lightweight, practical prevention mechanism for link-down events. Instead of coordinating a network-wide ordered FIB sequence across every router, RFC 8333 has **only the router adjacent to the failed link (`B`) delay its own FIB update**:
+
+```text
+Without RFC 8333:
+  t=0          t=70              t=260
+  |-- Repair --|---- LOOP A-B ---|---- Normal A->C->D ---->
+
+With RFC 8333 (B delays local FIB update to t=1000 ms):
+  t=0                            t=260                t=1000
+  |------- B uses Repair --------|---- Normal A->C->D ----->
+                                  (A converged; B's switch at 1000 is loop-free)
+```
+
+Because `B` keeps forwarding `D`-bound traffic over its TI-LFA repair path until `t = 1000 ms`, `A` finishes converging at `t = 260 ms` without `B` ever sending packets back to `A`. When `B`'s local delay expires at `1000 ms`, `A` is already pointing at `C`, so `B`'s transition to `B -> A -> C -> D` is completely loop-free.
+
+RFC 8333 has two strict limitations you must respect:
+- **Traffic must be protected during the delay.** If `B` does not have a valid fast-reroute repair (such as TI-LFA) or is not performing a planned maintenance drain, delaying `B`'s FIB update just extends a blackhole.
+- **It applies only to a single local link-down event.** RFC 8333 deliberately limits itself to link-down to keep it simple; link-up events are not protected, and a change that shows up as several events at once (a node failure, for example) is handled by normal convergence.
+
+## The lab
+
+To observe these timing interactions without guessing, you can model the RFC 8405 state machine, count-based back-off, and the square-topology microloop in a deterministic discrete-event simulation. The model runs directly on the parameters and topologies discussed above and prints exact event timestamps in milliseconds.
+
+```{.python filename="spf-backoff.py"}
+#!/usr/bin/env python3
+"""IGP convergence timing: the RFC 8405 SPF back-off FSM, a count-based back-off for contrast,
+and a microloop timeline on a four-router square (RFC 5715 / RFC 8333 ideas). Times in ms."""
+import heapq
+
+DEFAULTS = dict(initial=50, short=200, long=5000, learn=500, holddown=10000)   # RFC 8405 s6
+
+class Rfc8405:
+    def __init__(self, p=DEFAULTS):
+        self.p = p; self.state = 'QUIET'; self.spf_at = None; self.learn_at = None; self.hold_at = None
+        self.log = []
+    def _timers(self, now):
+        # fire timers due up to 'now' in time order (SPF, LEARN, HOLDDOWN)
+        while True:
+            due = [(t, n) for t, n in ((self.spf_at, 'spf'), (self.learn_at, 'learn'), (self.hold_at, 'hold')) if t is not None and t <= now]
+            if not due: return
+            t, n = min(due)
+            if n == 'spf':
+                self.spf_at = None; self.log.append((t, 'SPF', self.state))
+            elif n == 'learn':
+                self.learn_at = None; self.state = 'LONG_WAIT'; self.log.append((t, 'LEARN_TIMER -> LONG_WAIT', ''))
+            else:
+                self.hold_at = None; self.learn_at = None; self.state = 'QUIET'; self.log.append((t, 'HOLDDOWN -> QUIET', ''))
+    def event(self, now):
+        self._timers(now)
+        p = self.p
+        if self.state == 'QUIET':
+            if self.spf_at is None: self.spf_at = now + p['initial']
+            self.learn_at = now + p['learn']; self.hold_at = now + p['holddown']; self.state = 'SHORT_WAIT'
+        elif self.state == 'SHORT_WAIT':
+            self.hold_at = now + p['holddown']
+            if self.spf_at is None: self.spf_at = now + p['short']
+        else:
+            self.hold_at = now + p['holddown']
+            if self.spf_at is None: self.spf_at = now + p['long']
+        self.log.append((now, 'event', self.state))
+    def finish(self, until): self._timers(until)
+
+class CountBased:
+    """Generic 'double the wait after every SPF run' back-off (not RFC 8405)."""
+    def __init__(self, initial=50, maxw=5000, quiet=10000):
+        self.initial, self.maxw, self.quiet = initial, maxw, quiet
+        self.wait = initial; self.spf_at = None; self.last_spf = -10**9; self.log = []
+    def _timers(self, now):
+        if self.spf_at is not None and self.spf_at <= now:
+            self.log.append((self.spf_at, 'SPF', f'next wait {min(self.wait * 2, self.maxw)}'))
+            self.last_spf = self.spf_at; self.spf_at = None; self.wait = min(self.wait * 2, self.maxw)
+    def event(self, now):
+        self._timers(now)
+        if now - self.last_spf > self.quiet: self.wait = self.initial
+        if self.spf_at is None: self.spf_at = now + self.wait
+        self.log.append((now, 'event', ''))
+    def finish(self, until): self._timers(until)
+
+def run(fsm, events, until):
+    for t in events: fsm.event(t)
+    fsm.finish(until)
+    return fsm
+
+def spf_times(fsm): return [t for t, what, _ in fsm.log if what == 'SPF']
+
+def stale_time(events, spfs):
+    """For each event, how long until an SPF that includes it."""
+    out = []
+    for e in events:
+        nxt = [s for s in spfs if s >= e]
+        out.append(nxt[0] - e if nxt else None)
+    return out
+
+def section1():
+    print('== 1. RFC 8405 FSM with the RFC defaults', DEFAULTS)
+    scenarios = {
+        'single link failure': [0],
+        'node failure, 4 neighbours report at 0/15/40/120': [0, 15, 40, 120],
+        'flapping link, event every 300 ms for 3 s': list(range(0, 3001, 300)),
+    }
+    for name, ev in scenarios.items():
+        f = run(Rfc8405(), ev, 20000)
+        sp = spf_times(f)
+        print(f'  {name}: SPF runs at {sp}')
+        print(f'    per-event wait until an SPF covers it: {stale_time(ev, sp)}')
+        trans = [f'{t}:{w}' for t, w, _ in f.log if w not in ('event', 'SPF')]
+        print(f'    transitions: {trans}')
+
+def section2():
+    print('\n== 2. Two routers, same failure, events arrive a little differently (RFC 8405 s4)')
+    r1 = [0, 20, 45, 300]; r2 = [0, 20, 60, 300]
+    print(f'  R1 receives events at {r1}; R2 at {r2} (third event 15 ms later on R2)')
+    for name, cls in (('RFC 8405', Rfc8405), ('count-based doubling', CountBased)):
+        a = spf_times(run(cls(), r1, 20000)); b = spf_times(run(cls(), r2, 20000))
+        la = min(x for x in a if x >= 300); lb = min(x for x in b if x >= 300)
+        print(f'  {name:<22} R1 SPFs {a} | R2 SPFs {b} | event at 300 lands in FIB inputs at R1 {la}, R2 {lb} (skew {abs(la - lb)} ms)')
+    print('  a second burst 2 s later (0/20/45, then 2000/2020/2045):')
+    ev = [0, 20, 45, 2000, 2020, 2045]
+    for name, cls in (('RFC 8405', Rfc8405), ('count-based doubling', CountBased)):
+        print(f'    {name:<22} SPFs {spf_times(run(cls(), ev, 30000))}')
+
+# ---------------- microloop timeline -----------------
+# Square: A-B 1, B-D 1, A-C 1, C-D 10. Traffic A->D. Link B-D fails at t=0.
+BEFORE = {'A': 'B', 'B': 'D', 'C': 'A'}
+AFTER = {'A': 'C', 'B': 'A', 'C': 'D'}
+
+def walk(fib, src='A', protected_b=False, b_repair=False):
+    node, seen = src, []
+    for _ in range(8):
+        if node == 'D': return 'delivered via ' + '-'.join(seen + ['D'])
+        if node in seen: return 'LOOP ' + '-'.join(seen + [node])
+        seen.append(node)
+        nh = fib[node]
+        if node == 'B' and nh == 'D':        # link is down
+            if b_repair: return 'delivered via ' + '-'.join(seen + ['(repair tunnel to C)', 'D'])
+            return 'DROP at B (link down, no repair)'
+        node = nh
+    return 'ttl expired'
+
+def timeline(fib_ready, b_repair, step=10, until=1300):
+    segs = []
+    prev = None
+    for t in range(0, until, step):
+        fib = {n: (AFTER[n] if t >= fib_ready[n] else BEFORE[n]) for n in BEFORE}
+        res = walk(fib, b_repair=b_repair)
+        if res != prev:
+            segs.append([t, res]); prev = res
+    out = []
+    for i, (t, r) in enumerate(segs):
+        end = segs[i + 1][0] if i + 1 < len(segs) else until
+        out.append(f'{t:>5}-{end:<5} {r}')
+    return out
+
+def section3():
+    print('\n== 3. Microloop on a square (A-B 1, B-D 1, A-C 1, C-D 10), link B-D fails at t=0, traffic A->D')
+    print('  before: A->B->D; after: A->C->D, and B must go back through A')
+    cases = {
+        'same timers; B: detect 0 + SPF 50 + FIB 20; C: flood 10 + SPF 50 + FIB 30; A: flood 10 + SPF 50 + FIB 200':
+            (dict(A=260, B=70, C=90), False),
+        'same, but B has a TI-LFA repair path while it converges':
+            (dict(A=260, B=70, C=90), True),
+        'A uses a 200 ms initial delay (mixed timers)':
+            (dict(A=410, B=70, C=90), True),
+        'RFC 8333 local convergence delay at B (B keeps repairing until 1000 ms)':
+            (dict(A=260, B=1000, C=90), True),
+    }
+    for name, (ready, rep) in cases.items():
+        print(f'  {name}:')
+        for line in timeline(ready, rep): print('    ' + line)
+
+if __name__ == '__main__':
+    section1(); section2(); section3()
+```
+This is a discrete-event model: it needs only Python, and every number below comes from the RFC 8405 state machine and the timings written into the script. Output from Linux 6.12, iproute2 6.15.0, Python 3.13.5 (a real run, unedited):
+
+```text
+$ python3 spf-backoff.py
+== 1. RFC 8405 FSM with the RFC defaults {'initial': 50, 'short': 200, 'long': 5000, 'learn': 500, 'holddown': 10000}
+  single link failure: SPF runs at [50]
+    per-event wait until an SPF covers it: [50]
+    transitions: ['500:LEARN_TIMER -> LONG_WAIT', '10000:HOLDDOWN -> QUIET']
+  node failure, 4 neighbours report at 0/15/40/120: SPF runs at [50, 320]
+    per-event wait until an SPF covers it: [50, 35, 10, 200]
+    transitions: ['500:LEARN_TIMER -> LONG_WAIT', '10120:HOLDDOWN -> QUIET']
+  flapping link, event every 300 ms for 3 s: SPF runs at [50, 500, 5600]
+    per-event wait until an SPF covers it: [50, 200, 5000, 4700, 4400, 4100, 3800, 3500, 3200, 2900, 2600]
+    transitions: ['500:LEARN_TIMER -> LONG_WAIT', '13000:HOLDDOWN -> QUIET']
+
+== 2. Two routers, same failure, events arrive a little differently (RFC 8405 s4)
+  R1 receives events at [0, 20, 45, 300]; R2 at [0, 20, 60, 300] (third event 15 ms later on R2)
+  RFC 8405               R1 SPFs [50, 500] | R2 SPFs [50, 260, 500] | event at 300 lands in FIB inputs at R1 500, R2 500 (skew 0 ms)
+  count-based doubling   R1 SPFs [50, 400] | R2 SPFs [50, 160, 500] | event at 300 lands in FIB inputs at R1 400, R2 500 (skew 100 ms)
+  a second burst 2 s later (0/20/45, then 2000/2020/2045):
+    RFC 8405               SPFs [50, 7000]
+    count-based doubling   SPFs [50, 2100]
+
+== 3. Microloop on a square (A-B 1, B-D 1, A-C 1, C-D 10), link B-D fails at t=0, traffic A->D
+  before: A->B->D; after: A->C->D, and B must go back through A
+  same timers; B: detect 0 + SPF 50 + FIB 20; C: flood 10 + SPF 50 + FIB 30; A: flood 10 + SPF 50 + FIB 200:
+        0-70    DROP at B (link down, no repair)
+       70-260   LOOP A-B-A
+      260-1300  delivered via A-C-D
+  same, but B has a TI-LFA repair path while it converges:
+        0-70    delivered via A-B-(repair tunnel to C)-D
+       70-260   LOOP A-B-A
+      260-1300  delivered via A-C-D
+  A uses a 200 ms initial delay (mixed timers):
+        0-70    delivered via A-B-(repair tunnel to C)-D
+       70-410   LOOP A-B-A
+      410-1300  delivered via A-C-D
+  RFC 8333 local convergence delay at B (B keeps repairing until 1000 ms):
+        0-260   delivered via A-B-(repair tunnel to C)-D
+      260-1300  delivered via A-C-D
+```
+
+Walk through the three parts of the output carefully:
+
+1. **Single-router RFC 8405 behaviour (defaults: `50 / 200 / 5000`, `TIME_TO_LEARN = 500`, `HOLDDOWN = 10000`)**:
+   - *Single link failure at `t = 0`*: `SPF_TIMER` fires at **`50 ms`**. One event, one SPF, minimal delay.
+   - *Node failure with neighbours reporting at `0, 15, 40, 120 ms`*: The first three events (`0, 15, 40`) all fall inside the initial `50 ms` wait, so they batch into a single SPF at **`50 ms`** (per-event waits of `50`, `35`, and `10 ms`). The `120 ms` event arrives in `SHORT_WAIT`, triggering `SHORT_SPF_DELAY` (`200 ms`) and a second SPF at **`320 ms`**. At `500 ms`, `LEARN_TIMER` expires and moves the router to `LONG_WAIT`. Because the last event at `120 ms` reset `HOLDDOWN_TIMER`, the router does not return to `QUIET` until **`10120 ms`**.
+   - *Flapping link every `300 ms` for `3 s`*: SPFs fire at **`50 ms`**, **`500 ms`**, and **`5600 ms`**. The first flap triggers `50 ms`; the second (`300 ms`) triggers `SHORT_SPF_DELAY` (`200 ms`, running at `500 ms`); by the third flap (`600 ms`), the router has crossed `TIME_TO_LEARN` (`500 ms`) into `LONG_WAIT`, so subsequent events see `LONG_SPF_DELAY` (`5000 ms`) and coalesce into the `5600 ms` run (with per-event waits stepping down: `50, 200, 5000, 4700, ..., 2600 ms`). `QUIET` is reached at **`13000 ms`**.
+
+2. **Two-router skew: RFC 8405 vs. count-based doubling**:
+   - *Skewed arrival (`R1` sees events at `0, 20, 45, 300 ms`; `R2` sees `0, 20, 60, 300 ms`)*: Under RFC 8405, `R1` runs SPFs at **`[50, 500]`** and `R2` runs at **`[50, 260, 500]`**. Even though `R2` ran an extra SPF at `260 ms` because its third event arrived at `60 ms`, both routers remain in `SHORT_WAIT` at `300 ms` and run the `300 ms` event together at **`500 ms`** (`0 ms` skew). Under a generic count-based doubling back-off (wait doubles after each SPF; neither RFC 8405 nor FRR), `R1` runs at **`[50, 400]`** while `R2` runs at **`[50, 160, 500]`**, leaving **`100 ms`** of skew on the `300 ms` event.
+   - *Second burst 2 seconds later (`0, 20, 45` then `2000, 2020, 2045`)*: Under RFC 8405, the first burst runs at `50 ms`, `HOLDDOWN` (`10 s`) keeps the router in `LONG_WAIT` across the `2 s` gap, and the second burst waits `5000 ms` to run at **`7000 ms`**. Count-based doubling (if its reset window has elapsed) runs at **`50 ms`** and **`2100 ms`**. RFC 8405 deliberately trades fast reaction to a second nearby burst for predictable, consistent dampening across all routers; if 10 seconds is too conservative for your network, tune `HOLDDOWN_INTERVAL` and `LONG_SPF_DELAY` down.
+
+3. **Square-topology microloop (`A-B 1, B-D 1, A-C 1, C-D 10`, link `B-D` fails at `t = 0`)**:
+   - *No fast reroute*: `0–70 ms` **DROP** at `B`; `70–260 ms` **LOOP** (`A-B-A`); `260+ ms` delivered via `A-C-D`.
+   - *TI-LFA repair at `B`*: `0–70 ms` delivered via repair; **`70–260 ms` still LOOPs** (`A-B-A`) because `B` converges before `A`.
+   - *Mixed timers (`A` configured with `200 ms` initial delay)*: `B` still finishes at `70 ms`, `A` finishes at `410 ms` (`10 + 200 + 200`), widening the loop to **`70–410 ms`**.
+   - *RFC 8333 local convergence delay at `B` (keeps repair until `1000 ms`)*: `0–260 ms` delivered via repair; `260+ ms` delivered via `A-C-D`; **zero loop**.
+
+## Gotchas
+
+- **The trap: setting `INITIAL_SPF_DELAY` to `0 ms` everywhere without considering event storms.** Zero initial delay shaves 50 ms off a clean single-link failure, but on a node failure where four neighbours originate LSAs over 0–15 ms, a `0 ms` router starts Dijkstra on the very first LSA—before the other three arrive—and immediately triggers an extra SPF and FIB churn.
+- **The trap: mixing SPF timers across vendors or daemons.** Leaving one core router on a 200 ms initial delay while its neighbours run 50 ms directly widens the microloop window from `70–260 ms` to `70–410 ms`. Audit every router in the area/level and align effective timers.
+- **The trap: ignoring FIB programming time on large tables.** Operators routinely obsess over 50 ms vs. 10 ms SPF delays while running 50,000 prefixes on hardware that takes 300–500 ms to update the FIB. Measure your actual FIB programming rate under load; you cannot tune your way past a slow ASIC with SPF timers.
+- **The trap: forgetting LSA/LSP origination throttling.** If a link bounces down and back up within 200 ms, `MinLSInterval` (default 5000 ms in OSPF) holds the recovery LSA for up to 5 seconds. Your BFD and SPF timers are irrelevant if the updated LSA is sitting in the originator's throttle queue.
+- **The trap: setting `MinLSInterval` lower than `MinLSArrival` across neighbours.** If Router A originates a new LSA every 200 ms but Router B enforces `MinLSArrival = 1000 ms`, Router B drops the intermediate LSAs. Always keep `MinLSArrival <= MinLSInterval` across the entire domain.
+- **The trap: tuning BFD to 30 ms while leaving SPF/LSA timers at multi-second defaults.** Fast detection only starts the clock sooner; if SPF back-off or LSA throttling holds the update for 2 seconds, total convergence is still over 2 seconds.
+- **The trap: assuming TI-LFA prevents microloops.** TI-LFA only protects the `0–70 ms` window before the local router (`B`) runs SPF. As soon as `B` installs its post-SPF route at `70 ms`, traffic loops against slower remote routers (`A`) until `A` finishes its FIB update.
+- **The trap: relying on RFC 8333 without protection or for node failures.** Local convergence delay is only safe when traffic is actively protected by fast reroute (such as TI-LFA) or drained for maintenance, and it only works for link-down events.
+- **The trap: forgetting `HOLDDOWN_INTERVAL` keeps you in `LONG_WAIT`.** With the RFC 8405 default `HOLDDOWN_INTERVAL` of 10 seconds, a brief 500 ms burst leaves the router in `LONG_WAIT` for 10 full seconds. Any unrelated link failure 3 seconds later will hit the full `5000 ms` `LONG_SPF_DELAY`.
+
+## The boring rule
+
+Make every router in an IGP area or level use the same back-off and throttling timers, measure your FIB update time before chasing single-digit millisecond SPF delays, and pair TI-LFA with RFC 8333 local convergence delay if you care about packet loss during convergence.
+
+## Exercises
+
+1. **Trace RFC 8405 by hand.** Using the RFC 8405 defaults (`50 / 200 / 5000`, `TIME_TO_LEARN = 500`, `HOLDDOWN = 10000`), trace the exact state, active timers, and SPF execution timestamps for a router that receives IGP events at `t = 0, 30, 180, 480, 700, 12000 ms`. At what timestamp does the router return to `QUIET`?
+2. **Calculate a microloop window.** In the square topology (`A-B 1, B-D 1, A-C 1, C-D 10`), suppose `B` detects the `B-D` failure via BFD in `30 ms`, flooding takes `15 ms` to reach `A`, both `A` and `B` use `INITIAL_SPF_DELAY = 50 ms`, `B` takes `15 ms` to update its FIB, and `A` takes `280 ms` to update its FIB. Calculate the exact blackhole window (without TI-LFA) and the exact microloop window. What minimum `local-convergence-delay` must `B` configure under RFC 8333 to prevent the loop?
+3. **Spot the `MinLSArrival` mismatch.** Router 1 is configured with `timers throttle lsa all 200` and `timers lsa min-arrival 200`. Router 2 is left at FRR defaults (`5000` / `1000`). Router 1's link fails at `t = 0` and recovers at `t = 250 ms`. Describe what Router 1 originates at `0 ms` and `250 ms`, what Router 2 accepts or drops, and when Router 2 finally learns the link is back up.
+4. **Compare `ospfd` and `isisd` behaviour under a double burst.** Explain why FRR `isisd` (`spf-delay-ietf 50 200 5000 10000 500`) and FRR `ospfd` (`timers throttle spf 200 400 10000`) behave differently when two correlated bursts of three events occur 2 seconds apart. Which parameters would you adjust on `isisd` if a 5-second delay on the second burst violates your SLA?
+5. **Identify RFC 8333 failure modes.** Give two concrete operational scenarios where enabling RFC 8333 local convergence delay either fails to prevent a microloop or actively makes packet loss worse.
+6. **Lab measurement with containerlab/netlab (not run).** Build a 4-node square topology in containerlab or netlab running FRR `isisd` (not run on this host), inject a 100 Hz UDP probe stream from `A` to `D` with a packet generator, and fail link `B-D`. Measure packet loss and out-of-order/TTL-expired counts with: (a) default `spf-delay-ietf`, (b) mismatched `init-delay` (`50 ms` on `B`, `500 ms` on `A`), and (c) `local-convergence-delay` enabled alongside TI-LFA.
+
+## Sources
+
+- [RFC 8405: Shortest Path First (SPF) Back-Off Delay Algorithm for Link-State IGPs](https://www.rfc-editor.org/rfc/rfc8405)
+- [RFC 5715: A Framework for Loop-Free Convergence](https://www.rfc-editor.org/rfc/rfc5715)
+- [RFC 8333: Micro-loop Prevention by Introducing a Local Convergence Delay](https://www.rfc-editor.org/rfc/rfc8333)
+- [RFC 2328: OSPF Version 2 (Appendix D: Architectural Constants — MinLSInterval, MinLSArrival)](https://www.rfc-editor.org/rfc/rfc2328)
+- [RFC 1195: Use of OSI IS-IS for Routing in TCP/IP and Dual Environments](https://www.rfc-editor.org/rfc/rfc1195)
+- [FRR OSPF Documentation (`timers throttle spf`, `timers throttle lsa`, `timers lsa min-arrival`)](https://docs.frrouting.org/en/latest/ospfd.html)
+- [FRR IS-IS Documentation (`spf-delay-ietf`, `lsp-gen-interval`, `spf-interval`)](https://docs.frrouting.org/en/latest/isisd.html)
+- [FRR Source: `lib/spf_backoff.c`](https://github.com/FRRouting/frr/blob/master/lib/spf_backoff.c)
