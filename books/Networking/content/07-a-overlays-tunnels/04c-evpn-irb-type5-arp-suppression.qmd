@@ -1,0 +1,597 @@
+---
+title: "EVPN IRB: Symmetric vs Asymmetric Routing, Type-5 Prefix Routes and ARP/ND Suppression"
+author:
+  - name: "K19G"
+  - name: "grok-bot"
+---
+
+# EVPN IRB: Symmetric vs Asymmetric Routing, Type-5 Prefix Routes and ARP/ND Suppression
+
+Layer 2 bridging across a VXLAN fabric solves reachability inside a single broadcast domain, but modern tenants rarely live in one subnet. As soon as a host in subnet A needs to talk to a host in subnet B, traffic must cross an IP router. In a traditional three-tier campus or data-center network, that meant hair-pinning packets up to a centralised aggregation pair, burning spine bandwidth and adding latency on every east-west flow.
+
+Ethernet VPN Integrated Routing and Bridging (EVPN IRB), defined in RFC 9135, pushes the default gateway down to every leaf switch (Provider Edge, or PE). Every leaf acts as a distributed anycast router for the subnets attached to it. Once you distribute routing across dozens of leaves, three design problems immediately surface: how packets move between leaves when source and destination sit in different subnets (asymmetric versus symmetric IRB), how you advertise prefixes that are not tied to a single host MAC (Route Type 5, RFC 9136), and how you keep ARP and Neighbor Discovery broadcasts from flooding the underlay (RFC 9161 and RFC 9047).
+
+Get these three pieces right and your overlay scales cleanly with predictable forwarding paths. Mix them up—for example, by pairing a symmetric leaf with an asymmetric leaf, or by suppressing unknown ARP requests in a fabric with silent hosts—and you build silent black holes that only show up under production traffic.
+
+## Learning goals
+
+- Trace the exact lookup sequence, inner Ethernet header, VNI selection, and TTL behaviour for both asymmetric and symmetric EVPN IRB.
+- Quantify the per-leaf MAC-VRF, ARP/ND, and IP-VRF state trade-offs between asymmetric and symmetric designs as a fabric grows.
+- Decode EVPN Route Type 2 and Route Type 5 NLRIs at the byte level, including Label1/Label2 semantics and Extended Communities (Router's MAC, Encapsulation, Default Gateway, and ARP/ND).
+- Resolve EVPN Route Type 5 prefixes using an Overlay Index (Gateway IP or ESI), and predict when BGP treat-as-withdraw applies.
+- Configure and reason about Proxy ARP/ND suppression modes, balancing broadcast reduction against silent-host reachability and fast VM mobility.
+- Diagnose common EVPN IRB failure modes before they reach a live fabric.
+
+## Recap: where L2 bridging ends and IRB begins
+
+In the VXLAN data plane and EVPN control-plane intro chapters, you saw how a leaf encapsulates an Ethernet frame into UDP/VXLAN using an L2 VNI, how Type-3 routes build the BUM (Broadcast, Unknown unicast, Multicast) replication list, and how Type-2 routes advertise learned MAC addresses across the fabric. That machinery handles intra-subnet traffic: `h10` sends an Ethernet frame to `h11` in the same subnet, the ingress leaf looks up `h11`'s MAC in the MAC-VRF, encapsulates it with the subnet's L2 VNI, and ships it to the egress VTEP.
+
+Inter-subnet forwarding breaks that simplicity. When `h10` (`10.1.10.10/24`) wants to reach `h20` (`10.1.20.20/24`), `h10` ARPs for its default gateway (`10.1.10.254`), not for `h20`. It sends an Ethernet frame whose destination MAC is the gateway MAC and whose destination IP is `10.1.20.20`.
+
+To let `h10` move between leaves without changing its gateway IP or re-ARPing, EVPN uses an **anycast gateway**: every PE serving a subnet is configured with the exact same gateway IP address and the exact same gateway MAC address on its Integrated Routing and Bridging (IRB) interface (commonly called an SVI or BVI). Alternatively, PEs can signal gateway identity using the Default Gateway Extended Community (RFC 7432 Section 7.8: type `0x03`, sub-type `0x0d`). Because every leaf answers to the same gateway MAC and IP, the ingress leaf always intercepts the routed frame locally. What happens next depends on whether the fabric runs asymmetric or symmetric IRB.
+
+## Asymmetric vs Symmetric IRB (RFC 9135)
+
+RFC 9135 defines two distinct models for moving inter-subnet traffic between PEs. They differ in where the IP routing happens, which VNI rides on the wire, how much state each leaf must hold, and how many times the IP TTL (or IPv6 Hop Limit) is decremented.
+
+### Asymmetric IRB: route at ingress, bridge at egress
+
+In **asymmetric IRB**, the ingress PE does all the routing work, and the egress PE only bridges.
+
+1. `h10` sends a frame to the anycast gateway MAC (`00:00:5e:00:01:01`) with destination IP `10.1.20.20`.
+2. `leaf1` (ingress PE) performs a **MAC lookup** in subnet 10's MAC-VRF, sees its own anycast gateway MAC, and hands the packet to the IP-VRF.
+3. `leaf1` performs an **IP lookup** in the IP-VRF, finds `10.1.20.20` reachable via the IRB interface for subnet 20, and decrements the IP TTL once (e.g., `64 -> 63`).
+4. `leaf1` performs a second **MAC lookup**—this time in subnet 20's MAC-VRF—and rewrites the inner Ethernet header: source MAC becomes the anycast gateway MAC, and destination MAC becomes `h20`'s MAC.
+5. `leaf1` encapsulates the packet in VXLAN using **subnet 20's L2 VNI** (`10020`) and sends it over an Ethernet-type tunnel to `leaf2`.
+6. `leaf2` (egress PE) decapsulates VNI `10020`, performs a **single MAC lookup** in subnet 20's MAC-VRF, and forwards the frame to `h20`.
+
+```text
+Asymmetric IRB: h10 (10.1.10.10) -> h20 (10.1.20.20)
+
+h10                  leaf1 (Ingress PE)                 leaf2 (Egress PE)                  h20
+ |                         |                                  |                             |
+ | dstMAC=GW               |                                  |                             |
+ | dstIP=10.1.20.20        |                                  |                             |
+ | TTL=64                  |                                  |                             |
+ |------------------------>| 1. MAC lookup (VNI 10010 -> IRB) |                             |
+ |                         | 2. IP lookup  (IP-VRF -> SVI 20) |                             |
+ |                         |    TTL: 64 -> 63                 |                             |
+ |                         | 3. MAC lookup (VNI 10020 -> h20) |                             |
+ |                         |                                  |                             |
+ |                         | VXLAN VNI=10020 (L2 VNI of dst)  |                             |
+ |                         | inner srcMAC=GW, dstMAC=h20_MAC  |                             |
+ |                         |=================================>| 1. MAC lookup (VNI 10020)   |
+ |                         |                                  |    (no IP lookup, no TTL dec)|
+ |                         |                                  |---------------------------->|
+```
+
+Notice the operational consequence of step 4: for `leaf1` to rewrite the inner destination MAC to `h20`'s MAC and encapsulate into VNI `10020`, `leaf1` **must** have subnet 20's MAC-VRF, subnet 20's IRB interface, and an ARP/ND entry for `h20`—even if zero hosts from subnet 20 are physically attached to `leaf1`. Under RFC 9135, inter-subnet forwarding in asymmetric mode happens between MAC-VRFs/bridge tables, so the tunnel **must** be an Ethernet-type tunnel, and every PE in the IP-VRF must instantiate **all** subnets belonging to that IP-VRF.
+
+### Symmetric IRB: route at ingress, route at egress
+
+In **symmetric IRB**, both the ingress PE and the egress PE route. Forwarding between PEs happens **IP-VRF to IP-VRF** over a dedicated transit VNI called the **L3 VNI** (one L3 VNI per tenant IP-VRF).
+
+1. `h10` sends a frame to the anycast gateway MAC (`00:00:5e:00:01:01`) with destination IP `10.1.20.20`.
+2. `leaf1` performs a **MAC lookup** in subnet 10's MAC-VRF, sees the gateway MAC, and hands the packet to the IP-VRF.
+3. `leaf1` performs an **IP lookup** in the IP-VRF. It finds a `/32` host route (or `/128` for IPv6) for `10.1.20.20` pointing to `leaf2`'s VTEP (`192.0.2.12`) via **L3 VNI `50001`**, with `leaf2`'s Router MAC as the next-hop MAC. `leaf1` decrements TTL (`64 -> 63`).
+4. `leaf1` rewrites the inner Ethernet header so that source MAC is `leaf1`'s Router MAC and destination MAC is `leaf2`'s Router MAC, encapsulates in VXLAN with **L3 VNI `50001`**, and sends it to `leaf2`.
+5. `leaf2` decapsulates VNI `50001`, maps it to the tenant IP-VRF, sees its own Router MAC as the inner destination MAC, and performs an **IP lookup** in the IP-VRF. `leaf2` decrements TTL a second time (`63 -> 62`).
+6. `leaf2` finds `10.1.20.20` locally attached on subnet 20's IRB, performs a **MAC lookup** in subnet 20's MAC-VRF using its local ARP entry for `h20`, rewrites the inner Ethernet header (src = anycast GW MAC, dst = `h20`'s MAC), and delivers the frame.
+
+```text
+Symmetric IRB: h10 (10.1.10.10) -> h20 (10.1.20.20)
+
+h10                  leaf1 (Ingress PE)                 leaf2 (Egress PE)                  h20
+ |                         |                                  |                             |
+ | dstMAC=GW               |                                  |                             |
+ | dstIP=10.1.20.20        |                                  |                             |
+ | TTL=64                  |                                  |                             |
+ |------------------------>| 1. MAC lookup (VNI 10010 -> IRB) |                             |
+ |                         | 2. IP lookup  (IP-VRF -> 10.1.20.20/32 via L3VNI 50001)        |
+ |                         |    TTL: 64 -> 63                 |                             |
+ |                         |                                  |                             |
+ |                         | VXLAN VNI=50001 (L3 VNI)         |                             |
+ |                         | inner srcMAC=leaf1_RMAC          |                             |
+ |                         | inner dstMAC=leaf2_RMAC          |                             |
+ |                         |=================================>| 1. IP lookup (L3VNI 50001)  |
+ |                         |                                  |    TTL: 63 -> 62            |
+ |                         |                                  | 2. MAC lookup (VNI 10020)   |
+ |                         |                                  |    srcMAC=GW, dstMAC=h20    |
+ |                         |                                  |---------------------------->|
+```
+
+Because `leaf1` addresses the inner Ethernet frame to `leaf2`'s Router MAC rather than `h20`'s MAC, `leaf1` **never needs an ARP entry for `h20`** and **never needs subnet 20's MAC-VRF or IRB interface**. Each PE keeps ARP/ND entries only for locally attached hosts and MAC-VRFs only for locally attached subnets.
+
+### Comparing the two models
+
+| Property | Asymmetric IRB | Symmetric IRB |
+| :--- | :--- | :--- |
+| Ingress PE lookups | MAC -> IP -> MAC (3 lookups) | MAC -> IP (2 lookups) |
+| Egress PE lookups | MAC only (1 lookup) | IP -> MAC (2 lookups) |
+| Forwarding plane between PEs | MAC-VRF to MAC-VRF (dst L2 VNI) | IP-VRF to IP-VRF (tenant L3 VNI) |
+| Inner Ethernet MACs on wire | Anycast GW MAC -> Remote host MAC | Ingress Router MAC -> Egress Router MAC |
+| Tunnel type requirement | Must be Ethernet-type tunnel | IP-type (e.g. MPLS) or Ethernet-type (VXLAN, which needs the Router's MAC EC) |
+| Subnet / MAC-VRF placement | Every PE needs all subnets of the IP-VRF | PEs need only locally attached subnets + 1 L3 VNI |
+| ARP / ND table scope | Local + all remote hosts in the IP-VRF | Local hosts only |
+| IP-VRF host routes (`/32`, `/128`) | Not required for remote hosts (uses local SVI + ARP) | Required for remote hosts learned via Type-2 |
+| IP TTL / Hop Limit decrement | Once (ingress PE only) | Twice (ingress PE and egress PE) |
+
+### The scaling trade-off in numbers
+
+It is tempting to claim that symmetric IRB eliminates remote state. It does not—it **moves** state from MAC-VRFs, SVIs, and ARP/adjacency tables into the IP-VRF FIB as `/32` (or `/128`) host routes.
+
+Consider a single-VRF fabric where each subnet has 250 hosts and each subnet is placed on 2 leaves at random. The table shows the busiest leaf, because that is the one whose tables fill first:
+
+| Fabric size (leaves / subnets) | Asymmetric: VNIs per leaf | Asymmetric: ARP entries per leaf | Symmetric: VNIs per leaf | Symmetric: ARP entries per leaf | Symmetric: remote `/32` routes per leaf |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| 4 leaves / 8 subnets | 8 | 2,000 | 8 (7 local + 1 L3VNI) | 1,750 | 250 |
+| 16 leaves / 40 subnets | 40 | 10,000 | 11 | 2,500 | 7,500 |
+| 64 leaves / 200 subnets | 200 | 50,000 | 13 | 3,000 | 47,000 |
+
+At 64 leaves and 200 subnets, asymmetric IRB forces every leaf to instantiate all 200 L2 VNIs, 200 IRB interfaces, and 50,000 ARP/adjacency entries—even though each leaf only hosts a handful of subnets locally. Symmetric IRB keeps the busiest leaf down to its local L2 VNIs plus one L3 VNI (13 VNIs total) and 3,000 local ARP entries, while carrying 47,000 remote `/32` prefixes in the IP-VRF. Whether that is a win depends on your hardware: check the platform's host-route (or LPM) capacity against its ARP/adjacency and MAC capacity before you choose. On many data-center switches the routing tables are the larger resource, which is one reason symmetric IRB is the common choice for large multi-tenant fabrics; the other is that you no longer have to configure every subnet everywhere.
+
+## The Control Plane: Type-2 NLRI, Labels, and Extended Communities
+
+The data-plane difference between asymmetric and symmetric IRB is driven directly by what PEs advertise in BGP EVPN Route Type 2 (MAC/IP Advertisement route, RFC 7432).
+
+### Type-2 NLRI byte layout
+
+RFC 7432 defines the Type-2 NLRI as:
+
+```text
+ 0                   1                   2                   3
+ 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                  Route Distinguisher (8 octets)               |
+|                                                               |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|         Ethernet Segment Identifier (ESI, 10 octets)          |
+|                                                               |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                 Ethernet Tag ID (4 octets)                    |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|  MAC Len (1)  |          MAC Address (6 octets)               |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|  IP Len (1)   |          IP Address (0, 4, or 16 octets)      |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|              MPLS Label1 / L2 VNI (3 octets)                  |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|              MPLS Label2 / L3 VNI (0 or 3 octets)             |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+```
+
+For VXLAN, RFC 8365 specifies that the 3-octet label fields carry the 24-bit VNI directly (unlike MPLS, where 20 bits are label and 4 bits are traffic class/bottom-of-stack). That gives four exact Type-2 NLRI lengths:
+
+- **MAC-only** (IP Len = 0, Label1 only): `8 + 10 + 4 + 1 + 6 + 1 + 0 + 3 = 33 octets`.
+- **MAC + IPv4, asymmetric** (IP Len = 32, Label1 only): `33 + 4 = 37 octets`.
+- **MAC + IPv4, symmetric** (IP Len = 32, Label1 + Label2): `37 + 3 = 40 octets`.
+- **MAC + IPv6, symmetric** (IP Len = 128, Label1 + Label2): `33 + 16 + 3 = 52 octets`.
+
+### RFC 9135 rules on Label1, Label2, and Route Targets
+
+- **Label1** always identifies the **MAC-VRF (L2 VNI)**.
+- **Label2** identifies the **IP-VRF (L3 VNI)**.
+- For **symmetric IRB**, a PE advertising a MAC+IP Type-2 route includes **both** Label1 (L2 VNI) and Label2 (L3 VNI), and attaches **both** the MAC-VRF Route Target and the IP-VRF Route Target so that remote PEs that do not host that L2 subnet can still import the route into their IP-VRF.
+- For **asymmetric IRB**, Label2 **MUST NOT** be included in the Type-2 route.
+- A receiving PE that only supports asymmetric IRB **MUST** ignore Label2 if present.
+
+### Required Extended Communities
+
+Three BGP Extended Communities (8 octets each: 2-octet type/sub-type + 6-octet value) tie the Type-2 route to the VXLAN data plane:
+
+1. **EVPN Router's MAC Extended Community** (RFC 9135): Type `0x06`, Sub-type `0x03`, followed by the 6-octet Router MAC of the advertising PE. Only one Router's MAC Extended Community may appear per route. Required on symmetric IRB routes (both Type-2 with Label2 and Type-5) so the ingress PE knows what inner destination MAC to write.
+2. **BGP Encapsulation Extended Community** (RFC 9012 Section 4.1, RFC 8365): Type `0x03`, Sub-type `0x0c`, 4 reserved octets, and a 2-octet tunnel type at the end. Tunnel type `8` indicates VXLAN.
+3. **Default Gateway Extended Community** (RFC 7432 Section 7.8): Type `0x03`, Sub-type `0x0d`, 6 zero octets. Marks a Type-2 route as representing a default gateway MAC/IP pair.
+
+For concrete verification, take L2 VNI `10010` (`0x00271a`), L3 VNI `50001` (`0x00c351`), Router MAC `02:00:00:00:00:0b`, and IP-VRF Route Target `65000:50001`:
+
+- Symmetric Type-2 tail bytes: Label1 = `00 27 1a`, Label2 = `00 c3 51`.
+- Router's MAC EC: `06 03 02 00 00 00 00 0b`.
+- BGP Encapsulation EC (VXLAN): `03 0c 00 00 00 00 00 08`.
+- Default Gateway EC: `03 0d 00 00 00 00 00 00`.
+- IP-VRF Route Target (`65000:50001`, 2-octet AS specific): `00 02 fd e8 00 00 c3 51`.
+
+### FRR symmetric IRB configuration (from the docs, not run)
+
+In FRRouting, `zebra` binds the L3 VNI to the tenant VRF, and `bgpd` enables `advertise-all-vni` in the EVPN address family while advertising the VRF's IPv4/IPv6 unicast routes as Type-5 prefixes:
+
+```text
+! From the FRR EVPN documentation (not run)
+vrf vrf1
+ vni 50001
+exit-vrf
+!
+router bgp 65000
+ bgp router-id 192.0.2.11
+ neighbor 192.0.2.1 remote-as 65000
+ !
+ address-family l2vpn evpn
+  neighbor 192.0.2.1 activate
+  advertise-all-vni
+  advertise-svi-ip
+ exit-address-family
+!
+router bgp 65000 vrf vrf1
+ !
+ address-family l2vpn evpn
+  advertise ipv4 unicast
+ exit-address-family
+```
+
+The FRR documentation's own sample uses `advertise-svi-ip` in the default instance (it advertises the SVI addresses as MAC/IP routes) and `advertise ipv4 unicast` / `advertise ipv6 unicast` inside each tenant VRF, which is what turns VRF routes into Type-5 routes. `show vrf vni` lists each VRF's L3 VNI together with its VXLAN interface, L3 SVI and router MAC (`Rmac`), the address that ends up in the Router's MAC Extended Community (from the docs, not run).
+
+## IP Prefix Advertisement: EVPN Route Type 5 (RFC 9136)
+
+Route Type 2 advertises individual host `/32` or `/128` routes tied to a specific host MAC address. That breaks down as soon as you need to advertise a **prefix** that has no single host MAC behind it:
+
+- **External routes** behind a border leaf, WAN router, or firewall/load-balancer appliance.
+- **Summarised subnets** (e.g., `10.1.10.0/24`) announced to reach silent hosts or reduce host-route churn.
+- **Interface-less IP-VRF-to-IP-VRF** connectivity, where two PEs exchange tenant IP prefixes directly over an L3 VNI without instantiating shared L2 broadcast domains.
+
+RFC 9136 solves this with **EVPN Route Type 5 (IP Prefix Advertisement)**.
+
+### Type-5 NLRI format
+
+```text
+ 0                   1                   2                   3
+ 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                  Route Distinguisher (8 octets)               |
+|                                                               |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|         Ethernet Segment Identifier (ESI, 10 octets)          |
+|                                                               |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                 Ethernet Tag ID (4 octets)                    |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+| IP Prefix Len |        IP Prefix (4 or 16 octets)             |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                GW IP Address (4 or 16 octets)                 |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                 MPLS Label / L3 VNI (3 octets)                |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+```
+
+Unlike Type-2, Type-5 always encodes the IP Prefix and GW IP Address at fixed family widths (4 octets each for IPv4, 16 octets each for IPv6), with unused trailing bits of the prefix zeroed:
+
+- **Type-5 IPv4 NLRI length**: `8 + 10 + 4 + 1 + 4 + 4 + 3 = 34 octets`.
+- **Type-5 IPv6 NLRI length**: `8 + 10 + 4 + 1 + 16 + 16 + 3 = 58 octets`.
+
+The GW IP Address and IP Prefix **must** belong to the same address family.
+
+### Overlay Index and recursive resolution
+
+RFC 9136 allows a Type-5 route to resolve either **directly** to the advertising PE's VTEP or **recursively** through an **Overlay Index** (either the **GW IP Address** or a non-zero **ESI**). The MPLS Label / L3 VNI field governs which path the ingress PE takes:
+
+1. **Non-zero Label (e.g., L3 VNI `50001`), GW IP `0.0.0.0`, ESI `0`**: Direct IP-VRF-to-IP-VRF resolution. The ingress PE installs the prefix pointing to the advertising PE's BGP next-hop VTEP, encapsulating traffic with L3 VNI `50001` and the advertising PE's Router MAC (from the Router's MAC Extended Community).
+2. **Label `0`, non-zero Overlay Index (e.g., GW IP `10.1.10.254` or non-zero ESI)**: Recursive resolution. RFC 9136 says the sender SHOULD set the label to zero when recursive resolution is intended, and a receiver that sees label zero MUST find an Overlay Index and resolve recursively. The ingress PE looks up the GW IP (or ESI) in the EVPN table, finds the **Type-2 MAC/IP route** (or Type-1 EAD route for an ESI) that owns that Overlay Index, and inherits its VTEP, VNI, and Router MAC.
+3. **Label `0` and no Overlay Index (GW IP `0.0.0.0` and ESI `0`)**: Invalid NLRI. Under RFC 9136 and RFC 7606 (Revised Error Handling for BGP UPDATE Messages), the receiving PE **must** apply **treat-as-withdraw**—it discards the route as if a withdrawal had been received, without tearing down the BGP session.
+
+```text
+Type-5 Recursive Resolution (Label = 0, GW IP = 10.1.10.254)
+
+  Type-5 NLRI: 192.168.50.0/24, Label = 0, GW IP = 10.1.10.254
+                        |
+                        |  (Label is 0 -> look up Overlay Index 10.1.10.254)
+                        v
+  Type-2 NLRI: MAC=00:50:56:aa:bb:cc, IP=10.1.10.254, VTEP=192.0.2.15, L3VNI=50001
+                        |
+                        v
+  FIB entry:   192.168.50.0/24 -> VTEP 192.0.2.15, L3VNI 50001, RMAC(192.0.2.15)
+```
+
+Why use an Overlay Index instead of just advertising a non-zero L3 VNI? Consider a virtual firewall appliance (`10.1.10.254`) plugged into a tenant subnet on `leaf3` that peers with a route reflector or border leaf, or moves between hypervisors. Advertising `192.168.50.0/24` with `GW IP = 10.1.10.254` and `Label = 0` decouples prefix reachability from the firewall's current leaf attachment: wherever the firewall's Type-2 route moves, the Type-5 prefix automatically follows it.
+
+## ARP and ND Suppression (RFC 9161 & RFC 9047)
+
+In a large Layer 2 domain stretched across dozens of leaves, ARP requests and IPv6 Neighbor Solicitation (NS) packets are broadcast/multicast BUM traffic. Without mitigation, every ARP request from a host is replicated by the ingress PE to **every** remote PE participating in that L2 VNI.
+
+RFC 9161 defines **Proxy ARP/ND** for EVPN so that each PE can answer ARP and NS locally on behalf of remote hosts.
+
+### The Proxy ARP/ND table
+
+Each PE maintains a Proxy ARP/ND table per subnet populated from three sources:
+
+1. **Dynamic**: learned by snooping ARP/ND packets from locally attached hosts.
+2. **Static**: explicitly provisioned by the operator.
+3. **EVPN-learned**: installed from remote Type-2 MAC/IP Advertisement routes.
+
+RFC 9047 defines the **ARP/ND Extended Community** (type `0x06`, sub-type `0x08`) attached to Type-2 routes to carry IPv6 ND and ARP state flags:
+- **R (Router)**: set when the target is an IPv6 router (mirrors the NA `R` flag).
+- **O (Override)**: indicates the entry should override existing cache entries.
+- **I (Immutable)**: indicates a static/pinned binding that must not be overwritten by dynamic learning.
+
+### Flood vs suppress for unknown requests
+
+When a local host sends an ARP request or NS, the ingress PE checks its Proxy ARP/ND table:
+
+- **Hit**: the PE generates an ARP reply (or Neighbor Advertisement) locally and sends it back to the requesting host. Zero packets cross the VXLAN underlay.
+- **Miss (unknown target)**: the operator chooses between flooding the request across the BUM tree or suppressing (dropping) it.
+
+RFC 9161 Section 3.6 gives clear operational guidance here: **in networks where fast mobility is expected (the data-center use case), it is NOT RECOMMENDED to suppress the flooding of unknown ARP requests/NS or Gratuitous ARP (GARP) / unsolicited Neighbor Advertisements.** It also says a PE MAY offer separate knobs for the two kinds of flooding. Suppressing unknown requests breaks reachability to **silent hosts** (hosts that have not spoken recently and have aged out or never triggered a Type-2 route). Suppressing GARP/unsolicited NA breaks failover for active/standby appliances that announce a VIP move with a GARP. Full suppression is described for Internet Exchange Points (IXPs), where every CE's IP and MAC can be provisioned by a management system, or where all CEs are directly connected and announce themselves with a GARP/unsolicited NA when they connect; if either assumption fails, RFC 9161 says flooding SHOULD NOT be suppressed.
+
+RFC 9161 Section 3.7 also requires the Proxy ARP/ND function to support **Duplicate IP Detection**: the PE monitors "IP moves" in the Proxy ARP/ND table (the same IP bouncing between MACs), much like RFC 7432's duplicate-MAC detection, so that ARP/ND spoofing and human-error duplicates are caught instead of flapping traffic between hosts.
+
+### Linux bridge and FRR split (from the docs, not run)
+
+On Linux with FRR, ARP/ND suppression is **not** managed by FRR's BGP daemon. It is a kernel bridge port function enabled on the VXLAN interface:
+
+```text
+# iproute2 commands (from the docs, not run)
+ip link set dev vxlan100 type bridge_slave neigh_suppress on
+# or:
+bridge link set dev vxlan100 neigh_suppress on
+```
+
+The FRR documentation is explicit: ARP/ND suppression is a kernel function enabled per bridge port via `neigh_suppress`, it should only be enabled on VXLAN interfaces, and an SVI for an L2 VNI is only needed for routing (IRB) or ARP/ND suppression.
+
+The kernel bridge intercepts ARP/NS frames arriving from local ports, answers from its local neighbour table (which FRR populates from remote Type-2 routes via netlink), and suppresses flooding out `vxlan100` when a match exists.
+
+## The lab
+
+This chapter's lab is a pure standard-library Python model (no kernel VXLAN interfaces, FRR daemons, or root privileges required) that exercises five parts of the EVPN IRB control and data planes: exact NLRI and Extended Community byte encodings, asymmetric vs symmetric packet walks, per-leaf scaling math across fabric sizes, Proxy ARP/ND suppression with silent hosts, and Type-5 Overlay Index resolution.
+
+```{.python filename="evpn-irb.py"}
+#!/usr/bin/env python3
+"""EVPN IRB, Type-5 and ARP suppression as a runnable model (stdlib only).
+Encodings follow RFC 7432 s7.2, RFC 9135 s8.1, RFC 9136 s3.1, RFC 8365, RFC 9012 s4.1."""
+import ipaddress, struct, random
+
+def rd_type1(ip, num):          # RD type 1: IPv4 admin : 2-byte number
+    return struct.pack('!H', 1) + ipaddress.ip_address(ip).packed + struct.pack('!H', num)
+
+def label(vni):                  # 3-octet label field carrying a 24-bit VNI (RFC 8365 s5.1.3)
+    return vni.to_bytes(3, 'big')
+
+def mac_b(m): return bytes.fromhex(m.replace(':', ''))
+
+def type2(rd, mac, ip=None, l2vni=0, l3vni=None):
+    body = rd + bytes(10) + struct.pack('!I', 0) + bytes([48]) + mac_b(mac)
+    if ip:
+        a = ipaddress.ip_address(ip).packed
+        body += bytes([len(a) * 8]) + a
+    else:
+        body += bytes([0])
+    body += label(l2vni)
+    if l3vni is not None:
+        body += label(l3vni)
+    return bytes([2, len(body)]) + body
+
+def type5(rd, prefix, gw=None, vni=0, esi=bytes(10)):
+    n = ipaddress.ip_network(prefix)
+    fam = 4 if n.version == 4 else 16
+    gwb = ipaddress.ip_address(gw).packed if gw else bytes(fam)
+    body = rd + esi + struct.pack('!I', 0) + bytes([n.prefixlen]) + n.network_address.packed + gwb + label(vni)
+    return bytes([5, len(body)]) + body
+
+def ec_router_mac(mac): return bytes([0x06, 0x03]) + mac_b(mac)          # RFC 9135 s8.1
+def ec_encap(tunnel_type): return bytes([0x03, 0x0c, 0, 0, 0, 0]) + struct.pack('!H', tunnel_type)  # RFC 9012 s4.1
+def ec_default_gw(): return bytes([0x03, 0x0d]) + bytes(6)                # RFC 7432 s7.8
+def ec_rt(asn, val): return bytes([0x00, 0x02]) + struct.pack('!HI', asn, val)
+
+def hx(b): return ' '.join(f'{x:02x}' for x in b)
+
+def section1():
+    print('== 1. Wire encodings')
+    rd = rd_type1('192.0.2.11', 10)
+    rows = [
+        ('Type-2 MAC only (L2VNI 10010)', type2(rd, '00:00:5e:00:53:0a', None, 10010)),
+        ('Type-2 MAC+IPv4, asymmetric (Label1 only)', type2(rd, '00:00:5e:00:53:0a', '10.1.10.10', 10010)),
+        ('Type-2 MAC+IPv4, symmetric (Label1 L2VNI, Label2 L3VNI)', type2(rd, '00:00:5e:00:53:0a', '10.1.10.10', 10010, 50001)),
+        ('Type-2 MAC+IPv6, symmetric', type2(rd, '00:00:5e:00:53:0a', '2001:db8:10::10', 10010, 50001)),
+        ('Type-5 IPv4 10.99.0.0/16, VNI 50001', type5(rd_type1('192.0.2.11', 1), '10.99.0.0/16', None, 50001)),
+        ('Type-5 IPv6 2001:db8:99::/48, VNI 50001', type5(rd_type1('192.0.2.11', 1), '2001:db8:99::/48', None, 50001)),
+        ('Type-5 IPv4 GW-IP overlay index, label 0', type5(rd_type1('192.0.2.11', 1), '10.99.0.0/16', '10.1.10.254', 0)),
+    ]
+    for name, r in rows:
+        print(f'  {name}: route type {r[0]}, length {r[1]}')
+    t2 = rows[2][1]
+    print('  symmetric Type-2 bytes:', hx(t2))
+    print('    tail = Label1', hx(t2[-6:-3]), f'({int.from_bytes(t2[-6:-3], "big")}) Label2', hx(t2[-3:]), f'({int.from_bytes(t2[-3:], "big")})')
+    print('  Router MAC EC   :', hx(ec_router_mac('02:00:00:00:00:0b')))
+    print('  Encapsulation EC:', hx(ec_encap(8)), '(tunnel type 8 = VXLAN)')
+    print('  Default GW EC   :', hx(ec_default_gw()))
+    print('  RT 65000:50001  :', hx(ec_rt(65000, 50001)))
+
+# ---------- data plane walk ----------
+LEAVES = {
+    'leaf1': dict(vtep='192.0.2.11', rmac='02:00:00:00:00:0b', subnets={'10.1.10.0/24': 10010}),
+    'leaf2': dict(vtep='192.0.2.12', rmac='02:00:00:00:00:0c', subnets={'10.1.20.0/24': 10020}),
+}
+HOSTS = {'h10': ('10.1.10.10', '00:00:5e:00:53:0a', 'leaf1'), 'h20': ('10.1.20.20', '00:00:5e:00:53:14', 'leaf2')}
+ANYCAST_GW_MAC = '00:00:5e:00:01:01'
+L3VNI = 50001
+
+def walk(mode):
+    src, dst = HOSTS['h10'], HOSTS['h20']
+    ttl = 64; steps = []
+    steps.append(f'h10 -> leaf1: dst MAC {ANYCAST_GW_MAC} (anycast GW), TTL {ttl}')
+    ttl -= 1
+    if mode == 'asymmetric':
+        vni = 10020
+        steps.append(f'leaf1 routes into 10.1.20.0/24 locally (needs SVI + VNI {vni} + ARP entry for {dst[0]}), TTL {ttl}')
+        steps.append(f'leaf1 -> leaf2 VXLAN VNI {vni}, inner {ANYCAST_GW_MAC} -> {dst[1]}')
+        steps.append(f'leaf2 bridges in VNI {vni} (MAC lookup only) -> h20, TTL {ttl}')
+    else:
+        steps.append(f'leaf1 IP-VRF lookup: {dst[0]}/32 via VTEP {LEAVES["leaf2"]["vtep"]} L3VNI {L3VNI}, TTL {ttl}')
+        steps.append(f'leaf1 -> leaf2 VXLAN VNI {L3VNI}, inner {LEAVES["leaf1"]["rmac"]} -> {LEAVES["leaf2"]["rmac"]} (router MACs)')
+        ttl -= 1
+        steps.append(f'leaf2 IP-VRF lookup then ARP/MAC lookup in VNI 10020 -> h20, TTL {ttl}')
+    return steps, ttl
+
+def section2():
+    print('\n== 2. Packet walk h10 (10.1.10.10 on leaf1) -> h20 (10.1.20.20 on leaf2)')
+    for mode in ('asymmetric', 'symmetric'):
+        steps, ttl = walk(mode)
+        print(f'  {mode}: TTL at h20 = {ttl}')
+        for s in steps: print('    ' + s)
+
+def state(mode, leaves, subnets, hosts_per_subnet, subnets_per_leaf):
+    """Per-leaf state with subnets spread evenly; each subnet lives on subnets_per_leaf... returns max per leaf."""
+    random.seed(7)
+    placement = {s: random.sample(range(leaves), subnets_per_leaf) for s in range(subnets)}
+    per_leaf = []
+    for L in range(leaves):
+        local = [s for s, ls in placement.items() if L in ls]
+        if mode == 'asymmetric':
+            vnis = subnets + 0            # every L2VNI + SVI everywhere
+            arp = subnets * hosts_per_subnet   # every host in the VRF
+            host_routes = 0
+        else:
+            vnis = len(local) + 1         # local L2VNIs + one L3VNI
+            arp = len(local) * hosts_per_subnet  # local subnets only
+            host_routes = (subnets * hosts_per_subnet) - arp  # remote /32s in the IP-VRF (no ARP)
+        per_leaf.append((vnis, arp, host_routes))
+    return max(per_leaf)
+
+def section3():
+    print('\n== 3. Per-leaf state on the busiest leaf (random placement, seed 7), one tenant VRF, 250 hosts per subnet, each subnet on 2 leaves')
+    print(f'  {"leaves":>6} {"subnets":>7} | {"asym VNIs":>9} {"asym ARP":>9} | {"sym VNIs":>8} {"sym ARP":>8} {"sym /32s":>9}')
+    for leaves, subnets in ((4, 8), (16, 40), (64, 200)):
+        a = state('asymmetric', leaves, subnets, 250, 2)
+        s = state('symmetric', leaves, subnets, 250, 2)
+        print(f'  {leaves:>6} {subnets:>7} | {a[0]:>9} {a[1]:>9} | {s[0]:>8} {s[1]:>8} {s[2]:>9}')
+
+def section4():
+    print('\n== 4. ARP suppression on one L2VNI: 8 leaves, 40 hosts per leaf, each host ARPs for 10 random peers')
+    random.seed(11)
+    leaves, per = 8, 40
+    hosts = [(l, i) for l in range(leaves) for i in range(per)]
+    silent = set(random.sample(hosts, 6))   # hosts that never sent a packet (no GARP, no traffic)
+    asks = [(h, random.choice([x for x in hosts if x != h])) for h in hosts for _ in range(10)]
+    def run(suppress, flood_unknown):
+        flooded = answered_locally = unresolved = 0
+        for asker, target in asks:
+            known = target not in silent
+            if suppress and known:
+                answered_locally += 1
+            elif suppress and not flood_unknown:
+                unresolved += 1
+            else:
+                flooded += 1
+        return flooded, answered_locally, unresolved
+    for label_, sup, fu in (('no suppression', False, True),
+                            ('suppression, flood unknown', True, True),
+                            ('suppression, drop unknown', True, False)):
+        f, a, u = run(sup, fu)
+        print(f'  {label_:<28} requests {len(asks)}: flooded to {leaves - 1} remote VTEPs {f:>5} '
+              f'(copies {f * (leaves - 1):>5}), answered by local leaf {a:>5}, never resolved {u}')
+    print(f'  silent hosts: {len(silent)} (no EVPN Type-2 MAC/IP until they speak)')
+
+def section5():
+    print('\n== 5. Type-5 resolution: label vs GW-IP overlay index (RFC 9136 s3.1)')
+    cases = [('10.99.0.0/16', None, 50001, False), ('10.99.0.0/16', '10.1.10.254', 0, True),
+             ('10.99.0.0/16', None, 0, False)]
+    for p, gw, vni, has_t2 in cases:
+        if vni:
+            res = f'install {p} -> VTEP of the advertiser, VNI {vni}'
+        elif gw:
+            res = f'recursive: find Type-2 for {gw} -> its VTEP/MAC, then forward' if has_t2 else 'wait for Type-2 of GW'
+        else:
+            res = 'label 0 and no overlay index -> treat-as-withdraw (RFC 7606)'
+        print(f'  prefix {p} gw {gw or "0.0.0.0"} label {vni}: {res}')
+
+if __name__ == '__main__':
+    section1(); section2(); section3(); section4(); section5()
+```
+This is a model, not a live fabric: it needs only Python, no root, no kernel VXLAN and no FRR. Output from Linux 6.12, iproute2 6.15.0, Python 3.13.5 (a real run, unedited):
+
+```text
+$ python3 evpn-irb.py
+== 1. Wire encodings
+  Type-2 MAC only (L2VNI 10010): route type 2, length 33
+  Type-2 MAC+IPv4, asymmetric (Label1 only): route type 2, length 37
+  Type-2 MAC+IPv4, symmetric (Label1 L2VNI, Label2 L3VNI): route type 2, length 40
+  Type-2 MAC+IPv6, symmetric: route type 2, length 52
+  Type-5 IPv4 10.99.0.0/16, VNI 50001: route type 5, length 34
+  Type-5 IPv6 2001:db8:99::/48, VNI 50001: route type 5, length 58
+  Type-5 IPv4 GW-IP overlay index, label 0: route type 5, length 34
+  symmetric Type-2 bytes: 02 28 00 01 c0 00 02 0b 00 0a 00 00 00 00 00 00 00 00 00 00 00 00 00 00 30 00 00 5e 00 53 0a 20 0a 01 0a 0a 00 27 1a 00 c3 51
+    tail = Label1 00 27 1a (10010) Label2 00 c3 51 (50001)
+  Router MAC EC   : 06 03 02 00 00 00 00 0b
+  Encapsulation EC: 03 0c 00 00 00 00 00 08 (tunnel type 8 = VXLAN)
+  Default GW EC   : 03 0d 00 00 00 00 00 00
+  RT 65000:50001  : 00 02 fd e8 00 00 c3 51
+
+== 2. Packet walk h10 (10.1.10.10 on leaf1) -> h20 (10.1.20.20 on leaf2)
+  asymmetric: TTL at h20 = 63
+    h10 -> leaf1: dst MAC 00:00:5e:00:01:01 (anycast GW), TTL 64
+    leaf1 routes into 10.1.20.0/24 locally (needs SVI + VNI 10020 + ARP entry for 10.1.20.20), TTL 63
+    leaf1 -> leaf2 VXLAN VNI 10020, inner 00:00:5e:00:01:01 -> 00:00:5e:00:53:14
+    leaf2 bridges in VNI 10020 (MAC lookup only) -> h20, TTL 63
+  symmetric: TTL at h20 = 62
+    h10 -> leaf1: dst MAC 00:00:5e:00:01:01 (anycast GW), TTL 64
+    leaf1 IP-VRF lookup: 10.1.20.20/32 via VTEP 192.0.2.12 L3VNI 50001, TTL 63
+    leaf1 -> leaf2 VXLAN VNI 50001, inner 02:00:00:00:00:0b -> 02:00:00:00:00:0c (router MACs)
+    leaf2 IP-VRF lookup then ARP/MAC lookup in VNI 10020 -> h20, TTL 62
+
+== 3. Per-leaf state on the busiest leaf (random placement, seed 7), one tenant VRF, 250 hosts per subnet, each subnet on 2 leaves
+  leaves subnets | asym VNIs  asym ARP | sym VNIs  sym ARP  sym /32s
+       4       8 |         8      2000 |        8     1750       250
+      16      40 |        40     10000 |       11     2500      7500
+      64     200 |       200     50000 |       13     3000     47000
+
+== 4. ARP suppression on one L2VNI: 8 leaves, 40 hosts per leaf, each host ARPs for 10 random peers
+  no suppression               requests 3200: flooded to 7 remote VTEPs  3200 (copies 22400), answered by local leaf     0, never resolved 0
+  suppression, flood unknown   requests 3200: flooded to 7 remote VTEPs    63 (copies   441), answered by local leaf  3137, never resolved 0
+  suppression, drop unknown    requests 3200: flooded to 7 remote VTEPs     0 (copies     0), answered by local leaf  3137, never resolved 63
+  silent hosts: 6 (no EVPN Type-2 MAC/IP until they speak)
+
+== 5. Type-5 resolution: label vs GW-IP overlay index (RFC 9136 s3.1)
+  prefix 10.99.0.0/16 gw 0.0.0.0 label 50001: install 10.99.0.0/16 -> VTEP of the advertiser, VNI 50001
+  prefix 10.99.0.0/16 gw 10.1.10.254 label 0: recursive: find Type-2 for 10.1.10.254 -> its VTEP/MAC, then forward
+  prefix 10.99.0.0/16 gw 0.0.0.0 label 0: label 0 and no overlay index -> treat-as-withdraw (RFC 7606)
+```
+
+Walk through the five sections of the output carefully:
+
+1. **Encodings**: confirms the exact NLRI lengths (33/37/40/52 octets for Type-2; 34/58 octets for Type-5) and verifies the big-endian 24-bit VNI encoding in Label1 (`00 27 1a` for `10010`) and Label2 (`00 c3 51` for `50001`), alongside the 8-octet Extended Communities and Route Target.
+2. **Packet walk**: contrasts `h10` (`10.1.10.10`) reaching `h20` (`10.1.20.20`) under both models. In asymmetric mode, `leaf1` must own VNI `10020`, SVI `20`, and `h20`'s ARP entry, and `h20` receives the packet with TTL `63`. In symmetric mode, `leaf1` uses L3 VNI `50001` with `leaf1_RMAC -> leaf2_RMAC`, `leaf2` routes and then bridges into VNI `10020`, and `h20` receives the packet with TTL `62`.
+3. **Per-leaf state**: for the busiest leaf at 4 leaves/8 subnets, 16/40 and 64/200 (250 hosts per subnet, each subnet on 2 leaves), asymmetric ARP state climbs to 50,000 entries at 64 leaves, whereas symmetric caps local ARP at 3,000 and shifts the remaining 47,000 entries into IP-VRF `/32` host routes.
+4. **ARP suppression**: across 8 leaves with 40 hosts per leaf, 3,200 ARP requests, and 6 silent hosts, no suppression floods all 3,200 requests (22,400 VXLAN copies to remote VTEPs). Enabling suppression while flooding unknowns cuts flooding to 63 requests (441 copies) with 3,137 answered locally and 0 unresolved. Enabling suppression while dropping unknowns drops flooding to 0, but leaves all 63 requests to silent hosts unresolved.
+5. **Type-5 resolution**: verifies direct installation when `Label = 50001` and no GW IP is present, recursive resolution via the GW IP's Type-2 route when `Label = 0` and `GW IP = 10.1.10.254`, and BGP `treat-as-withdraw` when both `Label = 0` and the Overlay Index are absent.
+
+## Gotchas
+
+**The trap: mixing symmetric and asymmetric PEs in the same VRF.** If `leaf1` runs asymmetric IRB and `leaf2` runs symmetric IRB, `leaf2` sends Type-2 routes carrying Label2 (L3 VNI) and the IP-VRF Route Target. Under RFC 9135, an asymmetric-only PE ignores Label2. If `leaf1` does not instantiate `leaf2`'s L2 VNI locally, it drops traffic; if `leaf2` receives an L2-VNI-encapsulated frame for a subnet it expects to route over L3 VNI, forwarding breaks asymmetrically. Pick one IRB mode per tenant VRF across the entire fabric.
+
+**The trap: L3 VNI or Router MAC mismatches.** Symmetric IRB requires every leaf in the tenant IP-VRF to agree on the L3 VNI (for example, `50001`) and to advertise a valid, unique Router MAC in the Router's MAC Extended Community (`0x06`/`0x03`). If a leaf advertises a Router MAC that does not match the MAC programmed on its L3 VNI bridge/SVI, the egress PE decapsulates the VXLAN header, sees an unfamiliar inner destination MAC, and silently drops the frame instead of routing it.
+
+**The trap: anycast gateway MAC mismatch.** If `leaf1` uses `00:00:5e:00:01:01` and `leaf2` uses `00:00:5e:00:01:02` for the same subnet's IRB interface, a host migrating from `leaf1` to `leaf2` continues sending frames to `00:00:5e:00:01:01` until its ARP cache expires. `leaf2` will not intercept that MAC locally as its own router MAC, causing a mobility black hole. Audit anycast gateway IPs and MACs across all leaves before turning up workloads.
+
+**The trap: silent hosts with host-route-only reachability.** Symmetric IRB relies on hosts sending at least one ARP/ND or IP packet so the attached leaf learns their MAC+IP and originates a `/32` or `/128` Type-2 route. A silent host—such as a passive monitoring appliance or a newly booted IPMI interface that never initiates traffic—has no Type-2 route in remote IP-VRFs. Remote leaves drop traffic to it unless the attached leaf triggers an **ARP/ND glean** on receiving a packet for the subnet, or advertises a **Type-5 subnet route** (e.g., `10.1.20.0/24`) as a fallback so traffic reaches a leaf that can ARP locally.
+
+**The trap: double TTL decrement breaks TTL-1 protocols.** Because symmetric IRB routes at both the ingress PE and the egress PE, every inter-subnet packet loses **two** from its IP TTL (or IPv6 Hop Limit), whereas asymmetric IRB and traditional single-hop routers decrement by one. Any application or control-plane protocol relying on TTL=1 or Generalized TTL Security Mechanism (GTSM, expecting TTL=255 at the peer) across an EVPN symmetric IRB hop will fail unless explicitly accounted for.
+
+**The trap: inner Ethernet + VXLAN MTU overhead.** Both asymmetric and symmetric IRB carry a full inner Ethernet header (14 bytes, or 18 with 802.1Q) inside the VXLAN (8 bytes) + UDP (8 bytes) + outer IP (20 bytes IPv4 / 40 bytes IPv6) encapsulation. That is at least 50 bytes of overhead for IPv4 underlay (70 bytes for IPv6). If your underlay links run at 1500-byte MTU, inner 1500-byte frames will fragment or drop if DF is set. Set underlay MTU to at least 1550+ (typically 9000–9216 in data centers).
+
+**The trap: Type-5 vs Type-2 preference and longest-prefix match.** If `leaf2` advertises both a `/32` Type-2 host route for `10.1.20.20` and a `/24` Type-5 summary route for `10.1.20.0/24`, longest-prefix match always selects the `/32` Type-2 route. That is usually what you want—traffic goes straight to `leaf2`, not via a suboptimal border leaf. However, if `h20` moves to `leaf3` and `leaf2` has not yet withdrawn its `/32`, or if a border leaf injects a more specific `/32` Type-5 route, traffic can hairpin or black-hole. Know which routes originate `/32`s and which originate summaries.
+
+**The trap: missing IP-VRF Route Target imports.** A symmetric Type-2 route carries two Route Targets: the L2 VNI's RT and the IP-VRF's RT. If a leaf only imports the L2 VNI RT for its local subnets and forgets to import the IP-VRF RT, it will never install remote `/32` host routes into its IP-VRF—intra-subnet bridging will work, while inter-subnet routing will fail completely.
+
+**The trap: ARP suppression hiding GARP-based failover.** If you enable Proxy ARP/ND suppression and configure the bridge to suppress GARP or unsolicited NA flooding, an active/standby firewall pair that fails over by sending a GARP will update its local leaf, but remote leaves may keep stale ARP caches or delay updating their Proxy ARP tables. Follow RFC 9161 Section 3.6: keep GARP/unsolicited NA and unknown ARP/NS flooding enabled in dynamic data-center fabrics.
+
+**The trap: duplicate IP and rapid VM mobility.** When a VM moves from `leaf1` to `leaf2`, `leaf2` must signal that the MAC is newer using the **MAC Mobility Extended Community** sequence number (RFC 7432 Section 15). Without proper sequence-number incrementation—or if two VMs genuinely claim the same IP—RFC 9161 duplicate IP detection will flag a conflict or freeze the binding, leaving the moved VM unreachable.
+
+## Exercises
+
+1. **NLRI byte decoding:** A BGP speaker receives an EVPN Type-2 UPDATE with an NLRI length of 52 octets and two Extended Communities: `06 03 00 11 22 33 44 55` and `03 0c 00 00 00 00 00 08`. Identify the address family of the host IP, the encapsulation type, the Router MAC, and whether the sender is using symmetric or asymmetric IRB. Explain how an asymmetric-only PE must handle the final 3 octets of this NLRI.
+2. **TTL and header walk:** Host `A` (`10.2.10.5`) behind `leaf1` sends a packet with `TTL = 2` to Host `B` (`10.2.30.9`) behind `leaf3` across a symmetric IRB fabric (`L3VNI = 50002`). Trace the inner source/destination MACs, VXLAN VNI, and TTL at each hop. What happens if `A` sends the same packet with `TTL = 1`? Contrast this with an asymmetric IRB fabric.
+3. **Scaling calculation:** You are designing a single-VRF symmetric EVPN fabric with 32 leaves and 128 subnets. Each subnet has 200 hosts and is attached to exactly 4 leaves. Calculate per leaf: (a) the number of L2 VNIs, (b) total VNIs including the L3 VNI, (c) local ARP/ND entries, and (d) remote `/32` host routes in the IP-VRF. Compare those numbers against an asymmetric IRB deployment on the same topology.
+4. **Type-5 Overlay Index failure:** A border leaf advertises `172.16.0.0/16` in Route Type 5 with `Label = 0` and `GW IP = 10.1.10.254`. Traffic to `172.16.1.10` suddenly drops on `leaf1` even though the Type-5 route is still in `leaf1`'s BGP table. List two distinct control-plane causes for this failure and the exact CLI/table checks you would run to isolate them. What would `leaf1` do if the border leaf instead sent `Label = 0` and `GW IP = 0.0.0.0` with `ESI = 0`?
+5. **ARP suppression policy:** Compare two environments: (a) a Kubernetes/VMware cluster with live migration and occasional silent bare-metal IPMI hosts, and (b) a financial IXP peering LAN where every participant's IP/MAC is pre-registered. Which Proxy ARP/ND mode (flood unknown vs suppress unknown) should you deploy in each, and why?
+6. **Mixed-fabric migration:** You inherit a 12-leaf asymmetric IRB fabric and need to migrate it to symmetric IRB without a flag-day outage. Why can you not simply flip 6 leaves to symmetric IRB and leave 6 on asymmetric? Outline a safe migration strategy (e.g., using a new tenant VRF or staging L3 VNI provisioning) that avoids Label2 black holes.
+
+**The boring rule:** Pick symmetric IRB for every multi-subnet EVPN fabric unless a hardware constraint forces asymmetric, keep unknown ARP/NS and GARP flooding enabled wherever workloads move, and verify that every leaf agrees on the L3 VNI, IP-VRF Route Target, and anycast gateway MAC before a single host boots.
+
+## Sources
+
+- [RFC 9135: Integrated Routing and Bridging in Ethernet VPN (EVPN)](https://datatracker.ietf.org/doc/html/rfc9135)
+- [RFC 9136: IP Prefix Advertisement in Ethernet VPN (EVPN)](https://datatracker.ietf.org/doc/html/rfc9136)
+- [RFC 9161: Operational Aspects of Proxy ARP/ND in Ethernet VPN](https://datatracker.ietf.org/doc/html/rfc9161)
+- [RFC 9047: Propagation of ARP/ND Extended Community in EVPN](https://datatracker.ietf.org/doc/html/rfc9047)
+- [RFC 7432: BGP MPLS-Based Ethernet VPN](https://datatracker.ietf.org/doc/html/rfc7432)
+- [RFC 8365: A Network Virtualization Overlay Solution Using Ethernet VPN (EVPN)](https://datatracker.ietf.org/doc/html/rfc8365)
+- [RFC 9012: The BGP Tunnel Encapsulation Attribute](https://datatracker.ietf.org/doc/html/rfc9012)
+- [RFC 7606: Revised Error Handling for BGP UPDATE Messages](https://datatracker.ietf.org/doc/html/rfc7606)
+- [FRRouting EVPN Documentation](https://docs.frrouting.org/en/latest/evpn.html)
