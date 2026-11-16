@@ -1,0 +1,573 @@
+---
+title: "SRv6 on Linux: seg6 Encapsulation, seg6local Behaviours, SRH Walks and uSID Carriers"
+author:
+  - name: "K19G"
+  - name: "grok-bot"
+---
+
+# SRv6 on Linux: seg6 Encapsulation, seg6local Behaviours, SRH Walks and uSID Carriers
+
+Segment Routing over IPv6 (SRv6) turns the IPv6 forwarding plane into a programmable instruction tape. Instead of pushing a stack of 32-bit MPLS labels onto a packet, the ingress router encodes an ordered list of 128-bit Segment Identifiers (SIDs) into the IPv6 Destination Address (DA) and, when more than one segment is needed, an IPv6 Routing Header of type 4—the Segment Routing Header (SRH). Transit nodes that are not named in the active segment forward the packet using plain IPv6 longest-prefix match; nodes whose local SID matches the DA execute a bound behaviour, update the DA to the next segment, and send the packet on.
+
+The earlier chapter on Segment Routing, SRv6, and TI-LFA covered the architecture from RFC 8402 and the repair concepts, and the Flexible Algorithm chapter showed how IGP topologies carve paths by metric and constraints. This chapter moves into the Linux kernel data plane. You will build SRv6 SIDs, steer traffic at a head-end using `seg6` lightweight tunnels (`lwtunnel`), execute endpoint behaviours using `seg6local`, trace the exact bytes on the wire at each hop, and compress multi-hop paths into a single 128-bit uSID carrier.
+
+Understanding the wire format at this level matters because SRv6 hides subtle operational traps behind familiar `ip -6 route` syntax. A one-segment `H.Encaps` policy still burns 24 bytes of SRH overhead unless you ask for reduced encapsulation; a `Segment List` appears backwards in packet captures compared to the CLI; and an uninstantiated SID inside your own locator prefix does not fail silently—it fires ICMPv6 errors back to the outer head-end rather than the customer host.
+
+## Learning goals
+
+- Decompose a 128-bit SRv6 SID into its `LOC:FUNCT:ARG` fields per RFC 8986 and plan locator addressing alongside RFC 9602.
+- Read and verify an RFC 8754 Segment Routing Header on the wire, including reverse segment ordering, `Segments Left` indexing, and header length calculations.
+- Configure Linux `encap seg6` head-ends in `encap`, `encap.red`, and `inline` modes and predict the exact outer IPv6 header and SRH bytes produced by each.
+- Instantiate Linux `encap seg6local` endpoint behaviours (`End`, `End.X`, `End.DX4`, `End.DT6`, `End.DT4`) with per-SID counters and understand where VRF dependencies apply.
+- Compress multi-hop segment lists into 128-bit `NEXT-CSID` (uSID) carriers per RFC 9800 and design FIB prefix lengths that balance global and local CSIDs.
+- Diagnose SRv6 forwarding failures, capture-tap artefacts, MTU overruns, and domain-edge security gaps.
+
+## Anatomy of an SRv6 SID: LOC:FUNCT:ARG
+
+RFC 8986 defines SRv6 Network Programming. In that model, every 128-bit SRv6 SID is a structured instruction divided into three parts:
+
+```text
+ 0                                                                     127
++-----------------------------------+-------------------+-----------------+
+|              Locator              |     Function      |    Argument     |
+|  Locator-Block  |  Locator-Node   |                   |                 |
++-----------------------------------+-------------------+-----------------+
+|<----- LBL ----->|<----- LNL ----->|<------ FL ------->|<----- AL ------>|
+```
+
+- **Locator (`LOC`)**: The routable prefix that brings the packet to the node hosting the SID. RFC 8986 splits the locator into a **Locator-Block** (shared across an SR domain or Flexible Algorithm) and a **Locator-Node** (identifying the specific router). Transit routers only need a route to the `LOC` prefix; they never need to know the individual functions hosted behind it.
+- **Function (`FUNCT`)**: An opaque local identifier on that node that selects a specific behaviour—such as `End`, `End.X`, or `End.DX4`—and its bound parameters (an outgoing interface, a next-hop IPv4 address, or a VRF table).
+- **Argument (`ARG`)**: Optional bits trailing the function. Standard `End` behaviours leave the argument unused (zeroes), while compressed SIDs (`NEXT-CSID`) repurpose the argument field to pack subsequent segments into the same 128-bit address.
+
+| Field | Role in forwarding | Typical scope | Lab example |
+| :--- | :--- | :--- | :--- |
+| Locator-Block | Identifies the SR domain (or a Flex-Algo slice of it) | Domain-wide | `fcbb:bb00::/32` (uSID block) |
+| Locator-Node | Routes the packet to one node | Per node | `0200` = B, `0300` = C |
+| Function | Selects the `seg6local` behaviour | Local to the node | `f0d4` = C's End.DX4 |
+| Argument | Per-packet parameters, or the next CSIDs in a uSID carrier | Per packet | the bits after the active CSID |
+
+The classic SIDs in the lab (`fc00:0:b::e`, `fc00:0:c::d4`) are installed as plain `/128` routes, so their internal structure exists only on paper: `fc00:0:b::/48` is B's locator and the low bits are a function number chosen for readability. The uSID carriers later in the chapter are where the structure becomes real, because B and C install `/48` entries and shift the argument bits.
+
+For production deployments, RFC 9602 (October 2024) allocates the dedicated IPv6 prefix `5f00::/16` specifically for SRv6 SIDs. Using a dedicated prefix makes it straightforward to write infrastructure ACLs at domain borders and separate SRv6 SID space from loopbacks and customer addressing. In the lab in this chapter, the topologies use Unique Local Addresses (`fc00:0:X::/48` for classic SIDs and `fcbb:bb00::/32` for uSIDs) purely for readability so node letters and hexadecimal function IDs stand out in packet captures.
+
+## The Segment Routing Header (SRH) and Wire Order
+
+When a packet must traverse multiple explicit segments before reaching its final destination, the head-end inserts an IPv6 Routing Header of **Type 4**, defined in RFC 8754. The SRH sits between the outer IPv6 header (which carries `Next Header = 43` for Routing Header) and the inner payload (such as an encapsulated IPv4 packet with `Next Header = 4`, or IPv6 with `Next Header = 41`).
+
+```text
+ 0                   1                   2                   3
+ 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+| Next Header   |  Hdr Ext Len  | Routing Type  | Segments Left |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|  Last Entry   |     Flags     |              Tag              |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                                                               |
+|            Segment List[0] (128 bits) - LAST segment          |
+|                                                               |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                              ...                              |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                                                               |
+|           Segment List[n-1] (128 bits) - FIRST segment        |
+|                                                               |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|          Optional TLVs (e.g., HMAC TLV, Padding)              |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+```
+
+Three fields govern every SRH walk:
+
+1. **Hdr Ext Len**: Length of the SRH in 8-octet units, excluding the first 8 octets. With $n$ segments and no TLVs, the total SRH size is $8 + 16n$ bytes, so `Hdr Ext Len` equals $2n$.
+2. **Segments Left (`SL`)**: The index into `Segment List` pointing to the *currently active* segment. Each `End` or `End.X` behaviour decrements `SL` by 1 and copies `Segment List[SL]` into the IPv6 Destination Address.
+3. **Last Entry**: The zero-based index of the last element in `Segment List` (for an unreduced list of $n$ segments, `Last Entry = n - 1`).
+
+The most common source of confusion when reading an SRH capture is **reverse wire order**. RFC 8754 stores the path backwards: `Segment List[0]` is the **final** segment, and `Segment List[n-1]` is the **first** segment. Consider a two-segment path from head-end `A` through transit node `B` (`fc00:0:b::e`) to egress node `C` (`fc00:0:c::d4`):
+
+```text
+Leaving A (head-end, H.Encaps):
+  Outer IPv6 DA : fc00:0:b::e
+  SRH           : SL = 1, Last Entry = 1, Len = 40 bytes
+                  Segment List[0] = fc00:0:c::d4  (final segment)
+                  Segment List[1] = fc00:0:b::e   (first segment)
+
+      |
+      v   [B matches fc00:0:b::e -> End]
+          [Decrements SL: 1 -> 0]
+          [Copies Segment List[0] into DA]
+
+Leaving B (transit):
+  Outer IPv6 DA : fc00:0:c::d4
+  SRH           : SL = 0, Last Entry = 1, Len = 40 bytes
+                  Segment List[0] = fc00:0:c::d4
+                  Segment List[1] = fc00:0:b::e
+
+      |
+      v   [C matches fc00:0:c::d4 -> End.DX4]
+          [Strips outer IPv6 + SRH, forwards inner IPv4 to h2]
+```
+
+Because every SID is an instruction that can steer traffic inside your network, RFC 8754 (sections 5.1 and 7) establishes strict boundary rules: **SR domain border nodes MUST filter packets arriving from outside the domain that are destined to internal SIDs**. An inbound infrastructure ACL blocking your SID prefix (such as `5f00::/16` or your ULA SID block) at every external peering and customer interface prevents an outsider from injecting a packet with a forged SRH or steering directly to internal `End.X` or `End.DT4` functions. RFC 8754 also specifies that **BCP 38 source address filtering SHOULD be used** and provides an optional **HMAC TLV** inside the SRH when cryptographic verification of the segment list is required across untrusted hops.
+
+## Head-End Encapsulation: H.Encaps, H.Encaps.Red, and inline
+
+A head-end router steers an incoming customer packet (IPv4, IPv6, or Ethernet) into an SRv6 policy. RFC 8986 defines two primary encapsulation behaviours for IP packets, and Linux adds a third mode (`inline`) for native IPv6 insertion:
+
+- **`H.Encaps` (RFC 8986 section 5.1)**: Pushes a brand-new outer IPv6 header and a complete SRH containing every segment in the policy. Even if the policy has only one segment, `H.Encaps` still pushes a 24-byte SRH (`8 + 16 * 1`) with `SL = 0` and `Segment List[0]` equal to the single SID.
+- **`H.Encaps.Red` (RFC 8986 section 5.2)**: Reduced encapsulation. It places the first SID *only* in the outer IPv6 Destination Address and omits it from the SRH. For a three-segment policy `S1, S2, S3` on a packet destined to `T`, RFC 8986 shows `H.Encaps.Red` producing an outer packet `(T, S1)` with an SRH containing `(S3, S2; SL=2)`—note that `SL` starts at `2`, which is greater than `Last Entry` (`1`), and the first `End` at `S1` decrements `SL` to `1` to read `S2`. Crucially, when a policy has **only one segment**, `H.Encaps.Red` omits the SRH entirely, leaving just the 40-byte outer IPv6 header.
+- **`inline` (Linux `seg6` mode)**: Does *not* push an outer IPv6 header. Instead, it inserts an SRH directly into an existing IPv6 packet, rewriting the packet's original Destination Address into `Segment List[0]` and placing the first segment into the DA. Because it mutates the packet without encapsulation, `inline` only works for IPv6 traffic and cannot carry IPv4-in-IPv6 VPNs.
+
+On Linux, head-end steering is attached to a route via the `encap seg6` lightweight tunnel:
+
+```text
+ip route add 10.2.0.0/24 encap seg6 mode encap     segs fc00:0:b::e,fc00:0:c::d4 dev eth0
+ip route add 10.2.0.0/24 encap seg6 mode encap.red segs fc00:0:b::e,fc00:0:c::d4 dev eth0
+ip -6 route add 2001:db8:2::/64 encap seg6 mode inline segs fc00:0:b::e dev eth0
+```
+
+| Mode | Outer IPv6 Header | SRH Bytes (1 seg) | SRH Bytes (2 segs) | SRH Bytes (3 segs) | Carries IPv4? |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| `encap` (`H.Encaps`) | Yes (40 B) | 24 B (`SL=0`) | 40 B (`SL=1`) | 56 B (`SL=2`) | Yes |
+| `encap.red` (`H.Encaps.Red`) | Yes (40 B) | 0 B (no SRH) | 24 B (`SL=1`) | 40 B (`SL=2`) | Yes |
+| `inline` | No (0 B) | 40 B* | 56 B* | 72 B* | No |
+
+*\*In `inline` mode the packet's original destination is kept as `Segment List[0]`, so the SRH always has one more entry than the segments you configure. You can see the reserved slot when you add the route: on this host `ip -6 route add 2001:db8:2::/64 encap seg6 mode inline segs fc00::1 dev dm` is listed as `encap seg6 mode inline segs 2 [ fc00::1 :: ]`, and the `::` is filled with the real destination per packet. The byte counts in this row follow from that; inline mode was not exercised with traffic in the lab.*
+
+Two kernel sysctl details matter when you turn on `seg6`:
+
+- `net.ipv6.conf.<iface>.seg6_enabled`: Governs whether the kernel accepts and processes an SRH on packets addressed to a **local host address** on that interface (relevant for `inline` mode or SRH-bearing traffic terminating on a local socket). It defaults to `0` (disabled).
+- `net.ipv6.conf.all.forwarding = 1` (or per-interface `forwarding = 1`): Required on transit and endpoint routers so the kernel routes packets to `seg6local` lwtunnel entries and forwards encapsulated traffic. `seg6local` routes themselves are lwtunnel routes in the IPv6 FIB; they do not require `seg6_enabled` on transit interfaces when the DA matches a `seg6local` route, though forwarding must be enabled.
+
+## Endpoint Behaviours: seg6local on Linux
+
+Transit and egress routers instantiate SIDs in their IPv6 routing table using `encap seg6local`. Unlike `encap seg6`, which steers a customer prefix *into* an SRv6 tunnel, `seg6local` matches an incoming packet whose outer IPv6 DA hits the SID route and executes an RFC 8986 function.
+
+| Behaviour | RFC 8986 | Linux `seg6local` Syntax | Packet Action |
+| :--- | :--- | :--- | :--- |
+| `End` | 4.1 | `action End` | Decrement `SL`, copy `Segment List[SL]` to DA, IPv6 FIB lookup |
+| `End.X` | 4.2 | `action End.X nh6 <addr>` | Decrement `SL`, copy next SID to DA, forward to L3 adjacency `<addr>` |
+| `End.DX4` | 4.5 | `action End.DX4 nh4 <addr>` | Decapsulate outer IPv6+SRH, cross-connect inner IPv4 to `<addr>` |
+| `End.DT6` | 4.6 | `action End.DT6 table <id>` | Decapsulate outer IPv6+SRH, lookup inner IPv6 in table `<id>` |
+| `End.DT4` | 4.7 | `action End.DT4 vrftable <id>` | Decapsulate outer IPv6+SRH, lookup inner IPv4 in VRF `<id>` |
+| `End.DT46` | 4.8 | `action End.DT46 vrftable <id>` | Decapsulate outer IPv6+SRH, lookup inner IPv4 or IPv6 in VRF `<id>` |
+
+### Flavours: PSP, USP, and USD
+
+RFC 8986 section 4.16 defines three flavours that modify how `End`, `End.X`, and `End.T` handle the SRH when `SL` reaches `0` or `1`:
+
+- **PSP (Penultimate Segment Pop)**: Executed at the *penultimate* segment when `SL == 1`. After decrementing `SL` to `0` and copying `Segment List[0]` into the DA, the router removes the SRH from the packet before forwarding it to the final segment. This relieves the final node from parsing an SRH whose `SL` is already `0`.
+- **USP (Ultimate Segment Pop)**: Executed at the *ultimate* segment when `SL == 0`. The node removes the SRH and processes the rest of the packet itself, for example delivering it to a local upper-layer protocol.
+- **USD (Ultimate Segment Decapsulation)**: Executed at the *ultimate* segment when `SL == 0` and the payload is another IPv6 or IPv4 packet. It strips the outer IPv6 header (and SRH) and processes the inner packet.
+
+Kernel support for flavours is narrower than the RFC. On this host (Linux 6.12) `action End flavors psp` is accepted, while `flavors usp` and `flavors usd` are refused with `Error: Unsupported Flavor operation(s).`; check yours before designing around them.
+
+### Counters and Kernel Dependencies
+
+By default, Linux `seg6local` routes do not track per-SID statistics. Appending the `count` keyword enables per-behaviour `packets`, `bytes`, and `errors` counters, which you read back with `ip -s -6 route`:
+
+```text
+ip -6 route add fc00:0:b::e/128 encap seg6local action End count dev lo
+ip -s -6 route show fc00:0:b::e/128
+```
+
+One practical kernel dependency catches operators off guard: **`End.DT4` and `End.DT46` require a Linux VRF device** (`vrftable <id>`). If your kernel build lacks `CONFIG_NET_VRF` (so `ip link add ... type vrf` fails), you cannot instantiate `End.DT4`. In that case, `End.DX4` with an explicit `nh4` next-hop works without VRF support—which is why the lab in this chapter uses `End.DX4`.
+
+### Where the Control Plane Fits (BGP, FRR, and Vendor NOS)
+
+In a production L3VPN or EVPN deployment, you do not type `ip route` commands for every customer prefix. Instead, BGP distributes service SIDs (such as `End.DT4` or `End.DX4`) using the **BGP Prefix-SID attribute** defined in RFC 9252 (July 2022):
+
+- **TLV Type 5**: SRv6 L3 Service TLV (for IPv4/IPv6 L3VPN).
+- **TLV Type 6**: SRv6 L2 Service TLV (for EVPN).
+- Both carry an **SRv6 SID Information Sub-TLV** with the 128-bit SID and its endpoint behaviour; an optional SID Structure Sub-Sub-TLV gives the locator-block, locator-node, function and argument lengths.
+- RFC 9819 (July 2025) updates RFC 9252 to standardize argument signalling in those TLVs.
+
+On Linux with FRRouting (FRR) or on a vendor NOS, BGP installs the `encap seg6` head-end routes automatically from received Type 5 TLVs and advertises locally allocated `seg6local` SIDs (from the docs, not run here). In our lab below, static `ip route` commands stand in for BGP so you can inspect the data plane in isolation.
+
+## Compressed SRv6 (uSID / NEXT-CSID) Carriers
+
+Standard SRv6 SIDs consume 16 bytes per hop. A six-hop traffic-engineered path requires a 104-byte SRH ($8 + 16 \times 6$) on top of the 40-byte outer IPv6 header—144 bytes of overhead before the first byte of customer payload. For short-packet voice or telemetry traffic, or hardware pipelines with limited header-parsing depth, that overhead is expensive.
+
+**RFC 9800** (June 2025, updating RFC 8754) solves this with **Compressed SRv6 Segment List Encoding**. It defines two compression flavours:
+
+- **`NEXT-CSID`** (commonly called **uSID** when using 16-bit CSIDs): Packs multiple short CSIDs into the `Argument` field of a single 128-bit IPv6 address. Each hop shifts the next CSID into position inside the DA without touching an SRH.
+- **`REPLACE-CSID`**: Only the first element of a CSID sequence is a full SID; the SRH entries after it are containers packed with further CSIDs (without the Locator-Block), and each endpoint replaces the CSID in the DA with the next one from the container.
+
+Under RFC 9800, `End`, `End.X`, `End.T`, `End.B6.Encaps(.Red)`, and `End.BM` support both `NEXT-CSID` and `REPLACE-CSID`. Decapsulation behaviours (`End.DX4`, `End.DT4`, `End.DT6`, `End.DT46`) receive only `REPLACE-CSID`—but because **any standard SID can serve as the final element of a `NEXT-CSID` sequence**, an `End.DX4` or `End.DT4` function at the end of a uSID carrier needs no modification at all.
+
+### How `NEXT-CSID` Shifts Through a Carrier
+
+Implementations MUST support a **Locator-Block Length (`LBL`) of 32 bits** and a **Locator-Node + Function Length (`LNFL`) of 16 bits**. Every node participating in that uSID block shares the same 32-bit Locator-Block (`fcbb:bb00::/32` in the lab). The remaining 96 bits hold up to six 16-bit CSIDs:
+
+```text
+Carrier leaving A (128-bit DA, NO SRH):
++-------------------+--------+--------+--------+-----------------------+
+|   Locator-Block   | CSID 1 | CSID 2 | CSID 3 |       Zeroes          |
+|    fcbb:bb00      |  0200  |  0300  |  f0d4  |  0000:0000:0000       |
++-------------------+--------+--------+--------+-----------------------+
+|<---- 32 bits ---->|<--16-->|<--16-->|<--16-->|<------ 48 bits ------>|
+                     Active    Next     Final
+                     at B      at C     at C
+
+At B: matches fcbb:bb00:200::/48 (End, next-csid lblen 32 nflen 16)
+      Shifts bits [48..127] left by 16 bits into [32..111], zero-fills [112..127].
+
+Carrier leaving B (128-bit DA, NO SRH):
++-------------------+--------+--------+--------+-----------------------+
+|   Locator-Block   | CSID 2 | CSID 3 |  0000  |       Zeroes          |
+|    fcbb:bb00      |  0300  |  f0d4  |  0000  |  0000:0000:0000       |
++-------------------+--------+--------+--------+-----------------------+
+```
+
+On Linux, node B instantiates its uSID `End` behaviour with:
+
+```text
+ip -6 route add fcbb:bb00:200::/48 encap seg6local action End \
+  flavors next-csid lblen 32 nflen 16 count dev lo
+```
+
+Look closely at what happens when the packet arrives at node C with DA `fcbb:bb00:300:f0d4::`. Node C has two routes in its FIB:
+
+1. `fcbb:bb00:300::/48` — C's Global CSID (`GIB` / Global Identifier Block) `End` with `next-csid`.
+2. `fcbb:bb00:300:f0d4::/64` — C's combined **Global + Local** (`LIB` / Local Identifier Block) `End.DX4` route.
+
+RFC 9800 section 5.3 recommends FIB entries of length `LBL + LNL + FL` and explicitly permits a combined Global + Local entry—for example, `2001:db8:b1:10::/64` for `End` alongside `2001:db8:b1:10:f123::/80` for a local `End.X`. Because IPv6 longest-prefix match prefers `/64` over `/48`, node C matches `fcbb:bb00:300:f0d4::/64` directly, executes `End.DX4`, strips the outer IPv6 header, and delivers the inner IPv4 packet to `h2` without ever invoking its `/48` `End` route.
+
+If the path had continued past C to a fourth node D (`0400`), the carrier arriving at C would have been `fcbb:bb00:300:400:f0d4::`—which does *not* match `fcbb:bb00:300:f0d4::/64`, so C would match `fcbb:bb00:300::/48`, shift `0400` into the active position, and forward to D.
+
+## The lab
+
+The lab runs inside isolated Linux network namespaces (`unshare -rnm`, kernel `6.12.94`, `iproute2 6.15.0`, Python `3.13.5`) with five nodes wired in a line:
+
+```text
+  10.1.0.0/24      2001:db8:ab::/64      2001:db8:bc::/64      10.2.0.0/24
+ [h1] -------- [A] ----------------- [B] ----------------- [C] -------- [h2]
+            (head-end)            (transit)             (egress)
+```
+
+`h1` and `h2` speak only IPv4 (`10.1.0.0/24` and `10.2.0.0/24`). The core between `A`, `B`, and `C` is IPv6-only (`2001:db8:ab::/64` and `2001:db8:bc::/64`), with static routes distributing the classic locators (`fc00:0:a::/48`, `fc00:0:b::/48`, `fc00:0:c::/48`) and uSID locators (`fcbb:bb00:200::/48` on B and `fcbb:bb00:300::/48` on C). `h1` sends 100-byte UDP echo probes to `h2` (128-byte inner IPv4 packet), while `TPACKET_V2` raw packet taps on the sending side of `A->B` (`a-b`) and `B->C` (`b-c`) capture the exact outer IPv6 header, SRH, and hop limit across seven scenarios.
+
+```{.python filename="srv6-lab.py"}
+#!/usr/bin/env python3
+"""SRv6 on Linux with seg6 and seg6local. Run: unshare -rnm python3 srv6-lab.py
+Topology: h1 -- A -- B -- C -- h2. A and C are PEs carrying an IPv4 "VPN"
+over an IPv6-only core; B is a transit SRv6 node. No root, no packages."""
+import os, socket, struct, subprocess, sys, time, ipaddress
+
+SELF = os.path.abspath(__file__)
+
+def sh(cmd, check=True):
+    r = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+    if check and r.returncode:
+        raise SystemExit(f'FAILED: {cmd}\n{r.stderr}')
+    return (r.stdout + r.stderr).strip()
+
+def build():
+    sh('mount -t tmpfs none /run && mkdir -p /run/netns')
+    for ns in ('h1', 'A', 'B', 'C', 'h2'):
+        sh(f'ip netns add {ns}; ip -n {ns} link set lo up')
+    for a, b, na, nb in (('h1-a', 'a-h1', 'h1', 'A'), ('a-b', 'b-a', 'A', 'B'),
+                         ('b-c', 'c-b', 'B', 'C'), ('c-h2', 'h2-c', 'C', 'h2')):
+        sh(f'ip link add {a} type veth peer name {b}')
+        sh(f'ip link set {a} netns {na}; ip link set {b} netns {nb}')
+        sh(f'ip -n {na} link set {a} up; ip -n {nb} link set {b} up')
+    for ns in ('A', 'B', 'C'):
+        sh(f'ip netns exec {ns} sh -c "echo 1 > /proc/sys/net/ipv4/ip_forward; '
+           f'echo 1 > /proc/sys/net/ipv6/conf/all/forwarding"')
+    cmds = '''
+    ip -n h1 addr add 10.1.0.1/24 dev h1-a
+    ip -n h1 route add default via 10.1.0.254
+    ip -n A addr add 10.1.0.254/24 dev a-h1
+    ip -n A addr add 2001:db8:ab::a/64 dev a-b nodad
+    ip -n B addr add 2001:db8:ab::b/64 dev b-a nodad
+    ip -n B addr add 2001:db8:bc::b/64 dev b-c nodad
+    ip -n C addr add 2001:db8:bc::c/64 dev c-b nodad
+    ip -n C addr add 10.2.0.254/24 dev c-h2
+    ip -n h2 addr add 10.2.0.2/24 dev h2-c
+    ip -n h2 route add default via 10.2.0.254
+    ip -n A -6 route add fc00:0:b::/48 via 2001:db8:ab::b
+    ip -n A -6 route add fc00:0:c::/48 via 2001:db8:ab::b
+    ip -n A -6 route add fcbb:bb00:200::/48 via 2001:db8:ab::b
+    ip -n B -6 route add fc00:0:a::/48 via 2001:db8:ab::a
+    ip -n B -6 route add fc00:0:c::/48 via 2001:db8:bc::c
+    ip -n B -6 route add fcbb:bb00:300::/48 via 2001:db8:bc::c
+    ip -n C -6 route add fc00:0:a::/48 via 2001:db8:bc::b
+    ip -n C -6 route add fc00:0:b::/48 via 2001:db8:bc::b
+    ip -n A -6 route add fc00:0:a::d4/128 encap seg6local action End.DX4 nh4 10.1.0.1 count dev a-h1
+    ip -n C -6 route add fc00:0:c::d4/128 encap seg6local action End.DX4 nh4 10.2.0.2 count dev c-h2
+    ip -n B -6 route add fc00:0:b::e/128 encap seg6local action End count dev b-c
+    ip -n C route add 10.1.0.0/24 encap seg6 mode encap.red segs fc00:0:a::d4 dev c-b
+    ip -n B -6 route add fcbb:bb00:200::/48 encap seg6local action End flavors next-csid lblen 32 nflen 16 count dev b-c
+    ip -n C -6 route add fcbb:bb00:300::/48 encap seg6local action End flavors next-csid lblen 32 nflen 16 count dev c-b
+    ip -n C -6 route add fcbb:bb00:300:f0d4::/64 encap seg6local action End.DX4 nh4 10.2.0.2 count dev c-h2
+    '''
+    for c in cmds.split('\n'):
+        if c.strip(): sh(c.strip())
+    time.sleep(0.3)
+
+def parse(pkt):
+    """Decode Ethernet + IPv6 (+ SRH) + inner IPv4/UDP. Return a one-line summary."""
+    if len(pkt) < 54 or struct.unpack('!H', pkt[12:14])[0] != 0x86DD:
+        return None
+    ip6 = pkt[14:]
+    plen, nh, hlim = struct.unpack('!HBB', ip6[4:8])
+    src = ipaddress.IPv6Address(ip6[8:24]); dst = ipaddress.IPv6Address(ip6[24:40])
+    off = 40; s = f'IPv6 {src} > {dst} len {40 + plen} hlim {hlim}'
+    if nh == 43:
+        nxt, hdrlen, rtype, sl, last = struct.unpack('!BBBBB', ip6[off:off + 5])
+        segs = [str(ipaddress.IPv6Address(ip6[off + 8 + 16 * i: off + 24 + 16 * i]))
+                for i in range(last + 1)]
+        s += f' | SRH type {rtype} SL {sl} len {8 + 8 * hdrlen}B segs {segs}'
+        off += 8 + 8 * hdrlen; nh = nxt
+    if nh == 4:
+        isrc = socket.inet_ntoa(ip6[off + 12:off + 16]); idst = socket.inet_ntoa(ip6[off + 16:off + 20])
+        s += f' | inner IPv4 {isrc} > {idst}'
+    elif nh == 58:
+        s += f' | ICMPv6 type {ip6[off]} code {ip6[off+1]}'
+    else:
+        s += f' | next-header {nh}'
+    return s
+
+def capture(ifname, seconds):
+    """Tap the sending side of a link through a TPACKET_V2 ring, like tcpdump.
+    The ring copies each frame when it is seen. A plain recvfrom() on an
+    AF_PACKET socket reads a clone that shares data with the forwarded skb,
+    so by the time Python reads it the next node's seg6local may already
+    have rewritten the header in place."""
+    import mmap
+    SOL_PACKET, PACKET_RX_RING, PACKET_VERSION, TPACKET_V2 = 263, 5, 10, 1
+    sk = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(3))
+    sk.setsockopt(SOL_PACKET, PACKET_VERSION, TPACKET_V2)
+    fsz, nfr = 4096, 256
+    sk.setsockopt(SOL_PACKET, PACKET_RX_RING, struct.pack('IIII', fsz, nfr, fsz, nfr))
+    ring = mmap.mmap(sk.fileno(), fsz * nfr)
+    sk.bind((ifname, 0))
+    end = time.time() + float(seconds); seen = []; i = 0
+    while time.time() < end:
+        base = i * fsz
+        status, = struct.unpack_from('I', ring, base)
+        if not status & 1:                      # TP_STATUS_USER
+            time.sleep(0.01); continue
+        _, _, snap, mac = struct.unpack_from('IIIH', ring, base)
+        pkttype = ring[base + 32 + 10]          # sockaddr_ll.sll_pkttype
+        if pkttype == socket.PACKET_OUTGOING:
+            p = parse(bytes(ring[base + mac: base + mac + snap]))
+            if p and ('inner' in p or 'ICMPv6 type 1 ' in p) and p not in seen:
+                seen.append(p)
+        struct.pack_into('I', ring, base, 0)    # hand the frame back
+        i = (i + 1) % nfr
+    print('\n'.join(seen) if seen else '(nothing captured)')
+
+def echo_server():
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.bind(('10.2.0.2', 7000))
+    while True:
+        d, a = s.recvfrom(2048); s.sendto(d, a)
+
+def client(n):
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.settimeout(1)
+    ok = 0; rtts = []
+    for i in range(int(n)):
+        t = time.time(); s.sendto(b'x' * 100, ('10.2.0.2', 7000))
+        try:
+            s.recvfrom(2048); ok += 1; rtts.append((time.time() - t) * 1e3)
+        except socket.timeout:
+            pass
+    print(f'h1 -> 10.2.0.2:7000  {ok}/{n} echoed' + (f', max rtt {max(rtts):.2f} ms' if rtts else ''))
+
+def nsx(ns, *args, bg=False):
+    cmd = ['ip', 'netns', 'exec', ns, sys.executable, SELF, *args]
+    if bg:
+        return subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    return subprocess.run(cmd, capture_output=True, text=True).stdout.strip()
+
+def scenario(title, a_route, taps):
+    print(f'\n== {title}')
+    sh(f'ip -n A route replace 10.2.0.0/24 {a_route}')
+    print('A# ' + sh('ip -n A route show 10.2.0.0/24'))
+    caps = [(ns, ifn, nsx(ns, 'capture', ifn, '1.5', bg=True)) for ns, ifn in taps]
+    time.sleep(0.3)
+    print(nsx('h1', 'client', '3'))
+    for ns, ifn, p in caps:
+        out, _ = p.communicate()
+        print(f'-- leaving {ns} on {ifn}')
+        print(out.strip())
+
+def main():
+    build()
+    srv = subprocess.Popen(['ip', 'netns', 'exec', 'h2', sys.executable, SELF, 'echo'])
+    time.sleep(0.3)
+    print('kernel', os.uname().release, '| ' + sh('ip -V'))
+    print('C# ' + sh('ip -n C -6 route show fc00:0:c::d4'))
+    print('B# ' + sh('ip -n B -6 route show fc00:0:b::e'))
+    taps = [('A', 'a-b'), ('B', 'b-c')]
+    sh('ip -n A route replace 10.2.0.0/24 encap seg6 mode encap.red segs fc00:0:c::d4 dev a-b')
+    nsx('h1', 'client', '2')  # warm up neighbour caches; not counted below
+    # re-create the behaviours so their counters start at zero
+    sh('ip -n C -6 route replace fc00:0:c::d4/128 encap seg6local action End.DX4 nh4 10.2.0.2 count dev c-h2')
+    scenario('1. H.Encaps, one segment (SRH is still added)',
+             'encap seg6 mode encap segs fc00:0:c::d4 dev a-b', taps)
+    scenario('2. H.Encaps.Red, one segment (no SRH at all)',
+             'encap seg6 mode encap.red segs fc00:0:c::d4 dev a-b', taps)
+    scenario('3. Steer through B: End at B, then End.DX4 at C',
+             'encap seg6 mode encap segs fc00:0:b::e,fc00:0:c::d4 dev a-b', taps)
+    scenario('4. Same path with encap.red: first SID only in the DA',
+             'encap seg6 mode encap.red segs fc00:0:b::e,fc00:0:c::d4 dev a-b', taps)
+    scenario('5. uSID (RFC 9800 NEXT-C-SID): B and C in one 128-bit carrier',
+             'encap seg6 mode encap.red segs fcbb:bb00:200:300:f0d4:: dev a-b', taps)
+    print('\n== 6. Behaviour counters')
+    print('B# ' + sh('ip -n B -s -6 route show fc00:0:b::e'))
+    print('B# ' + sh('ip -n B -s -6 route show fcbb:bb00:200::/48'))
+    print('C# ' + sh('ip -n C -s -6 route show fcbb:bb00:300::/48'))
+    print('C# ' + sh('ip -n C -s -6 route show fcbb:bb00:300:f0d4::/64'))
+    print('C# ' + sh('ip -n C -s -6 route show fc00:0:c::d4'))
+    scenario('7. Steer to a SID nobody instantiated on B (fc00:0:b::99)',
+             'encap seg6 mode encap segs fc00:0:b::99,fc00:0:c::d4 dev a-b', [('A', 'a-b'), ('B', 'b-c'), ('B', 'b-a')])
+    srv.kill()
+
+if __name__ == '__main__':
+    if len(sys.argv) > 1:
+        {'capture': lambda: capture(*sys.argv[2:4]), 'echo': echo_server,
+         'client': lambda: client(sys.argv[2])}[sys.argv[1]]()
+    else:
+        main()
+```
+No root and no packages: `unshare -rnm` gives the script private user, network and mount namespaces in which it builds five more namespaces with veth links. Link-local addresses and timings will differ on your machine. Output from Linux 6.12, iproute2 6.15.0, Python 3.13.5 (a real run, unedited):
+
+```text
+$ unshare -rnm python3 srv6-lab.py
+kernel 6.12.94+ | ip utility, iproute2-6.15.0, libbpf 1.5.0
+C# fc00:0:c::d4  encap seg6local action End.DX4 nh4 10.2.0.2 dev c-h2 metric 1024 pref medium
+B# fc00:0:b::e  encap seg6local action End dev b-c metric 1024 pref medium
+
+== 1. H.Encaps, one segment (SRH is still added)
+A# 10.2.0.0/24  encap seg6 mode encap segs 1 [ fc00:0:c::d4 ] dev a-b scope link
+h1 -> 10.2.0.2:7000  3/3 echoed, max rtt 0.40 ms
+-- leaving A on a-b
+IPv6 2001:db8:ab::a > fc00:0:c::d4 len 192 hlim 63 | SRH type 4 SL 0 len 24B segs ['fc00:0:c::d4'] | inner IPv4 10.1.0.1 > 10.2.0.2
+-- leaving B on b-c
+IPv6 2001:db8:ab::a > fc00:0:c::d4 len 192 hlim 62 | SRH type 4 SL 0 len 24B segs ['fc00:0:c::d4'] | inner IPv4 10.1.0.1 > 10.2.0.2
+
+== 2. H.Encaps.Red, one segment (no SRH at all)
+A# 10.2.0.0/24  encap seg6 mode encap.red segs 1 [ fc00:0:c::d4 ] dev a-b scope link
+h1 -> 10.2.0.2:7000  3/3 echoed, max rtt 0.21 ms
+-- leaving A on a-b
+IPv6 2001:db8:ab::a > fc00:0:c::d4 len 168 hlim 63 | inner IPv4 10.1.0.1 > 10.2.0.2
+-- leaving B on b-c
+IPv6 2001:db8:ab::a > fc00:0:c::d4 len 168 hlim 62 | inner IPv4 10.1.0.1 > 10.2.0.2
+
+== 3. Steer through B: End at B, then End.DX4 at C
+A# 10.2.0.0/24  encap seg6 mode encap segs 2 [ fc00:0:b::e fc00:0:c::d4 ] dev a-b scope link
+h1 -> 10.2.0.2:7000  3/3 echoed, max rtt 0.44 ms
+-- leaving A on a-b
+IPv6 2001:db8:ab::a > fc00:0:b::e len 208 hlim 63 | SRH type 4 SL 1 len 40B segs ['fc00:0:c::d4', 'fc00:0:b::e'] | inner IPv4 10.1.0.1 > 10.2.0.2
+-- leaving B on b-c
+IPv6 2001:db8:ab::a > fc00:0:c::d4 len 208 hlim 62 | SRH type 4 SL 0 len 40B segs ['fc00:0:c::d4', 'fc00:0:b::e'] | inner IPv4 10.1.0.1 > 10.2.0.2
+
+== 4. Same path with encap.red: first SID only in the DA
+A# 10.2.0.0/24  encap seg6 mode encap.red segs 2 [ fc00:0:b::e fc00:0:c::d4 ] dev a-b scope link
+h1 -> 10.2.0.2:7000  3/3 echoed, max rtt 0.26 ms
+-- leaving A on a-b
+IPv6 2001:db8:ab::a > fc00:0:b::e len 192 hlim 63 | SRH type 4 SL 1 len 24B segs ['fc00:0:c::d4'] | inner IPv4 10.1.0.1 > 10.2.0.2
+-- leaving B on b-c
+IPv6 2001:db8:ab::a > fc00:0:c::d4 len 192 hlim 62 | SRH type 4 SL 0 len 24B segs ['fc00:0:c::d4'] | inner IPv4 10.1.0.1 > 10.2.0.2
+
+== 5. uSID (RFC 9800 NEXT-C-SID): B and C in one 128-bit carrier
+A# 10.2.0.0/24  encap seg6 mode encap.red segs 1 [ fcbb:bb00:200:300:f0d4:: ] dev a-b scope link
+h1 -> 10.2.0.2:7000  3/3 echoed, max rtt 0.20 ms
+-- leaving A on a-b
+IPv6 2001:db8:ab::a > fcbb:bb00:200:300:f0d4:: len 168 hlim 63 | inner IPv4 10.1.0.1 > 10.2.0.2
+-- leaving B on b-c
+IPv6 2001:db8:ab::a > fcbb:bb00:300:f0d4:: len 168 hlim 62 | inner IPv4 10.1.0.1 > 10.2.0.2
+
+== 6. Behaviour counters
+B# fc00:0:b::e  encap seg6local action End packets 6 bytes 1200 errors 0 dev b-c metric 1024 pref medium
+B# fcbb:bb00:200::/48  encap seg6local action End packets 3 bytes 504 errors 0 flavors next-csid lblen 32 nflen 16 dev b-c metric 1024 pref medium
+C# fcbb:bb00:300::/48  encap seg6local action End packets 0 bytes 0 errors 0 flavors next-csid lblen 32 nflen 16 dev c-b metric 1024 pref medium
+C# fcbb:bb00:300:f0d4::/64  encap seg6local action End.DX4 nh4 10.2.0.2 packets 3 bytes 504 errors 0 dev c-h2 metric 1024 pref medium
+C# fc00:0:c::d4  encap seg6local action End.DX4 nh4 10.2.0.2 packets 12 bytes 2280 errors 0 dev c-h2 metric 1024 pref medium
+
+== 7. Steer to a SID nobody instantiated on B (fc00:0:b::99)
+A# 10.2.0.0/24  encap seg6 mode encap segs 2 [ fc00:0:b::99 fc00:0:c::d4 ] dev a-b scope link
+h1 -> 10.2.0.2:7000  0/3 echoed
+-- leaving A on a-b
+IPv6 2001:db8:ab::a > fc00:0:b::99 len 208 hlim 63 | SRH type 4 SL 1 len 40B segs ['fc00:0:c::d4', 'fc00:0:b::99'] | inner IPv4 10.1.0.1 > 10.2.0.2
+-- leaving B on b-c
+(nothing captured)
+-- leaving B on b-a
+IPv6 2001:db8:ab::b > 2001:db8:ab::a len 256 hlim 64 | ICMPv6 type 1 code 0
+```
+
+The seven scenarios in the output confirm each mechanism on the wire:
+
+1. **`H.Encaps` with 1 segment (`fc00:0:c::d4`)**: `A` still inserts a 24-byte SRH (`SL = 0`, `Segment List = [fc00:0:c::d4]`), yielding a 192-byte outer IPv6 packet ($40 + 24 + 128$). Hop limit leaves `A` at `63` and leaves `B` at `62`.
+2. **`H.Encaps.Red` with 1 segment (`fc00:0:c::d4`)**: `A` omits the SRH completely, shrinking the packet on the wire to 168 bytes ($40 + 128$).
+3. **`H.Encaps` with 2 segments (`fc00:0:b::e,fc00:0:c::d4`)**: Leaving `A`, the outer DA is `fc00:0:b::e`, the SRH is 40 bytes with `SL = 1`, total length is 208 bytes, and the segment list appears in wire order `[fc00:0:c::d4, fc00:0:b::e]`. Leaving `B`, `B`'s `End` decremented `SL` to `0` and copied `fc00:0:c::d4` into the DA.
+4. **`H.Encaps.Red` with 2 segments**: Leaving `A`, the DA is `fc00:0:b::e`, the SRH is only 24 bytes containing `[fc00:0:c::d4]` with `SL = 1`, and the total length is 192 bytes. Leaving `B`, the DA is `fc00:0:c::d4` and `SL = 0`.
+5. **uSID (`NEXT-CSID`) with `encap.red` (`fcbb:bb00:200:300:f0d4::`)**: No SRH is present; the outer packet is 168 bytes. Leaving `A`, the DA is `fcbb:bb00:200:300:f0d4::`. Leaving `B`, `B`'s `next-csid` `End` shifted the 16-bit CSIDs left, turning the DA into `fcbb:bb00:300:f0d4::`. `C` matched its `/64` combined `End.DX4` entry (`fcbb:bb00:300:f0d4::/64`), beating its `/48` `End` route.
+6. **Counters (`ip -s -6 route`)**: `B`'s `fc00:0:b::e` `End` counted `6` packets and `1200` bytes with `0` errors (3 probes from scenario 3 plus 3 from scenario 4). `B`'s `fcbb:bb00:200::/48` uSID `End` counted `3` packets. `C`'s `fcbb:bb00:300::/48` uSID `End` stayed at `0` packets because the `/64` `End.DX4` (`3` packets) won longest-prefix match. `C`'s classic `fc00:0:c::d4` `End.DX4` counted `12` packets across scenarios 1–4. Every echo in scenarios 1–5 returned `3/3`.
+7. **Unbound SID (`fc00:0:b::99`)**: `A` steers traffic to a SID inside `B`'s locator that `B` never instantiated, and `B` has no route covering its own locator. `0/3` echoes return, nothing leaves `B` towards `C`, and `B` sends an **ICMPv6 Type 1 Code 0 (no route to destination)** back to the *outer* source `2001:db8:ab::a` (`A`). Customer host `h1` sees silent packet loss.
+
+## Gotchas
+
+### The trap: one-segment `H.Encaps` still costs 24 bytes
+
+Using `mode encap` with a single SID does not automatically omit the SRH. As scenario 1 proved, Linux pushes a 24-byte SRH with `SL = 0`, raising a 128-byte inner packet to 192 bytes. Always use `mode encap.red` when you want single-segment policies to carry zero SRH overhead.
+
+### MTU and the `40 + 8 + 16n` overhead budget
+
+Every SRv6 packet pays 40 bytes for the outer IPv6 header, plus $8 + 16n$ bytes for an unreduced SRH with $n$ segments (or $8 + 16(n - 1)$ for `encap.red` when $n \ge 2$). A 5-segment `H.Encaps` policy adds $40 + 8 + 80 = 128$ bytes, cutting a 1500-byte Ethernet link down to a 1372-byte inner MTU. Either raise core link MTUs (jumbo frames) or budget head-end Path MTU / MSS clamping before turning on multi-hop SRv6.
+
+### Reverse segment order and reduced-SRH indexing
+
+In `ip route ... segs S1,S2`, you write the path forward (`S1` then `S2`), whereas the wire SRH stores `Segment List` backwards (`[S2, S1]`). When `encap.red` is used with two segments, `Segment List` has only one element (`[S2]` at index `0`), yet `Segments Left` starts at `1`—one past `Last Entry` (`0`). Do not mistake `SL > Last Entry` in a `tcpdump` decode for a corrupted packet; it is normal RFC 8986 `H.Encaps.Red` behaviour.
+
+### The trap: unbound SIDs inside your own locator
+
+In scenario 7, `B` had no route for `fc00:0:b::99`, so it generated ICMPv6 Type 1 Code 0 back to `A` (`2001:db8:ab::a`). Worse, if `B` had a less-specific aggregate or default route pointing back toward `A`, `B` would forward the packet back to `A`, creating a forwarding loop until Hop Limit hits zero. **Always install a `blackhole` route for each node's local locator prefix** (for example, `ip -6 route add blackhole fc00:0:b::/48`) so any unbound SID within the locator drops cleanly instead of looping or leaking ICMPv6 unreachable probes.
+
+### Domain-edge SID filtering
+
+If an external peer can reach your `5f00::/16` or ULA SID space, they can steer traffic through internal `End.X` adjacencies or inject packets into `End.DT4` VRFs. Enforce an inbound infrastructure ACL at every SR domain border dropping packets destined to your SID prefix (RFC 8754 sections 5.1 and 7), and apply BCP 38 source filtering.
+
+### `End.DT4` and `End.DT46` require a VRF device
+
+Linux binds `End.DT4` and `End.DT46` to a VRF device via `vrftable <id>`. If your kernel was compiled without `CONFIG_NET_VRF`, `ip link add ... type vrf` fails and you cannot instantiate `End.DT4`. Use `End.DX4 nh4 <addr>` when a direct cross-connect suffices, or verify `CONFIG_NET_VRF` before deploying multi-tenant L3VPNs.
+
+### uSID `lblen`/`nflen` consistency and FIB prefix lengths
+
+Every router sharing a `NEXT-CSID` Locator-Block must agree on `lblen` and `nflen`. A mismatch causes one router to shift 16 bits while the next expects 24 or 32, corrupting the remaining CSIDs in the carrier. Equally, design your FIB prefix lengths per RFC 9800 section 5.3 so combined Global + Local entries (such as `/64` for `End.DX4` in the lab) are strictly longer than the node's `/48` Global `End` prefix.
+
+### The trap: `AF_PACKET` `recvfrom()` on a `veth` shows the *rewritten* header
+
+A first version of this lab used plain `AF_PACKET` sockets and `recvfrom()`. A packet socket queues a clone of the `sk_buff` that shares the packet data, and on a veth pair the same buffer goes straight on to the next namespace. When that node's `seg6local` rewrote the DA and `SL` in place before Python read the socket, the tap on A's sending side reported B's *rewritten* header (DA `fc00:0:c::d4`, `SL 0`) for packets that left A with DA `fc00:0:b::e`, `SL 1`. Use a `TPACKET_V2` (or `TPACKET_V3`) ring buffer—as `tcpdump` does—so the kernel copies the packet bytes into the ring at capture time.
+
+### Counters, Hop Limit, ECMP Flow Label, and `seg6_enabled`
+
+- **Counters**: `ip -s -6 route` shows `0` or no counters unless you explicitly pass `count` when creating the `seg6local` route.
+- **Hop Limit**: core routers decrement the **outer** IPv6 Hop Limit like any other IPv6 hop. In the lab the outer header left `A` with `63` and left `B` with `62`; `ttl` problems inside the core therefore show up as ICMPv6 errors sent to the head-end, not to the customer.
+- **ECMP hashing**: transit IPv6 routers hash on outer fields (source, destination, Flow Label, sometimes ports). All traffic between two PEs shares one outer source and destination, so the Flow Label is the only per-flow entropy left; RFC 8754 says the flow label is to be used for ECMP at transit nodes in an SR domain. Linux controls this with `net.ipv6.seg6_flowlabel` (seg6-sysctl docs): `0` (the default) copies the inner flow label for IPv6 payloads and sets **0 for IPv4 and L2 payloads**, `1` computes it from a hash of the inner packet, `-1` always sets zero. For an IPv4 VPN like the lab's, the default gives every flow the same outer label; set `seg6_flowlabel=1` on head-ends.
+- **`seg6_enabled`**: the kernel docs scope it to packets with an SRH whose DA is a local address. The lab never set it: every `seg6local` behaviour above ran with the default `0` and forwarding enabled.
+
+## Exercises
+
+1. **Explicit adjacency with `End.X`**: On node `B`, replace the `End` SID `fc00:0:b::e` with an `End.X` SID `fc00:0:b::e1` bound to `nh6 2001:db8:bc::c`, then add a `count` flag. Verify with `ip -s -6 route` that packets increment `End.X` and arrive at `C` even if `B`'s main routing table has a higher-cost or alternate path to `fc00:0:c::/48`.
+2. **Penultimate Segment Pop (`PSP`)**: Build a four-node core (`A -- B -- C -- D`) where `D` hosts `End.DX4`. Configure `C`'s `End` SID with the `psp` flavour (`encap seg6local action End flavors psp count`) and steer `A` through `B -> C -> D` using `encap`. Capture on the `C -> D` link and verify that the SRH is absent before the packet reaches `D`.
+3. **uSID carrier capacity**: Given `LBL = 32` bits and `LNFL = 16` bits, calculate the maximum number of CSIDs $K$ that fit in a single 128-bit carrier ($K = \lfloor (128 - 32) / 16 \rfloor = 6$). Write out the exact 128-bit DA leaving `A`, `B`, `C`, `D`, `E`, and `F` for a 6-hop path (`0100`, `0200`, `0300`, `0400`, `0500`, `f0d4`). How many bytes of SRH are needed if you add a 7th hop (`0600`)?
+4. **IPv6-in-IPv6 VPN with `End.DT6`**: Create a dedicated routing table (`table 100`) on `C` with a route to a customer IPv6 prefix behind `h2`. Instantiate an `End.DT6` SID on `C` (`encap seg6local action End.DT6 table 100 count`) and steer an IPv6 prefix from `A` using `encap.red`. Verify end-to-end reachability without using a VRF device.
+5. **Blackholing the local locator**: Repeat scenario 7 (head-end steering to unbound `fc00:0:b::99`), but first add `ip -6 route add blackhole fc00:0:b::/48` on `B`. Capture on `a-b` and compare the ICMPv6 response from `B` against the un-blackholed run.
+6. **Overhead and MTU budgeting**: Calculate the exact outer packet size and maximum inner IPv4 payload MTU over a standard 1500-byte Ethernet link for 3, 5, and 7 segments under both `H.Encaps` and `H.Encaps.Red`, assuming no SRH TLVs. Compare those numbers against a `NEXT-CSID` uSID carrier (`LBL = 32`, `LNFL = 16`) for the same 3-, 5-, and 7-segment paths.
+
+## The boring rule
+
+Every 128-bit SID in an SRv6 policy is a routing decision you have to pay for in bytes, FIB entries, and failure modes. Keep `encap.red` as your default head-end mode, blackhole every local locator prefix, filter your SID block at the domain edge, and verify the actual bytes on a `TPACKET_V2` tap before trusting a topology diagram.
+
+## Sources
+
+- [RFC 8402: Segment Routing Architecture](https://datatracker.ietf.org/doc/html/rfc8402)
+- [RFC 8754: IPv6 Segment Routing Header (SRH)](https://datatracker.ietf.org/doc/html/rfc8754)
+- [RFC 8986: Segment Routing over IPv6 (SRv6) Network Programming](https://datatracker.ietf.org/doc/html/rfc8986)
+- [RFC 9252: BGP Overlay Services Based on Segment Routing over IPv6 (SRv6)](https://datatracker.ietf.org/doc/html/rfc9252)
+- [RFC 9602: Segment Routing over IPv6 (SRv6) Segment Identifiers in the IPv6 Addressing Architecture](https://datatracker.ietf.org/doc/html/rfc9602)
+- [RFC 9800: Compressed SRv6 Segment List Encoding](https://datatracker.ietf.org/doc/html/rfc9800)
+- [RFC 9819: Argument Signaling for BGP Services in Segment Routing over IPv6 (SRv6)](https://datatracker.ietf.org/doc/html/rfc9819)
+- [ip-route(8) — Linux iproute2 manual (seg6 and seg6local)](https://man7.org/linux/man-pages/man8/ip-route.8.html)
+- [Linux Kernel Documentation: SRv6 Sysctl Variables](https://docs.kernel.org/networking/seg6-sysctl.html)
