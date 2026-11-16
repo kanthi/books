@@ -1,0 +1,558 @@
+---
+title: "BGP Communities in Practice: Standard, Extended and Large, Scrubbing, Action Communities and Matching Traps"
+author:
+  - name: "K19G"
+  - name: "grok-bot"
+---
+
+# BGP Communities in Practice: Standard, Extended and Large, Scrubbing, Action Communities and Matching Traps
+
+BGP routes carry more than prefixes and AS paths. Every time you tag a customer prefix with a geographic origin, ask an upstream transit provider to prepend twice toward a congested peer, or signal an urgent blackhole for a `/32` under attack, you are encoding policy into BGP communities. At the protocol level, a community is just an opaque integer attached to an `UPDATE` message. At the operational level, communities are the control plane's signalling bus—and the place where small configuration mistakes turn into global route leaks or silent traffic drops.
+
+Most BGP community outages do not come from exotic protocol bugs. They come from treating communities as magic strings instead of structured wire attributes: using 16-bit standard communities in a 32-bit ASN world, forgetting to scrub your own ASN's tags at the customer edge, running a `set` statement that silently wipes `NO_EXPORT`, or writing an unanchored regular expression that matches `64500:1001` when you meant `64500:1`.
+
+This chapter is the operator's working guide to BGP communities. It covers the three community attribute encodings on the wire, the IANA well-known registry, how to design an informational and action community scheme using Large Communities, edge scrubbing and blackhole acceptance rules, `set` vs `additive` semantics, malformed attribute handling, and the matching traps that break real policies.
+
+## Learning goals
+
+By the end of this chapter, you will be able to:
+
+- Decode and compare the wire formats, path attribute type codes, and size limits of Standard (RFC 1997), Extended (RFC 4360 / RFC 5668), and Large (RFC 8092) BGP communities.
+- Map the IANA BGP Well-Known Communities registry to operational behaviours, including `NO_EXPORT`, `NO_ADVERTISE`, `BLACKHOLE`, `GRACEFUL_SHUTDOWN`, and `LLGR_STALE`.
+- Design a clean `ASN:Function:Parameter` Large Community scheme that separates informational tags from customer-requested action signals.
+- Implement RFC 7454 edge scrubbing and RFC 7999 blackhole acceptance rules so neighbours cannot forge internal tags or blackhole prefixes they do not originate.
+- Avoid `set` replacement traps (RFC 8642), unanchored regex matches, `send-community` omissions, and `UPDATE` packing fragmentation.
+- Apply RFC 7606 and RFC 8092 error-handling rules to distinguish malformed community attributes (`treat-as-withdraw`) from valid edge cases such as duplicates.
+
+## Three generations of BGP communities
+
+BGP communities are optional transitive path attributes. In BGP-4, the attribute flags octet `0xc0` sets both the Optional bit (`0x80`) and the Transitive bit (`0x40`), meaning a BGP speaker that does not recognise the attribute must still accept the route and pass the attribute along to its peers (with the Partial bit set if it does not understand it).
+
+Over time, the IETF defined three distinct community attributes because 16-bit fields ran out of space and VPNs needed structured metadata.
+
+```text
+Standard Community (RFC 1997) — Type Code 8, Flags 0xc0 (Optional, Transitive)
+ 0                   1                   2                   3
+ 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|         ASN (16 bits)         |        Value (16 bits)        |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+Length must be a non-zero multiple of 4 octets.
+
+Extended Community (RFC 4360 / RFC 5668) — Type Code 16, Flags 0xc0
+ 0                   1                   2                   3
+ 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|  Type (8 b)   | Sub-Type (8 b)|                               |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+                               +
+|                     Value (48 bits / 6 octets)                |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+Length must be a non-zero multiple of 8 octets.
+
+Large Community (RFC 8092) — Type Code 32, Flags 0xc0
+ 0                   1                   2                   3
+ 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                   Global Administrator (32 bits)              |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                     Local Data Part 1 (32 bits)               |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                     Local Data Part 2 (32 bits)               |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+Length must be a non-zero multiple of 12 octets.
+```
+
+### Standard communities (RFC 1997)
+
+RFC 1997 defines the `COMMUNITIES` path attribute (type code 8). It carries a list of 4-octet values, conventionally written as `ASN:value`, where both halves are 16-bit unsigned integers (`0`–`65535`).
+
+Two ranges are reserved by RFC 1997:
+
+- `0x00000000`–`0x0000FFFF` (`0:0`–`0:65535`)
+- `0xFFFF0000`–`0xFFFFFFFF` (`65535:0`–`65535:65535`, used for IANA well-known communities)
+
+The middle range, `0x00010000`–`0xFFFEFFFF`, is private use, where operators place their 16-bit ASN in the upper 16 bits and a locally defined meaning in the lower 16 bits.
+
+The fatal limitation of RFC 1997 is size: a 32-bit ASN (such as `4200000001` or any public 4-octet ASN above `65535`) cannot fit in a 16-bit half. Operators sometimes tried to work around this by putting `23456` (`AS_TRANS`) in the upper 16 bits, which destroys ownership uniqueness because every 4-octet ASN shares `23456`. Do not use `AS_TRANS` hacks for policy communities; use Large Communities instead.
+
+### Extended communities (RFC 4360 and RFC 5668)
+
+RFC 4360 defines the `EXTENDED_COMMUNITIES` attribute (type code 16), where each community is 8 octets long. Unlike standard communities, extended communities carry explicit structure in their first two octets:
+
+- **High-order Type octet**: defines the encoding of the remaining 6 octets and whether the community is transitive across AS boundaries. Adding `0x40` to the type makes the extended community **non-transitive** (not propagated across eBGP sessions):
+  - `0x00` (or `0x40`): Two-octet AS specific (2-octet ASN + 4-octet local value).
+  - `0x01` (or `0x41`): IPv4 address specific (4-octet IPv4 address + 2-octet local value).
+  - `0x02` (or `0x42`): Four-octet AS specific, added by RFC 5668 (4-octet ASN + 2-octet local value).
+  - `0x03` (or `0x43`): Opaque (6-octet opaque value).
+- **Low-order Sub-Type octet**: defines the function, such as `0x02` for Route Target and `0x03` for Route Origin.
+
+Extended communities are the workhorse of MPLS/EVPN/L3VPN control planes (covered in the L3VPN chapter) and BGP FlowSpec actions (covered in the RTBH and FlowSpec chapter). While RFC 5668 lets you fit a 4-octet ASN into an extended community, the remaining local value shrinks to 16 bits—too small to carry both a function code and another 4-octet peer ASN for traffic engineering.
+
+### Large communities (RFC 8092)
+
+RFC 8092 defines the `LARGE_COMMUNITIES` attribute (type code 32, optional transitive) specifically to fix the 4-octet ASN problem for routing policy. Each Large Community is 12 octets, divided into three 32-bit unsigned integers and written in canonical text form as `GA:LD1:LD2`:
+
+1. **Global Administrator (4 octets)**: usually your ASN (2-octet or 4-octet).
+2. **Local Data Part 1 (4 octets)**: typically a function or category code.
+3. **Local Data Part 2 (4 octets)**: typically a parameter, such as a target peer's 32-bit ASN, a region ID, or a local-preference value.
+
+Because all three fields are 32 bits wide, a 4-octet ASN can express "do not announce to peer AS `4200000099`" in a single Large Community without collisions, lookup tables, or `AS_TRANS` workarounds.
+
+| Attribute | RFC | Type Code | Width per Entry | Text Format | Primary Use |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| `COMMUNITIES` | RFC 1997 | 8 | 4 octets | `ASN:value` (16:16) | Legacy policy, well-known communities |
+| `EXTENDED_COMMUNITIES` | RFC 4360, 5668 | 16 | 8 octets | `type:admin:value` | L3VPN Route Targets, Route Origin, FlowSpec |
+| `LARGE_COMMUNITIES` | RFC 8092 | 32 | 12 octets | `GA:LD1:LD2` (32:32:32) | Modern routing policy, 4-octet ASNs |
+
+## The IANA well-known communities
+
+IANA maintains the BGP Well-known Communities registry in the reserved `0xFFFF0000`–`0xFFFFFFFF` (`65535:x`) range of Standard Communities. Every BGP implementation understands at least the original RFC 1997 subset, though newer well-known values require explicit support or explicit route-map matching.
+
+| Name | Hex Value | `ASN:value` | Defining RFC | Operational Behaviour |
+| :--- | :--- | :--- | :--- | :--- |
+| `GRACEFUL_SHUTDOWN` | `0xFFFF0000` | `65535:0` | RFC 8326 | Signals planned maintenance; receivers lower local preference so traffic drains before teardown. |
+| `ACCEPT_OWN` | `0xFFFF0001` | `65535:1` | RFC 7611 | Permits a PE to accept its own VPN routes reflected back via a route reflector in specific inter-VRF topologies. |
+| `LLGR_STALE` | `0xFFFF0006` | `65535:6` | RFC 9494 | Marks routes retained during Long-Lived Graceful Restart; treated as least preferred. |
+| `NO_LLGR` | `0xFFFF0007` | `65535:7` | RFC 9494 | Instructs peers not to retain the route under Long-Lived Graceful Restart. |
+| `BLACKHOLE` | `0xFFFF029A` | `65535:666` | RFC 7999 | Requests that the receiving AS drop traffic destined for the prefix (RTBH). |
+| `NO_EXPORT` | `0xFFFFFF01` | `65535:65281` | RFC 1997 | Must not be advertised outside the local AS (or confederation boundary). |
+| `NO_ADVERTISE` | `0xFFFFFF02` | `65535:65282` | RFC 1997 | Must not be advertised to any BGP peer (neither iBGP nor eBGP). |
+| `NO_EXPORT_SUBCONFED` | `0xFFFFFF03` | `65535:65283` | RFC 1997 | Must not be advertised to any eBGP peer, including confederation member-AS peers. |
+| `NOPEER` | `0xFFFFFF04` | `65535:65284` | RFC 3765 | Advises transit/bilateral peers not to re-advertise the route to settlement-free peers. |
+
+Note two boundary details from the table. First, `GRACEFUL_SHUTDOWN`, `LLGR_STALE`, and `NO_LLGR` are covered in depth in the Graceful Restart chapter, and the full mechanics of Remotely Triggered Black Hole (RTBH) routing live in the RTBH and FlowSpec chapter. Second, never assume a peer honours `NOPEER` automatically—many networks match it only if they explicitly configure policy for it, whereas `NO_EXPORT` and `NO_ADVERTISE` are acted on by essentially every implementation without extra policy.
+
+## Designing a community scheme: informational vs action
+
+Once you move beyond well-known communities, you need an internal taxonomy. RFC 8195 (*Use of BGP Large Communities*, Informational) documents the industry-standard `ASN:Function:Parameter` pattern. Separating **informational** communities from **action** communities keeps your route maps readable and prevents accidental policy loops.
+
+### Informational communities
+
+Informational communities are **written by your own network** on ingress and read internally (or by downstream customers if you choose to expose them). They record facts about where and how a route entered your AS:
+
+- Relationship type (customer, settlement-free peer, IXP route server, transit provider).
+- Region, country, or PoP where the route was learned.
+- Validation state (for example, RPKI-valid vs unknown, if you track it in communities).
+
+For example, AS `64500` might define:
+
+- `64500:11:<region>`: Learned from a **customer** in `<region>`.
+- `64500:12:<region>`: Learned from a **peer** in `<region>`.
+- `64500:13:<region>`: Learned from a **transit provider** in `<region>`.
+
+Your egress filters can then simply match `64500:11:*` to decide which routes are safe to export to transit providers and peers, rather than maintaining giant prefix-list cross-references on every outbound session.
+
+### Action communities
+
+Action communities are **written by a customer or peer** on routes they send to you, asking your network to alter how you handle or re-advertise those routes. Typical actions include:
+
+- **Selective suppression**: `64500:0:<peer_asn>` — do not announce this prefix to `<peer_asn>`.
+- **AS-path prepending**: `64500:1:<peer_asn>` — prepend `64500` once when announcing to `<peer_asn>`; `64500:2:<peer_asn>` — prepend twice.
+- **Local preference tuning**: adjust your internal local-preference below or above the default customer tier (useful for active/backup multi-homing).
+
+```text
+Customer AS65010                 Edge Router (AS64500)                 Egress Peers
+----------------                 ---------------------                 ------------
+198.51.100.0/24                  1. Scrub own GA (64500:*:*),
+  + 64500:0:65020                   keeping allowed actions:
+  + 64500:2:65030                   [64500:0:65020, 64500:2:65030]
+  + 64500:12:3 (spoofed!)   ---> 2. Drop spoofed 64500:12:3     ---> AS65020: suppressed
+                                 3. Add info tag 64500:11:4     ---> AS65030: path 64500 64500 64500 65010
+                                 4. Strip internal tags         ---> AS65040: path 64500 65010
+                                    on eBGP egress
+```
+
+### Publish your scheme
+
+RFC 8195 encourages operators to publicly publish and maintain documentation for every Large Community they support or that is visible in their RIBs, informational and action alike, and recommends publishing the order in which action communities are processed. In practice that means a page on your website, mirrored in your IRR and PeeringDB records. An undocumented action community is useless to customers trying to engineer their inbound traffic, and an undocumented informational community confuses peers debugging why a route looks the way it does.
+
+## Edge hygiene: scrubbing, propagation, and blackholes
+
+An edge router that trusts inbound communities blindly lets any customer forge your internal state. If a customer attaches `64500:12:3` ("learned from peer in region 3") or a high-local-preference tag meant only for your backbone, your egress and best-path policies will treat their prefix as something it is not.
+
+### Scrubbing inbound communities (RFC 7454)
+
+RFC 7454 (BCP 194, Section 11, "BGP Community Scrubbing") is short and worth reading in full. It boils down to four rules for eBGP borders:
+
+1. **Scrub your own communities inbound**: network administrators SHOULD scrub inbound communities with their number in the high-order bits, and allow only those communities that customers/peers can use as a signalling mechanism. Apply the same idea to the Global Administrator of Large Communities.
+2. **Do not strip other communities**: administrators SHOULD NOT remove the other communities on received routes. Customers might need them to talk to upstream providers.
+3. **Keep the originals when you add**: when you apply a community, you SHOULD keep the original ones (the `additive` problem covered below).
+4. **Generally do not remove `NO_EXPORT`**: it is usually announced by the peer for a reason, so leave it in place unless you have agreed otherwise with that peer.
+
+### Egress stripping vs attribute bloat
+
+While RFC 7454 warns against stripping *other* networks' communities, you SHOULD strip your *own* internal informational and action communities on eBGP egress (except for any informational communities you deliberately publish for downstream customers, such as route-origin tags). Leaving internal tags like `64500:0:65020` or `64500:11:4` on routes sent to transit providers or peers leaks internal topology, exposes customer relationships, and bloats `UPDATE` messages.
+
+### Blackhole acceptance rules (RFC 7999)
+
+The `BLACKHOLE` well-known community (`65535:666`, `0xFFFF029A`) is an action signal with teeth: it tells your routers to discard traffic. Accepting it without strict guardrails turns a customer's typo—or malicious announcement—into a denial-of-service tool against someone else's prefix.
+
+RFC 7999 sets two operational controls:
+
+- **Scope containment (Section 3.2)**: A BGP speaker receiving a route tagged with `BLACKHOLE` SHOULD attach `NO_ADVERTISE` or `NO_EXPORT` (or an equivalent non-export policy) so the blackhole route stays inside the local AS and does not propagate to third-party peers.
+- **Strict prefix authorisation (Section 3.3)**: in a bilateral session, a BGP speaker MUST only accept and honour `BLACKHOLE` announcements when the announced prefix is covered by an equal or shorter prefix the neighbour is authorised to advertise, *and* the receiver agreed to honour `BLACKHOLE` on that session (route servers and other multilateral setups SHOULD apply the same conditions). Blackhole prefixes are typically as specific as possible (`/32` for IPv4, `/128` for IPv6), which is why your normal "nothing longer than /24 or /48" filter needs a carefully scoped exception for them. A customer announcing `203.0.113.7/32` with `BLACKHOLE` when they only own `198.51.100.0/24` must be rejected at ingress.
+
+### Checking `send-community` on every session
+
+Communities do not leave a router unless the session is configured to transmit them. In FRRouting (FRR), `send-community` for standard, extended, and large communities is enabled by default on BGP neighbours, and can be tuned with `neighbor PEER send-community <both|all|extended|standard|large>` (from the docs, not run). On several other vendor NOSs, however, `send-community` is **off by default** (or only standard communities are enabled, omitting extended and large). If your Large Communities vanish between two routers, check `send-community` on the egress neighbour before debugging your route-maps.
+
+## "Set" semantics, malformed attributes, and matching traps
+
+Even with a clean community design and strict edge scrubbing, three implementation details routinely break BGP policies in production: replacement semantics, malformed attribute handling, and string-matching regexes.
+
+### `set` vs `additive` and RFC 8642
+
+Historically, BGP implementations disagreed on what a route-map `set community X` (without `additive`) meant when a route already carried well-known communities such as `NO_EXPORT`:
+
+- Some implementations replaced **all** communities, silently deleting `NO_EXPORT` and turning a local-only route into a global route leak.
+- Other implementations replaced only **non-well-known** communities, preserving `NO_EXPORT` and `NO_ADVERTISE`.
+
+RFC 8642 (*Policy Behavior for Well-Known BGP Communities*, which updates RFC 1997) documents this divergence. It does not force vendors to converge, because changing existing behaviour would be disruptive. Instead it says vendors MUST clearly document what their `set` directive does, MUST NOT let that behaviour change for a community that later becomes well-known, and urges operators to limit their use of `set` and never rely on an implicit understanding of a neighbour's community handling. As an operator:
+
+- When adding a tag, always use `additive` (or your platform's equivalent append keyword).
+- When removing specific communities, match a community list and explicitly `delete` it rather than overwriting the entire attribute.
+
+In FRR, the distinction is explicit in the CLI (from the docs, not run):
+
+```text
+! Define standard and large community lists
+bgp community-list standard CL-MY-INTERNAL permit 64500:500
+bgp large-community-list standard LCL-MY-INTERNAL permit 64500:11:4
+bgp community alias 64500:11:4 CUST-REGION-4
+
+! Add communities without wiping existing ones (including NO_EXPORT)
+route-map RM-CUST-IN permit 10
+ set community 64500:500 additive
+ set large-community 64500:11:4 additive
+
+! Delete only internal communities on eBGP egress
+route-map RM-PEER-OUT permit 10
+ set comm-list CL-MY-INTERNAL delete
+ set large-comm-list LCL-MY-INTERNAL delete
+
+! Exact matching on large communities (matches entire community string)
+route-map RM-CHECK permit 10
+ match large-community LCL-MY-INTERNAL exact-match
+```
+
+Notice that in FRR, omitting `additive` in `set community <none|COMMUNITY> additive` replaces the old community list, and `match large-community LINE [exact-match]` matches against the entire community string when `exact-match` is specified (from the docs, not run).
+
+### Matching and regex traps
+
+When operators use expanded (regex-based) community lists, the BGP daemon typically formats the route's communities as a single space-separated string (for example, `"64500:1 64500:10 64500:100 65001:1 64500:1001"`) and runs the regular expression against that string.
+
+This creates two classic failures:
+
+1. **Unanchored substring match**: Writing `64500:1` matches `64500:1`, `64500:10`, `64500:100`, and `64500:1001`—four communities when you intended one.
+2. **Whole-string anchoring**: Writing `^64500:1$` fails whenever the route carries *any* other community, because `^` and `$` anchor to the start and end of the entire community list string, not the individual community token.
+
+To match a single community token reliably in an expanded regex, you must anchor on token boundaries: `(^| )64500:1($| )`. In FRR (see `bgpd/bgp_regex.c` in the source), the underscore `_` character is a shorthand that the engine converts to `(^|[,{}() ]|$)`, so `_64500:1_` matches only the exact `64500:1` token regardless of what other communities sit alongside it. Whenever possible, prefer **standard** (exact-match) community lists over expanded regex lists—they are faster and cannot misfire on substrings.
+
+### Malformed attribute handling (RFC 7606 and RFC 8092)
+
+Before RFC 7606 (*Revised Error Handling for BGP UPDATE Messages*), a single malformed path attribute could cause a BGP speaker to send a `NOTIFICATION` and tear down the entire BGP session. Today, malformed community attributes trigger **treat-as-withdraw** instead of a session reset:
+
+- **Standard Communities (RFC 7606, Section 7.8)**: If the `COMMUNITIES` attribute length is not a non-zero multiple of 4 octets, it is malformed -> `treat-as-withdraw`.
+- **Extended Communities (RFC 7606, Section 7.14)**: If the `EXTENDED_COMMUNITIES` attribute length is not a non-zero multiple of 8 octets, it is malformed -> `treat-as-withdraw`.
+- **Large Communities (RFC 8092, Section 6)**: If the `LARGE_COMMUNITIES` attribute length is not a non-zero multiple of 12 octets, it is malformed -> `treat-as-withdraw`.
+
+RFC 8092 Section 6 also clarifies two cases that are **not** malformed:
+
+- **Duplicate Large Communities** in the same attribute SHALL NOT make the attribute malformed. Senders MUST NOT transmit duplicates, and a receiver MUST silently remove the redundant copies (RFC 8092 Section 2).
+- An **unallocated, unassigned or reserved ASN** in the Global Administrator field MUST NOT make the attribute malformed.
+
+### Attribute size and `UPDATE` packing
+
+BGP attaches path attributes per `UPDATE` message, not per prefix. If you announce 10,000 prefixes with the exact same `AS_PATH`, `NEXT_HOP`, and community set, BGP can pack hundreds of NLRIs into each `UPDATE`. If every prefix carries a slightly different set of informational or per-prefix communities, BGP must split them into separate `UPDATE` messages—one per unique attribute combination. That multiplies control-plane CPU, memory, and convergence time. Keep your community vocabulary small and consistent across prefixes that share a policy fate.
+
+## The lab
+
+The lab below models these mechanics in standalone standard-library Python without root privileges, containers, or a running BGP daemon (it is a protocol-and-policy simulator, not a live FRR instance). It constructs wire-encoded `COMMUNITIES`, `LARGE_COMMUNITIES`, and `EXTENDED_COMMUNITIES` attributes, exercises RFC 7606 and RFC 8092 malformed-attribute checks, runs AS `64500`'s edge scrubbing and blackhole policy on customer announcements, compares `set` replacement behaviours under RFC 8642, and tests regex matching against a multi-community string.
+
+```{.python filename="communities.py"}
+#!/usr/bin/env python3
+"""BGP communities in practice: wire formats, scrubbing, actions, set-semantics and regex traps.
+Encodings: RFC 1997 (type 8), RFC 4360 (type 16), RFC 5668, RFC 8092 (type 32); RFC 7606 error handling."""
+import re, struct
+
+WELL_KNOWN = {0xFFFF0000: 'GRACEFUL_SHUTDOWN', 0xFFFF0001: 'ACCEPT_OWN', 0xFFFF0006: 'LLGR_STALE',
+              0xFFFF0007: 'NO_LLGR', 0xFFFF029A: 'BLACKHOLE', 0xFFFFFF01: 'NO_EXPORT',
+              0xFFFFFF02: 'NO_ADVERTISE', 0xFFFFFF03: 'NO_EXPORT_SUBCONFED', 0xFFFFFF04: 'NOPEER'}
+NAME2VAL = {v: k for k, v in WELL_KNOWN.items()}
+
+def std(s):
+    if s in NAME2VAL: return NAME2VAL[s]
+    a, b = map(int, s.split(':'))
+    if a > 65535 or b > 65535: raise ValueError(f'{s}: standard community halves are 16 bits')
+    return a << 16 | b
+
+def std_str(v): return WELL_KNOWN.get(v, f'{v >> 16}:{v & 0xFFFF}')
+
+def attr(flags, code, body):
+    if len(body) > 255:
+        return struct.pack('!BBH', flags | 0x10, code, len(body)) + body
+    return struct.pack('!BBB', flags, code, len(body)) + body
+
+def communities_attr(lst):  # optional transitive = 0xC0
+    return attr(0xC0, 8, b''.join(struct.pack('!I', std(c)) for c in lst))
+
+def large_attr(lst):
+    return attr(0xC0, 32, b''.join(struct.pack('!III', *map(int, c.split(':'))) for c in lst))
+
+def ext_rt_as2(asn, val): return bytes([0x00, 0x02]) + struct.pack('!HI', asn, val)
+def ext_rt_as4(asn, val): return bytes([0x02, 0x02]) + struct.pack('!IH', asn, val)
+
+def hx(b): return ' '.join(f'{x:02x}' for x in b)
+
+def section1():
+    print('== 1. Wire formats')
+    a = communities_attr(['65000:100', 'NO_EXPORT'])
+    print('  COMMUNITIES 65000:100 NO_EXPORT        :', hx(a))
+    a = large_attr(['4200000001:1:100'])
+    print('  LARGE_COMMUNITY 4200000001:1:100       :', hx(a))
+    print('  ext RT 2-octet AS 65000:50001 (type 0x00):', hx(ext_rt_as2(65000, 50001)))
+    print('  ext RT 4-octet AS 4200000001:100 (0x02)  :', hx(ext_rt_as4(4200000001, 100)))
+    try:
+        std('4200000001:100')
+    except ValueError as e:
+        print('  standard community for a 4-byte ASN     :', e)
+    for name, val in sorted(NAME2VAL.items(), key=lambda kv: kv[1]):
+        print(f'    {name:<20} 0x{val:08X} = {val >> 16}:{val & 0xFFFF}')
+
+def decode_communities(body):
+    if len(body) % 4: return 'treat-as-withdraw (length %d not a multiple of 4, RFC 7606 s7.8)' % len(body)
+    return [std_str(struct.unpack('!I', body[i:i + 4])[0]) for i in range(0, len(body), 4)]
+
+def decode_large(body):
+    if len(body) % 12: return 'treat-as-withdraw (length %d not a multiple of 12, RFC 8092 s6)' % len(body)
+    vals = [struct.unpack('!III', body[i:i + 12]) for i in range(0, len(body), 12)]
+    if len(set(vals)) != len(vals):
+        return 'duplicates present -> keep one copy, do not reset the session (RFC 8092 s6)'
+    return [':'.join(map(str, v)) for v in vals]
+
+def section2():
+    print('\n== 2. Receiving malformed attributes')
+    good = b''.join(struct.pack('!I', std(c)) for c in ['65000:100', 'NO_EXPORT'])
+    print('  8-byte COMMUNITIES body :', decode_communities(good))
+    print('  7-byte COMMUNITIES body :', decode_communities(good[:7]))
+    lc = struct.pack('!III', 4200000001, 1, 100)
+    print('  24-byte LARGE with dup  :', decode_large(lc + lc))
+    print('  13-byte LARGE body      :', decode_large(lc + b'\x00'))
+
+# ---------- a small edge policy, RFC 8195 style ASN:Function:Parameter ----------
+MY_AS = 64500
+ACTION_FUNCS = {0: 'do not announce to AS <param>', 1: 'prepend 1x to AS <param>', 2: 'prepend 2x to AS <param>'}
+INFO = {11: 'learned from customer in region <param>', 12: 'learned from peer in region <param>'}
+
+class Route:
+    def __init__(self, prefix, comms=(), large=(), path=()):
+        self.prefix, self.comms, self.large, self.path = prefix, list(comms), list(large), list(path)
+    def show(self):
+        return f'{self.prefix} path {" ".join(map(str, self.path)) or "(empty)"} comm [{" ".join(self.comms)}] large [{" ".join(self.large)}]'
+
+def ingress_customer(r, cust_as, region, cone):
+    log = []
+    keep = []
+    for lc in r.large:
+        g, f, p = map(int, lc.split(':'))
+        if g == MY_AS and f not in ACTION_FUNCS:
+            log.append(f'scrub {lc} (our ASN, not a customer-settable function)')
+        else:
+            keep.append(lc)
+    r.large = keep
+    if 'BLACKHOLE' in r.comms:
+        if r.prefix.endswith('/32') and any(r.prefix.startswith(c) for c in cone):
+            r.comms += ['NO_EXPORT']; log.append('BLACKHOLE accepted: /32 inside customer cone, NO_EXPORT added (RFC 7999 s3.2)')
+        else:
+            log.append('BLACKHOLE rejected: not a /32 inside the customer cone -> drop route'); return None, log
+    r.large.append(f'{MY_AS}:11:{region}'); log.append(f'tag {MY_AS}:11:{region}')
+    return r, log
+
+def egress_peer(r, peer_as):
+    if 'NO_EXPORT' in r.comms or 'NO_ADVERTISE' in r.comms:
+        return None, 'suppressed by well-known community'
+    path = [MY_AS] + r.path
+    for lc in r.large:
+        g, f, p = map(int, lc.split(':'))
+        if g == MY_AS and p == peer_as and f == 0:
+            return None, f'action {lc}: not announced to AS{peer_as}'
+        if g == MY_AS and p == peer_as and f in (1, 2):
+            path = [MY_AS] * f + path
+    out = Route(r.prefix, r.comms, [lc for lc in r.large], path)
+    return out, 'announced'
+
+def section3():
+    print(f'\n== 3. Edge policy in AS{MY_AS}: scrub on ingress, act on egress (RFC 7454 s11, RFC 8195)')
+    cone = ['198.51.100.']
+    routes = [
+        Route('198.51.100.0/24', [], [f'{MY_AS}:0:65020', f'{MY_AS}:2:65030'], [65010]),
+        Route('198.51.100.0/25', [], [f'{MY_AS}:12:3'], [65010]),
+        Route('198.51.100.7/32', ['BLACKHOLE'], [], [65010]),
+        Route('203.0.113.7/32', ['BLACKHOLE'], [], [65010]),
+    ]
+    for r in routes:
+        print('  in :', r.show())
+        r2, log = ingress_customer(r, 65010, 4, cone)
+        for l in log: print('       ' + l)
+        if not r2: continue
+        for peer in (65020, 65030, 65040):
+            out, why = egress_peer(r2, peer)
+            print(f'    -> AS{peer}: {why}' + (f'; path {" ".join(map(str, out.path))}' if out else ''))
+
+def section4():
+    print('\n== 4. "set community" on a route that carries NO_EXPORT (RFC 8642)')
+    r = ['65010:300', 'NO_EXPORT']
+    impl_a = ['64500:500']                                  # replaces everything
+    impl_b = [c for c in r if c in NAME2VAL] + ['64500:500']  # keeps well-known
+    for name, res in (('replace-all implementation', impl_a), ('keep-well-known implementation', impl_b)):
+        leaks = 'NO_EXPORT' not in res
+        print(f'  {name:<32}: {res} -> {"exported to eBGP peers (leak)" if leaks else "still NO_EXPORT"}')
+    print('  explicit additive policy          :', r + ['64500:500'])
+
+def section5():
+    print('\n== 5. Regex matching against the community string')
+    route = '64500:1 64500:10 64500:100 65001:1 64500:1001'
+    for pat in (r'64500:1', r'^64500:1$', r'(^| )64500:1($| )', r'_64500:1_'):
+        rx = pat.replace('_', r'(^|[ ,{}()]|$)')
+        hits = [c for c in route.split() if re.search(rx, c)]
+        whole = bool(re.search(rx, route))
+        print(f'  {pat:<20} whole-string match {str(whole):<5} | per-community hits {hits}')
+
+if __name__ == '__main__':
+    section1(); section2(); section3(); section4(); section5()
+```
+This is a policy model, not a live BGP session: it needs only Python. Output from Linux 6.12, iproute2 6.15.0, Python 3.13.5 (a real run, unedited):
+
+```text
+$ python3 communities.py
+== 1. Wire formats
+  COMMUNITIES 65000:100 NO_EXPORT        : c0 08 08 fd e8 00 64 ff ff ff 01
+  LARGE_COMMUNITY 4200000001:1:100       : c0 20 0c fa 56 ea 01 00 00 00 01 00 00 00 64
+  ext RT 2-octet AS 65000:50001 (type 0x00): 00 02 fd e8 00 00 c3 51
+  ext RT 4-octet AS 4200000001:100 (0x02)  : 02 02 fa 56 ea 01 00 64
+  standard community for a 4-byte ASN     : 4200000001:100: standard community halves are 16 bits
+    GRACEFUL_SHUTDOWN    0xFFFF0000 = 65535:0
+    ACCEPT_OWN           0xFFFF0001 = 65535:1
+    LLGR_STALE           0xFFFF0006 = 65535:6
+    NO_LLGR              0xFFFF0007 = 65535:7
+    BLACKHOLE            0xFFFF029A = 65535:666
+    NO_EXPORT            0xFFFFFF01 = 65535:65281
+    NO_ADVERTISE         0xFFFFFF02 = 65535:65282
+    NO_EXPORT_SUBCONFED  0xFFFFFF03 = 65535:65283
+    NOPEER               0xFFFFFF04 = 65535:65284
+
+== 2. Receiving malformed attributes
+  8-byte COMMUNITIES body : ['65000:100', 'NO_EXPORT']
+  7-byte COMMUNITIES body : treat-as-withdraw (length 7 not a multiple of 4, RFC 7606 s7.8)
+  24-byte LARGE with dup  : duplicates present -> keep one copy, do not reset the session (RFC 8092 s6)
+  13-byte LARGE body      : treat-as-withdraw (length 13 not a multiple of 12, RFC 8092 s6)
+
+== 3. Edge policy in AS64500: scrub on ingress, act on egress (RFC 7454 s11, RFC 8195)
+  in : 198.51.100.0/24 path 65010 comm [] large [64500:0:65020 64500:2:65030]
+       tag 64500:11:4
+    -> AS65020: action 64500:0:65020: not announced to AS65020
+    -> AS65030: announced; path 64500 64500 64500 65010
+    -> AS65040: announced; path 64500 65010
+  in : 198.51.100.0/25 path 65010 comm [] large [64500:12:3]
+       scrub 64500:12:3 (our ASN, not a customer-settable function)
+       tag 64500:11:4
+    -> AS65020: announced; path 64500 65010
+    -> AS65030: announced; path 64500 65010
+    -> AS65040: announced; path 64500 65010
+  in : 198.51.100.7/32 path 65010 comm [BLACKHOLE] large []
+       BLACKHOLE accepted: /32 inside customer cone, NO_EXPORT added (RFC 7999 s3.2)
+       tag 64500:11:4
+    -> AS65020: suppressed by well-known community
+    -> AS65030: suppressed by well-known community
+    -> AS65040: suppressed by well-known community
+  in : 203.0.113.7/32 path 65010 comm [BLACKHOLE] large []
+       BLACKHOLE rejected: not a /32 inside the customer cone -> drop route
+
+== 4. "set community" on a route that carries NO_EXPORT (RFC 8642)
+  replace-all implementation      : ['64500:500'] -> exported to eBGP peers (leak)
+  keep-well-known implementation  : ['NO_EXPORT', '64500:500'] -> still NO_EXPORT
+  explicit additive policy          : ['65010:300', 'NO_EXPORT', '64500:500']
+
+== 5. Regex matching against the community string
+  64500:1              whole-string match True  | per-community hits ['64500:1', '64500:10', '64500:100', '64500:1001']
+  ^64500:1$            whole-string match False | per-community hits ['64500:1']
+  (^| )64500:1($| )    whole-string match True  | per-community hits ['64500:1']
+  _64500:1_            whole-string match True  | per-community hits ['64500:1']
+```
+
+Walk through the five lab checks and verify each result against the rules in this chapter:
+
+1. **Wire encoding and well-known table**: `COMMUNITIES` carrying `65000:100` + `NO_EXPORT` encodes to `c0 08 08 fd e8 00 64 ff ff ff 01` (`0xc0` flags, type `0x08`, length `0x08`). `LARGE_COMMUNITY` `4200000001:1:100` encodes to `c0 20 0c fa 56 ea 01 00 00 00 01 00 00 00 64` (type `0x20`, length `0x0c`). Extended Route Targets encode as `00 02 fd e8 00 00 c3 51` for 2-octet AS `65000:50001` and `02 02 fa 56 ea 01 00 64` for 4-octet AS `4200000001:100`. Attempting to encode `4200000001:100` as a standard community fails because the halves are 16-bit. The printed well-known table confirms both hex and `ASN:value` forms (`NO_EXPORT = 65535:65281`, `BLACKHOLE = 65535:666`, `GRACEFUL_SHUTDOWN = 65535:0`, `LLGR_STALE = 65535:6`, `NO_LLGR = 65535:7`).
+2. **Malformed attribute handling**: A 7-byte `COMMUNITIES` attribute triggers `treat-as-withdraw` (RFC 7606 s7.8), and a 13-byte `LARGE_COMMUNITIES` attribute triggers `treat-as-withdraw` (RFC 8092 s6). A duplicate Large Community is accepted as valid and deduplicated to one copy.
+3. **Edge policy of AS `64500`**: Customer AS `65010` announces `198.51.100.0/24` with `64500:0:65020` and `64500:2:65030`. AS `64500` tags it `64500:11:4`, suppresses it toward AS `65020`, prepends twice toward AS `65030` (`64500 64500 64500 65010`), and announces normally to AS `65040` (`64500 65010`). When the customer sends `198.51.100.0/25` with a spoofed `64500:12:3`, the edge scrubs the forged tag, applies `64500:11:4`, and announces normally. A `BLACKHOLE` route for `198.51.100.7/32` (inside the customer cone) is accepted with `NO_EXPORT` added and suppressed to all eBGP peers; `203.0.113.7/32` with `BLACKHOLE` (outside the cone) is rejected.
+4. **`set` vs `additive` semantics**: On a route carrying `[65010:300, NO_EXPORT]`, a replace-all `set` leaves `[64500:500]` and leaks the route externally; a keep-well-known `set` leaves `[NO_EXPORT, 64500:500]`; an explicit `additive` keeps `[65010:300, NO_EXPORT, 64500:500]`.
+5. **Regex matching**: Against `"64500:1 64500:10 64500:100 65001:1 64500:1001"`, an unanchored `64500:1` matches 4 communities (`64500:1`, `:10`, `:100`, `:1001`), `^64500:1$` fails against the whole string, and `(^| )64500:1($| )` (as well as FRR-style `_64500:1_`) matches only `64500:1`.
+
+## Gotchas
+
+### The trap: unanchored community regexes
+
+Writing `64500:1` in an expanded community list matches `64500:10`, `64500:100`, and `64500:1001`. Writing `^64500:1$` breaks whenever any second community is present on the route. Always use explicit token boundaries such as `(^| )64500:1($| )` (or `_64500:1_` in FRR), or better yet, use standard non-regex community lists.
+
+### The trap: `set` wiping customer and well-known communities
+
+Running `set community 64500:500` without `additive` can strip `NO_EXPORT`, customer-signalled action tags, and third-party communities in one stroke—violating RFC 7454 and turning a local-only route into a global leak. Read your NOS's documented `set` behaviour (RFC 8642 makes vendors document it) and always specify `additive` when appending or `comm-list ... delete` when removing.
+
+### The trap: forgetting `send-community`
+
+FRR enables `send-community` for standard, extended, and large communities by default, but other NOSs frequently disable some or all of them until you configure `send-community` per neighbour or peer-group. A policy that looks right in `show bgp` locally will silently fail downstream if the communities are never put on the wire.
+
+### The trap: missing inbound scrubbing
+
+If you do not scrub your own ASN's communities at customer and peer ingress, any neighbour can attach your internal informational tags (such as `64500:12:3` or high-local-pref tags) and hijack your egress and best-path decisions. Scrub your own ASN inbound first, permitting only documented action communities.
+
+### The trap: leaking internal communities vs stripping everyone else's
+
+Leaving internal informational and action communities on eBGP egress bloats `UPDATE`s and exposes your internal topology and customer relationships. Conversely, stripping *all* communities on ingress or egress breaks third-party signalling that RFC 7454 explicitly tells you to preserve. Strip yours at egress; preserve theirs.
+
+### The trap: stuffing 32-bit ASNs into standard communities
+
+Standard communities only have 16-bit halves. Trying to encode a 4-octet ASN with `AS_TRANS` (`23456`) creates collisions across every 4-octet network on the internet. Use Large Communities (RFC 8092) for all 4-octet ASN policy signalling.
+
+### The trap: `BLACKHOLE` without `NO_EXPORT` or prefix filtering
+
+Accepting `BLACKHOLE` (`65535:666`) without attaching `NO_ADVERTISE` or `NO_EXPORT` lets a local discard signal leak to your peers. Accepting `BLACKHOLE` without strict customer-cone prefix filtering lets a neighbour blackhole someone else's `/32` through your network.
+
+### The trap: confusing Route Targets with policy communities
+
+Extended community Route Targets (`type 0x00/0x02, sub-type 0x02`) control VRF import/export in L3VPNs and EVPNs. Do not repurpose them for internet routing policy, and do not casually strip extended communities on PE-CE or VPNv4/VPNv6 boundaries without understanding how your VPN control plane uses them.
+
+### The trap: `UPDATE` packing fragmentation and undocumented schemes
+
+Attaching unique per-prefix community combinations prevents BGP from packing prefixes into shared `UPDATE`s, inflating memory and convergence time. And if you invent action communities without publishing them (RFC 8195), customers cannot use them correctly and peers cannot troubleshoot them.
+
+## Exercises
+
+1. **Wire decoding**: Decode the hex string `c0 20 18 fa 56 ea 01 00 00 00 0b 00 00 00 04 fa 56 ea 01 00 00 00 00 00 00 fd 34`. Identify the path attribute flags, type code, length, and both Large Communities in canonical `GA:LD1:LD2` notation. What would RFC 8092 Section 6 require if the length octet were `0x16` instead of `0x18`?
+2. **Designing a Large Community table**: You operate AS `4200000500` with three regions (`1` = Europe, `2` = North America, `3` = APAC) and three neighbour types (`customer`, `peer`, `transit`). Write an RFC 8195-style `GA:Function:Parameter` table covering informational origin tags, selective non-announcement, 1x/2x/3x prepending, and local-preference lowering for backup links. Specify which communities are scrubbed inbound, which are accepted from customers, and which are stripped on eBGP egress.
+3. **Blackhole policy audit**: A customer owning `198.51.100.0/24` sends `198.51.100.42/32` with `65535:666` (`BLACKHOLE`) and `203.0.113.42/32` with `65535:666`. Write the ingress route-map logic (in FRR syntax or vendor-neutral pseudocode) that accepts the first, adds `NO_EXPORT` (or `NO_ADVERTISE`), sets the discard next-hop, and rejects the second. Explain what happens if `NO_EXPORT` is omitted.
+4. **Fixing a broken `set` policy**: Your colleague wrote `route-map CUST-IN permit 10` with `set community 64500:500` on an older NOS that replaces all communities. A customer sends `198.51.100.0/24` tagged with `NO_EXPORT` and `65010:300`. Describe the exact failure mode, what RFC 8642 says vendors and operators must do about such `set` behaviour, and how to rewrite the policy safely.
+5. **Regex repair**: An operator wants to match routes carrying `64500:12` to apply a peer-tier policy. They configure an expanded community list with `64500:12`. Give three valid community strings that this regex matches by mistake, explain why `^64500:12$` fails on multi-community routes, and write the corrected pattern using both POSIX boundaries and FRR `_` syntax.
+6. **Attribute packing analysis**: You have 4,000 customer prefixes in a single `/16` block. Under Policy A, all 4,000 prefixes share `[64500:11:1]`. Under Policy B, each `/24` gets a unique per-customer-port tag `64500:99:<port_id>`. Explain the impact on BGP `UPDATE` generation, RIB memory, and peer convergence.
+
+## The boring rule
+
+Scrub your own ASN at the edge, never `set` without `additive`, anchor every community match, and keep `BLACKHOLE` inside your AS.
+
+## Sources
+
+- [RFC 1997: BGP Communities Attribute](https://datatracker.ietf.org/doc/html/rfc1997)
+- [RFC 3765: NOPEER Community for Border Gateway Protocol (BGP) Route Scope Control](https://datatracker.ietf.org/doc/html/rfc3765)
+- [RFC 4360: BGP Extended Communities Attribute](https://datatracker.ietf.org/doc/html/rfc4360)
+- [RFC 5668: 4-Octet AS Specific BGP Extended Community](https://datatracker.ietf.org/doc/html/rfc5668)
+- [RFC 7454: BGP Operations and Security (BCP 194)](https://datatracker.ietf.org/doc/html/rfc7454)
+- [RFC 7606: Revised Error Handling for BGP UPDATE Messages](https://datatracker.ietf.org/doc/html/rfc7606)
+- [RFC 7611: BGP ACCEPT_OWN Community Attribute](https://datatracker.ietf.org/doc/html/rfc7611)
+- [RFC 7999: BLACKHOLE Community](https://datatracker.ietf.org/doc/html/rfc7999)
+- [RFC 8092: BGP Large Communities Attribute](https://datatracker.ietf.org/doc/html/rfc8092)
+- [RFC 8195: Use of BGP Large Communities](https://datatracker.ietf.org/doc/html/rfc8195)
+- [RFC 8326: Graceful BGP Session Shutdown](https://datatracker.ietf.org/doc/html/rfc8326)
+- [RFC 8642: Policy Behavior for Well-Known BGP Communities](https://datatracker.ietf.org/doc/html/rfc8642)
+- [RFC 9494: Long-Lived Graceful Restart for BGP](https://datatracker.ietf.org/doc/html/rfc9494)
+- [IANA BGP Well-known Communities Registry](https://www.iana.org/assignments/bgp-well-known-communities/bgp-well-known-communities.xhtml)
+- [FRRouting BGP Documentation](https://docs.frrouting.org/en/latest/bgp.html)
