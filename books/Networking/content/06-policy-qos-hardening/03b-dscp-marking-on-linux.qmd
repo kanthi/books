@@ -1,0 +1,570 @@
+---
+title: "DSCP on Linux: PHBs, Service Classes, Socket Marking and Steering by DSCP"
+author:
+  - name: "K19G"
+  - name: "grok-bot"
+---
+
+# DSCP on Linux: PHBs, Service Classes, Socket Marking and Steering by DSCP
+
+A Differentiated Services Code Point (DSCP) is a six-bit label carried in every IPv4 and IPv6 packet header, and almost everything operators assume about it on Linux is half-remembered from the 1990s. You set `IP_TOS` on a socket expecting the kernel to treat Expedited Forwarding as high-priority traffic, and instead the kernel's internal queue priority reads four legacy Type-of-Service bits from the middle of the byte. You write `ip rule add tos 0xb8 table 101` to steer voice traffic onto a low-jitter path, and the kernel rejects the command because `tos` still refuses the upper DSCP bits. You mark packets on a client and assume the server's replies carry the same class back, until a capture shows the return path running in Default Forwarding.
+
+In "QoS Vocabulary", you saw how queueing disciplines—HTB, TBF, and friends—shape and police traffic once it hits an interface, and why a DSCP value by itself moves zero packets faster unless a scheduler matches it. This chapter zooms in on the bits themselves and the host stack that writes and reads them: what the six DSCP bits and two ECN bits actually are, which Per-Hop Behaviors (PHBs) the standard codepoints name, how RFC 4594 and RFC 8325 map those codepoints to wired and Wi-Fi service classes, what Linux 6.12 does when an application sets `IP_TOS` or `IPV6_TCLASS`, and how `ip rule dscp` steers packets by DSCP without tripping over legacy TOS masks.
+
+## Learning goals
+
+By the end of this chapter, you should be able to:
+
+- Decode an IPv4 Type-of-Service octet or IPv6 Traffic Class byte into its 6-bit DSCP, 2-bit ECN field, and legacy RFC 1349 TOS bits without reaching for a cheat sheet.
+- Map standard DSCP names (`EF`, `VOICE-ADMIT`, `AFxy`, `CSx`, `LE`, `DF`) to their binary values, decimal codepoints, unshifted byte values, and Per-Hop Behaviors.
+- Explain how RFC 4594 groups DSCPs into service classes and why RFC 8325 remaps those classes onto IEEE 802.11 User Priorities instead of copying the top three bits.
+- Predict what Linux 6.12 does when a socket sets `IP_TOS` or `IPV6_TCLASS`, including ECN bit stripping on TCP, `SO_PRIORITY` calculation via `ip_tos2prio[]`, and `net.ipv4.tcp_reflect_tos`.
+- Steer packets into alternate routing tables on Linux 6.12+ using `ip rule add dscp` while avoiding the legacy `tos` selector trap.
+- Design a DSCP trust boundary at your network edge so untrusted host or internet markings cannot starve control or best-effort traffic.
+
+## The DiffServ byte: DSCP, ECN, and the ghost of TOS
+
+Both IPv4 and IPv6 reserve an 8-bit field near the start of the header for per-packet service treatment. In IPv4, byte 1 of the header was originally called the Type of Service (TOS) octet; in IPv6, the corresponding 8 bits straddle bytes 0 and 1 as the Traffic Class field. RFC 2474 redefined that 8-bit field as the Differentiated Services (DS) field, and RFC 3168 carved out the bottom two bits for Explicit Congestion Notification (ECN). RFC 3260 later tightened the terminology so there is no ambiguity: the 8-bit DS field consists of a 6-bit DSCP in the high-order bits and a 2-bit ECN field in the low-order bits.
+
+```text
+ 0   1   2   3   4   5   6   7
++---+---+---+---+---+---+---+---+
+|          DSCP         |  ECN  |   RFC 2474 / RFC 3168 / RFC 3260
++---+---+---+---+---+---+---+---+
+|<------ 6 bits ------->|<2 bit>|
+
+Legacy RFC 1349 TOS interpretation (still read by Linux ip_tos2prio[]):
++---+---+---+---+---+---+---+---+
+| Prec  |      TOS          |MBZ|
++---+---+---+---+---+---+---+---+
+  7..5     4   3   2   1      0
+          |  mask 0x1E  |
+```
+
+Because DSCP sits in bits 7 down to 2 of the octet, a DSCP value `d` occupies the wire byte `d << 2` when ECN is `00`. That shift is the source of endless confusion between tools:
+
+- **DSCP notation** gives the 6-bit number (`0` to `63`), such as `46` for Expedited Forwarding (`101110`).
+- **Hex or TOS byte notation** gives the full 8-bit value (`0x00` to `0xff`), such as `0xb8` (`10111000`) when ECN is `00`, or `0xb9` (`10111001`) when ECN is `ECT(1)`.
+
+If you pass `46` where a tool expects a full TOS byte, you actually put `001011` (`11`) in the DSCP field and `10` (`ECT(0)`) in the ECN field. Always check whether an API or CLI flag takes a 6-bit DSCP or an 8-bit DS/TOS byte.
+
+RFC 2474 also preserved backward compatibility with the old 3-bit IP Precedence field by defining the Class Selector (CS) codepoints of the form `xxx000`:
+
+| Class Selector | 6-bit Binary | DSCP (dec) | Byte (ECN=0) | Legacy IP Precedence |
+| :--- | :--- | :--- | :--- | :--- |
+| `CS0` (`DF`) | `000000` | `0` | `0x00` | `0` (Routine) |
+| `CS1` | `001000` | `8` | `0x20` | `1` (Priority) |
+| `CS2` | `010000` | `16` | `0x40` | `2` (Immediate) |
+| `CS3` | `011000` | `24` | `0x60` | `3` (Flash) |
+| `CS4` | `100000` | `32` | `0x80` | `4` (Flash Override) |
+| `CS5` | `101000` | `40` | `0xa0` | `5` (CRITIC/ECP) |
+| `CS6` | `110000` | `48` | `0xc0` | `6` (Internetwork Control) |
+| `CS7` | `111000` | `56` | `0xe0` | `7` (Network Control) |
+
+A router that only understands IP Precedence inspects the top three bits and sees an ordered hierarchy from `0` to `7`. As you will see in the Wi-Fi and Linux kernel sections, blindly trusting those top three bits creates serious operational hazards when modern DSCPs share the byte with legacy code.
+
+## Per-Hop Behaviors and standard codepoints
+
+A DSCP does not name an end-to-end guarantee; it names a **Per-Hop Behavior (PHB)**—the externally observable forwarding treatment a single DiffServ node applies to a packet in a Behavior Aggregate. Across a DiffServ domain, consistent PHBs at each hop compose into a predictable service.
+
+Four PHB families cover almost all production deployments:
+
+1. **Default Forwarding (DF, RFC 2474)**: Codepoint `000000` (`0`, byte `0x00`, identical to `CS0`). This is standard best-effort forwarding. Every DiffServ-compliant node must support `DF`, and unmarked packets enter this PHB.
+2. **Expedited Forwarding (EF, RFC 3246)** and **VOICE-ADMIT (RFC 5865)**:
+   - `EF` is `101110` (`46`, byte `0xb8`). Its PHB is a low-loss, low-latency, low-jitter forwarding behavior where the configured departure rate of the EF aggregate equals or exceeds its arrival rate over any practical time interval. In practice, EF is backed by a strict-priority or tightly bounded LLQ/rate-limited queue so it cannot starve the rest of the link if misbehaving traffic arrives.
+   - `VOICE-ADMIT` is `101100` (`44`, byte `0xb0`). RFC 5865 defines it for capacity-admitted real-time voice—flows that have passed an explicit admission-control check (such as RSVP or a session border controller) rather than unpoliced voice traffic.
+3. **Assured Forwarding (AF, RFC 2597)**: Named `AFxy`, where `x` (`1`–`4`) is the forwarding class and `y` (`1`–`3`) is the drop precedence. Each AF class receives its own allocated bandwidth and buffer space, and packets within the same class are never reordered relative to one another. Under congestion, a node drops higher drop precedence first: `AFx3` drops before `AFx2`, which drops before `AFx1`. Notice the encoding pattern: `AFxy` is `(x << 3) | (y << 1)` in 6-bit DSCP space, so the bottom bit of the 6-bit DSCP is always `0`.
+4. **Lower Effort (LE, RFC 8622)**: Codepoint `000001` (`1`, byte `0x04`). RFC 8622 (Standards Track, June 2019) obsoleted RFC 3662 and updated both RFC 4594 and RFC 8325. For years, operators used `CS1` (`001000`, `8`) for scavenger/background traffic because RFC 3662 suggested it as a "less-than-best-effort" option, even though legacy IP Precedence treated `CS1` (`1`) as *higher* priority than `CS0` (`0`). Whenever a packet marked `CS1` crossed a node that only understood Class Selectors, it accidentally got promoted *above* best-effort traffic. `LE` (`000001`) fixes that ambiguity: it is a dedicated PHB for traffic that should yield to everything else, including `DF`.
+
+Here is the complete reference table for the standard non-CS PHB codepoints:
+
+| PHB | 6-bit Binary | DSCP (dec) | Byte (ECN=0) | RFC | Forwarding Meaning |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| `DF` (`CS0`) | `000000` | `0` | `0x00` | RFC 2474 | Best-effort default |
+| `LE` | `000001` | `1` | `0x04` | RFC 8622 | Lower Effort (scavenger; yields to DF) |
+| `AF11` | `001010` | `10` | `0x28` | RFC 2597 | Class 1, low drop precedence |
+| `AF12` | `001100` | `12` | `0x30` | RFC 2597 | Class 1, medium drop precedence |
+| `AF13` | `001110` | `14` | `0x38` | RFC 2597 | Class 1, high drop precedence |
+| `AF21` | `010010` | `18` | `0x48` | RFC 2597 | Class 2, low drop precedence |
+| `AF22` | `010100` | `20` | `0x50` | RFC 2597 | Class 2, medium drop precedence |
+| `AF23` | `010110` | `22` | `0x58` | RFC 2597 | Class 2, high drop precedence |
+| `AF31` | `011010` | `26` | `0x68` | RFC 2597 | Class 3, low drop precedence |
+| `AF32` | `011100` | `28` | `0x70` | RFC 2597 | Class 3, medium drop precedence |
+| `AF33` | `011110` | `30` | `0x78` | RFC 2597 | Class 3, high drop precedence |
+| `AF41` | `100010` | `34` | `0x88` | RFC 2597 | Class 4, low drop precedence |
+| `AF42` | `100100` | `36` | `0x90` | RFC 2597 | Class 4, medium drop precedence |
+| `AF43` | `100110` | `38` | `0x98` | RFC 2597 | Class 4, high drop precedence |
+| `VOICE-ADMIT` | `101100` | `44` | `0xb0` | RFC 5865 | Admitted real-time voice |
+| `EF` | `101110` | `46` | `0xb8` | RFC 3246 | Expedited Forwarding (low loss/latency/jitter) |
+
+## Service class maps: RFC 4594 and Wi-Fi (RFC 8325)
+
+Having 64 possible codepoints does not mean you should configure 64 queues. RFC 4594 ("Configuration Guidelines for DiffServ Service Classes") explicitly advises starting with **three or four service classes** and adding others only when you have a concrete traffic-engineering need and the queuing hardware to back them up. Figure 3 of RFC 4594 defines a 12-class recommended map for networks that do grow into full differentiation:
+
+| RFC 4594 Service Class | Recommended DSCP | Application / Traffic Type |
+| :--- | :--- | :--- |
+| Network Control | `CS6` (`110000`, `48`) | Network routing (OSPF, BGP, ISIS, BFD) |
+| Telephony | `EF` (`101110`, `46`) | IP telephony bearer (RTP voice) |
+| Signaling | `CS5` (`101000`, `40`) | Telephony/session signaling (SIP) |
+| Multimedia Conferencing | `AF41`/`AF42`/`AF43` (`34`/`36`/`38`) | Video conferencing (variable rate) |
+| Real-Time Interactive | `CS4` (`100000`, `32`) | Interactive gaming, virtual desktop |
+| Multimedia Streaming | `AF31`/`AF32`/`AF33` (`26`/`28`/`30`) | Buffered video/audio streaming |
+| Broadcast Video | `CS3` (`011000`, `24`) | Live broadcast video feeds |
+| Low-Latency Data | `AF21`/`AF22`/`AF23` (`18`/`20`/`22`) | Interactive/transactional client-server data |
+| OAM | `CS2` (`010000`, `16`) | Operations, administration, management (SSH, SNMP, syslog) |
+| High-Throughput Data | `AF11`/`AF12`/`AF13` (`10`/`12`/`14`) | Bulk transfers, backups, replication |
+| Standard | `DF` / `CS0` (`000000`, `0`) | Undifferentiated best-effort traffic |
+| Low-Priority Data | `LE` (`000001`, `1`) *(was `CS1` in RFC 4594; updated by RFC 8622)* | Scavenger, OS updates, background sync |
+
+Notice `CS7` is absent from the map. RFC 4594 section 3.1 says `CS6` SHOULD be used for routing and control and `CS7` SHOULD be reserved for future use; its recommended edge conditioning is to drop or re-mark `CS7` at ingress to the DiffServ domain and never send it across peering points.
+
+### Wired-to-wireless: why RFC 8325 exists
+
+On a wired Ethernet trunk, you have 802.1Q PCP bits or DiffServ queues that you configure yourself. On IEEE 802.11 Wi-Fi, contention is governed by four WMM Access Categories (`AC_VO`, `AC_VI`, `AC_BE`, `AC_BK`), indexed by an 802.11 User Priority (`UP`, `0`–`7`). Many legacy access points and client drivers map DSCP to UP by simply copying the **top three bits** of the DSCP (`DSCP >> 3`) directly into the 3-bit UP.
+
+That naive `DSCP >> 3` mapping breaks badly:
+
+- `CS6` (`48`, top 3 bits `6`) and `CS7` (`56`, top 3 bits `7`) both land in `AC_VO` (Voice, UP 6–7). Any host or compromised device that stamps `CS6` on bulk traffic gets the highest wireless airtime contention priority and starves every other station on the BSS.
+- `EF` (`46`, top 3 bits `5`) lands in `AC_VI` (Video) instead of `AC_VO` (Voice), even though `EF` is specifically for voice!
+- `CS1` (`8`, top 3 bits `1`) lands in `AC_BK`, which was the intent under old RFC 4594, whereas `LE` (`1`, top 3 bits `0`) would land in `AC_BE` unless the AP explicitly maps `LE` to `UP 1` (`AC_BK`).
+
+RFC 8325 defines the standard wired-to-wireless DSCP-to-UP mapping at the access point, and RFC 8622 updates it so Low-Priority Data uses `LE` instead of `CS1`:
+
+```text
+Wired DSCP (RFC 4594 / 8622)        RFC 8325 Mapping at AP        802.11 WMM AC
+----------------------------        ----------------------        -------------
+EF (46), VOICE-ADMIT (44)    -----> UP 6                   -----> AC_VO (Voice)
+CS5 (40)                     -----> UP 5                   -----> AC_VI (Video)
+AF4x (34..38), CS4 (32),
+CS3 (24), AF3x (26..30)      -----> UP 4                   -----> AC_VI (Video)
+AF2x (18..22)                -----> UP 3                   -----> AC_BE (Best Effort)
+CS2 (16), AF1x (10..14), DF  -----> UP 0                   -----> AC_BE (Best Effort)
+LE (1) [RFC 8622; was CS1]   -----> UP 1                   -----> AC_BK (Background)
+
+CS6 (48): UP 7 allowed for true network control, or UP 0 (security warning in RFC 8325)
+CS7 (56): Reserved (do not emit from hosts)
+```
+
+For `CS6`, RFC 8325 allows `UP 7` (`AC_VO`) when the AP trusts the wired network control plane, but explicitly discusses `UP 0` (`AC_BE`) as a safer alternative and flags security considerations: wireless clients rarely need to originate `CS6` routing control packets, and trusting `CS6` from arbitrary stations invites airtime starvation attacks.
+
+## How Linux sockets mark packets (and what the kernel changes)
+
+An application on Linux marks outgoing IPv4 packets using `setsockopt(fd, IPPROTO_IP, IP_TOS, &val, sizeof(val))` and outgoing IPv6 packets using `setsockopt(fd, IPPROTO_IPV6, IPV6_TCLASS, &val, sizeof(val))`. Both take the **full 8-bit DS/Traffic Class byte** (for example, `0xb8` for `EF`, not `46`). What happens inside the kernel after `setsockopt()` surprises almost everyone who reads the packet path for the first time.
+
+### 1. TCP owns the ECN bits (`SOCK_STREAM` vs `SOCK_DGRAM`)
+
+In Linux 6.12 (`net/ipv4/ip_sockglue.c`, `__ip_sock_set_tos()`), the kernel checks whether the socket is a `SOCK_STREAM` socket (TCP). If it is, `__ip_sock_set_tos()` masks off the low two ECN bits of the value you passed and preserves the socket's own ECN state. TCP negotiates and controls ECN via the three-way handshake and congestion control state machine (covered in the ECN and L4S chapter); user space cannot force `ECT(0)`, `ECT(1)`, or `CE` onto a TCP segment through `IP_TOS`.
+
+If you pass `0xbb` (`EF` + `CE`) to `setsockopt(IP_TOS)` on a TCP socket and immediately read it back with `getsockopt(IP_TOS)`, the kernel returns `0xb8`. On a UDP (`SOCK_DGRAM`) socket, by contrast, the kernel does **not** strip the ECN bits: passing `0xb9` (`EF` + `ECT(1)`) sends `0xb9` on the wire, which is how user-space UDP transports like QUIC manage ECN themselves.
+
+### 2. `SO_PRIORITY` still reads legacy RFC 1349 TOS bits
+
+After storing the DSCP/TOS byte, `__ip_sock_set_tos()` updates the socket's internal queueing priority:
+
+```text
+setsockopt(IP_TOS, val)
+        │
+        ├── if SOCK_STREAM: val = (val & ~0x03) | (sk_tos & 0x03)   [TCP owns ECN]
+        │
+        └── sk->sk_priority = rt_tos2priority(val)
+                                  │
+                                  ▼
+                       ip_tos2prio[ (val & 0x1E) >> 1 ]
+                       (include/net/route.h, net/ipv4/route.c)
+```
+
+Look closely at that index expression in `include/net/route.h`: `((tos & 0x1E) >> 1)`. It ignores bits 7, 6, 5 (the IP Precedence / high DSCP bits!) and bit 0, and indexes a 16-entry lookup table `ip_tos2prio[]` using only the four legacy RFC 1349 TOS bits (`0x1E`). The four values in `ip_tos2prio[]` map to Linux traffic control priorities:
+
+- `TC_PRIO_BESTEFFORT` (`0`)
+- `TC_PRIO_BULK` (`2`)
+- `TC_PRIO_INTERACTIVE_BULK` (`4`)
+- `TC_PRIO_INTERACTIVE` (`6`)
+
+Because `CS6` (`0xc0`) has bits 4..1 equal to `0000`, `(0xc0 & 0x1E) >> 1` is `0`, so `CS6` gets `SO_PRIORITY = 0` (`BESTEFFORT`). Because `EF` (`0xb8`, `10111000`) has bits 4..1 equal to `1100` (`0x18 >> 1 = 12`), `ip_tos2prio[12]` gives `SO_PRIORITY = 4` (`INTERACTIVE_BULK`), not `6` (`INTERACTIVE`).
+
+| Name | Byte (`ECN=0`) | `(tos & 0x1E) >> 1` | Linux `SO_PRIORITY` | `ip_tos2prio` Constant |
+| :--- | :--- | :--- | :--- | :--- |
+| `DF` (`CS0`) | `0x00` | `0` | `0` | `TC_PRIO_BESTEFFORT` |
+| `LE` | `0x04` | `2` | `0` | `TC_PRIO_BESTEFFORT` |
+| `AF11` | `0x28` | `4` | `2` | `TC_PRIO_BULK` |
+| `EF` | `0xb8` | `12` | `4` | `TC_PRIO_INTERACTIVE_BULK` |
+| `CS6` | `0xc0` | `0` | `0` | `TC_PRIO_BESTEFFORT` |
+
+For `pfifo_fast` and `prio` (and the priority-to-traffic-class map of `mqprio`), which read `skb->priority`,, setting `IP_TOS` to `EF` does **not** put the packet in the highest-priority band (`6`), and setting `CS6` leaves it in `0`. If you want `skb->priority` to reflect your DSCP policy, set `SO_PRIORITY` explicitly or classify by DSCP in `tc`/`nftables`.
+
+### 3. `IPV6_TCLASS` does not touch `SO_PRIORITY`
+
+On IPv6 sockets, `setsockopt(IPPROTO_IPV6, IPV6_TCLASS)` sets the Traffic Class byte in the IPv6 header, but Linux does **not** run `rt_tos2priority()` or modify `sk->sk_priority`. Whether you set `IPV6_TCLASS` to `0x00`, `0xb8`, or `0xb9`, `SO_PRIORITY` remains `0` unless the application sets `SO_PRIORITY` separately.
+
+### 4. Return-path symmetry: `net.ipv4.tcp_reflect_tos`
+
+When a client connects to a server with `IP_TOS = 0xb8` (`EF`), the client's `SYN`, `ACK`, data, and `FIN` segments carry `0xb8`. By default on Linux, the server's listening socket sends `SYN-ACK` and all server-to-client segments with `0x00` (`DF`), because `IP_TOS` on the listening socket defaults to `0` and the server has no reason to trust the client's marking.
+
+If you *do* want a server to mirror the client's DSCP on a per-connection basis (for example, inside a trusted data-center fabric where clients classify flows), Linux provides the sysctl `net.ipv4.tcp_reflect_tos`. Despite living under `net/ipv4/`, the `ip-sysctl` documentation notes that `tcp_reflect_tos` affects **both IPv4 and IPv6** listening sockets. Its default is `0` (disabled). When set to `1`, the kernel copies the DSCP from the incoming `SYN` onto the `SYN-ACK` and all subsequent outgoing segments for that accepted connection.
+
+### 5. Marking outside the application (from the docs, not run)
+
+Many applications have no `IP_TOS` knob, or you do not want applications choosing their own priority. In production Linux routers and gateways, marking is usually done in `nftables` or `tc` rather than trusting `setsockopt()`. These snippets are from the `nftables` and `tc` documentation and were not run on the lab host:
+
+```text
+# nftables (from the docs, not run): mark EF in a postrouting mangle hook
+nft add table inet qos
+nft add chain inet qos mark '{ type filter hook postrouting priority mangle; policy accept; }'
+nft add rule inet qos mark udp dport 5060 ip dscp set cs5
+nft add rule inet qos mark udp dport 10000-20000 ip dscp set ef
+nft add rule inet qos mark udp dport 10000-20000 ip6 dscp set ef
+
+# tc (from the docs, not run): rewrite DSCP/ECN byte via pedit or set skb->priority via skbedit
+tc filter add dev eth0 egress protocol ip u32 match ip dport 5001 0xffff \
+    action skbedit priority 1:10
+```
+
+Using `nftables` `ip dscp set` / `ip6 dscp set` updates only the 6-bit DSCP and leaves the 2-bit ECN field untouched—avoiding the classic mistake of overwriting ECN bits with a raw byte write.
+
+## Steering by DSCP with `ip rule` and trust boundaries
+
+Marking a packet changes its DSCP header bits; **policy routing** lets a Linux router choose a different routing table (and therefore a different next hop, tunnel, or WAN uplink) based on that DSCP.
+
+For decades, `ip rule` only had a `tos` selector:
+
+```text
+ip rule add tos 0xb8 table 101
+```
+
+On Linux 6.12, that command fails with:
+
+```text
+Error: Invalid tos.
+```
+
+In `net/ipv4/fib_rules.c`, `fib4_rule_configure()` validates the `FRA_TOS` attribute against `IPTOS_TOS_MASK` (`0x1E`) and rejects any bit outside those four legacy TOS bits. There is even a comment in the kernel source explaining why: `"IPv4 currently doesn't handle high order DSCP bits correctly"`. `0xb8 & ~0x1E` is `0xa0` (bits 7 and 5, the top of the DSCP), so `fib4_rule_configure()` refuses it outright. Only legacy TOS values like `0x10` (`IPTOS_LOWDELAY`) pass the `tos` check.
+
+Linux 6.12 introduced a dedicated `FRA_DSCP` fib-rule attribute, and `iproute2` (6.15.0 in our environment) exposes it as the `dscp` selector:
+
+```text
+ip rule add dscp EF table 101
+```
+
+Unlike `tos`, the `dscp` selector takes a 6-bit DSCP: either a name from iproute2's DSCP table (`EF`, `AF41`, `CS1` and friends all parse here) or a number (`0`–`63`), with an optional `/MASK`. `LE` is not in iproute2 6.15's name table (`ip rule add dscp LE` fails with `invalid dscp`), so write `dscp 1`; `ip rule` then lists it as `dscp 1`. Crucially, `FRA_DSCP` matches **only the 6-bit DSCP** and ignores the 2-bit ECN field: a packet marked `EF` (`0xb8`), `EF + ECT(1)` (`0xb9`), or `EF + CE` (`0xbb`) all match `dscp EF` and route via table `101`.
+
+### The trust boundary
+
+RFC 2474 defines DSCP as a **per-domain** signal. A DSCP has meaning only inside a DiffServ domain where every router agrees on the PHB mapping and enforces admission at the perimeter. Across the public internet, networks are free to bleach (zero to `DF`) or rewrite DSCPs at their own edges to protect their own queues, so you cannot rely on a marking surviving more than your own domain.
+
+```text
+[ Untrusted Host / Internet ]
+              │
+              │  (may arrive with CS6, EF, or bleached to DF)
+              ▼
+   +----------------------+
+   |   Trust Boundary     |  Edge router / ingress NIC:
+   |  (classify & mark)   |  re-mark untrusted DSCP -> DF (or policed AF/EF)
+   +----------------------+
+              │
+              │  (clean, domain-consistent DSCP)
+              ▼
+   [ Internal DiffServ Domain ] ---> ip rule dscp / WMM / qdiscs
+```
+
+Treat any DSCP arriving from an untrusted host, container, or external peering link as advisory at best and hostile at worst. Re-classify and re-mark at your trust boundary before packets hit internal `ip rule dscp` policies, queues, or Wi-Fi APs.
+
+Also check your **encapsulation** behavior before assuming DSCP survives tunnels. Overlay and VPN encapsulations—VXLAN, WireGuard, IPsec, GRE—have different defaults and configuration knobs for whether the inner packet's DSCP/ECN byte is copied to the outer IP header on encapsulation and whether the outer ECN bits are merged back on decapsulation. Never assume an inner `EF` marking reaches the underlay scheduler unless you have verified the tunnel configuration and captured the outer packets on the wire.
+
+## The lab
+
+To verify how Linux 6.12 handles socket marking, `SO_PRIORITY`, `tcp_reflect_tos`, IPv6 `IPV6_TCLASS`, and `ip rule dscp` without needing root on a multi-host testbed, the lab runs inside an unprivileged user/network/mount namespace (`unshare -rnm`) with three network namespaces wired as `h1 -- r -- h2`. Router `r` has two parallel links to `h2` (`a2` and `b2`); loopback address `10.9.9.9/32` on `h2` is reachable via `a2` in the `main` routing table and via `b2` in routing table `101`. A standard-library Python script drives the sockets and captures raw frames via `AF_PACKET` on `h2` and `h1` under Linux 6.12 and `iproute2` 6.15.0.
+
+```{.python filename="dscp-lab.py"}
+#!/usr/bin/env python3
+"""DSCP on Linux, measured. Run: unshare -rnm python3 dscp-lab.py
+Builds h1 -- r -- h2 (two links r->h2), marks packets from sockets,
+captures them with AF_PACKET, and steers by DSCP with ip rule."""
+import os, socket, struct, subprocess, sys, time, json, threading
+
+SELF = os.path.abspath(__file__)
+NAMES = {0:'DF',1:'LE',8:'CS1',10:'AF11',18:'AF21',26:'AF31',34:'AF41',
+         40:'CS5',44:'VA',46:'EF',48:'CS6',56:'CS7'}
+PRIO = {0:'BESTEFFORT',2:'BULK',4:'INTERACTIVE_BULK',6:'INTERACTIVE'}
+
+def sh(cmd, check=True):
+    r = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+    if check and r.returncode:
+        raise SystemExit(f'FAILED: {cmd}\n{r.stderr}')
+    return (r.stdout + r.stderr).strip()
+
+def nsrun(ns, *args):
+    return subprocess.run(['ip', 'netns', 'exec', ns, sys.executable, SELF, *args],
+                          capture_output=True, text=True)
+
+def build():
+    sh('mount -t tmpfs none /run && mkdir -p /run/netns')
+    for ns in ('h1', 'r', 'h2'):
+        sh(f'ip netns add {ns}')
+        sh(f'ip -n {ns} link set lo up')
+    sh('ip link add h1r type veth peer name rh1')
+    sh('ip link add ra type veth peer name a2')
+    sh('ip link add rb type veth peer name b2')
+    sh('ip link set h1r netns h1; ip link set rh1 netns r; ip link set ra netns r; '
+       'ip link set rb netns r; ip link set a2 netns h2; ip link set b2 netns h2')
+    cmds = '''
+    ip -n h1 addr add 10.1.0.1/24 dev h1r
+    ip -n h1 addr add 2001:db8:1::1/64 dev h1r nodad
+    ip -n r addr add 10.1.0.254/24 dev rh1
+    ip -n r addr add 2001:db8:1::fe/64 dev rh1 nodad
+    ip -n r addr add 10.2.0.254/24 dev ra
+    ip -n r addr add 2001:db8:2::fe/64 dev ra nodad
+    ip -n r addr add 10.3.0.254/24 dev rb
+    ip -n h2 addr add 10.2.0.2/24 dev a2
+    ip -n h2 addr add 2001:db8:2::2/64 dev a2 nodad
+    ip -n h2 addr add 10.3.0.2/24 dev b2
+    ip -n h2 addr add 10.9.9.9/32 dev lo
+    '''
+    for c in cmds.split('\n'):
+        if c.strip(): sh(c.strip())
+    for ns, devs in (('h1', ['h1r']), ('r', ['rh1', 'ra', 'rb']), ('h2', ['a2', 'b2'])):
+        for d in devs: sh(f'ip -n {ns} link set {d} up')
+    sh('ip -n h1 route add default via 10.1.0.254')
+    sh('ip -n h1 -6 route add default via 2001:db8:1::fe')
+    sh('ip -n h2 route add 10.1.0.0/24 via 10.2.0.254')
+    sh('ip -n h2 -6 route add default via 2001:db8:2::fe')
+    sh('ip -n r route add 10.9.9.9/32 via 10.2.0.2')
+    sh('ip -n r route add 10.9.9.9/32 via 10.3.0.2 table 101')
+    sh('ip netns exec r sh -c "echo 1 > /proc/sys/net/ipv4/ip_forward; '
+       'echo 1 > /proc/sys/net/ipv6/conf/all/forwarding"')
+    sh('ip netns exec h1 sh -c "echo 64 > /proc/sys/net/ipv4/ip_default_ttl"')
+    for ns in ('h2',):
+        sh(f'ip netns exec {ns} sh -c "for f in /proc/sys/net/ipv4/conf/*/rp_filter; do echo 0 > \\$f; done"')
+
+# ---------- helpers that run inside a namespace ----------
+def capture(ifaces, seconds, proto_filter, outgoing=False):
+    socks = []
+    for i in ifaces:
+        s = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.ntohs(3))
+        s.bind((i, 0)); s.settimeout(0.05); socks.append((i, s))
+    out = []
+    end = time.time() + seconds
+    while time.time() < end:
+        for i, s in socks:
+            try:
+                pkt, addr = s.recvfrom(65535)
+            except socket.timeout:
+                continue
+            if addr[2] == socket.PACKET_OUTGOING and not outgoing:
+                continue
+            et = struct.unpack('!H', pkt[12:14])[0]
+            if et == 0x0800:
+                ip = pkt[14:]
+                ds, ttl, proto = ip[1], ip[8], ip[9]
+                src, dst = socket.inet_ntoa(ip[12:16]), socket.inet_ntoa(ip[16:20])
+                ihl = (ip[0] & 15) * 4
+                l4 = ip[ihl:]
+            elif et == 0x86dd:
+                ip = pkt[14:]
+                vtf = struct.unpack('!I', ip[0:4])[0]
+                ds = (vtf >> 20) & 0xff
+                proto, ttl = ip[6], ip[7]
+                src = socket.inet_ntop(socket.AF_INET6, ip[8:24])
+                dst = socket.inet_ntop(socket.AF_INET6, ip[24:40])
+                l4 = ip[40:]
+            else:
+                continue
+            if proto not in proto_filter:
+                continue
+            flags = ''
+            if proto == 6:
+                f = l4[13]
+                flags = ''.join(n for b, n in ((2, 'S'), (16, '.'), (8, 'P'), (1, 'F')) if f & b)
+            out.append(dict(iface=i, src=src, dst=dst, ds=ds, ttl=ttl, proto=proto, flags=flags))
+    return out
+
+def role(argv):
+    cmd = argv[0]
+    if cmd == 'cap':
+        ifaces = argv[1].split(','); secs = float(argv[2]); protos = [int(x) for x in argv[3].split(',')]
+        print(json.dumps(capture(ifaces, secs, protos, outgoing=len(argv) > 4)))
+    elif cmd == 'udp':
+        fam, dst, tos = argv[1], argv[2], int(argv[3], 0)
+        af = socket.AF_INET6 if fam == '6' else socket.AF_INET
+        s = socket.socket(af, socket.SOCK_DGRAM)
+        if af == socket.AF_INET:
+            s.setsockopt(socket.IPPROTO_IP, socket.IP_TOS, tos)
+            got = s.getsockopt(socket.IPPROTO_IP, socket.IP_TOS)
+        else:
+            s.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_TCLASS, tos)
+            got = s.getsockopt(socket.IPPROTO_IPV6, socket.IPV6_TCLASS)
+        prio = s.getsockopt(socket.SOL_SOCKET, socket.SO_PRIORITY)
+        s.sendto(b'x' * 32, (dst, 9))
+        print(json.dumps(dict(set=tos, got=got, prio=prio)))
+    elif cmd == 'tcpsrv':
+        s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        s.bind(('10.9.9.9', 5001)); s.listen(); s.settimeout(4)
+        c, _ = s.accept(); c.recv(100); c.sendall(b'reply'); time.sleep(0.3); c.close()
+    elif cmd == 'tcpcli':
+        tos = int(argv[1], 0)
+        s = socket.socket(); s.setsockopt(socket.IPPROTO_IP, socket.IP_TOS, tos)
+        got = s.getsockopt(socket.IPPROTO_IP, socket.IP_TOS)
+        prio = s.getsockopt(socket.SOL_SOCKET, socket.SO_PRIORITY)
+        s.connect(('10.9.9.9', 5001)); s.sendall(b'hello'); s.recv(100); time.sleep(0.2); s.close()
+        print(json.dumps(dict(set=tos, got=got, prio=prio)))
+
+def fmt_ds(ds):
+    d, e = ds >> 2, ds & 3
+    return f'0x{ds:02x} dscp={d:<2} ({NAMES.get(d, "?"):4}) ecn={e}'
+
+def bg_cap(ns, ifaces, secs, protos, outgoing=False):
+    return subprocess.Popen(['ip', 'netns', 'exec', ns, sys.executable, SELF, 'cap',
+                             ','.join(ifaces), str(secs), ','.join(map(str, protos))] + (['out'] if outgoing else []),
+                            stdout=subprocess.PIPE, text=True)
+
+def udp_round(tos_list, fam='4', dst='10.9.9.9', ifaces=('a2', 'b2')):
+    for tos in tos_list:
+        cap = bg_cap('h2', ifaces, 0.8, [17]); time.sleep(0.3)
+        r = json.loads(nsrun('h1', 'udp', fam, dst, hex(tos)).stdout)
+        pk = json.loads(cap.communicate()[0])
+        seen = '; '.join(f"{p['iface']} {fmt_ds(p['ds'])} ttl={p['ttl']}" for p in pk) or 'nothing captured'
+        opt = 'IPV6_TCLASS' if fam == '6' else 'IP_TOS'
+        print(f"  {opt} set 0x{r['set']:02x} -> getsockopt 0x{r['got']:02x}, "
+              f"SO_PRIORITY {r['prio']} ({PRIO.get(r['prio'], '?')}) | at h2: {seen}")
+
+def main():
+    if len(sys.argv) > 1:
+        return role(sys.argv[1:])
+    build()
+    print('== 1. UDP from h1 to 10.9.9.9, marked with IP_TOS, captured on h2 (after one forward hop)')
+    udp_round([0x00, 0x04, 0x28, 0xb8, 0xb9, 0xc0])
+    print('\n== 2. On r: try to steer EF with the legacy "tos" selector, then with "dscp"')
+    print('  $ ip rule add tos 0xb8 table 101   ->', sh('ip -n r rule add tos 0xb8 table 101', check=False) or 'ok')
+    print('  $ ip rule add tos 0x10 table 101   ->', sh('ip -n r rule add tos 0x10 table 101', check=False) or 'ok')
+    sh('ip -n r rule del tos 0x10 table 101')
+    print('  $ ip rule add dscp EF table 101    ->', sh('ip -n r rule add dscp EF table 101', check=False) or 'ok')
+    for line in sh('ip -n r rule show').splitlines():
+        print('    ' + line)
+    udp_round([0x00, 0xb8, 0xb9, 0xb8 | 3, 0xc0])
+    sh('ip -n r rule del dscp EF table 101')
+
+    print('\n== 3. TCP: client sets IP_TOS 0xbb (EF + CE) before connect(); capture both directions on h1')
+    for reflect in (0, 1):
+        sh(f'ip netns exec h2 sh -c "echo {reflect} > /proc/sys/net/ipv4/tcp_reflect_tos"')
+        srv = subprocess.Popen(['ip', 'netns', 'exec', 'h2', sys.executable, SELF, 'tcpsrv'])
+        cap = bg_cap('h1', ['h1r'], 2.0, [6], outgoing=True); time.sleep(0.4)
+        r = json.loads(nsrun('h1', 'tcpcli', '0xbb').stdout)
+        srv.wait(); pk = json.loads(cap.communicate()[0])
+        print(f"  h2 tcp_reflect_tos={reflect}; client getsockopt IP_TOS=0x{r['got']:02x} SO_PRIORITY={r['prio']}")
+        seen = set()
+        for p in pk:
+            dirn = 'h1->h2' if p['src'] == '10.1.0.1' else 'h2->h1'
+            key = (dirn, p['flags'], p['ds'])
+            if key in seen: continue
+            seen.add(key)
+            print(f"    {dirn} [{p['flags']:<3}] {fmt_ds(p['ds'])}")
+
+    print('\n== 4. IPv6: IPV6_TCLASS on UDP, captured on h2 a2')
+    udp_round([0x00, 0xb8, 0xb9], fam='6', dst='2001:db8:2::2', ifaces=('a2',))
+
+if __name__ == '__main__':
+    main()
+```
+It needs no root and no packages: `unshare -rnm` gives the script a private user, network and mount namespace in which it can create the three namespaces itself. Output from Linux 6.12, iproute2 6.15.0, Python 3.13.5 (a real run, unedited):
+
+```text
+$ unshare -rnm python3 dscp-lab.py
+== 1. UDP from h1 to 10.9.9.9, marked with IP_TOS, captured on h2 (after one forward hop)
+  IP_TOS set 0x00 -> getsockopt 0x00, SO_PRIORITY 0 (BESTEFFORT) | at h2: a2 0x00 dscp=0  (DF  ) ecn=0 ttl=63
+  IP_TOS set 0x04 -> getsockopt 0x04, SO_PRIORITY 0 (BESTEFFORT) | at h2: a2 0x04 dscp=1  (LE  ) ecn=0 ttl=63
+  IP_TOS set 0x28 -> getsockopt 0x28, SO_PRIORITY 2 (BULK) | at h2: a2 0x28 dscp=10 (AF11) ecn=0 ttl=63
+  IP_TOS set 0xb8 -> getsockopt 0xb8, SO_PRIORITY 4 (INTERACTIVE_BULK) | at h2: a2 0xb8 dscp=46 (EF  ) ecn=0 ttl=63
+  IP_TOS set 0xb9 -> getsockopt 0xb9, SO_PRIORITY 4 (INTERACTIVE_BULK) | at h2: a2 0xb9 dscp=46 (EF  ) ecn=1 ttl=63
+  IP_TOS set 0xc0 -> getsockopt 0xc0, SO_PRIORITY 0 (BESTEFFORT) | at h2: a2 0xc0 dscp=48 (CS6 ) ecn=0 ttl=63
+
+== 2. On r: try to steer EF with the legacy "tos" selector, then with "dscp"
+  $ ip rule add tos 0xb8 table 101   -> Error: Invalid tos.
+  $ ip rule add tos 0x10 table 101   -> ok
+  $ ip rule add dscp EF table 101    -> ok
+    0:	from all lookup local
+    32765:	from all lookup 101 dscp EF
+    32766:	from all lookup main
+    32767:	from all lookup default
+  IP_TOS set 0x00 -> getsockopt 0x00, SO_PRIORITY 0 (BESTEFFORT) | at h2: a2 0x00 dscp=0  (DF  ) ecn=0 ttl=63
+  IP_TOS set 0xb8 -> getsockopt 0xb8, SO_PRIORITY 4 (INTERACTIVE_BULK) | at h2: b2 0xb8 dscp=46 (EF  ) ecn=0 ttl=63
+  IP_TOS set 0xb9 -> getsockopt 0xb9, SO_PRIORITY 4 (INTERACTIVE_BULK) | at h2: b2 0xb9 dscp=46 (EF  ) ecn=1 ttl=63
+  IP_TOS set 0xbb -> getsockopt 0xbb, SO_PRIORITY 4 (INTERACTIVE_BULK) | at h2: b2 0xbb dscp=46 (EF  ) ecn=3 ttl=63
+  IP_TOS set 0xc0 -> getsockopt 0xc0, SO_PRIORITY 0 (BESTEFFORT) | at h2: a2 0xc0 dscp=48 (CS6 ) ecn=0 ttl=63
+
+== 3. TCP: client sets IP_TOS 0xbb (EF + CE) before connect(); capture both directions on h1
+  h2 tcp_reflect_tos=0; client getsockopt IP_TOS=0xb8 SO_PRIORITY=4
+    h1->h2 [S  ] 0xb8 dscp=46 (EF  ) ecn=0
+    h2->h1 [S. ] 0x00 dscp=0  (DF  ) ecn=0
+    h1->h2 [.  ] 0xb8 dscp=46 (EF  ) ecn=0
+    h1->h2 [.P ] 0xb8 dscp=46 (EF  ) ecn=0
+    h2->h1 [.  ] 0x00 dscp=0  (DF  ) ecn=0
+    h2->h1 [.P ] 0x00 dscp=0  (DF  ) ecn=0
+    h1->h2 [.F ] 0xb8 dscp=46 (EF  ) ecn=0
+    h2->h1 [.F ] 0x00 dscp=0  (DF  ) ecn=0
+  h2 tcp_reflect_tos=1; client getsockopt IP_TOS=0xb8 SO_PRIORITY=4
+    h1->h2 [S  ] 0xb8 dscp=46 (EF  ) ecn=0
+    h2->h1 [S. ] 0xb8 dscp=46 (EF  ) ecn=0
+    h1->h2 [.  ] 0xb8 dscp=46 (EF  ) ecn=0
+    h1->h2 [.P ] 0xb8 dscp=46 (EF  ) ecn=0
+    h2->h1 [.  ] 0xb8 dscp=46 (EF  ) ecn=0
+    h2->h1 [.P ] 0xb8 dscp=46 (EF  ) ecn=0
+    h1->h2 [.F ] 0xb8 dscp=46 (EF  ) ecn=0
+    h2->h1 [.F ] 0xb8 dscp=46 (EF  ) ecn=0
+
+== 4. IPv6: IPV6_TCLASS on UDP, captured on h2 a2
+  IPV6_TCLASS set 0x00 -> getsockopt 0x00, SO_PRIORITY 0 (BESTEFFORT) | at h2: a2 0x00 dscp=0  (DF  ) ecn=0 ttl=63
+  IPV6_TCLASS set 0xb8 -> getsockopt 0xb8, SO_PRIORITY 0 (BESTEFFORT) | at h2: a2 0xb8 dscp=46 (EF  ) ecn=0 ttl=63
+  IPV6_TCLASS set 0xb9 -> getsockopt 0xb9, SO_PRIORITY 0 (BESTEFFORT) | at h2: a2 0xb9 dscp=46 (EF  ) ecn=1 ttl=63
+```
+
+Four concrete behaviors stand out in the captured output:
+
+1. **UDP `IP_TOS` and `SO_PRIORITY` across one routed hop**: Sending UDP packets from `h1` to `h2` (TTL drops from `64` to `63` across `r`) preserves every marking: `0x00` arrives as `DF` (`ecn 0`, `SO_PRIORITY 0`), `0x04` arrives as `LE` (`dscp 1`, `SO_PRIORITY 0`), `0x28` arrives as `AF11` (`SO_PRIORITY 2`, `BULK`), `0xb8` arrives as `EF` (`SO_PRIORITY 4`, `INTERACTIVE_BULK`), `0xb9` arrives as `EF` with `ecn 1` (`SO_PRIORITY 4`—confirming UDP can set ECN bits directly), and `0xc0` arrives as `CS6` (`SO_PRIORITY 0`, `BESTEFFORT`).
+2. **Legacy `ip rule tos` vs `ip rule dscp` on `r`**: Running `ip rule add tos 0xb8 table 101` fails with `Error: Invalid tos.`, whereas `ip rule add tos 0x10` succeeds (because `0x10` is a legacy RFC 1349 TOS bit). Running `ip rule add dscp EF table 101` succeeds and appears as `32765: from all lookup 101 dscp EF`. With that rule active, `DF` and `CS6` still arrive on `a2` (`main`), while `EF` (`0xb8`), `EF + ECT(1)` (`0xb9`), and `EF + CE` (`0xbb`) all arrive on `b2` (table `101`), proving `FRA_DSCP` ignores the ECN bits.
+3. **TCP ECN stripping and `tcp_reflect_tos`**: When the `h1` TCP client sets `IP_TOS` to `0xbb` (`EF + CE`) before `connect()`, `getsockopt(IP_TOS)` immediately returns `0xb8` (ECN bits stripped) and `SO_PRIORITY` is `4`. With `tcp_reflect_tos=0` on `h2`, every `h1 -> h2` segment (`SYN`, `ACK`, data, `FIN`) carries `0xb8` (`EF`), while every `h2 -> h1` segment (`SYN-ACK`, `ACK`, data, `FIN`) carries `0x00` (`DF`). Flipping `tcp_reflect_tos=1` on `h2` alone causes `h2`'s `SYN-ACK` and all later `h2 -> h1` segments to carry `0xb8` (`EF`).
+4. **IPv6 UDP `IPV6_TCLASS`**: Setting `IPV6_TCLASS` to `0x00`, `0xb8`, or `0xb9` delivers the Traffic Class unchanged across `r` (Hop Limit drops from `64` to `63`), while `SO_PRIORITY` stays `0` for all three.
+
+## Gotchas
+
+- **The trap: TCP silently strips your ECN bits.** If you pass `0xb9` or `0xbb` to `setsockopt(IP_TOS)` on a `SOCK_STREAM` socket, `__ip_sock_set_tos()` zeroes out your ECN bits and keeps TCP's own ECN state. Only `SOCK_DGRAM` / raw sockets let user space write the ECN bits directly.
+- **The trap: Asymmetric marking on TCP.** Marking packets on the client only paints one direction of the conversation. Unless the server application sets `IP_TOS` itself, a middlebox re-marks return traffic, or the server enables `net.ipv4.tcp_reflect_tos=1`, all server-to-client segments return as `DF` (`0x00`).
+- **The trap: `SO_PRIORITY` is not DSCP priority.** Linux derives `sk_priority` from the four legacy RFC 1349 TOS bits (`(tos & 0x1E) >> 1`), not from the 6-bit DSCP. `EF` (`0xb8`) gets `SO_PRIORITY 4` (`INTERACTIVE_BULK`), `AF11` (`0x28`) gets `2` (`BULK`), and `CS6` (`0xc0`) gets `0` (`BESTEFFORT`). Never assume `IP_TOS` puts `EF` or `CS6` into the top band of a Linux qdisc.
+- **The trap: `IPV6_TCLASS` leaves `SO_PRIORITY` at `0`.** Unlike IPv4 `IP_TOS`, setting `IPV6_TCLASS` does not run `rt_tos2priority()`. If your dual-stack host relies on `skb->priority` for egress queuing, IPv6 sockets will silently land in the default band unless you set `SO_PRIORITY` or classify in `tc`/`nftables`.
+- **The trap: `ip rule tos` cannot match DSCP.** On Linux 6.12, `ip rule add tos 0xb8 ...` fails with `Error: Invalid tos.` because `fib4_rule_configure()` rejects any bit outside `IPTOS_TOS_MASK` (`0x1E`). Use `ip rule add dscp EF ...` on Linux 6.12+ (or an `nftables` `fwmark` + `ip rule fwmark` on older kernels).
+- **The trap: Marking without a matching queue does nothing.** A DSCP bit in an IP header is just ink on an envelope. Unless downstream routers, switches, or Linux qdiscs (`htb`, `hfsc`, `cake`, `mqprio`—see "QoS Vocabulary") actually inspect that DSCP and schedule packets accordingly, `EF` and `DF` experience the exact same queue and drop rate.
+- **The trap: Trusting `CS6` or `CS7` from hosts.** Hosts and containers should not be allowed to inject `CS6` or `CS7` into your network. On routers, `CS6` competes with routing protocols; on Wi-Fi, naive APs map `CS6`/`CS7` into `AC_VO` (voice), letting a misconfigured host starve the entire wireless cell. Re-mark untrusted markings at the trust boundary.
+- **The trap: Public internet bleaching.** Across transit providers and the public internet, DSCP markings are frequently zeroed to `DF` or rewritten to local transit classes. Do not design an internet-facing service that depends on end-to-end DSCP survival; re-classify at your own ingress.
+- **The trap: Tunnels and containers hiding inner DSCP.** When traffic enters VXLAN, GRE, WireGuard or IPsec, the outer IP header may be stamped `0x00` (`DF`) instead of inheriting the inner DSCP, depending on the implementation and its settings (a plain Linux bridge does not touch the IP header at all). Always verify outer-header DSCP propagation on the wire before trusting underlay QoS for overlay traffic.
+
+## The boring rule
+
+Classify and re-mark at the trust boundary, start with three or four service classes you actually queue for, use `ip rule dscp` (not `tos`) when steering on Linux 6.12+, and always verify both directions of a flow on the wire.
+
+## Exercises
+
+1. **Decode the wire byte**: Convert the following 8-bit IPv4 TOS / IPv6 Traffic Class hex values into their 6-bit DSCP (binary and decimal), PHB name, and 2-bit ECN state: `0x04`, `0x2a`, `0x48`, `0xb0`, `0xb9`, `0xe0`. Which of them would be rejected by `ip rule add tos` on Linux 6.12?
+2. **Predict `ip_tos2prio[]` behavior**: Using `((tos & 0x1E) >> 1)`, explain why `AF11` (`0x28`) receives `SO_PRIORITY = 2` while `CS6` (`0xc0`) receives `SO_PRIORITY = 0`. What happens to `AF41` (`0x88`) and `VOICE-ADMIT` (`0xb0`)?
+3. **Asymmetric TCP debugging**: You configure `ip rule add dscp EF table 101` on a Linux 6.12 router between a client and a server so voice-control TCP flows take a low-latency link (`b2`). Packet captures show client-to-server packets on `b2`, but server-to-client packets are still returning on `a2`. List two distinct ways to fix the return path—one on the server host and one on the router—and explain the trust implications of each.
+4. **Wi-Fi starvation audit**: An enterprise campus marks all syslog and SNMP traffic as `CS6` (`48`) and deploys a new fleet of Wi-Fi APs using a naive `DSCP >> 3` mapping. Using RFC 4594 and RFC 8325, identify the two mistakes in this setup and state the exact DSCP and 802.11 User Priority values you would deploy instead.
+5. **Dual-stack egress queuing**: A dual-stack application sets `IP_TOS = 0xb8` on IPv4 sockets and `IPV6_TCLASS = 0xb8` on IPv6 sockets, and relies on a `pfifo_fast` egress qdisc on the host. Explain why IPv4 and IPv6 packets from the exact same application receive different queueing treatment on Linux 6.12, and write the `nftables` or `tc` approach (marking it "from the docs, not run") that makes both families consistent.
+6. **Scavenger traffic migration**: Your network currently uses `CS1` (`001000`) for overnight backup replication, and a legacy switch along the path only implements RFC 2474 Class Selectors (`xxx000`). Explain why backups are outperforming `DF` (`000000`) traffic on that switch, and describe what changes when you migrate backups to `LE` (`000001`, RFC 8622), including what the Wi-Fi AP must do under RFC 8325 + RFC 8622.
+
+## Sources
+
+- [RFC 2474: Definition of the Differentiated Services Field (DS Field) in the IPv4 and IPv6 Headers](https://datatracker.ietf.org/doc/html/rfc2474)
+- [RFC 3260: New Terminology and Clarifications for Diffserv](https://datatracker.ietf.org/doc/html/rfc3260)
+- [RFC 3168: The Addition of Explicit Congestion Notification (ECN) to IP](https://datatracker.ietf.org/doc/html/rfc3168)
+- [RFC 3246: An Expedited Forwarding PHB (Per-Hop Behavior)](https://datatracker.ietf.org/doc/html/rfc3246)
+- [RFC 2597: Assured Forwarding PHB Group](https://datatracker.ietf.org/doc/html/rfc2597)
+- [RFC 5865: A Differentiated Services Code Point (DSCP) for Capacity-Admitted Traffic (VOICE-ADMIT)](https://datatracker.ietf.org/doc/html/rfc5865)
+- [RFC 8622: A Lower-Effort Per-Hop Behavior (LE PHB) for Differentiated Services](https://datatracker.ietf.org/doc/html/rfc8622)
+- [RFC 4594: Configuration Guidelines for DiffServ Service Classes](https://datatracker.ietf.org/doc/html/rfc4594)
+- [RFC 8325: Mapping Diffserv to IEEE 802.11](https://datatracker.ietf.org/doc/html/rfc8325)
+- [RFC 8100: Diffserv-Interconnection Classes and Practice](https://datatracker.ietf.org/doc/html/rfc8100)
+- [Linux `ip(7)` manual page](https://man7.org/linux/man-pages/man7/ip.7.html)
+- [Linux `ipv6(7)` manual page](https://man7.org/linux/man-pages/man7/ipv6.7.html)
+- [Linux `ip-sysctl.rst` documentation (`tcp_reflect_tos`)](https://docs.kernel.org/networking/ip-sysctl.html)
+- [iproute2 `ip-rule(8)` manual page](https://man7.org/linux/man-pages/man8/ip-rule.8.html)
+- [Linux v6.12 `net/ipv4/ip_sockglue.c`](https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/net/ipv4/ip_sockglue.c?h=v6.12)
+- [Linux v6.12 `include/net/route.h`](https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/include/net/route.h?h=v6.12)
+- [Linux v6.12 `net/ipv4/route.c`](https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/net/ipv4/route.c?h=v6.12)
+- [Linux v6.12 `net/ipv4/fib_rules.c`](https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/net/ipv4/fib_rules.c?h=v6.12)
