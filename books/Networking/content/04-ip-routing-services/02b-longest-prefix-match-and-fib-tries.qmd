@@ -1,0 +1,754 @@
+---
+title: "Longest-Prefix Match: Tries, Strides and the Linux FIB"
+author:
+  - name: "K19G"
+  - name: "grok-bot"
+---
+
+# Longest-Prefix Match: Tries, Strides and the Linux FIB
+
+Every IPv4 and IPv6 packet traversing a network device requires a decision: to which next hop should this IP address be forwarded? When a routing table contains overlapping subnets—such as a broad default route `0.0.0.0/0`, an enterprise aggregate `10.0.0.0/8`, a data center subnet `10.1.0.0/16`, and an host route `10.1.2.200/32`—the router cannot simply pick the first match it encounters. IP routing protocols mandate the rule of longest-prefix match (LPM): the route with the most specific matching network mask (the highest prefix length) must select the next hop.
+
+For network operators and systems engineers, knowing how LPM is implemented turns routing performance from an abstraction into concrete resource limits. An operator running software routers on commodity x86 hardware, tuning the Linux kernel Forwarding Information Base (FIB), or sizing the hardware FIB of a switch ASIC meets LPM mechanics directly. The lookup structure decides memory bandwidth, CPU cache behaviour, lookup latency variance and how many routes fit.
+
+A naive approach to route lookups might rely on exact-match hash tables, requiring a separate probe for every possible prefix length, or flat array scans scaling linearly with table size. Modern production systems employ far more sophisticated data structures. In software, these range from unibit and path-compressed binary tries to level-compressed multi-bit tries. In hardware, routers rely on specialized Ternary Content-Addressable Memory (TCAM). This chapter deconstructs these data structures, demonstrates their algorithmic trade-offs through Python prototypes, and inspects how the Linux kernel implements its IPv4 FIB using Level-Compressed Tries (LC-trie).
+
+## Learning goals
+
+- Explain why exact-match hash tables and linear array scans fail to meet performance and scalability requirements for IP longest-prefix matching.
+- Trace bitwise traversal in unibit binary tries and demonstrate how path compression (PATRICIA tries) reduces intermediate node overhead.
+- Quantify the trade-off between memory footprint and lookup steps when applying multi-bit strides (DIR-24-8) and multi-level stride configurations.
+- Interpret Linux IPv4 kernel FIB state from `/proc/net/fib_trie` and system statistics from `/proc/net/fib_triestat`.
+- Analyze kernel routing behavior for special route types, including `blackhole`, `unreachable`, and `prohibit`, and map them to userspace error codes.
+- Evaluate the operational differences between software trie traversals in CPU cache and hardware TCAM lookups in line-rate ASIC pipelines.
+
+## Version note
+
+The kernel mechanics, `/proc` interface outputs and route behaviour described in this chapter were observed on Linux 6.12 (x86_64) with CPython 3.13.5. `net/ipv4/fib_trie.c` has been the only IPv4 FIB implementation since Linux 2.6.39 removed the older hash-based `fib_hash`; details such as resize thresholds and table merging have changed over time, so read the source for your kernel.
+
+## Exact matching versus prefix matching
+
+In standard data structure design, exact key lookups are typically solved in $O(1)$ average time complexity using hash tables. However, IP destination addresses present a fundamental challenge: the destination key in a packet header (a 32-bit IPv4 or 128-bit IPv6 scalar) does not explicitly identify which prefix length was used when the originating network advertised the destination.
+
+### Why linear scans and hash chains fail
+
+If a routing table is stored as an unordered array of prefix entries, determining the longest matching prefix for an address requires testing every entry in the table against the address. For a destination address $A$, each entry $(P_i, L_i)$ with prefix $P_i$ and prefix length $L_i$ is evaluated by checking if $(A \text{ AND } \text{mask}(L_i)) == P_i$. If multiple entries match, the one with the maximum $L_i$ value is selected.
+
+| Route Table Entry | Prefix / Mask | Matching Address (`10.1.2.200`) | Prefix Length ($L_i$) | Match Status |
+| :--- | :--- | :--- | :--- | :--- |
+| `0.0.0.0/0` | `0.0.0.0 / 0` | `0.0.0.0` | 0 | Match (Fallback) |
+| `10.0.0.0/8` | `255.0.0.0` | `10.0.0.0` | 8 | Match |
+| `10.1.0.0/16` | `255.255.0.0` | `10.1.0.0` | 16 | Match |
+| `10.1.2.0/24` | `255.255.255.0` | `10.1.2.0` | 24 | Match |
+| `10.1.2.200/32` | `255.255.255.255` | `10.1.2.200` | 32 | **Longest Match** |
+
+A linear scan requires $O(N)$ comparisons per lookup, where $N$ is the number of routes in the routing table. A router carrying a full IPv4 table holds around a million prefixes; a million comparisons per packet at line rate (a 100 Gb/s port can deliver about 148 million minimum-size packets per second) is out of the question.
+
+To adapt $O(1)$ hash tables to LPM, an algorithm could instantiate 33 distinct hash tables for IPv4 (one for each possible prefix length from `/0` through `/32`), or 129 hash tables for IPv6. To resolve an address:
+1. Probe the `/32` hash table with the full address $A$.
+2. If no match is found, probe the `/31` table with $A \text{ AND } \text{mask}(31)$.
+3. Repeat sequentially down to `/0`.
+
+In the worst-case scenario, this requires 33 sequential hash table probes per packet. While binary search on prefix lengths (Waldvogel et al., SIGCOMM 1997) reduces the number of hash probes to $O(\log_2 W)$—where $W=32$ for IPv4 or $W=128$ for IPv6—hash collisions, non-deterministic memory access patterns, and complex marker update operations during route flapping present significant hardware and software implementation challenges.
+
+## Binary tries and path compression
+
+To achieve deterministic lookup bounds without probing up to 33 hash tables, routing systems use tree-based data structures known as *tries* (derived from "retrieval"). A trie organizes routes based on the bit sequence of their binary representation.
+
+### Unibit binary tries
+
+In a unibit binary trie, branching decisions are made one bit at a time. The root node represents bit position 0 (the most significant bit of the IP address). If the bit at position $k$ is `0`, the lookup descends to the left child; if `1`, it descends to the right child.
+
+Nodes that correspond to installed network prefixes store associated next-hop metadata. Nodes that merely exist to form intermediate paths carry no next-hop metadata.
+
+```text
+                  Root (0.0.0.0/0) -> NH: isp
+                   /
+                  0 (Bit 0 = 0)
+                 /
+               ... [Bits 1-7]
+               /
+          10.0.0.0/8 -> NH: core
+             /
+           ... [Bits 8-15]
+           /
+      10.1.0.0/16 -> NH: dc1
+         /
+       ... [Bits 16-23]
+       /
+  10.1.2.0/24 -> NH: rack7
+       \
+        1 (Bit 24 = 1)
+         \
+      10.1.2.128/25 -> NH: rack7-b
+```
+
+A unibit trie guarantees that a lookup performs at most 32 memory references (for IPv4) or 128 (for IPv6). However, unibit tries suffer from two primary drawbacks:
+1. **Memory Inefficiency:** Sparse address spaces create long, one-child chains of intermediate nodes that store no routing payload. Inserting a single `/32` route into an empty unibit trie allocates 33 node objects.
+2. **Lookup Latency:** A packet must walk node-by-node down the tree, requiring up to 32 pointer dereferences per lookup.
+
+### Path-compressed tries (PATRICIA)
+
+Path compression, originally introduced as Practical Algorithm To Retrieve Information Coded In Alphanumeric (PATRICIA) by Donald R. Morrison (1968), eliminates long single-child node chains.
+
+If an intermediate node has only one child and stores no next-hop data, it is redundant. Path compression collapses these intermediate chains into a single node that explicitly records:
+- The target key prefix.
+- The prefix length (`plen`) or position bit index at which the next true branch occurs.
+- Pointers to child subtrees.
+
+```text
+               Unibit chain                       Path-compressed (PATRICIA)
+     root (no NH)                                 10.1.0.0/16  NH dc1   (skips bits 0-15 in one step)
+        | bit 0 = 0                                 /                \
+     node (no NH)                       bit 16 = 0                    bit 16 = 1
+        | bit 1 = 0         ===>             /                            \
+       ...  (14 more one-child nodes)   10.1.2.0/24  NH rack7      10.1.200.0/24  NH rack9
+        |
+     10.1.0.0/16  NH dc1
+```
+
+In a path-compressed trie, a route table containing $N$ prefixes allocates at most $2N - 1$ total nodes. The maximum lookup depth is bounded by the number of actual branching points rather than the static bit-length $W$ of the address family.
+
+During lookup traversal in a path-compressed trie, the search algorithm compares the target IP address against the node's stored prefix key up to `plen`. If the target address bits do not match the skipped intermediate bits, traversal stops immediately, returning the most specific valid parent route encountered up to that point.
+
+## Multi-bit tries and direct indexing
+
+While path compression reduces the total node count, pointer traversal overhead remains bound by sequential memory reads. To reduce the tree height and accelerate lookups, multi-bit tries evaluate multiple bits of the IP address simultaneously in a single lookup step. The number of bits evaluated in one step is known as the **stride**.
+
+### Stride mechanics and expansion
+
+A node with a stride length of $k$ bits has $2^k$ potential child pointers. Instead of a binary choice between `0` and `1`, the node performs a $2^k$-wide array index lookup using $k$ contiguous bits of the address key.
+
+```text
+             Unibit (Stride = 1)                 Multi-bit (Stride = 4)
+                  [ Node ]                            [ Node (16 pointers) ]
+                 /        \                           /   |   |   | ... \
+               '0'        '1'                       0000 0001 0010 0011  1111
+```
+
+If a route prefix length is not an exact multiple of the stride length, the prefix must undergo **controlled prefix expansion**. For example, in a trie using a fixed stride of 8 bits (byte-by-byte traversal), a `/22` route (e.g., `10.1.0.0/22`) does not align cleanly with an 8-bit boundary. It covers four distinct `/24` spaces: `10.1.0.0/24`, `10.1.1.0/24`, `10.1.2.0/24`, and `10.1.3.0/24`. The installation logic expands this single `/22` route by populating four duplicate pointers in the level-3 child array.
+
+### The DIR-24-8 architecture
+
+The extreme application of multi-bit strides is the DIR-24-8 scheme proposed by Gupta, Lin, and McKeown (INFOCOM 1998). DIR-24-8 optimizes for IPv4 traffic distributions where the vast majority of globally routed prefixes are `/24` or shorter.
+
+DIR-24-8 constructs a direct memory table indexed by the first 24 bits of the IPv4 address:
+- **First Level (Table 1):** Consists of $2^{24} = 16,777,216$ entries. Each entry represents a unique `/24` address space.
+- **Second Level (Table 2 / Extension Tables):** Stores secondary arrays for routes with prefix lengths greater than `/24` (e.g., `/25` through `/32`).
+
+If a lookup matches a prefix $\le /24$, Table 1 returns the next-hop result directly in a single memory access ($O(1)$ lookup). If the entry indicates an extension table exists, the Table 1 value acts as a pointer base address into Table 2, requiring exactly one additional memory access using the remaining 8 bits of the IPv4 address.
+
+| Architecture | First-Level Stride | Slot Count | Memory Requirement (4 bytes/slot) | Worst-Case Memory Touches |
+| :--- | :--- | :--- | :--- | :--- |
+| Unibit Trie | 1 bit | 2 slots | 8 Bytes | 32 |
+| Byte-Stride Trie | 8 bits | 256 slots | 1 KiB | 4 |
+| Half-Word Stride | 16 bits | 65,536 slots | 256 KiB | 2 |
+| **DIR-24-8** | **24 bits** | **16,777,216 slots** | **64 MiB (65,536 KiB)** | **2** |
+
+The trade-off of DIR-24-8 is rigid memory utilization. Allocating Table 1 requires 64 MiB of memory regardless of whether the table contains 10 routes or 1,000,000 routes. While easily manageable on modern server CPUs, such static memory footprints are challenging in hardware ASIC environments.
+
+To achieve high lookup performance with reduced memory footprints, modern software algorithms use advanced multi-bit trie compression schemes:
+- **Tree Bitmap (Eatherton, Varghese, Dittia, 2004):** Uses bit maps to represent dense multi-bit trie nodes, allowing variable-stride lookups with minimal pointer storage overhead.
+- **Poptrie (Asai, Ohara, SIGCOMM 2015):** Uses the CPU population-count instruction (`POPCNT`) on per-node bitmaps to find child offsets, keeping the structure compact enough to stay largely in CPU cache.
+
+### Hardware lookups: TCAM versus SRAM software tries
+
+Dedicated hardware routers bypass CPU-bound trie traversals by executing LPM in Ternary Content-Addressable Memory (TCAM). Standard memory (RAM) receives an address and returns data. TCAM receives data (an IP destination address) and returns the address of the matching entry in one search operation.
+
+In TCAM, every memory bit cell can hold one of three states: `0`, `1`, or `X` ("Don't Care").
+
+```text
+TCAM Search Key:  10.1.2.200 (00001010.00000001.00000010.11001000)
+
+Entry 0:  00001010.00000001.00000010.11001000  (10.1.2.200/32) -> Match Index 0
+Entry 1:  00001010.00000001.00000010.XXXXXXXX  (10.1.2.0/24)   -> Match Index 1
+Entry 2:  00001010.00000001.XXXXXXXX.XXXXXXXX  (10.1.0.0/16)   -> Match Index 2
+Entry 3:  00001010.XXXXXXXX.XXXXXXXX.XXXXXXXX  (10.0.0.0/8)    -> Match Index 3
+Entry 4:  XXXXXXXX.XXXXXXXX.XXXXXXXX.XXXXXXXX  (0.0.0.0/0)     -> Match Index 4
+```
+
+TCAM evaluates all physical memory rows simultaneously in parallel. If multiple rows match, a hardware priority encoder returns the matching entry located at the lowest physical memory index. Therefore, control plane software must maintain TCAM entries sorted strictly by prefix length (longest prefixes at the lowest numerical indexes).
+
+| Characteristic | Software LC-Trie (x86 / RAM) | Hardware TCAM (Router ASIC) |
+| :--- | :--- | :--- |
+| **Lookup Latency** | Variable (a few to tens of dependent memory reads, depending on cache hits) | Fixed (one search operation) |
+| **Power Consumption** | Modest; only the touched memory is read | High; every row is compared on every search |
+| **Density & Cost** | Cheap commodity DRAM, gigabytes available | Expensive per bit, small capacity |
+| **Update Overhead** | Fast pointer rewrites in memory | High (Requires moving TCAM entries to maintain sort order) |
+
+## The Linux IPv4 FIB architecture
+
+The Linux kernel manages IPv4 routing information in the Forwarding Information Base (FIB). The underlying data structure implemented in `net/ipv4/fib_trie.c` is a specialized variation of the Level-Compressed Trie (LC-trie), originally designed by Nilsson and Karlsson (1999).
+
+### Level Compression (LC-trie) principles
+
+An LC-trie combines path compression with dynamic level compression. Where path compression collapses single-child vertical chains, level compression collapses dense, fully populated binary subtrees horizontally into multi-bit nodes.
+
+If a binary subtree of height $h$ is dense (meaning a large fraction of its $2^h$ leaves are present), the kernel replaces that binary subtree with a single node carrying $2^h$ child pointers, expanding its stride branching factor dynamically.
+
+```text
+        Uncompressed Dense Subtree                     Level-Compressed Node
+                  Node                                  [ Node: 8 Pointers ]
+                 /    \                                 /  |  |  |  |  |  | \
+               Node   Node             ===>            000 ...           111
+              /   \   /   \
+             N     N N     N
+```
+
+The Linux kernel dynamically calculates node density using inflation and shrinkage thresholds during route insertion and deletion:
+- **Inflation:** If a node's child array density exceeds a predefined threshold, the kernel increases the node's branching stride (allocating a larger child array and doubling pointer slots).
+- **Shrinkage:** If route deletions render a multi-bit node sparse, the kernel decreases its branching stride, collapsing empty child pointers to conserve memory.
+
+### Merged tables: Main and Local
+
+Historically, the Linux kernel maintained two completely isolated FIB tries: the `local` table (table 255, containing local interface addresses, loopback routes, and broadcast destinations) and the `main` table (table 254, containing unicast static, DHCP, and dynamic routing protocol routes).
+
+In current kernels, while no custom policy routing rules (`ip rule`) exist, the `local` and `main` tables share one trie, and `fib_trie.c` contains `fib_trie_unmerge()` to split them again when rules are added. Sharing saves a second lookup. That is why `/proc/net/fib_trie` in the lab shows local host entries (such as `127.0.0.1/32 host LOCAL`) under `Main:` next to unicast routes, told apart by scope (`host`, `link`, `universe`) and type (`LOCAL`, `UNICAST`, `BROADCAST`).
+
+### Examining `/proc/net/fib_trie` and `/proc/net/fib_triestat`
+
+The kernel exports human-readable diagnostic views of its IPv4 routing trie structure via the proc filesystem.
+
+#### Structural formatting of `/proc/net/fib_trie`
+
+The `/proc/net/fib_trie` interface uses explicit indentation markers to denote tree topology:
+- **`+-- prefix/len bits full empty`**: an **internal node** (a `tnode` in the source).
+- **`|-- prefix`**: Denotes a **leaf node** storing actual route definitions.
+
+Consider an internal node entry output from `/proc/net/fib_trie`:
+```text
++-- 10.1.0.0/21 3 1 3
+```
+The line is printed by `fib_trie_seq_show()` in `net/ipv4/fib_trie.c` with the format `"+-- %pI4/%zu %u %u %u"` and the arguments `KEYLENGTH - pos - bits`, `bits`, `full_children` and `empty_children`:
+1. `10.1.0.0/21`: the node's key and how many leading bits are fixed above it (32 - pos - bits = 21).
+2. `3`: `bits`, the number of address bits this node indexes. It has $2^3 = 8$ child slots.
+3. `1`: `full_children`, children that are themselves fully populated internal nodes (the resize logic uses this count).
+4. `3`: `empty_children`, slots that are empty.
+
+Directly underneath internal nodes, leaf nodes list destination prefixes alongside execution metadata:
+```text
+|-- 10.1.2.0
+   /24 link UNICAST
+```
+This specifies a `/24` prefix matching `10.1.2.0`, scoped to `link` (directly attached interface), with a route type of `UNICAST`.
+
+#### Global metrics from `/proc/net/fib_triestat`
+
+The `/proc/net/fib_triestat` file summarizes global performance and structural metrics for each routing table:
+- **Aver depth:** The calculated average lookup depth across all installed leaf routes.
+- **Max depth:** The absolute maximum pointer hop count required to reach the deepest leaf.
+- **Leaves:** The total count of active leaf nodes storing prefixes.
+- **Prefixes:** The total count of individual network route entries (multiple prefixes can inhabit a single leaf).
+- **Internal nodes:** The total count of internal branching nodes, followed by a histogram mapping stride bit sizes to node counts (e.g., `10: 1` indicates one internal node branching on 10 bits, representing a $2^{10} = 1024$-way split).
+- **Pointers / Null ptrs:** Total pointer capacity allocated across internal node arrays, versus unallocated (`NULL`) slots.
+- **Total size:** The total memory consumed by the FIB trie structure in kilobytes.
+
+### Kernel special route types and error semantics
+
+The Linux kernel supports several special-purpose route types that bypass standard next-hop forwarding, altering packet processing directly within the network layer:
+
+1. **`unicast`:** Standard routing entry. Forward packet to specified gateway or interface.
+2. **`blackhole`:** Silently drop matching packets. No ICMP error message is generated.
+3. **`unreachable`:** Drop matching packets and generate an ICMP Destination Unreachable (Code 1 - Host Unreachable) message back to the sender.
+4. **`prohibit`:** Drop matching packets and generate an ICMP Destination Unreachable (Code 13 - Communication Administratively Prohibited) message.
+
+When userspace applications query route resolution using netlink or socket API system calls (e.g., `ip route get`), these special route types map directly to POSIX error codes (`errno`):
+
+| Route Type | ICMP Action Generated | POSIX `errno` Returned to Application |
+| :--- | :--- | :--- |
+| `blackhole` | None (Silent drop) | `EINVAL` (Invalid argument) |
+| `unreachable` | ICMP Host Unreachable (code 1) | `EHOSTUNREACH` (No route to host) |
+| `prohibit` | ICMP Communication Administratively Prohibited (code 13) | `EACCES` (Permission denied) |
+| *No Route Found* | ICMP Network Unreachable (code 0) | `ENETUNREACH` (Network is unreachable) |
+
+### IPv6 FIB differences (`net/ipv6/ip6_fib.c`)
+
+Unlike the IPv4 subsystem's LC-trie, the Linux IPv6 routing subsystem uses a different data structure implemented in `net/ipv6/ip6_fib.c`: an augmented **radix tree** (fib6 tree).
+
+The IPv6 fib6 tree structure incorporates source-specific routing support (SADR - Source Address Dependent Routing) directly into the tree architecture. Each node in the primary destination radix tree can spawn a secondary sub-tree rooted at that node, matching on the IPv6 packet source address. Because 128-bit key comparisons are significantly more expensive than 32-bit keys, the IPv6 tree relies heavily on prefix length node structures and direct pointer traversals without the dynamic level compression inflation routines used in IPv4 `fib_trie.c`.
+
+## The lab
+
+The lab demonstrates LPM principles across three implementations: a pure Python benchmark comparing linear search, unibit tries, and path-compressed PATRICIA tries; a direct-indexing stride memory calculator; and an isolated Linux kernel namespace environment inspecting `/proc/net/fib_trie` and `ip route get` execution paths.
+
+### Lab files
+
+Python prototype demonstrating linear scan, unibit trie, and PATRICIA trie structures alongside multi-bit stride memory consumption:
+```{.python filename="lpm.py"}
+#!/usr/bin/env python3
+"""Longest-prefix match three ways: linear scan, unibit trie, path-compressed
+trie. Counts memory touches per lookup so the trade-offs are visible."""
+import ipaddress, random, time
+
+class Node:
+    __slots__ = ("kids", "nh")
+    def __init__(self):
+        self.kids, self.nh = [None, None], None
+
+def bits(addr, n):
+    for i in range(n):
+        yield (addr >> (31 - i)) & 1
+
+class UnibitTrie:
+    def __init__(self):
+        self.root, self.nodes = Node(), 1
+    def insert(self, net, nh):
+        n = self.root
+        for b in bits(int(net.network_address), net.prefixlen):
+            if n.kids[b] is None:
+                n.kids[b] = Node(); self.nodes += 1
+            n = n.kids[b]
+        n.nh = nh
+    def lookup(self, a):
+        n, best, touches = self.root, self.root.nh, 1
+        for b in bits(a, 32):
+            n = n.kids[b]
+            if n is None:
+                break
+            touches += 1
+            if n.nh is not None:
+                best = n.nh
+        return best, touches
+
+class PNode:
+    __slots__ = ("key", "plen", "nh", "kids")
+    def __init__(self, key, plen, nh=None):
+        self.key, self.plen, self.nh, self.kids = key, plen, nh, [None, None]
+
+def mask(plen):
+    return (0xFFFFFFFF << (32 - plen)) & 0xFFFFFFFF if plen else 0
+
+def common(a, b, limit):
+    x = a ^ b
+    n = 0
+    while n < limit and not (x >> (31 - n)) & 1:
+        n += 1
+    return n
+
+class PatriciaTrie:
+    """Path-compressed binary trie: a node exists only where prefixes branch or end."""
+    def __init__(self):
+        self.root, self.nodes = None, 0
+    def insert(self, net, nh):
+        key, plen = int(net.network_address), net.prefixlen
+        new = PNode(key, plen, nh)
+        if self.root is None:
+            self.root, self.nodes = new, 1; return
+        parent, side, n = None, 0, self.root
+        while True:
+            c = common(key, n.key, min(plen, n.plen))
+            if c == n.plen == plen:              # same prefix: replace next hop
+                n.nh = nh; return
+            if c == n.plen:                      # n is an ancestor; descend
+                b = (key >> (31 - n.plen)) & 1
+                if n.kids[b] is None:
+                    n.kids[b] = new; self.nodes += 1; return
+                parent, side, n = n, b, n.kids[b]; continue
+            if c == plen:                        # new prefix is an ancestor of n
+                new.kids[(n.key >> (31 - plen)) & 1] = n
+                self._link(parent, side, new); self.nodes += 1; return
+            glue = PNode(key & mask(c), c)       # branch point with no route of its own
+            glue.kids[(key >> (31 - c)) & 1] = new
+            glue.kids[(n.key >> (31 - c)) & 1] = n
+            self._link(parent, side, glue); self.nodes += 2; return
+    def _link(self, parent, side, node):
+        if parent is None: self.root = node
+        else: parent.kids[side] = node
+    def lookup(self, a):
+        n, best, touches = self.root, None, 0
+        while n is not None:
+            touches += 1
+            if (a & mask(n.plen)) != n.key:
+                break                            # skipped bits did not match: stop
+            if n.nh is not None:
+                best = n.nh
+            if n.plen == 32:
+                break
+            n = n.kids[(a >> (31 - n.plen)) & 1]
+        return best, touches
+
+def linear(table, a):
+    best, bl = None, -1
+    for key, plen, nh in table:
+        if (a & mask(plen)) == key and plen > bl:
+            best, bl = nh, plen
+    return best, len(table)
+
+print("== 1. A tiny table, one address, three answers")
+routes = [("0.0.0.0/0", "isp"), ("10.0.0.0/8", "core"), ("10.1.0.0/16", "dc1"),
+          ("10.1.2.0/24", "rack7"), ("10.1.2.128/25", "rack7-b"), ("10.1.2.200/32", "anycast-vip")]
+u, p = UnibitTrie(), PatriciaTrie()
+table = []
+for r, nh in routes:
+    net = ipaddress.ip_network(r)
+    u.insert(net, nh); p.insert(net, nh)
+    table.append((int(net.network_address), net.prefixlen, nh))
+for q in ["10.1.2.200", "10.1.2.201", "10.1.2.5", "10.1.9.9", "10.200.0.1", "192.0.2.1"]:
+    a = int(ipaddress.ip_address(q))
+    (l, lt), (ub, ut), (pb, pt) = linear(table, a), u.lookup(a), p.lookup(a)
+    assert l == ub == pb
+    print(f"{q:<12} -> {l:<12} touches: linear={lt}  unibit={ut:2}  patricia={pt}")
+print(f"nodes: unibit={u.nodes}  patricia={p.nodes}  (routes={len(routes)})")
+
+print("\n== 2. 20 000 random routes, 20 000 random lookups")
+random.seed(2026)
+plens = [8]*2 + [16]*10 + [20]*10 + [22]*15 + [24]*55 + [32]*8   # rough shape of a real table
+u, p, table, seen = UnibitTrie(), PatriciaTrie(), [], set()
+while len(seen) < 20000:
+    pl = random.choice(plens)
+    net = ipaddress.ip_network((random.getrandbits(32) & mask(pl), pl))
+    if net in seen: continue
+    seen.add(net); nh = f"nh{len(seen) % 64}"
+    u.insert(net, nh); p.insert(net, nh); table.append((int(net.network_address), pl, nh))
+# bias lookups towards covered space, like real traffic
+probes = [(t[0] | random.getrandbits(32 - t[1])) if random.random() < 0.8 else random.getrandbits(32)
+          for t in random.choices(table, k=20000)]
+for name, fn in [("linear", lambda a: linear(table, a)), ("unibit", u.lookup), ("patricia", p.lookup)]:
+    sample = probes if name != "linear" else probes[:500]
+    t0 = time.perf_counter(); tot = mx = 0
+    for a in sample:
+        _, t = fn(a); tot += t; mx = max(mx, t)
+    us = (time.perf_counter() - t0) / len(sample) * 1e6
+    print(f"{name:9} avg touches={tot/len(sample):8.1f}  max={mx:5}  ~{us:7.2f} us/lookup (CPython)")
+mism = sum(1 for a in probes[:2000] if u.lookup(a)[0] != p.lookup(a)[0] or u.lookup(a)[0] != linear(table, a)[0])
+print(f"disagreements across 2000 probes: {mism}")
+print(f"nodes: unibit={u.nodes}  patricia={p.nodes}  (routes={len(table)})")
+
+print("\n== 3. Multibit strides: memory for direct-indexed first levels")
+for stride in (8, 16, 24):
+    slots = 2 ** stride
+    print(f"first-level stride {stride:2}: {slots:>10,} slots x 4 bytes = {slots*4/1024:10,.0f} KiB, "
+          f"then {32-stride} bits left for later levels")
+```
+Shell script executing inside a private network namespace to populate routes, query kernel LPM resolution, and read fib_trie metrics:
+```{.bash filename="kernel.sh"}
+#!/bin/sh
+# Runs inside a private network namespace: unshare -rn sh kernel.sh
+set -e
+ip link set lo up
+for r in 10.0.0.0/8 10.1.0.0/16 10.1.2.0/24 10.1.2.128/25 10.1.2.200/32; do
+  ip route add $r dev lo
+done
+ip route add blackhole 10.1.3.0/24
+ip route add unreachable 10.1.4.0/24
+ip route add prohibit 10.1.5.0/24
+echo "--- ip -4 route show table main"
+ip -4 route show table main
+echo "--- ip route get (the kernel's own longest-prefix match)"
+for a in 10.1.2.200 10.1.2.201 10.1.2.5 10.1.9.9 10.200.0.1; do
+  printf '%-12s ' $a; ip route get $a | head -1
+done
+for a in 10.1.3.1 10.1.4.1 10.1.5.1 192.0.2.1; do
+  printf '%-12s ' $a; ip route get $a 2>&1 | head -1
+done
+echo "--- /proc/net/fib_trie (Main table only)"
+sed -n '/^Main:/,/^Local:/p' /proc/net/fib_trie | sed '$d'
+echo "--- /proc/net/fib_triestat (Main table only)"
+sed -n '/^Main:/,/^Local:/p' /proc/net/fib_triestat | sed '$d'
+echo "--- add 1000 /24s under 172.16.0.0/12 and look again"
+python3 -c '
+for i in range(1000):
+    print(f"route add 172.{16 + i // 256}.{i % 256}.0/24 dev lo")' > /tmp/batch.$$
+ip -batch /tmp/batch.$$ && rm -f /tmp/batch.$$
+sed -n '/^Main:/,/^Local:/p' /proc/net/fib_triestat | sed '$d'
+```
+Master execution script orchestrating Python benchmarking and isolated kernel namespace execution:
+```{.bash filename="run.sh"}
+#!/bin/sh
+cd "$(dirname "$0")"
+python3 lpm.py
+echo
+echo "== 4. The Linux FIB in a private namespace (unshare -rn, no sudo)"
+unshare -rn sh kernel.sh
+```
+To execute the lab, run `sh run.sh`. The script executes `lpm.py` using standard CPython and invokes `kernel.sh` inside an isolated, unprivileged network namespace (`unshare -rn`). Root privileges (`sudo`) are not required.
+
+### Execution output
+
+```text
+== 1. A tiny table, one address, three answers
+10.1.2.200   -> anycast-vip  touches: linear=6  unibit=33  patricia=6
+10.1.2.201   -> rack7-b      touches: linear=6  unibit=32  patricia=6
+10.1.2.5     -> rack7        touches: linear=6  unibit=25  patricia=4
+10.1.9.9     -> dc1          touches: linear=6  unibit=21  patricia=4
+10.200.0.1   -> core         touches: linear=6  unibit= 9  patricia=2
+192.0.2.1    -> isp          touches: linear=6  unibit= 1  patricia=1
+nodes: unibit=33  patricia=6  (routes=6)
+
+== 2. 20 000 random routes, 20 000 random lookups
+linear    avg touches= 20000.0  max=20000  ~2543.64 us/lookup (CPython)
+unibit    avg touches=    22.3  max=   33  ~   2.52 us/lookup (CPython)
+patricia  avg touches=    15.4  max=   20  ~   3.09 us/lookup (CPython)
+disagreements across 2000 probes: 0
+nodes: unibit=196618  patricia=39070  (routes=20000)
+
+== 3. Multibit strides: memory for direct-indexed first levels
+first-level stride  8:        256 slots x 4 bytes =          1 KiB, then 24 bits left for later levels
+first-level stride 16:     65,536 slots x 4 bytes =        256 KiB, then 16 bits left for later levels
+first-level stride 24: 16,777,216 slots x 4 bytes =     65,536 KiB, then 8 bits left for later levels
+
+== 4. The Linux FIB in a private namespace (unshare -rn, no sudo)
+--- ip -4 route show table main
+10.0.0.0/8 dev lo scope link 
+10.1.0.0/16 dev lo scope link 
+10.1.2.0/24 dev lo scope link 
+10.1.2.128/25 dev lo scope link 
+10.1.2.200 dev lo scope link 
+blackhole 10.1.3.0/24 
+unreachable 10.1.4.0/24 
+prohibit 10.1.5.0/24 
+--- ip route get (the kernel's own longest-prefix match)
+10.1.2.200   10.1.2.200 dev lo uid 0 
+10.1.2.201   10.1.2.201 dev lo uid 0 
+10.1.2.5     10.1.2.5 dev lo uid 0 
+10.1.9.9     10.1.9.9 dev lo uid 0 
+10.200.0.1   10.200.0.1 dev lo uid 0 
+10.1.3.1     RTNETLINK answers: Invalid argument
+10.1.4.1     RTNETLINK answers: No route to host
+10.1.5.1     RTNETLINK answers: Permission denied
+192.0.2.1    RTNETLINK answers: Network is unreachable
+--- /proc/net/fib_trie (Main table only)
+Main:
+  +-- 0.0.0.0/1 2 0 2
+     +-- 10.0.0.0/15 2 0 2
+        |-- 10.0.0.0
+           /8 link UNICAST
+        +-- 10.1.0.0/21 3 1 3
+           |-- 10.1.0.0
+              /16 link UNICAST
+           +-- 10.1.2.0/24 2 0 1
+              |-- 10.1.2.0
+                 /24 link UNICAST
+              |-- 10.1.2.128
+                 /25 link UNICAST
+              |-- 10.1.2.200
+                 /32 link UNICAST
+           |-- 10.1.3.0
+              /24 universe BLACKHOLE
+           |-- 10.1.4.0
+              /24 universe UNREACHABLE
+           |-- 10.1.5.0
+              /24 universe PROHIBIT
+     +-- 127.0.0.0/8 2 0 2
+        +-- 127.0.0.0/31 1 0 0
+           |-- 127.0.0.0
+              /8 host LOCAL
+           |-- 127.0.0.1
+              /32 host LOCAL
+        |-- 127.255.255.255
+           /32 link BROADCAST
+--- /proc/net/fib_triestat (Main table only)
+Main:
+	Aver depth:     3.09
+	Max depth:      4
+	Leaves:         11
+	Prefixes:       11
+	Internal nodes: 6
+	  1: 1  2: 4  3: 1
+	Pointers: 26
+Null ptrs: 10
+Total size: 2  kB
+--- add 1000 /24s under 172.16.0.0/12 and look again
+Main:
+	Aver depth:     2.01
+	Max depth:      4
+	Leaves:         1011
+	Prefixes:       1011
+	Internal nodes: 7
+	  1: 1  2: 3  3: 2  10: 1
+	Pointers: 1054
+Null ptrs: 37
+Total size: 112  kB
+```
+## Reading the output
+
+### Section 1: A tiny table, one address, three answers
+
+The first benchmark constructs a miniature routing table containing six routes (`0.0.0.0/0`, `10.0.0.0/8`, `10.1.0.0/16`, `10.1.2.0/24`, `10.1.2.128/25`, and `10.1.2.200/32`). Six distinct IP addresses are resolved against all three implementation models to verify correctness and count memory touches (node accesses) per lookup.
+
+For target address `10.1.2.200`:
+- **Linear Scan:** Evaluates all 6 table entries sequentially (`touches: linear=6`).
+- **Unibit Trie:** Traverses bit-by-bit down to bit position 32, requiring 33 node visits (`unibit=33`).
+- **Patricia Trie:** Path compression skips redundant intermediate bit checks, reaching the target `/32` leaf in exactly 6 node visits (`patricia=6`).
+
+For target address `10.200.0.1`:
+- Unibit trie evaluates 9 bits down to `10.0.0.0/8`, requiring 9 node accesses (`unibit= 9`).
+- Patricia trie branches immediately at bit boundaries, requiring only 2 node accesses (`patricia=2`).
+
+For target address `192.0.2.1`:
+- Matches default route `0.0.0.0/0`. The first bit of 192 is 1 and neither trie has a child on that side, so both stop after the root (`unibit= 1`, `patricia=1`).
+
+**Node Count Summary:** Populating 6 routes allocates 33 total node objects in the unibit trie due to sparse single-child bit chains. The Patricia trie allocates exactly 6 nodes (`nodes: unibit=33 patricia=6`), matching the total route count because no intermediate prefix splits were required.
+
+### Section 2: 20,000 random routes, 20,000 random lookups
+
+Section 2 scales the routing table to 20,000 random prefixes distributed according to typical Internet routing table prefix length distributions (dominated by `/24` and `/22` prefixes).
+
+1. **Average Touches:**
+   - **Linear:** Scans all 20,000 table entries for every lookup (`avg touches= 20000.0`).
+   - **Unibit:** Averages 22.3 bit node traversals per lookup (`avg touches= 22.3`), bounded strictly by the maximum IPv4 depth of 33 (`max= 33`).
+   - **Patricia:** Path compression reduces average node traversals to 15.4 per lookup (`avg touches= 15.4`), with a maximum observed depth of 20 (`max= 20`).
+2. **Node Footprint:**
+   - Unibit trie allocates 196,618 node objects to represent 20,000 prefixes (`unibit=196618`).
+   - Patricia trie allocates 39,070 node objects (`patricia=39070`), roughly $2N$, representing a **80.1% reduction** in memory allocation objects.
+3. **CPython Timing Note:** Measured execution times per lookup (~2.52 $\mu$s for unibit vs ~3.09 $\mu$s for Patricia in CPython) reflect Python interpreter object instantiation overhead during string formatting and function call stack management rather than algorithmic complexity. Algorithmic efficiency is measured strictly by memory touches, where Patricia outperforms unibit by ~31%.
+
+### Section 3: Multibit strides: memory for direct-indexed first levels
+
+Section 3 evaluates the memory required for direct-indexed first-level multi-bit strides assuming 4-byte pointer address slots:
+- **Stride 8 (256 slots):** Allocates $256 \times 4 \text{ bytes} = 1 \text{ KiB}$ memory. Leaves 24 bits for subsequent tree levels.
+- **Stride 16 (65,536 slots):** Allocates $65,536 \times 4 \text{ bytes} = 256 \text{ KiB}$ memory. Leaves 16 bits for subsequent tree levels.
+- **Stride 24 (16,777,216 slots):** Allocates $16,777,216 \times 4 \text{ bytes} = 65,536 \text{ KiB}$ (**64 MiB**) memory. Resolves all routes up to `/24` in a single lookup step.
+
+### Section 4: The Linux FIB in a private namespace
+
+Section 4 inspects real Linux kernel FIB mechanics operating inside an isolated namespace containing 8 installed routes plus local loopback destinations.
+
+#### Kernel `ip route get` LPM resolution
+
+Queries to `ip route get` demonstrate kernel LPM matching and special route error handling:
+- `10.1.2.200` resolves to host route `10.1.2.200 dev lo`.
+- `10.1.2.201` falls back to subnet route `10.1.2.128/25`.
+- `10.1.2.5` falls back to subnet route `10.1.2.0/24`.
+- `10.1.9.9` falls back to `10.1.0.0/16`.
+- `10.200.0.1` falls back to `10.0.0.0/8`.
+
+For special route types, netlink queries return specific RTNETLINK error strings mapping to standard POSIX `errno` definitions:
+- `10.1.3.1` (blackhole route): Returns `RTNETLINK answers: Invalid argument` (`EINVAL`).
+- `10.1.4.1` (unreachable route): Returns `RTNETLINK answers: No route to host` (`EHOSTUNREACH`).
+- `10.1.5.1` (prohibit route): Returns `RTNETLINK answers: Permission denied` (`EACCES`).
+- `192.0.2.1` (unrouted address): Returns `RTNETLINK answers: Network is unreachable` (`ENETUNREACH`).
+
+#### Structural tree analysis (`/proc/net/fib_trie`)
+
+The `/proc/net/fib_trie` output reflects the merged IPv4 main and local table trie structure:
+- Root internal node `+-- 0.0.0.0/1 2 0 2`: the node's key is `0.0.0.0` with its first 1 bit fixed, it indexes the next 2 bits (4 child slots), 0 of its children are full nodes and 2 slots are empty.
+- `+-- 10.0.0.0/15 2 0 2` covers 10.0.0.0 to 10.1.255.255 and indexes 2 more bits; 2 of its 4 slots are empty.
+- `+-- 10.1.0.0/21 3 1 3` covers 10.1.0.0 to 10.1.7.255 and indexes 3 bits (8 slots, one per /24 from 10.1.0.0 to 10.1.7.0). Slot 0 holds the leaf for key 10.1.0.0 (`/16`), slot 2 holds the `10.1.2.0/24` internal node (1 full child), slots 3, 4 and 5 hold the blackhole, unreachable and prohibit leaves, and slots 1, 6 and 7 are empty (3 empty children).
+- Subtree branch `+-- 127.0.0.0/8 2 0 2` holds the loopback entries (`127.0.0.1 host LOCAL`). They sit in the same trie as the unicast routes because no custom `ip rule` exists in the namespace, so `local` and `main` share one trie.
+
+#### Dynamic trie expansion (`/proc/net/fib_triestat`)
+
+Before batch insertion, `fib_triestat` shows:
+- `Aver depth: 3.09`, `Max depth: 4`.
+- `Leaves: 11`, `Internal nodes: 6`.
+- `Total size: 2 kB`.
+
+After inserting 1,000 synthetic `/24` routes under `172.16.0.0/12`:
+- `Leaves` scales from 11 to 1011 (`Leaves: 1011`).
+- `Internal nodes` increases from 6 to 7 (`Internal nodes: 7`).
+- The internal node histogram shows `10: 1`, indicating that the kernel's level compression algorithm dynamically inflated a single internal node to branch across 10 bits ($2^{10} = 1024$ pointers) in a single stride.
+- `Aver depth` drops from 3.09 to 2.01 (`Aver depth: 2.01`) because 1,000 routes are evaluated under a single wide multi-bit node rather than deep binary subtrees.
+- Total FIB memory footprint increases from 2 kB to 112 kB (`Total size: 112 kB`).
+
+## In production
+
+Managing routing tables on production Linux systems and network hardware requires specific CLI utilities for monitoring FIB state, verifying LPM decisions, and diagnosing route limits.
+
+### Inspecting kernel route lookup execution
+
+To test exact kernel route resolution for a target IP address without injecting actual data plane traffic, use `ip route get`:
+
+```bash
+# (not run here)
+# Perform direct FIB LPM resolution for a target destination
+ip route get 192.0.2.45
+```
+
+To print the FIB entry (the prefix) that matched rather than the resolved route, use `fibmatch`:
+
+```bash
+# (not run here)
+# Display the precise FIB prefix entry that matched the target address
+ip route get fibmatch 192.0.2.45
+```
+
+### Monitoring route table cache statistics
+
+To watch the size and shape of the IPv4 FIB:
+
+```bash
+# (not run here)
+# Trie shape and size, then the number of IPv4 routes in all tables (the IPv4 route cache was removed in Linux 3.6)
+cat /proc/net/fib_triestat; ip -4 route show table all | wc -l
+```
+
+### Real-time route update monitoring
+
+To observe netlink FIB modifications (route additions, deletions, and updates) in real time as dynamic routing daemons (such as FRR or BIRD) push updates to the kernel:
+
+```bash
+# (not run here)
+# Monitor real-time netlink routing event streams
+ip monitor route
+```
+
+### Global routing table scale and ASIC limitations
+
+In production edge and transit environments:
+1. **Full IPv4 / IPv6 Table Size:** The IPv4 default-free zone carries around a million prefixes and the IPv6 table is several times smaller. Both grow every month; check the CIDR Report and potaroo.net for current counts instead of trusting a number in a book.
+2. **FIB Aggregation / Compression:** Software routing daemons can apply FIB aggregation algorithms (such as ORTC - Optimal Routing Table Compression) to merge contiguous adjacent prefixes with identical next hops before installing routes into kernel space, reducing memory footprint.
+3. **Hardware ASIC Limits:** Switch ASICs have a fixed amount of TCAM and algorithmic LPM memory, often carved between IPv4, IPv6, MAC and ACL entries by a profile. What happens when a table does not fit depends on the platform: route installs fail, or some prefixes are handled in software or dropped. Know the profile and the limit before you accept a full table.
+
+## Gotchas
+
+- **Order Independence in Trie Construction:** A unibit trie and a path-compressed trie are canonical: the same set of prefixes gives the same tree whatever the insertion order. Linux's LC-trie resizes nodes as routes come and go, so treat its exact shape as an implementation detail rather than a fixed function of the route set.
+- **CPython Microbenchmarks vs Memory Touches:** Microsecond lookup timings generated in high-level interpreted languages like Python reflect interpreter object allocation and dynamic type dispatch overhead. True algorithmic efficiency in trie engineering is governed strictly by hardware memory bus references (L1/L2/L3 cache misses and DRAM access cycles).
+- **Default Route (`0.0.0.0/0`) Traversal:** A default route matches every destination IP address ($L_i = 0$), but acts as a fallback. In trie structures, it resides at the root node. A lookup algorithm must preserve the root node's next hop as the default candidate match while descending deeper into matching branches.
+- **Memory Inflation during Stride Expansion:** Multi-bit tries improve lookup performance at the expense of memory footprint. Expanding a stride from 16 to 24 bits increases internal pointer array allocations from 65,536 slots to 16,777,216 slots per node, requiring 64 MiB per expanded node.
+- **Silent Packet Drops via Blackhole Routes:** A `blackhole` route drops matching traffic without any ICMP error. Use `ip route get` on the router to see it; `traceroute` from a host only shows timeouts (asterisks) from that hop onward.
+- **Merged Main/Local Tables:** While no custom `ip rule` exists, `local` and `main` share one trie, so `/proc/net/fib_trie` shows loopback (`127.0.0.1`) and local interface addresses under `Main:` beside unicast routes. Do not read that as a misconfiguration.
+- **IPv4 LC-Trie vs IPv6 Radix Tree Differences:** Linux uses completely different C implementations for IPv4 (`net/ipv4/fib_trie.c`) and IPv6 (`net/ipv6/ip6_fib.c`). Performance tuning parameters, `/proc` interfaces, and dynamic level compression routines applied to IPv4 do not transfer to IPv6 routing performance.
+- **Hardware TCAM Priority Sorting Requirements:** Hardware TCAM switches perform parallel matching across all memory rows simultaneously. To guarantee LPM compliance, control plane drivers must continuously resort physical TCAM memory rows whenever routes are added or withdrawn, placing significant load on switch CPUs during high route churn events (route flapping).
+
+## Exercises
+
+1. **Insert-Order Independence Proof:** Given a list of four prefixes (`10.0.0.0/8`, `10.1.0.0/16`, `10.1.2.0/24`, `10.1.2.128/25`), draw the path-compressed (PATRICIA) trie structure obtained by inserting them sequentially. Then, re-draw the trie inserting them in reverse order. Verify that both resulting trees share identical node topologies and branch parameters.
+2. **Path-Compressed Node Calculation:** Calculate the exact total number of nodes (internal branching nodes plus leaf nodes) allocated in a PATRICIA trie containing the following seven IPv4 prefixes: `0.0.0.0/0`, `10.0.0.0/8`, `10.1.0.0/16`, `10.2.0.0/16`, `10.1.1.0/24`, `10.1.2.0/24`, and `10.1.2.128/25`.
+3. **DIR-24-8 Memory Footprint Analysis:** A router uses a DIR-24-8 lookup structure. If the routing table contains 800,000 routes with prefix lengths $\le /24$, and 50,000 routes with prefix lengths between `/25` and `/32` (requiring 200 secondary Table 2 extension arrays of 256 slots each), calculate the exact memory required in megabytes (assume 4-byte pointer entries).
+4. **Deciphering `/proc/net/fib_trie`:** Given the `/proc/net/fib_trie` output line `+-- 172.16.0.0/12 4 2 10`, identify:
+   a) The node key and how many leading bits are fixed above it.
+   b) The node's `pos` (use `KEYLENGTH - pos - bits = 12`).
+   c) The number of bits it indexes (`bits`) and its child slot count.
+   d) How many slots are empty and how many children are full internal nodes.
+5. **IPv6 Multi-bit Stride Design:** Design a multi-bit fixed-stride trie architecture for IPv6 addresses (128 bits). Select an optimal sequence of four stride levels that resolves standard IPv6 global unicast allocations (`/32` RIR allocations, `/48` site prefixes, `/64` subnets, and `/128` host routes) with minimum pointer traversals while preventing excessive table memory expansion.
+6. **Error Code Mapping Analysis:** Trace the kernel execution path when an application transmits a UDP packet to destination IP `10.1.4.5`, given a routing table containing `unreachable 10.1.4.0/24`. Specify the exact POSIX error code returned by the `sendto()` system call and state whether an ICMP packet is transmitted over the network interface.
+
+## Verification
+
+This section documents the explicit execution state and source material validation for all content presented in this chapter:
+
+- **Executed Components:**
+  - Python prototype script `lpm.py` was executed directly under CPython 3.13.5. Output numbers for linear scan, unibit trie, PATRICIA trie, stride memory allocations, and route probes were recorded directly from execution.
+  - Shell script `kernel.sh` was executed inside an isolated, unprivileged Linux network namespace (`unshare -rn`) on Linux kernel 6.12. All `/proc/net/fib_trie`, `/proc/net/fib_triestat`, and `ip route get` outputs were captured from live kernel execution.
+- **Non-Executed Components:**
+  - Production CLI commands listed under "## In production" (`ip route get fibmatch`, `ip -4 route show table all`, `ip monitor route`) are marked `(not run here)`.
+- **System Environment:**
+  - Linux Kernel: `6.12.x` (x86_64 architecture).
+  - Python Environment: `CPython 3.13.5`.
+  - Namespace Execution: Unprivileged network namespace via `unshare -rn` (no root/sudo required).
+
+## Sources
+
+- **RFC 1812:** *Requirements for IP Version 4 Routers* (Section 5.2.4.3 - Longest Match Routing).  
+  URL: https://www.rfc-editor.org/rfc/rfc1812.html
+- **RFC 4632:** *Classless Inter-domain Routing (CIDR): The Internet Address Assignment and Aggregation Plan*.  
+  URL: https://www.rfc-editor.org/rfc/rfc4632.html
+- **Waldvogel et al. (SIGCOMM 1997):** *Scalable High Speed IP Routing Lookups* (Binary search on prefix lengths).  
+  URL: https://dl.acm.org/doi/10.1145/263105.263136
+- **Morrison, Donald R. (1968):** *PATRICIA—Practical Algorithm To Retrieve Information Coded in Alphanumeric*. Journal of the ACM, 15(4), 514-534.  
+  URL: https://dl.acm.org/doi/10.1145/321479.321481
+- **Gupta, Lin, and McKeown (INFOCOM 1998):** *Routing Lookups in Hardware at Memory Access Speeds* (DIR-24-8 architecture).  
+  URL: https://ieeexplore.ieee.org/document/658428
+- **Nilsson and Karlsson (1999):** *IP-address lookup using LC-tries*. IEEE Journal on Selected Areas in Communications, 17(6), 1083-1092.  
+  URL: https://ieeexplore.ieee.org/document/771042
+- **Eatherton, Varghese, and Dittia (2004):** *Tree Bitmap: Hardware/Software IP Lookups with Incremental Updates*.  
+  URL: https://ieeexplore.ieee.org/document/1360150
+- **Asai and Ohara (SIGCOMM 2015):** *Poptrie: A Compressed Trie with Population Count for Fast Packet Routing Lookups*.  
+  URL: https://dl.acm.org/doi/10.1145/2785956.2787498
+- **Linux Kernel Source Code:** IPv4 FIB Trie Implementation (`net/ipv4/fib_trie.c`).  
+  URL: https://docs.kernel.org/
+- **Linux Kernel Source Code:** IPv6 FIB Implementation (`net/ipv6/ip6_fib.c`).  
+  URL: https://docs.kernel.org/
+- **Linux IP-Route Man Pages:** `ip-route(8)` manual page.  
+  URL: https://man7.org/linux/man-pages/man8/ip-route.8.html
