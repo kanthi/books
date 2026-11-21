@@ -1,0 +1,578 @@
+---
+title: "LLDP: TLVs, Neighbour Tables and What Your Switch Tells the Wire"
+author:
+  - name: "K19G"
+  - name: "grok-bot"
+---
+
+# LLDP: TLVs, Neighbour Tables and What Your Switch Tells the Wire
+
+Link Layer Discovery Protocol (LLDP) is the baseline protocol for network visibility at Layer 2. Operating directly over Ethernet without requiring IP connectivity, routing protocols, or pre-configured security credentials, LLDP enables networked devices to announce their existence, identify their capabilities, and describe their local interfaces to directly connected peers. For network operators, systems administrators, and site reliability engineers, LLDP provides an authoritative ground truth about physical connectivity. When a cable is plugged into the wrong switch port, when a trunk VLAN is mismatched, or when an automated inventory collector needs to build an accurate network topology graph, LLDP is the mechanism that delivers that information across the wire.
+
+Unlike traditional keepalive or request-response protocols, LLDP is a one-way, periodic multicast advertisement. A device running LLDP transmits advertisements—known as LLDP Data Units (LLDPDUs)—at regular intervals out of its enabled interfaces. It does not wait for a handshake, expect acknowledgements, or maintain stateful sessions with its neighbours. Receiving interfaces simply capture these incoming frames, parse the structured data payload, and populate a local, soft-state database called the LLDP neighbour table (or Remote Systems MIB). If a neighbour stops transmitting, its entry in the database eventually expires and is purged.
+
+In modern data centre and enterprise architecture, LLDP forms the foundation of automated provisioning, zero-touch provisioning (ZTP), and continuous compliance monitoring. Orchestration tools query host and switch neighbour tables via SNMP, NETCONF, gNMI, or local Linux utilities like `lldpcli` to verify that physical cabling matches the intended network topology before pushing production configurations. Additionally, extended variants such as LLDP-MED (Media Endpoint Discovery) allow switches to dynamically push VLAN assignments, Quality of Service (QoS) markings, and power budgets to IP phones and access points the moment they are plugged in.
+
+Understanding LLDP at the wire level—down to EtherTypes, multicast destination MACs, and Type-Length-Value (TLV) bit structures—is critical when troubleshooting bridging behavior, hypervisor virtual switches, systemd networking daemons, and SmartNIC offloads. When frames mysteriously vanish between a physical switch port and a Linux host, the root cause is frequently found in LLDP multicast filtering rules, proprietary NIC firmware offload engines, or Linux bridge parameter masks.
+
+## Learning goals
+
+- Decode the Ethernet encapsulation of LLDP frames, including specific link-local multicast destination MAC addresses and EtherType `0x88CC`.
+- Parse the bitwise header structure of Type-Length-Value (TLV) elements, distinguishing mandatory TLVs from optional and organizationally specific extensions.
+- Analyze the Chassis ID and Port ID subtypes to understand how devices uniquely identify themselves across different network operating systems.
+- Explain the role of the Time To Live (TTL) TLV, including the transmission mechanism of immediate shutdown frames (TTL 0).
+- Evaluate organizationally specific TLVs, specifically IEEE 802.1 (Port VLAN ID), IEEE 802.3 (Max Frame Size), and ANSI/TIA-1057 (LLDP-MED Network Policy).
+- Configure and troubleshoot Linux LLDP implementations using `lldpd`, `systemd-networkd`, `networkctl`, and `ethtool` private flags.
+- Identify security risks associated with LLDP information disclosure and frame spoofing, and implement hardening techniques on untrusted ports.
+
+## Version note
+
+This chapter references IEEE 802.1AB-2016 (Station and Media Access Control Connectivity Discovery), which consolidates earlier standards (IEEE 802.1AB-2005 and IEEE 802.1AB-2009). The ANSI/TIA-1057 standard defines LLDP-MED extensions. Linux examples use `lldpd`/`lldpcli`, `systemd-networkd` and `ip-link`; option names were checked against the current lldpd usage page, systemd.network(5) and ip-link(8). The lab ran on Linux 6.12.
+
+## LLDP Frame Structure and Multicast Addressing
+
+LLDP frames are encapsulated directly inside standard Ethernet II frames using EtherType `0x88CC`. Because LLDP operates strictly at Layer 2, it does not rely on IP, UDP, or TCP headers. An LLDPDU is transmitted directly following the Ethernet header and consists of a sequence of variable-length TLV structures terminated by a mandatory End of LLDPDU TLV.
+
+```text
++-------------------+-------------------+-------------------+------------------------+
+| Destination MAC   | Source MAC        | EtherType         | LLDPDU                 |
+| (6 bytes)         | (6 bytes)         | 0x88CC (2 bytes)  | (Sequence of TLVs)     |
++-------------------+-------------------+-------------------+------------------------+
+```
+
+To ensure that LLDP advertisements reach directly connected network entities without flooding across an entire Layer 2 domain, IEEE 802.1AB defines three reserved link-local multicast MAC addresses. Standard IEEE 802.1D and 802.1Q compliant bridges are required to restrict these addresses according to their specific bridging scope.
+
+| Destination MAC Address | Bridge Scope Name | Forwarding Behavior by 802.1D/802.1Q Bridges |
+| :--- | :--- | :--- |
+| `01-80-C2-00-00-0E` | Nearest Bridge | Must **never** be forwarded by any MAC bridge or switch port. Stops at the very first active L2 hop. Default target for LLDP. |
+| `01-80-C2-00-00-03` | Nearest Non-TPMR Bridge | Relayed by Two-Port MAC Relays (TPMRs), but stopped by all standard MAC bridges and customer switches. |
+| `01-80-C2-00-00-00` | Nearest Customer Bridge | Relayed by Provider Bridges (802.1ad QinQ Provider Edge switches), stopping only at Customer Edge switches. |
+
+In almost all standard enterprise and data centre deployments, LLDP generates frames addressed to the Nearest Bridge MAC (`01-80-C2-00-00-0E`). When a physical switch port receives a frame with this destination address, its internal MAC forwarding engine traps the frame, delivers it to the local LLDP management process, and strictly drops it from being flooded out any other switch interface.
+
+## TLV Header Format and Processing
+
+An LLDPDU is a concatenation of TLV (Type-Length-Value) triplets. Every TLV begins with a 2-octet (16-bit) header, which packs two distinct fields: a 7-bit TLV Type and a 9-bit TLV Length.
+
+```text
+ 0                   1
+ 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|  TLV Type   |    TLV Length     |
+|  (bits 0-6) |   (bits 7-15)     |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|       Value (0 to 511 octets) ...
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+```
+
+The bit fields in the header are interpreted as follows:
+- **TLV Type (7 bits)**: Identifies the type of information contained in the Value field. Supports integer values from 0 to 127.
+- **TLV Length (9 bits)**: Specifies the length of the Value field in octets (bytes). The maximum possible value for a 9-bit field is 511 (`0x1FF`). The length excludes the 2-octet TLV header itself.
+
+To calculate the 16-bit integer representation of a TLV header programmatically, the 7-bit type is shifted left by 9 bits and bitwise-ORed with the 9-bit length: `header = (type << 9) | length`.
+
+### Mandatory TLV Order
+
+IEEE 802.1AB mandates that every valid LLDPDU must begin with exactly three specific TLVs in a precise order, and must end with a specific termination TLV:
+
+1. **Chassis ID TLV (Type 1)**: Uniquely identifies the transmitting chassis.
+2. **Port ID TLV (Type 2)**: Uniquely identifies the transmitting port/interface.
+3. **Time To Live TLV (Type 3)**: Specifies how long the receiving agent must retain the information.
+4. *[Optional Basic and Organizationally Specific TLVs]* (Types 4–8, 127).
+5. **End of LLDPDU TLV (Type 0)**: Signifies the end of the payload (Length = 0).
+
+If a received LLDPDU violates this structural sequence—for instance, if Port ID precedes Chassis ID, or if TTL is omitted—the receiving LLDP agent discards the frame as malformed.
+
+## Standard Basic TLVs
+
+The IEEE standard defines basic management TLVs (Types 0 through 8) that provide fundamental host and interface discovery parameters.
+
+| Type | Name | Purpose / Standard Value Structure |
+| :--- | :--- | :--- |
+| `0` | End of LLDPDU | Marks end of PDU. Always zero length (`0x0000`). |
+| `1` | Chassis ID | Octet 0: Subtype. Octets 1+: Component value (MAC, string, local index). |
+| `2` | Port ID | Octet 0: Subtype. Octets 1+: Interface identifier (Name, MAC, alias). |
+| `3` | Time To Live (TTL) | 2 octets (16-bit integer). Seconds the information remains valid. |
+| `4` | Port Description | ASCII string describing the interface (e.g., "uplink to rack 7"). |
+| `5` | System Name | ASCII string containing the configured system hostname (e.g., "leaf07.lab"). |
+| `6` | System Description | ASCII string with OS version, kernel release, or hardware build. |
+| `7` | System Capabilities | 4 octets: 2 octets Supported Capabilities bitmap, 2 octets Enabled Capabilities bitmap. |
+| `8` | Management Address | Length of address + Address Family + IP/IPv6 Address + Interface Subtype + Interface Number. |
+
+### Subtypes for Chassis ID and Port ID
+
+Because devices express interface and system naming differently (some use hardware MAC addresses, others use OS interface names like `Ethernet7` or `eth0`), TLVs 1 and 2 prepend a 1-byte **Subtype** field before the identification value.
+
+#### Chassis ID Subtypes (TLV Type 1)
+
+- `1`: Chassis component
+- `2`: Interface alias
+- `3`: Port component
+- `4`: MAC address (most common in switch and Linux environments)
+- `5`: Network address
+- `6`: Interface name
+- `7`: Locally assigned
+
+#### Port ID Subtypes (TLV Type 2)
+
+- `1`: Interface alias
+- `2`: Port component
+- `3`: MAC address
+- `4`: Network address
+- `5`: Interface name (e.g., "Ethernet7")
+- `6`: Agent circuit ID
+- `7`: Locally assigned
+
+### System Capabilities Bitmap
+
+System Capabilities (TLV Type 7) uses a 16-bit bitmap structure to denote system roles. The first 2 bytes list all capabilities the device hardware/software *supports*, while the second 2 bytes list capabilities currently *enabled*.
+
+```text
+Bit 0 : Other
+Bit 1 : Repeater
+Bit 2 : MAC Bridge (Switch)
+Bit 3 : WLAN Access Point
+Bit 4 : Router
+Bit 5 : Telephone
+Bit 6 : DOCSIS cable device
+Bit 7 : Station Only (End Host / Server)
+Bit 8 : C-VLAN Component
+Bit 9 : S-VLAN Component
+Bit 10: Two-Port MAC Relay (TPMR)
+Bits 11-15: Reserved
+```
+
+For instance, a Layer 3 switch acting purely as an IP router and L2 bridge will advertise supported bits for `Bridge` (bit 2) and `Router` (bit 4), while setting its enabled bitmap according to its running configuration.
+
+## Organizationally Specific TLVs (Type 127) and Extensions
+
+TLV Type 127 permits standards bodies, vendors, and industry consortia to define proprietary or technology-specific extensions without consuming global TLV type integers. The value field of an Organizationally Specific TLV always begins with a 3-octet Organizationally Unique Identifier (OUI), followed by a 1-octet vendor-defined subtype, followed by the custom payload.
+
+```text
++-------------------+-------------------+-------------------+------------------------+
+| Header (Type 127) | OUI (3 bytes)     | Subtype (1 byte)  | Custom Data            |
+| 2 bytes           | e.g. 00-80-C2     | e.g. 0x01         | (Variable length)      |
++-------------------+-------------------+-------------------+------------------------+
+```
+
+### Key Standard Organizationally Specific TLVs
+
+1. **IEEE 802.1 (OUI `00-80-C2`)**
+   - **Subtype 1 - Port VLAN ID (PVID)**: Advertises the native/untagged VLAN integer assigned to the egress port (encoded as a 16-bit big-endian integer). Used extensively to detect native VLAN mismatches across switch trunks.
+
+2. **IEEE 802.3 (OUI `00-12-0F`)**
+   - **Subtype 1 - MAC/PHY Configuration/Status**: Reports duplex, auto-negotiation status, and current link speed.
+   - **Subtype 2 - Power Via MDI**: Reports Power over Ethernet (PoE) allocated wattage, power pairs, and class.
+   - **Subtype 4 - Maximum Frame Size**: Advertises the largest frame the MAC/PHY supports, as a frame size rather than an IP MTU (e.g., `9216` on a jumbo-capable port). Compare both ends; a mismatch is a classic cause of large packets dying on a link.
+
+3. **ANSI/TIA-1057 LLDP-MED (OUI `00-12-BB`)**
+   - **Subtype 2 - Network Policy**: Used by switch ports to push automatic VLAN and QoS configurations to IP phones and video endpoints. The payload contains an Application Type (e.g., `1` for Voice), policy flags, a 12-bit VLAN ID, a 3-bit Layer 2 Priority Code Point (PCP), and a 6-bit DSCP value.
+
+```text
+LLDP-MED Network Policy Value Field (4 bytes):
+Byte 0: Application Type (1 = Voice, 2 = Voice Signaling, 3 = Guest Voice, etc.)
+Bytes 1-3: Bitfield containing:
+  - Unknown Flag (1 bit)
+  - Tagged Flag (1 bit: 0 = Untagged, 1 = Tagged)
+  - Reserved (1 bit)
+  - VLAN ID (12 bits)
+  - L2 Priority (3 bits, 0-7)
+  - DSCP (6 bits, 0-63)
+```
+
+## Timers, TTL, and Shutdown LLDPDUs
+
+LLDP operates on a periodic timer model governed by two primary parameters:
+- **Transmit Interval (`tx-interval`)**: The continuous delay between consecutive routine LLDP advertisements (typically 30 seconds).
+- **Hold Multiplier (`hold-multiplier`)**: A scaling factor applied to the transmit interval to determine the advertised Time To Live (typically 4).
+
+lldpd and most switches advertise a TTL of transmit interval x hold multiplier (lldpd: `tx-interval` 30 s and `tx-hold` 4 by default). With default parameters (30s interval, hold multiplier 4), the transmitted TTL is 120 seconds. Each receiving neighbour resets its internal holding timer for that entry to 120 seconds upon receiving the update. If no subsequent frame arrives before the timer decrements to zero, the neighbour entry is deleted from the switch table.
+
+### Shutdown Frame (TTL = 0)
+
+When LLDP transmission is disabled on a port or the agent shuts down cleanly, it sends a final "shutdown" LLDPDU.
+
+A shutdown LLDPDU contains only the three mandatory standard header TLVs (Chassis ID, Port ID, TTL) and the End TLV. Crucially, the **TTL value is explicitly set to 0**. Upon parsing a frame with TTL = 0, any receiving LLDP agent immediately flushes that specific neighbour entry from its database without waiting for the holding timer to expire.
+
+### Minimum Frame Padding Considerations
+
+The Ethernet IEEE 802.3 standard mandates a minimum frame size of 64 octets, which includes the 14-octet Ethernet header, the payload, and a 4-octet Frame Check Sequence (FCS). Therefore, the minimum payload sent over physical wires must be at least 46 bytes.
+
+A standard shutdown LLDPDU consists of:
+- Ethernet header: 14 bytes
+- Chassis ID (Subtype 4 MAC): 2-byte header + 1-byte subtype + 6-byte MAC = 9 bytes
+- Port ID (Subtype 5 string "Ethernet7"): 2-byte header + 1-byte subtype + 9-byte string = 12 bytes
+- TTL (0): 2-byte header + 2-byte value = 4 bytes
+- End of LLDPDU: 2 bytes
+- **Total Frame Size**: 14 + 9 + 12 + 4 + 2 = 41 bytes.
+
+On a physical NIC the 41-byte frame is padded with 19 zero octets to 60 bytes, and the 4-byte FCS brings it to the 64-byte minimum (the LLDPDU itself is 27 bytes, short of the 46-byte minimum payload). However, when captured inside virtual environments or on local loopback interfaces (`lo`), Ethernet hardware padding is bypassed, allowing tools like `tcpdump` or custom packet sockets to read the raw 41-byte frame directly.
+
+## Linux System Architecture and Tooling
+
+On Linux systems, LLDP interaction occurs either via userspace daemons (`lldpd`), system services (`systemd-networkd`), or hardware drivers.
+
+```text
++-----------------------------------------------------------------------+
+|                             Linux Kernel                              |
+|                                                                       |
+|   +---------------------+                   +---------------------+   |
+|   | Socket (AF_PACKET)  |                   |    Linux Bridge     |   |
+|   +----------+----------+                   +----------+----------+   |
+|              |                                         |              |
+|              | Intercepts 0x88CC                       | Filters      |
+|              v                                         v              |
+|   +---------------------+                   +---------------------+   |
+|   |  lldpd / systemd    |                   |   group_fwd_mask    |   |
+|   +---------------------+                   +---------------------+   |
++-----------------------------------------------------------------------+
+```
+
+### `lldpd` and `lldpcli`
+
+The standard third-party daemon for enterprise Linux hosts is `lldpd`. It binds an `AF_PACKET` raw socket to listen for incoming EtherType `0x88CC` frames while periodically generating outbound notifications.
+
+Common administrative tasks performed with `lldpcli`:
+
+```bash
+# View summary table of all learned LLDP neighbours (not run here)
+lldpcli show neighbors
+
+# Display complete TLV field breakdown for all interfaces (not run here)
+lldpcli show neighbors details
+
+# Reconfigure global transmit timer to 15 seconds (not run here)
+lldpcli configure lldp tx-interval 15
+```
+
+### `systemd-networkd` Built-in LLDP Engine
+
+Modern Linux installations utilizing `systemd-networkd` possess an integrated LLDP stack controlled per interface inside `.network` profiles.
+
+```ini
+[Match]
+Name=eth0
+
+[Network]
+# LLDP reception modes: "yes", "no", or "routers-only" (default: "routers-only")
+LLDP=yes
+
+# LLDP transmission targets: "no", "yes", "nearest-bridge", "non-tpmr-bridge", "customer-bridge"
+EmitLLDP=nearest-bridge
+```
+
+To view learned neighbours natively under systemd:
+
+```bash
+# Query systemd LLDP neighbour table (not run here)
+networkctl lldp
+```
+
+### Linux Bridge Multicast Forwarding Mask
+
+By default, the Linux kernel bridge implementation operates as an IEEE 802.1Q compliant switch. Consequently, it automatically drops reserved link-local frames addressed to `01-80-C2-00-00-0X`. If a virtual host or container running inside a Linux bridge attempts to send LLDP to an upstream physical switch, the host bridge drops the frame.
+
+To force a Linux bridge interface (`br0`) to forward link-local LLDP frames addressed to `01-80-C2-00-00-0E`, bit 14 (`0x4000`) of the bridge's `group_fwd_mask` sysfs attribute must be enabled via `ip-link`:
+
+```bash
+# Permit Linux bridge br0 to forward Nearest Bridge LLDP frames (not run here)
+ip link set dev br0 type bridge group_fwd_mask 0x4000
+```
+
+*Note*: bits 0, 1 and 2 (`01-80-C2-00-00-00` STP, `-01` MAC pause and `-02` slow protocols such as LACP) are restricted by the kernel and cannot be set through `group_fwd_mask`. Bit 3 is 802.1X (PAE).
+
+### SmartNIC and Intel i40e Firmware Offloads
+
+Some NICs run an LLDP agent in firmware. The kernel's i40e documentation (Intel 700-series adapters) says the adapter firmware implements LLDP and DCBX agents. While that agent runs, LLDP frames can be consumed by the adapter and never reach the host's LLDP daemon.
+
+If `lldpd` or `tcpdump` on such a host sees no LLDP at all on a live link, check the firmware agent. The driver exposes a private flag to disable it:
+
+```bash
+# Disable embedded firmware LLDP agent on Intel i40e interface eth0 (not run here)
+ethtool --set-priv-flags eth0 disable-fw-lldp on
+```
+
+## The lab
+
+The following Python script (`lldp.py`) demonstrates LLDP frame construction, bitwise header encoding, raw socket transmission over the Linux loopback interface (`lo`), frame capture, and full TLV decoding. It executes within a isolated Linux network namespace via `unshare -rn` to run without administrative permissions.
+
+### Lab files
+
+The custom LLDP builder and decoder script:
+```{.python filename="lldp.py"}
+#!/usr/bin/env python3
+"""Build, send, capture and decode an LLDPDU (IEEE 802.1AB) on loopback.
+Run inside `unshare -rn` so the AF_PACKET socket needs no real root."""
+import socket, struct, sys
+
+NEAREST_BRIDGE = bytes.fromhex("0180c200000e")
+ETH_LLDP = 0x88CC
+CAPS = ["Other", "Repeater", "Bridge", "WLAN-AP", "Router", "Telephone",
+        "DOCSIS", "Station", "C-VLAN", "S-VLAN", "TPMR"]
+
+def tlv(t, value: bytes) -> bytes:
+    assert t < 128 and len(value) < 512           # 7-bit type, 9-bit length
+    return struct.pack("!H", (t << 9) | len(value)) + value
+
+def org(oui: str, subtype: int, body: bytes) -> bytes:
+    return tlv(127, bytes.fromhex(oui) + bytes([subtype]) + body)
+
+def caps(names):
+    return sum(1 << CAPS.index(n) for n in names)
+
+def build(chassis_mac, port, ttl, sysname, voice_vlan=None):
+    pdu = tlv(1, b"\x04" + chassis_mac)                          # chassis ID, subtype 4 = MAC
+    pdu += tlv(2, b"\x05" + port.encode())                       # port ID, subtype 5 = ifname
+    pdu += tlv(3, struct.pack("!H", ttl))                        # TTL in seconds
+    if ttl:
+        pdu += tlv(4, b"uplink to rack 7")                        # port description
+        pdu += tlv(5, sysname.encode())                           # system name
+        pdu += tlv(7, struct.pack("!HH", caps(["Bridge", "Router"]), caps(["Bridge"])))
+        mgmt = socket.inet_aton("192.0.2.10")
+        pdu += tlv(8, bytes([1 + len(mgmt), 1]) + mgmt + b"\x02" + struct.pack("!I", 7) + b"\x00")
+        pdu += org("0080c2", 1, struct.pack("!H", 20))            # 802.1: port VLAN ID 20
+        pdu += org("00120f", 4, struct.pack("!H", 9216))          # 802.3: max frame size
+        if voice_vlan is not None:                                # TIA-1057 LLDP-MED network policy
+            app, tagged, prio, dscp = 1, 1, 5, 46                 # app 1 = voice
+            word = (tagged << 22) | (voice_vlan << 9) | (prio << 6) | dscp   # U=0, T, X=0, VLAN, L2 prio, DSCP
+            pdu += org("0012bb", 2, bytes([app]) + word.to_bytes(3, "big"))
+    return pdu + tlv(0, b"")                                     # End of LLDPDU
+
+def decode(pdu: bytes):
+    i, out = 0, []
+    while i + 2 <= len(pdu):
+        h = struct.unpack("!H", pdu[i:i+2])[0]; t, n = h >> 9, h & 0x1FF
+        v = pdu[i+2:i+2+n]; i += 2 + n
+        if t == 0:
+            out.append(("End", "")); break
+        if t == 1: out.append(("Chassis ID", f"subtype {v[0]} " + (v[1:].hex(":") if v[0] == 4 else v[1:].decode())))
+        elif t == 2: out.append(("Port ID", f"subtype {v[0]} {v[1:].decode()}"))
+        elif t == 3: out.append(("TTL", f"{struct.unpack('!H', v)[0]} s"))
+        elif t == 4: out.append(("Port Description", v.decode()))
+        elif t == 5: out.append(("System Name", v.decode()))
+        elif t == 7:
+            s, e = struct.unpack("!HH", v)
+            out.append(("Capabilities", f"supported={[c for b, c in enumerate(CAPS) if s >> b & 1]} enabled={[c for b, c in enumerate(CAPS) if e >> b & 1]}"))
+        elif t == 8:
+            alen = v[0]; af = v[1]; addr = v[2:1+alen]
+            ifsub = v[1+alen]; ifnum = struct.unpack("!I", v[2+alen:6+alen])[0]
+            out.append(("Mgmt Address", f"family {af} {socket.inet_ntoa(addr)} ifsubtype {ifsub} ifIndex {ifnum}"))
+        elif t == 127:
+            oui, sub, body = v[:3].hex("-"), v[3], v[4:]
+            if oui == "00-80-c2" and sub == 1: out.append(("802.1 Port VLAN ID", str(struct.unpack("!H", body)[0])))
+            elif oui == "00-12-0f" and sub == 4: out.append(("802.3 Max Frame Size", str(struct.unpack("!H", body)[0])))
+            elif oui == "00-12-bb" and sub == 2:
+                w = int.from_bytes(body[1:4], "big")
+                out.append(("MED Network Policy", f"app={body[0]} unknown={w >> 23 & 1} tagged={w >> 22 & 1} vlan={w >> 9 & 0xFFF} l2prio={w >> 6 & 7} dscp={w & 0x3F}"))
+            else: out.append((f"Org {oui}/{sub}", body.hex()))
+        else: out.append((f"TLV {t}", v.hex()))
+    return out
+
+def main():
+    mac = bytes.fromhex("02005e10ab01")                          # locally administered source MAC
+    s = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(ETH_LLDP))
+    s.bind(("lo", 0)); s.settimeout(0.5)
+    for label, pdu in [("normal advertisement", build(mac, "Ethernet7", 120, "leaf07.lab", voice_vlan=110)),
+                       ("shutdown (TTL 0)", build(mac, "Ethernet7", 0, "leaf07.lab"))]:
+        frame = NEAREST_BRIDGE + mac + struct.pack("!H", ETH_LLDP) + pdu
+        s.send(frame)
+        while True:
+            f, addr = s.recvfrom(2048)
+            if addr[2] != socket.PACKET_OUTGOING: break
+        print(f"== {label}: frame {len(f)} bytes, LLDPDU {len(f) - 14} bytes, captured on {addr[0]}")
+        print(f"   dst {f[0:6].hex(':')}  src {f[6:12].hex(':')}  ethertype 0x{struct.unpack('!H', f[12:14])[0]:04x}")
+        print("   first TLV bytes:", f[14:24].hex(" "))
+        for k, v in decode(f[14:]):
+            print(f"   {k:<22} {v}")
+        print()
+    print("== TLV header arithmetic")
+    for t, n in [(1, 7), (127, 6), (8, 12)]:
+        h = (t << 9) | n
+        print(f"   type {t:3} length {n:3} -> header 0x{h:04x} ({h >> 8:08b} {h & 0xFF:08b})")
+    print(f"   max value length = {0x1FF} bytes; typical TTL = 30 s tx interval x hold multiplier 4 = {30*4} s")
+
+if __name__ == "__main__":
+    main()
+```
+The shell wrapper script executing the test namespace:
+```{.bash filename="run.sh"}
+#!/bin/sh
+cd "$(dirname "$0")"
+unshare -rn sh -c "ip link set lo up && python3 lldp.py"
+```
+To execute the experiment, run `sh run.sh` in your terminal shell. The script configures the loopback interface, instantiates a raw socket bound to EtherType `0x88CC`, emits both a standard functional advertisement and a shutdown frame, and prints the parsed byte fields.
+
+### Execution output
+
+```text
+== normal advertisement: frame 117 bytes, LLDPDU 103 bytes, captured on lo
+   dst 01:80:c2:00:00:0e  src 02:00:5e:10:ab:01  ethertype 0x88cc
+   first TLV bytes: 02 07 04 02 00 5e 10 ab 01 04
+   Chassis ID             subtype 4 02:00:5e:10:ab:01
+   Port ID                subtype 5 Ethernet7
+   TTL                    120 s
+   Port Description       uplink to rack 7
+   System Name            leaf07.lab
+   Capabilities           supported=['Bridge', 'Router'] enabled=['Bridge']
+   Mgmt Address           family 1 192.0.2.10 ifsubtype 2 ifIndex 7
+   802.1 Port VLAN ID     20
+   802.3 Max Frame Size   9216
+   MED Network Policy     app=1 unknown=0 tagged=1 vlan=110 l2prio=5 dscp=46
+   End                    
+
+== shutdown (TTL 0): frame 41 bytes, LLDPDU 27 bytes, captured on lo
+   dst 01:80:c2:00:00:0e  src 02:00:5e:10:ab:01  ethertype 0x88cc
+   first TLV bytes: 02 07 04 02 00 5e 10 ab 01 04
+   Chassis ID             subtype 4 02:00:5e:10:ab:01
+   Port ID                subtype 5 Ethernet7
+   TTL                    0 s
+   End                    
+
+== TLV header arithmetic
+   type   1 length   7 -> header 0x0207 (00000010 00000111)
+   type 127 length   6 -> header 0xfe06 (11111110 00000110)
+   type   8 length  12 -> header 0x100c (00010000 00001100)
+   max value length = 511 bytes; typical TTL = 30 s tx interval x hold multiplier 4 = 120 s
+```
+## Reading the output
+
+### Normal Advertisement Parsing
+
+In the first test execution ("normal advertisement"), the python script emits a full-featured LLDPDU frame containing standard and extended TLVs.
+
+1. **Frame Demuxing**:
+   - Total captured frame length is 117 bytes. Subtracting the 14-byte Ethernet II header (`dst` + `src` + `ethertype`) leaves an exact LLDPDU payload size of 103 bytes.
+   - Ethernet destination MAC `01:80:c2:00:00:0e` confirms this frame targets the standard IEEE Nearest Bridge agent.
+   - Source MAC is locally administered (`02:00:5e:10:ab:01`).
+   - EtherType `0x88cc` routes the payload directly to the raw LLDP socket decoder.
+
+2. **First TLV Header Byte Decomposition**:
+   - The hex dump of the first 10 bytes of the payload reads: `02 07 04 02 00 5e 10 ab 01 04`.
+   - The first two bytes (`02 07`) constitute the 16-bit header structure for Chassis ID. Binary expansion yields `0000 0010 0000 0111`.
+   - Right-shifting by 9 bits gives integer `1` (Chassis ID).
+   - Bitwise AND with `0x01FF` yields integer `7` (Value length = 7 bytes).
+   - Byte 2 (value index 0) is `04`, indicating Chassis Subtype 4 (MAC Address).
+   - Bytes 3 through 8 (`02 00 5e 10 ab 01`) supply the 6-byte hardware MAC address.
+
+3. **Decoded TLV Stack Analysis**:
+   - `Chassis ID`: Decoded correctly as MAC address `02:00:5e:10:ab:01`.
+   - `Port ID`: Header indicates Subtype 5 (Interface Name), string value `Ethernet7`.
+   - `TTL`: Decoded 16-bit integer value `120 s` (30s interval x 4 multiplier).
+   - `Port Description`: String payload `uplink to rack 7`.
+   - `System Name`: String payload `leaf07.lab`.
+   - `Capabilities`: Evaluates supported bitmap (`0x0014` = Bridge + Router) and enabled bitmap (`0x0004` = Bridge).
+   - `Mgmt Address`: Length 5 (1 byte family + 4 bytes IPv4), address family 1 (IPv4 `192.0.2.10`), interface numbering subtype 2 (ifIndex), index 7.
+   - `802.1 Port VLAN ID`: IEEE OUI `00-80-c2`, Subtype 1. Decodes big-endian integer `20` (Native VLAN 20).
+   - `802.3 Max Frame Size`: IEEE OUI `00-12-0f`, Subtype 4. Decodes big-endian integer `9216` (a jumbo-capable port; this is a frame size, not an IP MTU).
+   - `MED Network Policy`: TIA OUI `00-12-bb`, Subtype 2. App 1 (Voice), Tagged=1, VLAN=110, L2 Priority=5, DSCP=46 (Expedited Forwarding).
+   - `End`: TLV Type 0, length 0. Terminates parser loop cleanly.
+
+### Shutdown Frame (TTL = 0) Analysis
+
+The second test builds the shutdown LLDPDU an agent sends when it stops transmitting on a port.
+
+1. **Size Differences**:
+   - The normal advertisement frame was 117 bytes (103-byte LLDPDU).
+   - The shutdown frame drops all optional descriptors, yielding a total length of 41 bytes (27-byte LLDPDU).
+   - Payload byte count calculation: Chassis ID (9 bytes) + Port ID (12 bytes) + TTL (4 bytes) + End TLV (2 bytes) = 27 bytes. Adding 14 bytes for the Ethernet header equals exactly 41 bytes.
+   - *Note on loopback versus physical wire*: On physical hardware, this 41-byte frame would be padded with 19 zero bytes to 60 bytes, and the 4-byte FCS makes 64 (the 27-byte LLDPDU is below the 46-byte minimum payload). Over the Linux loopback adapter (`lo`), no hardware padding occurs.
+
+2. **Operational Effect**:
+   - The TTL TLV decodes explicitly to `0 s`.
+   - Receiving bridges processing this frame immediately delete the neighbour keyed by chassis ID `02:00:5e:10:ab:01` and port ID `Ethernet7`. The shutdown frame carries no System Name; the receiver matches on the two IDs.
+
+### Header Arithmetic Verification
+
+The final section of the output verifies the mathematical bit-packing formula used to construct the 2-byte TLV headers:
+
+- **Type 1, Length 7** (Chassis ID):
+  - `(1 << 9) | 7` = `0x0200 | 0x0007` = `0x0207` (`00000010 00000111`).
+- **Type 127, Length 6** (Org-Specific VLAN ID):
+  - `(127 << 9) | 6` = `0xFE00 | 0x0006` = `0xfe06` (`11111110 00000110`).
+- **Type 8, Length 12** (Management Address):
+  - `(8 << 9) | 12` = `0x1000 | 0x000C` = `0x100c` (`00010000 00001100`).
+
+## In production
+
+In enterprise deployments, LLDP configuration and operational validation are managed through switch operating systems and Linux server daemons.
+
+### Cisco IOS-XE Switch Configuration
+
+```text
+! Cisco IOS-XE (not run here)
+lldp run
+lldp timer 30
+lldp holdtime 120
+! untrusted access port: stop advertising, keep listening if you want inventory
+interface GigabitEthernet1/0/10
+ no lldp transmit
+```
+
+### Arista EOS Topology Query
+
+```text
+# View LLDP neighbour table summary (not run here)
+show lldp neighbors
+
+# View detailed TLVs learned on a specific interface (not run here)
+show lldp neighbors Ethernet1 detail
+```
+
+### Linux Host Daemon Configuration (`/etc/lldpd.conf`)
+
+To prevent servers from disclosing kernel versions or hardware descriptors to access networks, `lldpd` can be configured to advertise minimal information:
+
+```text
+# /etc/lldpd.conf - minimal advertisement (not run here)
+configure system description "Linux host"
+configure system hostname "host01"
+# listen on the access-facing NIC but never transmit there
+configure ports eth1 lldp status rx-only
+```
+
+## Gotchas
+
+- **Intel i40e Firmware Interference**: The firmware LLDP agent on Intel 700-series adapters can consume LLDP frames before the host sees them. When an Intel 700-series host sees no LLDP, check `ethtool --show-priv-flags IFACE` and consider `disable-fw-lldp`.
+- **Linux Bridge Silently Dropping LLDP**: Linux bridges do not forward link-local multicast MACs such as `01-80-C2-00-00-0E` by default. Set bit 14 (`0x4000`) in `/sys/class/net/br0/bridge/group_fwd_mask` (or with `ip link`) to allow virtual machines or containers to speak LLDP to physical switches.
+- **LACP and Bonding Mismatches**: On Linux bonded interfaces, running LLDP on individual slave interfaces versus the master `bond0` interface can confuse switch neighbour tables. Always verify whether the switch expects LLDP per physical member or per logical Link Aggregation Group (LAG).
+- **LLDP-MED Voice VLAN Hopping Vector**: Malicious devices can parse incoming LLDP-MED Network Policy TLVs to discover untagged voice VLAN IDs, statically tag their own traffic to that VLAN, and gain unauthorized access to isolated VoIP subnets.
+- **VLAN Mismatches via PVID TLV**: When connecting switch trunks, mismatched native/untagged VLAN IDs cause traffic leakage. Inspect IEEE 802.1 Org-Specific TLV (Subtype 1) in `lldpcli show neighbors details` to catch native VLAN discrepancies.
+- **Missing Management IP in Automation**: Orchestration scripts relying on LLDP to discover device management addresses will fail if switches omit TLV Type 8. Ensure management address advertising is explicitly enabled in switch global configurations.
+- **One LLDPDU, one frame**: each TLV value is at most 511 octets and the whole LLDPDU must fit in a single Ethernet frame. A device with many optional TLVs (long descriptions, many VLAN names) has to leave some out, so do not assume every TLV you configured reached the neighbour.
+- **Loopback and Virtual Interfaces Non-Padding**: Raw packet sockets sniffing LLDP on loopback or veth pairs capture frames smaller than 64 bytes (such as 41-byte shutdown frames) because hardware Ethernet padding is bypassed in software.
+
+## Exercises
+
+1. **Manual Header Calculation**: Calculate the 2-octet hex header for a System Name TLV (Type 5) containing the string `spine01.datacenter.internal` (26 bytes). Verify your arithmetic using Python bit-shift operations.
+2. **Wireshark / Tcpdump Filter Construction**: Write an exact `tcpdump` filter expression to capture only LLDP shutdown frames (TTL = 0) targeting the Nearest Bridge MAC address without capturing normal periodic advertisements.
+3. **Bridge Mask Bitmask Analysis**: Derive the binary bitmask for `group_fwd_mask` required to simultaneously allow forwarding of IEEE 802.1X (`01-80-C2-00-00-03`) and LLDP (`01-80-C2-00-00-0E`) through a Linux bridge.
+4. **Python Parser Extension**: Modify the `decode()` function in the lab script to parse IEEE 802.3 Subtype 1 (MAC/PHY Configuration/Status) TLVs and extract duplex and auto-negotiation flags.
+5. **Systemd-networkd Lab Setup**: Construct a complete `/etc/systemd/network/10-eth1.network` configuration file that enables LLDP reception, emits customer-bridge LLDP advertisements, and overrides the default system hostname disclosure.
+
+## Verification
+
+The concepts, frame formats, bit arithmetic, and code executions in this chapter were verified in a controlled Linux execution environment:
+
+- **OS / Kernel**: Linux 6.12 x86_64
+- **Python Runtime**: Python 3.13.5
+- **Execution Context**: Unprivileged network namespace isolated via `unshare -rn`
+- **Commands Executed Live in Lab**: Python raw socket assembly, payload generation, loopback frame transmission, raw byte sniffing, and bitwise decoding (`lldp.py`).
+- **Commands Marked Not Run**: All production switch CLI snippets (`lldp run`, `show lldp neighbors`), system daemon modifications (`lldpcli`, `systemd-networkd` `.network` edits), and driver modifications (`ethtool --set-priv-flags`).
+
+## Sources
+
+- IEEE 802.1AB-2016 Standard: *Station and Media Access Control Connectivity Discovery*  
+  https://standards.ieee.org/ieee/802.1AB/6103/
+- ANSI/TIA-1057: *Telecommunications Infrastructure Standard for IP Telephony Convergence - Link Layer Discovery Protocol-Media Endpoint Discovery*  
+- lldpd usage (lldpcli `tx-interval`, `tx-hold`, `lldp status`, `system description`)  
+  https://lldpd.github.io/usage.html
+- systemd.network(5): `LLDP=` and `EmitLLDP=`  
+  https://www.freedesktop.org/software/systemd/man/latest/systemd.network.html
+- Linux kernel i40e driver documentation (firmware LLDP agent, `disable-fw-lldp`)  
+  https://docs.kernel.org/networking/device_drivers/ethernet/intel/i40e.html
+- Linux Kernel Documentation: *Linux Ethernet Bridging Documentation*  
+  https://docs.kernel.org/networking/bridge.html
+- Linux Manual Pages: `ip-link(8)` — *configure network devices*  
+  https://man7.org/linux/man-pages/man8/ip-link.8.html
+- Linux Manual Pages: `ethtool(8)` — *query or control network driver and hardware settings*  
+  https://man7.org/linux/man-pages/man8/ethtool.8.html
