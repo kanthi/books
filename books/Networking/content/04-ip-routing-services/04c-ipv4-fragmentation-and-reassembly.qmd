@@ -1,0 +1,534 @@
+---
+title: "IPv4 Fragmentation and Reassembly: Offsets, IDs, Overlaps and Timeouts"
+author:
+  - name: "K19G"
+  - name: "grok-bot"
+---
+
+# IPv4 Fragmentation and Reassembly: Offsets, IDs, Overlaps and Timeouts
+
+IP fragmentation allows a network layer protocol to transmit datagrams larger than the Maximum Transmission Unit (MTU) of an intermediate link. While originally designed to provide transparent end-to-end transport across heterogeneous physical networks, fragmentation in modern IPv4 networks introduces significant operational risks, resource degradation, and security vulnerabilities. Network operators must understand the precise semantics of IP headers, kernel reassembly mechanisms, and middlebox behaviors to diagnose silent packet drops, performance bottlenecks, and security filtering anomalies.
+
+When an IPv4 datagram exceeds the egress link MTU, an intermediate router or the sending host splits the payload into smaller fragments. Each fragment becomes an independent IP packet carrying a slice of the original payload alongside a replica of the original IP header, modified to reflect the fragment's offset and flags. The receiving endpoint must buffer these fragments, track missing segments, and reconstruct the original datagram before delivering it to upper-layer protocols like UDP or ICMP.
+
+Because stateless middleboxes, load balancers, and firewalls often depend on Layer 4 headers (such as TCP/UDP ports) to make forwarding and security decisions, non-first fragments—which lack Layer 4 headers—present severe operational challenges. Furthermore, stateful reassembly at line rate subjects network devices and endpoints to memory exhaustion, reassembly timeout overhead, and packet injection attacks.
+
+## Learning goals
+
+- Decode the IPv4 header fields governing fragmentation: Identification, Flags (DF, MF), and Fragment Offset.
+- Calculate exact fragment boundaries, byte offsets, and alignment restrictions across varying MTU sizes.
+- Trace the RFC 815 hole-descriptor reassembly algorithm and observe out-of-order slice management.
+- Analyze the mechanics and security implications of packet overlapping, field wraparound, and stale fragment misassociation under high throughput.
+- Inspect Linux kernel sysctls and MIB SNMP counters governing IPv4 reassembly buffers and garbage collection.
+- Evaluate the impact of IP fragmentation on stateful firewalls, ECMP hashing, and NAT middleboxes.
+
+## Version note
+
+The kernel behaviour, sysctls and counters in this chapter were observed on Linux 6.12 and checked against `net/ipv4/ip_fragment.c`, `net/ipv4/inet_fragment.c` and `Documentation/networking/ip-sysctl.rst`. Since Linux 4.17 the documentation marks `ipfrag_low_thresh` obsolete: the sysctl still exists, but only `ipfrag_high_thresh` limits reassembly memory. `IP_MTU_DISCOVER` is a Linux socket option described in ip(7). IPv6 fragmentation differs and is summarised in one short section.
+
+## Concept: IPv4 header fields for fragmentation
+
+IPv4 header fragmentation relies on three fields within the standard 20-byte base header: Identification (16 bits), Flags (3 bits), and Fragment Offset (13 bits).
+
+```text
+ 0                   1                   2                   3
+ 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|Version|  IHL  |Type of Service|          Total Length         |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|         Identification        |Flags|      Fragment Offset    |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|  Time to Live |    Protocol   |        Header Checksum        |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+```
+
+| Field Name | Bit Width | Function / Semantics |
+| :--- | :--- | :--- |
+| **Identification** | 16 bits | Unique sequence value assigned by sender to group fragments of the same original datagram. |
+| **Flags: Reserved** | 1 bit | Must be zero. |
+| **Flags: DF** | 1 bit | Don't Fragment. If set to 1, routers must not fragment the packet. |
+| **Flags: MF** | 1 bit | More Fragments. Set to 1 on all fragments except the final fragment (MF=0). |
+| **Fragment Offset** | 13 bits | Position of fragment payload relative to original payload, measured in 8-octet (64-bit) units. |
+
+The 13-bit Fragment Offset field limits fragment positioning to multiples of 8 bytes ($2^3 = 8$). Consequently, every non-final fragment must contain a payload length that is an integer multiple of 8 octets.
+
+### Fragment slicing and calculation
+
+When a host or router fragments an IP packet of total length $L$ and header length $IHL$ over an egress link with maximum transmission unit $MTU$, the maximum allowable IP payload per fragment $P_{max}$ is:
+
+$$P_{max} = \left\lfloor \frac{MTU - IHL}{8} \right\rfloor \times 8$$
+
+Each non-final fragment carries $P_{max}$ bytes of payload, sets $MF=1$, and updates its Total Length to $IHL + P_{max}$. The final fragment carries the remaining bytes $P_{last} \le P_{max}$, sets $MF=0$, and has a Total Length of $IHL + P_{last}$.
+
+RFC 791 establishes two architectural limits:
+1. Every IPv4 network module must be able to forward a datagram of 68 octets without further fragmentation (allowing a 60-byte maximum IPv4 header plus 8 payload bytes).
+2. Every destination host must be capable of reassembling datagrams up to at least 576 octets in length.
+
+When a router receives a packet exceeding the outgoing link's MTU with $DF=1$, it drops the packet and generates an ICMP Destination Unreachable message (Type 3, Code 4: "fragmentation needed and DF set") as specified in RFC 1191.
+
+### RFC 6864 updates to ID semantics
+
+Historically, RFC 791 required unique Identification values for every datagram sent by a source host to a destination host for a given Protocol field. Under high data rates, a 16-bit field (65,536 unique values) wraps rapidly, causing misassociation of stale fragments.
+
+RFC 6864 updated these rules:
+- **Atomic datagrams**: Defined as packets where $DF=1$ and $MF=0$ with Fragment Offset $= 0$. These packets are not fragmentable. Senders may reuse or set static Identification values (such as zero) for atomic datagrams, as receivers ignore the ID field when $DF=1$ and $MF=0$.
+- **Non-atomic datagrams**: Packets where $DF=0$ (or $MF=1$ / Offset $> 0$). The Identification field must remain unique for any active tuple of `(Source IP, Destination IP, Protocol, Identification)` within the Maximum Datagram Lifetime (MDL).
+
+## Concept: RFC 815 hole-descriptor reassembly
+
+RFC 815 specifies an efficient algorithm for datagram reassembly using a linked list of hole descriptors. Instead of maintaining complex bitmasks for every received byte, the reassembly buffer begins with a single hole covering the entire potential address space from byte 0 to infinity: `(0, inf)`.
+
+When a fragment arrives with starting offset $First$ and ending byte position $Last = First + Length - 1$:
+
+1. The receiver scans its hole list for any hole `(Hole_First, Hole_Last)` that overlaps with `[First, Last]`.
+2. The intersecting hole is deleted from the list.
+3. If $First > Hole\_First$, a new hole is created: `(Hole_First, First - 1)`.
+4. If $Last < Hole\_Last$ and $MF = 1$, a new hole is created: `(Last + 1, Hole_Last)`.
+
+```text
+Initial state:  [-------------------- Hole: 0 to INF --------------------]
+
+Frag 1 arrives: [First: 0, Last: 1479, MF=1]
+Updated state:  [Data: 0..1479] | [--------- Hole: 1480 to INF ---------]
+
+Frag 3 arrives: [First: 2960, Last: 4007, MF=0]
+Updated state:  [Data: 0..1479] | [--- Hole: 1480 to 2959 ---] | [Data: 2960..4007]
+
+Frag 2 arrives: [First: 1480, Last: 2959, MF=1]
+Updated state:  [Data: 0..1479] | [Data: 1480..2959] | [Data: 2960..4007]
+Hole list:      EMPTY -> Datagram Complete!
+```
+
+Reassembly completes when the hole descriptor list contains zero entries.
+
+## Concept: High-throughput ID wraparound (RFC 4963)
+
+At gigabit rates, the 16-bit Identification field wraps in milliseconds. If a single fragment in a train is delayed or lost, a newly transmitted datagram with a wrapped ID value can mix with stale buffered fragments.
+
+```text
+Time t=0ms:    Sender sends Datagram ID=0x1234 (Frag 1 lost, Frag 2 buffered)
+Time t=10ms:   ID counter wraps after 65,536 datagrams
+Time t=10ms:   Sender sends NEW Datagram ID=0x1234 (Frag 1 arrives)
+Receiver:      Combines Frag 1 (New) + Frag 2 (Stale) -> Data Corruption!
+```
+
+RFC 4963 points out that the 16-bit UDP checksum catches only part of these misassembled datagrams, so at high rates corrupted data can reach the application. TCP is less exposed in practice because it normally sets DF and avoids fragmentation altogether.
+
+## Concept: Overlapping fragments and security attacks
+
+Overlapping fragments occur when two fragments within the same datagram claim overlapping byte ranges. Historically, OS implementations handled overlaps inconsistently (e.g., first-copy wins vs. last-copy wins), creating opportunities for security evasion and denial-of-service attacks:
+
+- **Tiny Fragment Attacks (RFC 1858 section 3.1)**: The first fragment is made so small that the TCP flags (or even the ports) land in the second fragment. A filter that inspects only the first fragment, for example to drop inbound SYNs, never sees the flags.
+- **Overlapping Fragment Attacks (RFC 1858 section 3.2, RFC 3128)**: A later fragment overlaps the first and rewrites header bytes the filter already approved. RFC 1858 recommends dropping any fragment with offset 1 (8 bytes) for TCP; RFC 3128 describes a variant that defeats a filter applying only that rule. Teardrop was a historical denial-of-service that sent overlapping offsets to crash buggy reassembly code.
+
+Modern Linux kernels reject overlapping IPv4 fragments immediately. Upon detecting an overlap, the kernel drops the packet, discards the entire reassembly queue for that datagram, and increments the MIB counter `IpExtReasmOverlaps` and `IpReasmFails`. RFC 5722 explicitly forbids overlapping fragments in IPv6; modern Linux enforces equivalent strict rejection for IPv4.
+
+## Concept: Middleboxes and stateful tracking
+
+Middleboxes present major obstacles for fragmented traffic:
+
+- **Stateful Firewalls & Connection Tracking (conntrack)**: Non-first fragments lack Layer 4 source/destination ports. Stateful firewalls must either perform full IP defragmentation before evaluation or drop non-first fragments.
+- **ECMP Hashing**: Equal-Cost Multi-Path routers hash tuples `(Src IP, Dst IP, Protocol, Src Port, Dst Port)` to distribute traffic. Non-first fragments lack L4 port information, causing routers to hash them to a different path than the first fragment, leading to out-of-order delivery or loss.
+- **DNS over UDP**: DNS responses larger than 512 bytes need EDNS(0), and large EDNS buffer sizes make UDP responses fragment; fragments are often dropped on the path. DNS Flag Day 2020 recommended a default EDNS buffer size of 1232 bytes, chosen so that a response fits in the IPv6 minimum MTU of 1280 bytes (1232 + 8 UDP + 40 IPv6 = 1280) and therefore in almost every IPv4 path too.
+
+## Concept: Key differences in IPv6 fragmentation
+
+While this chapter focuses on IPv4, note these structural IPv6 differences:
+- **No In-Route Fragmentation**: IPv6 routers never fragment packets in transit. If a packet exceeds path MTU, the router drops it and sends an ICMPv6 Packet Too Big message.
+- **Extension Header**: IPv6 moves fragmentation fields out of the base header into a Fragment extension header (Next Header value 44), added only by the source.
+- **32-Bit Identification**: IPv6 expands the Identification field from 16 bits to 32 bits, mitigating rapid wraparound at high speeds.
+
+## The lab
+
+This lab executes a sequence of Python automation scripts inside an unshare namespace on Linux, manipulating socket options, generating raw fragments, observing kernel metrics, and executing custom user-space reassembly.
+
+### Lab files
+
+The lab suite consists of three primary code files:
+1. `frag.py`: Pure Python implementation of IPv4 fragment calculation and RFC 815 hole-descriptor reassembly.
+```{.python filename="frag.py"}
+#!/usr/bin/env python3
+"""IPv4 fragmentation and reassembly by hand (RFC 791 / RFC 815)."""
+import struct
+
+def fragment(payload_len, mtu, ihl=20):
+    """Return (offset_bytes, length, MF) per fragment. Non-final fragment
+    data must be a multiple of 8 because Fragment Offset counts 8-octet units."""
+    per = (mtu - ihl) // 8 * 8
+    out, off = [], 0
+    while off < payload_len:
+        n = min(per, payload_len - off)
+        out.append((off, n, off + n < payload_len))
+        off += n
+    return out
+
+class Reassembler:
+    """RFC 815 hole-descriptor list."""
+    def __init__(self):
+        self.holes = [(0, float("inf"))]
+        self.buf = {}
+    def add(self, off, data, mf):
+        first, last = off, off + len(data) - 1
+        new = []
+        for hf, hl in self.holes:
+            if first > hl or last < hf:
+                new.append((hf, hl)); continue
+            if first > hf: new.append((hf, first - 1))
+            if last < hl and mf: new.append((last + 1, hl))
+        self.holes = new
+        for i, b in enumerate(data):
+            self.buf.setdefault(off + i, b)      # first copy wins
+        return not self.holes
+
+def main():
+    print("== 1. Fragmenting a 4000-byte UDP datagram (4008 bytes of IP payload)")
+    for mtu in (1500, 1280, 576, 68):
+        fr = fragment(4008, mtu)
+        print(f"MTU {mtu:4}: {len(fr):3} fragments; first three:", ", ".join(
+            f"off={o}(unit {o//8}) len={n} MF={int(m)}" for o, n, m in fr[:3]))
+    print("MTU   68 is the RFC 791 minimum every IPv4 module must forward without further fragmentation")
+
+    print("\n== 2. Reassembly out of order (RFC 815 holes)")
+    data = bytes(range(256)) * 4                      # 1024 bytes
+    fr = fragment(len(data), 300)
+    r = Reassembler()
+    for o, n, m in [fr[2], fr[0], fr[3], fr[1]]:
+        done = r.add(o, data[o:o+n], m)
+        print(f"got off={o:4} len={n:3} MF={int(m)} -> holes={[(a, 'inf' if b == float('inf') else b) for a, b in r.holes]} done={done}")
+    print("reassembled == original:", bytes(r.buf[i] for i in range(len(data))) == data)
+
+    print("\n== 3. Identification wraparound (RFC 4963)")
+    for rate in (100, 2185, 10_000, 100_000):
+        print(f"{rate:>7} fragmented datagrams/s per (src,dst,proto): ID space of 65536 wraps every {65536/rate:8.2f} s")
+    print("Linux keeps incomplete datagrams for net.ipv4.ipfrag_time seconds (default 30);")
+    print("once the ID wraps inside that window a stale fragment can be glued into a new datagram.")
+    for gbps in (0.1, 1, 10):
+        pps = gbps * 1e9 / 8 / 1500 / 3              # 3 x 1500-byte fragments per 4 kB datagram
+        print(f"  {gbps:>4} Gb/s of 4 kB datagrams ~ {pps:>9,.0f} datagrams/s -> wrap in {65536/pps:7.3f} s")
+
+if __name__ == "__main__":
+    main()
+```
+2. `kernel.py`: Interacts with Linux kernel networking via raw sockets and socket options to verify path MTU behavior, fragment creation, overlap rejection, and reassembly timeouts.
+```{.python filename="kernel.py"}
+#!/usr/bin/env python3
+"""Run inside `unshare -rn` after `ip link set lo up mtu 1500`.
+Watches the Linux stack fragment, reassemble, reject overlaps and time out."""
+import socket, struct, time
+from frag import Reassembler
+
+IP_MTU_DISCOVER, IP_PMTUDISC_DONT, IP_PMTUDISC_DO = 10, 0, 2   # <linux/in.h>
+
+def csum(b):
+    if len(b) % 2: b += b"\0"
+    s = sum(struct.unpack("!%dH" % (len(b) // 2), b))
+    while s >> 16: s = (s & 0xFFFF) + (s >> 16)
+    return ~s & 0xFFFF
+
+def counters():
+    out = {}
+    for path in ("/proc/net/snmp", "/proc/net/netstat"):
+        lines = [l.split() for l in open(path)]
+        for h, v in zip(lines[::2], lines[1::2]):
+            if h[0] in ("Ip:", "IpExt:"):
+                out.update({k: int(x) for k, x in zip(h[1:], v[1:])})
+    return {k: out[k] for k in ("FragCreates", "ReasmReqds", "ReasmOKs", "ReasmFails",
+                                "ReasmTimeout", "ReasmOverlaps") if k in out}
+
+def delta(before):
+    now = counters()
+    return {k: now[k] - before[k] for k in now if now[k] != before[k]}
+
+cap = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(0x0800))
+cap.bind(("lo", 0)); cap.settimeout(0.3)
+rx = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); rx.bind(("127.0.0.1", 9000)); rx.settimeout(0.5)
+
+def drain(show=True):
+    seen = []
+    while True:
+        try: f, a = cap.recvfrom(65535)
+        except socket.timeout: return seen
+        if a[2] == socket.PACKET_OUTGOING: continue
+        ip = f[14:]
+        ident, ff = struct.unpack("!HH", ip[4:8])
+        seen.append((ident, (ff & 0x1FFF) * 8, bool(ff & 0x2000), bool(ff & 0x4000), len(ip), ip[9], ip))
+        if show:
+            extra = ""
+            if ip[9] == 1:
+                extra = f" ICMP type={ip[20]} code={ip[21]}"
+            print(f"  id=0x{ident:04x} off={(ff & 0x1FFF)*8:5} MF={int(bool(ff & 0x2000))} DF={int(bool(ff & 0x4000))} "
+                  f"len={len(ip):5} proto={ip[9]}{extra}")
+
+def recv():
+    try: d, _ = rx.recvfrom(65535); return len(d)
+    except socket.timeout: return None
+
+print("== 4. The kernel fragments a 4000-byte UDP send (lo MTU 1500, PMTUDISC_DONT)")
+tx = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+tx.setsockopt(socket.IPPROTO_IP, IP_MTU_DISCOVER, IP_PMTUDISC_DONT)
+c0 = counters()
+tx.sendto(b"A" * 4000, ("127.0.0.1", 9000))
+frags = drain()
+print("  receiver got", recv(), "bytes; counters:", delta(c0))
+
+print("\n== 5. Same send with DF (IP_PMTUDISC_DO): the kernel refuses")
+tx2 = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+tx2.setsockopt(socket.IPPROTO_IP, IP_MTU_DISCOVER, IP_PMTUDISC_DO)
+try:
+    tx2.sendto(b"A" * 4000, ("127.0.0.1", 9000)); print("  sent?!")
+except OSError as e:
+    print(f"  sendto: {e.strerror} (errno {e.errno})")
+
+raw = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_RAW)
+def send_frag(ident, off, mf, payload):
+    ff = (off // 8) | (0x2000 if mf else 0)
+    h = struct.pack("!BBHHHBBH4s4s", 0x45, 0, 20 + len(payload), ident, ff, 64, 17, 0,
+                    socket.inet_aton("127.0.0.1"), socket.inet_aton("127.0.0.1"))
+    raw.sendto(h[:10] + struct.pack("!H", csum(h)) + h[12:] + payload, ("127.0.0.1", 0))
+
+def udp_dgram(body):
+    u = struct.pack("!HHHH", 40000, 9000, 8 + len(body), 0) + body   # checksum 0 = none (IPv4)
+    return u
+
+print("\n== 6. Hand-made fragments: in order, reversed, overlapping")
+dg = udp_dgram(b"B" * 2392)                     # 2400-byte UDP datagram
+for label, plan in [("in order", [(0, 1200, True), (1200, 1200, False)]),
+                    ("reversed", [(1200, 1200, False), (0, 1200, True)]),
+                    ("overlap by 8 bytes", [(0, 1208, True), (1200, 1200, False)])]:
+    ident = {"in order": 0x1111, "reversed": 0x2222, "overlap by 8 bytes": 0x3333}[label]
+    c0 = counters()
+    for off, n, mf in plan:
+        send_frag(ident, off, mf, dg[off:off + n])
+    drain(show=False)
+    print(f"  {label:<20} receiver got {recv()} bytes; counters {delta(c0)}")
+
+print("\n== 7. A lost last fragment: what the timeout looks like")
+tlimit = int(open("/proc/sys/net/ipv4/ipfrag_time").read())
+c0 = counters()
+send_frag(0x4444, 0, True, dg[:1200])
+time.sleep(tlimit + 1.5)
+drain()
+print(f"  ipfrag_time={tlimit}s; receiver got {recv()}; counters {delta(c0)}")
+
+print("\n== 8. Python reassembler fed the kernel's own fragments from section 4")
+r = Reassembler()
+for ident, off, mf, df, ln, proto, ip in frags:
+    done = r.add(off, ip[20:], mf)
+print(f"  fragments={len(frags)} complete={done} bytes={len(r.buf)} (8 UDP header + 4000 payload)")
+```
+3. `run.sh`: Shell wrapper configuring loopback parameters and executing the test suite inside an isolated network namespace.
+```{.bash filename="run.sh"}
+#!/bin/sh
+cd "$(dirname "$0")"
+python3 frag.py
+echo
+echo "(sections 4-8 run in a private namespace: unshare -rn, lo MTU 1500)"
+unshare -rn sh -c 'ip link set lo up mtu 1500 && echo "ipfrag_time=$(cat /proc/sys/net/ipv4/ipfrag_time) ipfrag_high_thresh=$(cat /proc/sys/net/ipv4/ipfrag_high_thresh) ipfrag_max_dist=$(cat /proc/sys/net/ipv4/ipfrag_max_dist)" && python3 kernel.py'
+```
+To execute the lab environment, execute `sh run.sh`. The shell runner executes inside an unprivileged user namespace using `unshare -rn` without requiring root privileges.
+
+### Execution output
+
+```text
+== 1. Fragmenting a 4000-byte UDP datagram (4008 bytes of IP payload)
+MTU 1500:   3 fragments; first three: off=0(unit 0) len=1480 MF=1, off=1480(unit 185) len=1480 MF=1, off=2960(unit 370) len=1048 MF=0
+MTU 1280:   4 fragments; first three: off=0(unit 0) len=1256 MF=1, off=1256(unit 157) len=1256 MF=1, off=2512(unit 314) len=1256 MF=1
+MTU  576:   8 fragments; first three: off=0(unit 0) len=552 MF=1, off=552(unit 69) len=552 MF=1, off=1104(unit 138) len=552 MF=1
+MTU   68:  84 fragments; first three: off=0(unit 0) len=48 MF=1, off=48(unit 6) len=48 MF=1, off=96(unit 12) len=48 MF=1
+MTU   68 is the RFC 791 minimum every IPv4 module must forward without further fragmentation
+
+== 2. Reassembly out of order (RFC 815 holes)
+got off= 560 len=280 MF=1 -> holes=[(0, 559), (840, 'inf')] done=False
+got off=   0 len=280 MF=1 -> holes=[(280, 559), (840, 'inf')] done=False
+got off= 840 len=184 MF=0 -> holes=[(280, 559)] done=False
+got off= 280 len=280 MF=1 -> holes=[] done=True
+reassembled == original: True
+
+== 3. Identification wraparound (RFC 4963)
+    100 fragmented datagrams/s per (src,dst,proto): ID space of 65536 wraps every   655.36 s
+   2185 fragmented datagrams/s per (src,dst,proto): ID space of 65536 wraps every    29.99 s
+  10000 fragmented datagrams/s per (src,dst,proto): ID space of 65536 wraps every     6.55 s
+ 100000 fragmented datagrams/s per (src,dst,proto): ID space of 65536 wraps every     0.66 s
+Linux keeps incomplete datagrams for net.ipv4.ipfrag_time seconds (default 30);
+once the ID wraps inside that window a stale fragment can be glued into a new datagram.
+   0.1 Gb/s of 4 kB datagrams ~     2,778 datagrams/s -> wrap in  23.593 s
+     1 Gb/s of 4 kB datagrams ~    27,778 datagrams/s -> wrap in   2.359 s
+    10 Gb/s of 4 kB datagrams ~   277,778 datagrams/s -> wrap in   0.236 s
+
+(sections 4-8 run in a private namespace: unshare -rn, lo MTU 1500)
+ipfrag_time=1 ipfrag_high_thresh=4194304 ipfrag_max_dist=64
+== 4. The kernel fragments a 4000-byte UDP send (lo MTU 1500, PMTUDISC_DONT)
+  id=0xbab8 off=    0 MF=1 DF=0 len= 1500 proto=17
+  id=0xbab8 off= 1480 MF=1 DF=0 len= 1500 proto=17
+  id=0xbab8 off= 2960 MF=0 DF=0 len= 1068 proto=17
+  receiver got 4000 bytes; counters: {'FragCreates': 3, 'ReasmReqds': 3, 'ReasmOKs': 1}
+
+== 5. Same send with DF (IP_PMTUDISC_DO): the kernel refuses
+  sendto: Message too long (errno 90)
+
+== 6. Hand-made fragments: in order, reversed, overlapping
+  in order             receiver got 2392 bytes; counters {'ReasmReqds': 2, 'ReasmOKs': 1}
+  reversed             receiver got 2392 bytes; counters {'ReasmReqds': 2, 'ReasmOKs': 1}
+  overlap by 8 bytes   receiver got None bytes; counters {'ReasmReqds': 2, 'ReasmFails': 1, 'ReasmOverlaps': 1}
+
+== 7. A lost last fragment: what the timeout looks like
+  id=0x4444 off=    0 MF=1 DF=0 len= 1220 proto=17
+  ipfrag_time=1s; receiver got None; counters {'ReasmReqds': 1, 'ReasmFails': 1, 'ReasmTimeout': 1}
+
+== 8. Python reassembler fed the kernel's own fragments from section 4
+  fragments=3 complete=True bytes=4008 (8 UDP header + 4000 payload)
+```
+## Reading the output
+
+Every section of the execution output demonstrates a fundamental mechanic of the IPv4 subsystem.
+
+### Section 1: User-space fragment calculations
+
+The script calculates fragment boundaries for a 4000-byte UDP payload (plus 8 bytes UDP header = 4008 IP payload bytes) across four link MTU constraints:
+
+- **MTU 1500**: Payload slice per non-final fragment is $\lfloor(1500 - 20)/8\rfloor \times 8 = 1480$ bytes. 
+  - Fragment 0: `off=0` (unit 0), `len=1480`, `MF=1`.
+  - Fragment 1: `off=1480` (unit 185, since $1480 / 8 = 185$), `len=1480`, `MF=1`.
+  - Fragment 2: `off=2960` (unit 370), remaining payload `len=1048` ($4008 - 2960 = 1048$), `MF=0`. Total fragments: 3.
+- **MTU 1280**: Max slice $\lfloor(1280 - 20)/8\rfloor \times 8 = 1256$ bytes ($1256 / 8 = 157$ units). Yields 4 fragments.
+- **MTU 576**: Max slice $\lfloor(576 - 20)/8\rfloor \times 8 = 552$ bytes ($552 / 8 = 69$ units). Yields 8 fragments.
+- **MTU 68**: Minimum RFC 791 IPv4 MTU. Max slice $\lfloor(68 - 20)/8\rfloor \times 8 = 48$ bytes ($48 / 8 = 6$ units). Slicing 4008 payload bytes requires 84 fragments.
+
+### Section 2: Out-of-order hole descriptor reassembly
+
+Demonstrates RFC 815 state transitions when receiving four fragments of a 1024-byte payload out of order:
+1. Receives slice `off=560`, `len=280`, `MF=1` (bytes 560..839). Split initial hole `(0, inf)` into holes `[(0, 559), (840, inf)]`.
+2. Receives slice `off=0`, `len=280`, `MF=1` (bytes 0..279). First hole shifts: `[(280, 559), (840, inf)]`.
+3. Receives final slice `off=840`, `len=184`, `MF=0` (bytes 840..1023). Third fragment closes upper infinite bound: `[(280, 559)]`.
+4. Receives missing slice `off=280`, `len=280`, `MF=1` (bytes 280..559). Holes list becomes empty (`[]`), signaling completed reassembly (`done=True`).
+
+### Section 3: Identification wraparound window
+
+Quantifies ID lifetime across generation rates:
+- At 2,185 fragmented datagrams/sec, a 16-bit space (65,536 IDs) wraps in $65536 / 2185 = 29.99$ seconds.
+- At 10 Gb/s throughput of 4 kB datagrams (~277,778 datagrams/sec), wraparound occurs in $0.236$ seconds.
+If the reassembly timeout is longer than this wrap window, a stale fragment can be glued into a new datagram that reuses its ID. The result is wrong data delivered to the application (if the UDP checksum happens to match), not memory corruption.
+
+### Section 4: Kernel fragment generation and metrics
+
+The host kernel transmits 4000 payload bytes over loopback (`lo` MTU 1500) with `IP_PMTUDISC_DONT`:
+- The kernel emits 3 fragments with ID `0xbab8`:
+  - `off=0`, `len=1500` (20 IP + 1480 payload), `MF=1`, `DF=0`.
+  - `off=1480`, `len=1500`, `MF=1`, `DF=0`.
+  - `off=2960`, `len=1068` (20 IP header + the last 1048 bytes of the IP payload; the UDP header travelled in the first fragment), `MF=0`, `DF=0`.
+- Receiver successfully reconstructs 4000 UDP payload bytes.
+- MIB counter changes: `FragCreates: 3` (kernel created 3 fragments), `ReasmReqds: 3` (3 fragments submitted for reassembly), `ReasmOKs: 1` (1 datagram reassembled successfully).
+
+### Section 5: PMTU constraint enforce
+
+When socket option `IP_MTU_DISCOVER` is set to `IP_PMTUDISC_DO`, local fragmentation is disabled ($DF=1$). Transmitting 4000 bytes over MTU 1500 immediately fails locally with POSIX OS error: `Message too long (errno 90)` (`EMSGSIZE`).
+
+### Section 6: Hand-made fragment patterns and overlaps
+
+Raw fragments injected via `SOCK_RAW`:
+- **In Order**: Two 1200-byte fragments (`ID 0x1111`) arrive in sequence. Reassembled ok (2392 UDP payload bytes). Metrics: `ReasmReqds: 2`, `ReasmOKs: 1`.
+- **Reversed**: Fragment 2 arrives before Fragment 1 (`ID 0x2222`). Reassembled ok. Metrics: `ReasmReqds: 2`, `ReasmOKs: 1`.
+- **Overlap by 8 Bytes**: Fragment 1 covers offset 0..1207 (`len=1208`); Fragment 2 covers offset 1200..2399 (`len=1200`). The kernel detects duplicate coverage in range 1200..1207. 
+  - Result: Packet dropped, receiver gets `None`.
+  - Metrics: `ReasmReqds: 2`, `ReasmFails: 1`, `ReasmOverlaps: 1`.
+
+### Section 7: Reassembly timeout behavior
+
+A single fragment (`ID 0x4444`, `off=0`, `MF=1`) is sent. The second fragment is deliberately withheld.
+- This host reports `ipfrag_time=1`. That is a setting of the host image; the kernel default `IP_FRAG_TIME` is 30 seconds (`include/net/ip.h`). Expect 30 on a stock system.
+- After sleeping 2.5 seconds (exceeding `ipfrag_time`), the incomplete buffer expires.
+- Receiver gets `None`. Metrics: `ReasmReqds: 1`, `ReasmFails: 1`, `ReasmTimeout: 1`.
+- *Note*: Linux sends ICMP Time Exceeded (Type 11, Code 1: "fragment reassembly time exceeded") only if fragment 0 was received and route lookup succeeds (function `ip_expire` in `net/ipv4/ip_fragment.c`). No ICMP packet appeared in this loopback capture.
+
+### Section 8: Direct payload injection to RFC 815 reassembler
+
+The custom Python `Reassembler` receives the 3 raw IP frames captured from the kernel in Section 4. Slicing off IP headers (`ip[20:]`) and feeding offsets into the hole descriptor yields `complete=True`, producing 4008 total bytes (8-byte UDP header + 4000 payload bytes).
+
+## In production
+
+### Monitoring fragment statistics via CLI
+
+To inspect system-wide IPv4 fragment MIB counters:
+
+```bash
+# Display MIB SNMP statistics (not run here)
+nstat -az | grep -i reasm
+```
+
+```bash
+# Directly view kernel SNMP metrics (not run here)
+cat /proc/net/snmp | grep -A 1 "Ip:"
+cat /proc/net/netstat | grep -A 1 "IpExt:"
+```
+
+### Tuning kernel sysctls for reassembly and security
+
+Configure IPv4 fragment dynamic allocation bounds in sysctl configuration:
+
+```bash
+# Modify fragment memory boundaries and timeout parameters (not run here)
+sysctl -w net.ipv4.ipfrag_high_thresh=4194304
+sysctl -w net.ipv4.ipfrag_time=30
+sysctl -w net.ipv4.ipfrag_max_dist=64
+```
+
+Persistent configuration in `/etc/sysctl.d/99-ipfrag.conf`:
+
+```text
+# IPv4 Fragment Memory and Timeout Bounds (not run here)
+net.ipv4.ipfrag_high_thresh = 4194304
+net.ipv4.ipfrag_time = 30
+net.ipv4.ipfrag_max_dist = 64
+```
+
+### Firewalls and connection tracking
+
+Loading connection tracking pulls in `nf_defrag_ipv4`, which reassembles fragments in the PREROUTING and OUTPUT hooks at priority -400 (`NF_IP_PRI_CONNTRACK_DEFRAG`), before the raw table at -300 (`NF_IP_PRI_RAW`). Rules therefore see whole datagrams with ports. A `NOTRACK` / `notrack` rule in the raw table skips connection tracking but does not undo defragmentation, which has already happened.
+
+```bash
+# (not run here) see which fragment-related counters a busy firewall is incrementing
+nstat -az | grep -Ei 'reasm|frag'
+```
+
+## Gotchas
+
+- **Non-first fragments bypass simple port filters**: Rule sets checking `--dport 80` without stateful inspection fail to match non-first fragments, as L4 headers are missing.
+- **`ipfrag_high_thresh` exhaustion drops all new fragments**: When reassembly buffer memory reaches `ipfrag_high_thresh`, the kernel drops incoming fragments until memory usage decreases.
+- **Overlapping fragments cause silent drops**: Linux discards overlapping fragments outright (`ReasmOverlaps`), preventing delivery without sending an ICMP error back to the sender.
+- **ICMP Reassembly Timeout generation conditions**: ICMP type 11 code 1 (fragment reassembly time exceeded) is sent **only** if the fragment with offset 0 arrived before the timer expired, and only after a successful route lookup back to the source (`ip_expire()`).
+- **Path MTU Discovery failure traps traffic**: Path blackholing occurs when intermediate ICMP Type 3 Code 4 messages are dropped by misconfigured firewalls while $DF=1$ is set.
+- **ECMP load balancer fragmentation skew**: Routers distributing flows via 5-tuple hashes send non-first fragments (lacking L4 ports) over alternate links, causing misordered delivery or drop.
+- **Obsolete sysctls linger**: `ipfrag_low_thresh` is obsolete since Linux 4.17 but still present, so tuning guides that lower it achieve nothing. Only `ipfrag_high_thresh` caps reassembly memory; above it, `inet_frag_find()` refuses new fragments.
+
+## Exercises
+
+1. **Calculate Fragment Slices**: Given an IPv4 datagram with 4500 bytes of payload (plus 20 bytes IPv4 header) traversing a link with MTU 1400, calculate total fragments generated, and the Total Length, Fragment Offset, and MF flag for each fragment.
+2. **Trace Hole Descriptor States**: Starting with an initial hole descriptor `(0, inf)`, step through the list transformations as fragments with the following ranges arrive: `[200..399, MF=1]`, `[0..199, MF=1]`, `[600..799, MF=0]`, `[400..599, MF=1]`.
+3. **Simulate Wrap Time**: Write a script to calculate the ID wraparound time in seconds for a host sending 1400-byte UDP datagrams at 1 Gbps, 10 Gbps, and 40 Gbps stream rates.
+4. **Inspect Production System Counters**: Execute `nstat -az | grep -i Reasm` on a Linux server and map each non-zero counter to its corresponding `/proc/net/snmp` or `/proc/net/netstat` field.
+5. **Construct an Overlapping Fragment Test**: Modify `kernel.py` to test an overlap where Fragment 2 starts at an offset *before* Fragment 1 ends. Confirm via MIB counters whether `ReasmOverlaps` increments.
+
+## Verification
+
+The output provided in this chapter was generated on a live system running Linux kernel version `6.12` and Python `3.13.5` inside an unprivileged user network namespace (`unshare -rn`).
+
+Commands executed during testing:
+- Python environment execution of `frag.py` and `kernel.py`.
+- Network link configuration: `ip link set lo up mtu 1500`.
+- MIB counter extraction via direct inspection of `/proc/net/snmp` and `/proc/net/netstat`.
+
+Production sysctl tuning, `nstat` invocations, `iptables`/`nftables` rules, and `/etc/sysctl.d/` configurations presented in the "In production" section are sample administrative commands (explicitly marked "(not run here)") and were not executed during transcript collection.
+
+## Sources
+
+- RFC 791: Internet Protocol Specification: <https://www.rfc-editor.org/rfc/rfc791>
+- RFC 815: IP Datagram Reassembly Algorithms: <https://www.rfc-editor.org/rfc/rfc815>
+- RFC 1191: Path MTU Discovery: <https://www.rfc-editor.org/rfc/rfc1191>
+- RFC 1858: Security Considerations for IP Fragment Filtering: <https://www.rfc-editor.org/rfc/rfc1858>
+- RFC 3128: Protection Against Variant of Tiny Fragment Attack: <https://www.rfc-editor.org/rfc/rfc3128>
+- RFC 4963: IPv4 Reassembly Errors at High Data Rates: <https://www.rfc-editor.org/rfc/rfc4963>
+- RFC 5722: Handling of Overlapping IPv6 Fragments: <https://www.rfc-editor.org/rfc/rfc5722>
+- RFC 6864: Updated Specification of the IPv4 ID Field: <https://www.rfc-editor.org/rfc/rfc6864>
+- RFC 8900: IP Fragmentation Considered Fragile (BCP 230): <https://www.rfc-editor.org/rfc/rfc8900>
+- Linux Kernel IP Sysctl Documentation: <https://docs.kernel.org/networking/ip-sysctl.html>
+- Linux Socket Man Page (`ip(7)`): <https://man7.org/linux/man-pages/man7/ip.7.html>
