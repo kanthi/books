@@ -10,7 +10,7 @@ Almost every useful program talks to the outside world. In C, console I/O goes t
 | Standard output | `stdout` | Normal program output |
 | Standard error | `stderr` | Diagnostics and errors |
 
-The declarations live in `<stdio.h>`. This chapter covers formatted I/O (`printf` / `scanf`), character I/O, safer line input with `fgets`, buffer pitfalls, and two mini-projects: a menu-driven CLI and a simple invoice printer.
+The declarations live in `<stdio.h>`. This chapter covers formatted I/O (`printf` / `scanf`), character I/O, safer line input with `fgets`, buffer pitfalls, and a checked integer-input mini-project.
 
 Compile examples with:
 
@@ -194,6 +194,8 @@ int scanf(const char *format, ...);
 
 Returns the number of input **items** assigned, or `EOF` on input failure before any assignment.
 
+Checking that count is necessary but not sufficient for arbitrary numeric input: if the converted value cannot be represented in the destination, C does not define the behavior. The demonstrations below assume values in range; use the checked line parser later for untrusted input.
+
 ### Address operator
 
 `scanf` needs **pointers** to the objects it will write:
@@ -225,6 +227,8 @@ scanf("%49s", name);    /* no & for the array */
 | `%x` | `unsigned int *` | Hex input |
 
 ### Full demo — reading several fields
+
+This introductory demonstration assumes controlled, in-range numeric input. Assignment counts detect matching failures, but do not make numeric conversions safe for arbitrary input; see the checked mini-project below.
 
 ```c
 #include <stdio.h>
@@ -317,7 +321,7 @@ If the user types `abc` for `%d`, `scanf` returns `0` and does not update the `i
 
 ### Clearing the rest of a line
 
-After a failed or partial read, discard through newline:
+After a matching failure or partial read, discard through newline. This example assumes numeric input is in `int` range; use the checked parser below for arbitrary input:
 
 ```c
 #include <stdio.h>
@@ -333,7 +337,12 @@ int main(void) {
     int n;
 
     printf("Enter integer: ");
-    while (scanf("%d", &n) != 1) {
+    int result;
+    while ((result = scanf("%d", &n)) != 1) {
+        if (result == EOF) {
+            fprintf(stderr, "Input ended or failed.\n");
+            return 1;
+        }
         fprintf(stderr, "Not an integer. Try again: ");
         clear_line();
     }
@@ -417,7 +426,7 @@ int main(void) {
 }
 ```
 
-Use `int` for the variable that holds `getchar()` so `EOF` (−1) is distinguishable from a byte value `0xFF`.
+Use `int` for the variable that holds `getchar()` so its result can be compared with `EOF`. `EOF` is a negative macro; do not assume its numeric value. On ordinary systems, `int` can represent every `unsigned char` value as well as `EOF`.
 
 ---
 
@@ -432,6 +441,8 @@ char *fgets(char *s, int size, FILE *stream);
 Reads at most `size - 1` characters into `s`, stops early on newline, always null-terminates on success. Returns `s` on success, `NULL` on EOF/error.
 
 ### Basic pattern
+
+This short echo demonstrates bounded storage; it prints only the first chunk if the line is longer than the buffer. It assumes text without embedded NUL bytes.
 
 ```c
 #include <stdio.h>
@@ -472,30 +483,9 @@ gcc -std=c17 -Wall -Wextra -Wpedantic -o line_echo line_echo.c
 
 Leftover newlines still bite. Patterns that work:
 
-**Option A — prefer `fgets` for everything**, then parse with `sscanf`:
+**Option A — read whole lines**, then parse and validate each line. The checked mini-project below demonstrates this with `strtol`, including range checks and rejection of trailing text.
 
-```c
-#include <stdio.h>
-
-int main(void) {
-    char line[64];
-    int age;
-
-    printf("Age: ");
-    if (fgets(line, sizeof line, stdin) == NULL) {
-        return 1;
-    }
-    if (sscanf(line, "%d", &age) != 1) {
-        fprintf(stderr, "invalid age\n");
-        return 1;
-    }
-
-    printf("age=%d\n", age);
-    return 0;
-}
-```
-
-**Option B — after `scanf`, drain the line** before the next `fgets`:
+**Option B — after `scanf`, drain the line** before the next `fgets`. The numeric input here is assumed to be in range:
 
 ```c
 #include <stdio.h>
@@ -527,35 +517,9 @@ int main(void) {
 }
 ```
 
-### Detecting truncated lines
+### Detecting incomplete lines
 
-If `fgets` fills the buffer without seeing `\n`, the line was longer than the buffer:
-
-```c
-#include <stdio.h>
-#include <string.h>
-
-int main(void) {
-    char line[16];
-
-    printf("Short buffer demo (type a long line):\n");
-    if (fgets(line, sizeof line, stdin) == NULL) {
-        return 1;
-    }
-
-    if (strchr(line, '\n') == NULL) {
-        fprintf(stderr, "warning: line truncated\n");
-        /* optional: drain the rest of the line */
-        int c;
-        while ((c = getchar()) != '\n' && c != EOF) { }
-    } else {
-        line[strcspn(line, "\n")] = '\0';
-    }
-
-    printf("stored: \"%s\"\n", line);
-    return 0;
-}
-```
+A successful `fgets` without a newline does **not** by itself prove truncation: the input might end without a newline, or the buffer may hold exactly the characters before a newline that remains unread. A program that needs a complete line must distinguish these cases and handle the remainder. Embedded NUL bytes also make string functions unable to inspect the entire input read by `fgets`. The mini-project below uses a character-at-a-time reader with an explicit maximum, drains overlong lines, and accepts a final unterminated line.
 
 ---
 
@@ -580,7 +544,7 @@ int main(void) {
 }
 ```
 
-Useful when you already have a full line from `fgets` and want conversion with error checking.
+This fixed literal is controlled and in range. For arbitrary numeric input, a successful assignment count does not guarantee safe range handling or that the whole line was consumed. The checked parser below uses `strtol` and validates both.
 
 ---
 
@@ -610,238 +574,97 @@ Treat return-value checks as part of correct I/O, not optional polish.
 
 ---
 
-## Mini-project 1 — Menu-driven CLI
+## Mini-project — read and add two integers
 
-A small loop that presents options until the user quits. Uses `fgets` + `sscanf` to avoid buffer traps.
+This complete program accepts a decimal integer on each line, rejects extra text and out-of-range values, and checks the sum before adding. Save it as `checked_add.c`. The line reader accepts at most 63 bytes before a newline; longer lines and embedded NUL bytes are rejected and drained so the next prompt starts on a fresh line. A final line without a newline is accepted. EOF before a new line ends the program instead of retrying forever.
 
 ```c
+#include <ctype.h>
+#include <errno.h>
+#include <limits.h>
 #include <stdio.h>
-#include <string.h>
+#include <stdlib.h>
 
-static int read_int(const char *prompt, int *out) {
-    char line[64];
+/* 1 = line, 0 = EOF before a line, -1 = invalid/overlong, -2 = I/O error */
+static int read_line(char *buf, size_t capacity) {
+    size_t used = 0;
+    int c;
+    int bad = 0;
+    int saw_input = 0;
 
-    printf("%s", prompt);
-    if (fgets(line, sizeof line, stdin) == NULL) {
+    while ((c = getchar()) != EOF && c != '\n') {
+        saw_input = 1;
+        if (c == '\0' || used + 1 >= capacity) {
+            bad = 1;
+        } else if (!bad) {
+            buf[used++] = (char)c;
+        }
+    }
+    if (c == EOF && ferror(stdin)) return -2;
+    if (c == EOF && !saw_input) return 0;
+    buf[used] = '\0';
+    return bad ? -1 : 1;
+}
+
+static int parse_int(const char *text, int *out) {
+    char *end;
+    long value;
+
+    errno = 0;
+    value = strtol(text, &end, 10);
+    if (end == text || errno == ERANGE || value < INT_MIN || value > INT_MAX)
         return 0;
-    }
-    return sscanf(line, "%d", out) == 1;
+    while (isspace((unsigned char)*end)) end++;
+    if (*end != '\0') return 0;
+    *out = (int)value;
+    return 1;
 }
 
-int main(void) {
+/* 1 = success, 0 = end of input, -1 = stream error */
+static int ask_int(const char *prompt, int *out) {
     char line[64];
-    int choice;
-    int running = 1;
-
-    while (running) {
-        printf("\n==== Mini CLI ====\n");
-        printf("1) Echo a line\n");
-        printf("2) Add two integers\n");
-        printf("3) Show ASCII code of a character\n");
-        printf("0) Quit\n");
-        printf("Select: ");
-
-        if (fgets(line, sizeof line, stdin) == NULL) {
-            break;
-        }
-        if (sscanf(line, "%d", &choice) != 1) {
-            printf("Please enter a number from the menu.\n");
-            continue;
-        }
-
-        switch (choice) {
-        case 0:
-            running = 0;
-            printf("Bye.\n");
-            break;
-        case 1: {
-            char text[128];
-            printf("Text: ");
-            if (fgets(text, sizeof text, stdin) == NULL) {
-                running = 0;
-                break;
-            }
-            text[strcspn(text, "\n")] = '\0';
-            printf("Echo: %s\n", text);
-            break;
-        }
-        case 2: {
-            int a, b;
-            if (!read_int("a = ", &a) || !read_int("b = ", &b)) {
-                printf("Invalid integer input.\n");
-                break;
-            }
-            printf("%d + %d = %d\n", a, b, a + b);
-            break;
-        }
-        case 3: {
-            char raw[16];
-            printf("Character: ");
-            if (fgets(raw, sizeof raw, stdin) == NULL) {
-                running = 0;
-                break;
-            }
-            if (raw[0] == '\0' || raw[0] == '\n') {
-                printf("No character entered.\n");
-                break;
-            }
-            printf("'%c' has code %d\n", raw[0], (unsigned char)raw[0]);
-            break;
-        }
-        default:
-            printf("Unknown option.\n");
-            break;
-        }
+    for (;;) {
+        fputs(prompt, stdout);
+        fflush(stdout); /* show prompt even if stdout is buffered */
+        int result = read_line(line, sizeof line);
+        if (result == 0) return 0;
+        if (result == -2) return -1;
+        if (result == 1 && parse_int(line, out)) return 1;
+        fprintf(stderr, "Enter one in-range decimal integer.\n");
     }
-
-    return 0;
 }
-```
-
-```bash
-gcc -std=c17 -Wall -Wextra -Wpedantic -o menu_cli menu_cli.c
-./menu_cli
-```
-
----
-
-## Mini-project 2 — Simple invoice printer
-
-Reads a few line items and prints a formatted invoice on `stdout`.
-
-```c
-#include <stdio.h>
-#include <string.h>
-
-#define MAX_ITEMS 5
-#define NAME_LEN  48
 
 int main(void) {
-    char customer[64];
-    char names[MAX_ITEMS][NAME_LEN];
-    int quantities[MAX_ITEMS];
-    double prices[MAX_ITEMS];
-    int count = 0;
-    double subtotal = 0.0;
-    const double tax_rate = 0.08;
-    char line[128];
+    int a, b;
+    int result = ask_int("First integer: ", &a);
+    if (result != 1) return result < 0 ? EXIT_FAILURE : EXIT_SUCCESS;
+    result = ask_int("Second integer: ", &b);
+    if (result != 1) return result < 0 ? EXIT_FAILURE : EXIT_SUCCESS;
 
-    printf("Customer name: ");
-    if (fgets(customer, sizeof customer, stdin) == NULL) {
-        return 1;
+    if ((b > 0 && a > INT_MAX - b) ||
+        (b < 0 && a < INT_MIN - b)) {
+        fprintf(stderr, "The sum is outside the range of int.\n");
+        return EXIT_FAILURE;
     }
-    customer[strcspn(customer, "\n")] = '\0';
-
-    printf("How many line items (1-%d)? ", MAX_ITEMS);
-    if (fgets(line, sizeof line, stdin) == NULL) {
-        return 1;
-    }
-    if (sscanf(line, "%d", &count) != 1 || count < 1 || count > MAX_ITEMS) {
-        fprintf(stderr, "Invalid item count\n");
-        return 1;
-    }
-
-    for (int i = 0; i < count; i++) {
-        printf("\nItem %d name: ", i + 1);
-        if (fgets(names[i], NAME_LEN, stdin) == NULL) {
-            return 1;
-        }
-        names[i][strcspn(names[i], "\n")] = '\0';
-
-        printf("Quantity: ");
-        if (fgets(line, sizeof line, stdin) == NULL) {
-            return 1;
-        }
-        if (sscanf(line, "%d", &quantities[i]) != 1 || quantities[i] < 0) {
-            fprintf(stderr, "Invalid quantity\n");
-            return 1;
-        }
-
-        printf("Unit price: ");
-        if (fgets(line, sizeof line, stdin) == NULL) {
-            return 1;
-        }
-        if (sscanf(line, "%lf", &prices[i]) != 1 || prices[i] < 0.0) {
-            fprintf(stderr, "Invalid price\n");
-            return 1;
-        }
-    }
-
-    printf("\n========================================\n");
-    printf("              INVOICE\n");
-    printf("========================================\n");
-    printf("Customer: %s\n\n", customer);
-    printf("%-20s %5s %10s %10s\n", "Item", "Qty", "Unit", "Line");
-    printf("----------------------------------------\n");
-
-    for (int i = 0; i < count; i++) {
-        double line_total = quantities[i] * prices[i];
-        subtotal += line_total;
-        printf("%-20.20s %5d %10.2f %10.2f\n",
-               names[i], quantities[i], prices[i], line_total);
-    }
-
-    double tax = subtotal * tax_rate;
-    double total = subtotal + tax;
-
-    printf("----------------------------------------\n");
-    printf("%-28s %10.2f\n", "Subtotal", subtotal);
-    printf("%-28s %10.2f\n", "Tax (8%)", tax);
-    printf("%-28s %10.2f\n", "TOTAL", total);
-    printf("========================================\n");
-
-    return 0;
+    printf("%d + %d = %d\n", a, b, a + b);
+    return EXIT_SUCCESS;
 }
 ```
 
-```bash
-gcc -std=c17 -Wall -Wextra -Wpedantic -o invoice invoice.c
-./invoice
+```sh
+gcc -std=c17 -Wall -Wextra -Wpedantic -o checked_add checked_add.c
+printf '12\n-5\n' | ./checked_add
+printf '12x\n12\n-5\n' | ./checked_add
+./checked_add < /dev/null
 ```
 
-This uses a C99-style `for (int i = 0; ...)` loop (fine under `-std=c17`). Arrays show up formally in a later module; here they are only storage for the demo.
+The first run prints `12 + -5 = 7` after the prompts. In the second, `12x` is rejected and the next line is read as the first integer. The third exits at EOF. To test the addition boundary on your implementation, use the values printed by a program using `INT_MAX` and `INT_MIN` from `<limits.h>`, then add 1 to the maximum; do not assume that `int` has a particular width.
 
----
+`strtol` skips leading whitespace and reports where conversion stopped through `end`. Resetting `errno` matters because a successful call need not clear an old error. Check for no digits, `ERANGE`, the narrower `int` range, and any non-whitespace suffix **before** casting. The `isspace` cast is required because its argument must be `EOF` or representable as `unsigned char`. The addition guard evaluates only representable expressions: it avoids computing `a + b` until the result is known to fit.
 
-## Practical calculator (formatted I/O review)
+The example handles ordinary text input and embedded NULs explicitly. It does not implement locale-independent Unicode parsing or a general-purpose line library. Output errors are not handled in this compact exercise; applications that must guarantee output delivery should check writes and final flush/close as well.
 
-```c
-#include <stdio.h>
-
-int main(void) {
-    double num1, num2, result;
-    char op;
-    char line[128];
-
-    printf("Enter expression (e.g. 3.5 * 2): ");
-    if (fgets(line, sizeof line, stdin) == NULL) {
-        return 1;
-    }
-    if (sscanf(line, "%lf %c %lf", &num1, &op, &num2) != 3) {
-        fprintf(stderr, "Could not parse expression\n");
-        return 1;
-    }
-
-    switch (op) {
-    case '+': result = num1 + num2; break;
-    case '-': result = num1 - num2; break;
-    case '*': result = num1 * num2; break;
-    case '/':
-        if (num2 == 0.0) {
-            fprintf(stderr, "Division by zero\n");
-            return 1;
-        }
-        result = num1 / num2;
-        break;
-    default:
-        fprintf(stderr, "Invalid operator '%c'\n", op);
-        return 1;
-    }
-
-    printf("%.10g %c %.10g = %.10g\n", num1, op, num2, result);
-    return 0;
-}
-```
+For details, see the [C11 committee draft, sections 7.21.6.2 and 7.22.1.4](https://www.open-std.org/jtc1/sc22/wg14/www/docs/n1570.pdf) and the [POSIX `strtol` specification](https://pubs.opengroup.org/onlinepubs/9799919799/functions/strtol.html).
 
 ---
 
@@ -849,7 +672,7 @@ int main(void) {
 
 1. **Check return values** of `scanf`, `fgets`, and parsing helpers.
 2. **Bound every string read** (`%49s`, `fgets(..., sizeof buf, ...)`).
-3. **Prefer `fgets` + `sscanf`** for interactive line-oriented tools.
+3. **Read complete lines and use `strtol`/`strtod` with range and end-pointer checks** for arbitrary numeric input.
 4. **Never use `gets`.**
 5. **Send errors to `stderr`** with `fprintf(stderr, ...)`.
 6. **Mind whitespace** when mixing `%d` and `%c`, or `scanf` and `fgets`.
@@ -863,8 +686,8 @@ int main(void) {
 - `printf` formats output; width and precision control alignment and detail.
 - `scanf` reads tokens; always pass addresses (except arrays), check the return count, and bound `%s`.
 - Character I/O with `getchar` / `putchar` is simple and stream-friendly; store results in `int`.
-- `fgets` is the default safe way to read a line; strip `\n` with `strcspn` or equivalent.
-- Menu CLIs and small printers are good practice for real interactive programs.
+- `fgets` bounds writes; check whether you received a complete line before treating it as one record.
+- Validate the entire input, its numeric range, and the result of arithmetic in interactive programs.
 
 Next module: data types and variables—so the values you print and scan have precise sizes, ranges, and conversion rules.
 
@@ -878,9 +701,9 @@ Use `-std=c17 -Wall -Wextra -Wpedantic` for all of these.
 2. **Column report** — Print three rows of “name / quantity / price” using width specifiers so columns align.
 3. **Scanf trap lab** — Demonstrate the leftover-newline bug with `%d` followed by `%c` *without* a leading space, then show the fixed version.
 4. **Line reverser (partial)** — Read a line with `fgets` and print its length (excluding newline). Full reverse can wait until arrays/strings if needed; do it now if you already can.
-5. **Retry loop** — Keep asking for an integer until `sscanf` after `fgets` succeeds.
-6. **Menu extension** — Add a fourth menu option that converts Celsius to Fahrenheit.
-7. **Invoice tax flag** — Modify the invoice program to ask whether tax applies (`y`/`n`) before printing totals.
+5. **Retry loop** — Adapt the checked mini-project to accept only integers from 1 to 10, and exit on EOF.
+6. **Range test** — Test the checked addition program at `INT_MIN` and `INT_MAX` and with an overflowing sum.
+7. **Line limit** — Supply 63 and 64 characters followed by a newline to the mini-project; explain the different outcomes.
 8. **stderr routing** — Write a program that prints `OK` to stdout and `BAD` to stderr; run with redirects and show both files.
 9. **`snprintf` card** — Build a string `"ID=###;NAME=..."` into a 64-byte buffer and report truncation if it occurs.
 10. **Char histogram (lite)** — Read characters until EOF and count how many were digits (`'0'`–`'9'`). Print the count.
