@@ -24,31 +24,29 @@ The % symbol is shorthand for "per hundred"
 Percentage Models
 ════════════════
 
-1. Grid Model (100 squares):
-   25% = 25 out of 100 squares shaded
+1. Grid model (100 squares):
+   Each row has 10 squares. Two full rows and five more are shaded:
 
-   ┌─┬─┬─┬─┬─┬─┬─┬─┬─┬─┐
-   │▓│▓│▓│▓│▓│ │ │ │ │ │  25% shaded
-   ├─┼─┼─┼─┼─┼─┼─┼─┼─┼─┤  (25 out of 100)
-   │▓│▓│▓│▓│▓│ │ │ │ │ │
-   ├─┼─┼─┼─┼─┼─┼─┼─┼─┼─┤
-   │▓│▓│▓│▓│▓│ │ │ │ │ │
-   ├─┼─┼─┼─┼─┼─┼─┼─┼─┼─┤
-   │▓│▓│▓│▓│▓│ │ │ │ │ │
-   ├─┼─┼─┼─┼─┼─┼─┼─┼─┼─┤
-   │▓│▓│▓│▓│▓│ │ │ │ │ │
-   └─┴─┴─┴─┴─┴─┴─┴─┴─┴─┘
+   ■■■■■■■■■■
+   ■■■■■■■■■■
+   ■■■■■□□□□□
+   □□□□□□□□□□
+   □□□□□□□□□□
+   □□□□□□□□□□
+   □□□□□□□□□□
+   □□□□□□□□□□
+   □□□□□□□□□□
+   □□□□□□□□□□
 
-2. Circle Model (Pie Chart):
-   25% = quarter of a circle
+   25 shaded out of 100 = 25/100 = 25%.
 
-        ╭─────╮
-       ╱   ▓▓▓ ╲  ← 25% shaded
-      ╱   ▓▓▓   ╲
-     ╱    ▓▓▓    ╲
-    ╱      ●      ╲
-   ╱               ╲
-  ╱_________________╲
+2. Quarter model:
+   Divide a whole into four equal parts. One shaded part is 25%.
+   ┌─────┬─────┐
+   │  ■  │     │
+   ├─────┼─────┤
+   │     │     │
+   └─────┴─────┘
 
 3. Bar Model:
    25% of 80 = 20
@@ -70,11 +68,10 @@ Percentage Models
 The Conversion Triangle
 ══════════════════════
 
-      Percentage
-         ÷100  ×100
-        ↙     ↖
-   Decimal ←→ Fraction
-      ×100    ÷100
+Percentage → decimal: divide the percentage number by 100.
+Decimal → percentage: multiply by 100, then attach %.
+Fraction → decimal: divide numerator by denominator.
+Decimal → fraction: write the decimal over its place value and simplify.
 
 Common Equivalents:
 Percentage │ Decimal │ Fraction
@@ -114,9 +111,7 @@ Examples:
 0.5% = 0.5 ÷ 100 = 0.005
 
 Visual representation:
-25% → 25.% → 0.25%
-      ↑      ↑
-   Move decimal point 2 places left
+25% → 25 ÷ 100 → 0.25
 
 Step-by-step process:
 1. Remove the % symbol
@@ -139,15 +134,13 @@ Converting Decimals to Percentages
 Rule: Multiply by 100 (or move decimal point 2 places right)
 
 Examples:
-0.25 = 0.25 × 100 = 25%
-0.07 = 0.07 × 100 = 7%
-1.50 = 1.50 × 100 = 150%
-0.005 = 0.005 × 100 = 0.5%
+0.25 × 100 = 25, so 0.25 = 25%
+0.07 × 100 = 7, so 0.07 = 7%
+1.50 × 100 = 150, so 1.50 = 150%
+0.005 × 100 = 0.5, so 0.005 = 0.5%
 
 Visual representation:
-0.25 → 0.25 → 25.%
-       ↑      ↑
-   Move decimal point 2 places right
+0.25 → 0.25 × 100 = 25 → 25%
 
 Step-by-step process:
 1. Move decimal point 2 places to the right
@@ -193,11 +186,8 @@ Visual verification for 3/4 = 75%:
      │▓▓▓│▓▓▓│▓▓▓│   │
      └───┴───┴───┴───┘
 
-75%: ┌─┬─┬─┬─┬─┬─┬─┬─┬─┬─┐
-     │▓│▓│▓│▓│▓│▓│▓│▓│ │ │  (75 out of 100)
-     ├─┼─┼─┼─┼─┼─┼─┼─┼─┼─┤
-     │▓│▓│▓│▓│▓│▓│▓│▓│ │ │
-     └─┴─┴─┴─┴─┴─┴─┴─┴─┴─┘
+75%: ■■■■■■■■■■
+     ■■■■■□□□□□  (15 shaded out of 20 = 75%)
 
 Same proportion shaded!
 ```
@@ -332,6 +322,7 @@ Percentage Change Formula
 ════════════════════════
 
 Percentage Change = (New Value - Original Value) / Original Value × 100
+Use a positive, nonzero original value for the usual increase/decrease interpretation.
 
 Increase: Result is positive
 Decrease: Result is negative
@@ -375,7 +366,7 @@ Sales performance:
 Multiple Percentage Changes
 ══════════════════════════
 
-Important: Successive percentages are NOT additive!
+Successive changes are generally not additive: each change uses the current value as its base.
 
 Example: Price increases 20%, then decreases 20%
 Original price: $100
@@ -389,7 +380,9 @@ Why? The 20% decrease is calculated on the new higher price ($120), not the orig
 
 General formula for successive changes:
 Final = Original × (1 + r₁) × (1 + r₂) × ... × (1 + rₙ)
-Where r is the decimal form of percentage change (positive for increase, negative for decrease)
+Where r is the decimal form of percentage change (positive for increase, negative for decrease).
+Percentages describing separate parts of the same whole may be added when appropriate;
+this formula concerns changes applied in sequence to a changing base.
 
 Complex example:
 Investment: $1,000
@@ -524,11 +517,12 @@ Tip: 18%
 Tip amount: 18% of $67.50 = 0.18 × $67.50 = $12.15
 Total: $67.50 + $12.15 = $79.65
 
-Credit Card Interest:
-Balance: $2,500
-Annual interest rate: 18.9%
+Illustrative simple interest (not a credit-card billing calculation):
+Balance: $2,500; nominal annual rate: 18.9%
+Assume one month is exactly 1/12 year and the balance is constant.
 Monthly rate: 18.9% ÷ 12 = 1.575%
-Monthly interest: 1.575% of $2,500 = 0.01575 × $2,500 = $39.38
+Estimated interest: 0.01575 × $2,500 = $39.375, or $39.38 rounded to cents.
+Actual account interest can use daily balances, different day counts, fees, and contractual rounding.
 
 Investment Returns:
 Investment: $5,000
@@ -590,23 +584,14 @@ Market share: ($12M ÷ $80M) × 100 = 15%
 Health and Science Applications
 ══════════════════════════════
 
-Medical Dosages:
-Patient weight: 70 kg
-Medication: 5 mg per kg of body weight
-Dose: 70 × 5 = 350 mg
-
-If patient can only take 80% of full dose:
-Reduced dose: 80% of 350 mg = 0.80 × 350 = 280 mg
-
 Nutrition Labels:
 Daily Value for sodium: 2,300 mg
 Amount in food item: 460 mg
 Percentage of Daily Value: (460 ÷ 2,300) × 100 = 20%
 
 Solution Concentrations:
-Salt solution: 250 mL total volume
-Salt: 15 mL
-Concentration: (15 ÷ 250) × 100 = 6%
+A liquid mixture: 250 mL final volume, containing 15 mL of one liquid.
+Volume/volume percentage: (15 ÷ 250) × 100 = 6%.
 
 Body Composition:
 Total body weight: 70 kg
@@ -638,9 +623,9 @@ Common Percentage Mistakes
 ═════════════════════════
 
 Mistake 1: Confusing percentage OF vs percentage INCREASE
-Wrong: "Sales increased 20% from $100 to $120"
-The increase is $20, which is 20% OF the original $100
-Correct: "Sales increased BY 20%" or "Sales increased TO 120% of original"
+Wrong: "Sales increased TO 20% of the original" for $100 → $120.
+Correct: Sales increased BY 20% and reached 120% of the original.
+The increase, $20, is 20% of $100; the new total, $120, is 120% of $100.
 
 Mistake 2: Adding percentages incorrectly
 Wrong: 20% increase followed by 30% increase = 50% total increase
@@ -653,9 +638,9 @@ Correct: ($20 ÷ $80) × 100 = 25%
 (Always use original value as base for percentage change)
 
 Mistake 4: Percentage vs percentage points
-Wrong: "Interest rate increased from 3% to 5%, a 67% increase"
-Correct: "Interest rate increased by 2 percentage points" or "increased by 67%"
-Both are correct but mean different things!
+From 3% to 5% is an increase of 2 percentage points.
+Relative to the original 3%, the increase is (5 - 3) / 3 = 66⅔%.
+Both descriptions are correct, but describe different quantities.
 
 Mistake 5: Forgetting to convert percentage to decimal
 Wrong: 25% of 80 = 25 × 80 = 2000
@@ -669,6 +654,33 @@ Prevention Strategies:
 - Check answers for reasonableness
 - Practice distinguishing between percentage points and percentages
 ```
+
+## Choosing a base: worked comparisons
+
+A percentage is a ratio, so always say what the denominator represents. The same difference can have different relative percentages when the base changes.
+
+**Reverse a discount.** A price of 80 is reduced by 25% to 60. Returning from 60 to 80 takes an increase of $20/60 = 1/3$, or **33⅓%**, because the new starting point is 60. Conversely, if a 25% discount produces 60, the original is $60 / 0.75 = 80$. Adding 25% to 60 would produce only 75.
+
+**Combine groups of different sizes.** One group has 9 successes in 10 trials (90%); another has 50 successes in 100 trials (50%). The combined success rate is $(9 + 50)/(10 + 100) = 59/110 \approx 53.6\%$. Averaging 90% and 50% equally gives 70%, which gives both groups the same weight despite their different sizes. Combine counts first, or weight each rate by its group size, when calculating a pooled rate.
+
+**A zero starting value.** Going from 0 to 5 is an increase of 5 units, but the usual percentage-change formula divides by zero, so its result is **undefined**. Report the absolute change and context instead of inventing a percentage. For negative starting values, conventions differ and a signed ratio can be misleading; state the values and method rather than applying the positive-base interpretation without explanation.
+
+**Percentage points versus relative change.** A rate going from 10% to 12% rises by 2 percentage points. The relative increase is $2/10 = 20\%$ of its initial rate. A rate going from 12% back to 10% falls by 2 percentage points, but the relative decrease is $2/12 = 16\frac{2}{3}\%$ of its own starting rate.
+
+## Practice with checks
+
+Try each without looking at the answers. Show the base in your working.
+
+1. Convert $0.375$ to a percentage and a simplified fraction.
+2. A book costs 48 after a 20% discount. What was the original price?
+3. A rate changes from 4% to 5%. Give the change in percentage points and the relative percentage increase.
+4. A class has 18 passes out of 20; another has 6 passes out of 10. What is the combined pass rate?
+5. A count increases from 0 to 12. Can the usual percentage-change formula give a result?
+6. A price falls by 10% and then rises by 10%. What fraction of the original price remains?
+
+**Answers:** (1) 37.5%, or $3/8$. (2) 60, since $48/0.8=60$. (3) 1 percentage point and 25%, since $1/4=0.25$. (4) $24/30=80\%$. (5) No; division by the zero starting value is undefined. (6) $0.9 \times 1.1 = 0.99$, or 99% of the original.
+
+Further reading: [OpenStax on percent](https://openstax.org/books/contemporary-mathematics/pages/6-1-understanding-percent) and the [Office for National Statistics on percentage points](https://service-manual.ons.gov.uk/content/numbers/percentages).
 
 ## Building Percentage Fluency
 
